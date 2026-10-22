@@ -95,6 +95,7 @@ pub enum ToolResultStatus { Completed, Failed, Interrupted }
 pub struct ToolErrorInfo { kind: ToolErrorKind, message: String }
 pub enum ToolErrorKind {
     InvalidArgs, Denied, Timeout, Cancelled, Panic, Transport, Internal,
+    NotFound,                        // 工具不在注册表；模型可见
 }
 pub enum TurnEndReason {
     Completed, Cancelled, Failed, Stopped { reason: String },
@@ -107,6 +108,7 @@ pub enum TurnEndReason {
 
 - **没有通用 `Error` 事件**。错误是它所附着事件的终态（`ModelCallAborted`、`ToolResult::Failed`、`ChildOutcome`）。
 - `ToolResult` 是工具调用的唯一终态：`Failed` 必带 `error`；`Interrupted` 的 `output` / `error` 为 `None`。
+- `ToolCallRequested` 的 `provenance` 可以是 `Unknown`（请求的工具不在注册表），此时 `replay` 记 `Unsafe`；恢复按 [plugins.md](plugins.md) §8 处理。`NotFound` 是模型可见的工具错误类型，不新增 status。
 - 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。`model` 记在三个承载 usage 的终态记录上，是发起请求的 `ModelSpec`（#13）。
@@ -266,4 +268,4 @@ recover(session):
 - **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
 - **#12**：已定。trace 是日志的确定性投影；`recorded_at`、`CompactionStarted`、`SignalAwaited` 的追踪挂接见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
-- **#16**：插件发现与外部能力边界。
+- **#16**：已定。插件清单、加载、版本协商与外部能力边界见 [plugins.md](plugins.md)；v1 不做插件发现。`Provenance` 新增 `Unknown`，只用于工具不存在的请求记录。

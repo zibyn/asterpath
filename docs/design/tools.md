@@ -38,7 +38,7 @@ pub struct ToolDescriptor {
     pub parallelism: Parallelism,   // Parallel | Exclusive
     pub replay: ReplaySafety,       // Safe | Unsafe
     pub side_effect: SideEffect,    // ReadOnly | Mutating
-    pub provenance: Provenance,     // InProcess | External { transport }
+    pub provenance: Provenance,     // InProcess | External { transport }；Unknown 仅出现在请求记录
     pub timeout: Option<Duration>,
     pub max_output_bytes: Option<usize>,
 }
@@ -69,7 +69,9 @@ pub enum ToolError {
 - **超时由管线执行**，工具只观察 `CancelToken`（`is_cancelled` / `cancelled`），不自己管 deadline。
 - `CancelToken` 只在本次调用内有效；具体类型归 #15 打包。
 - 工具不写日志、不写 `ToolResult`；返回值由管线落盘。
-- `ToolDescriptor` 在工具生命周期内不可变；`ToolName` 唯一性与命名空间归 [#16](https://github.com/zibyn/asterpath/issues/16)。
+- `ToolDescriptor` 在工具生命周期内不可变。
+- `ToolName` 在注册表中唯一：进程内工具用裸名，字符集 `[A-Za-z0-9_-]`、长度 1–64，`__` 保留；外部工具暴露为 `<plugin_id>__<sanitized_name>`。命名空间、重名与整插件失败规则见 [plugins.md](plugins.md) §6。
+- `Provenance::Unknown` 只出现在 `ToolCallRequested`（请求的工具不在注册表），描述符不得使用；它不进入审批。
 - `side_effect` 是**声明**，不是强制；审批策略消费它。
 - `description` 是模型可见的工具说明；补上 #2 的最小 seam。
 - `max_output_bytes` 是该工具的单次上限覆盖；`None` 用默认值。
@@ -81,6 +83,7 @@ AssistantMessage(tool_calls)
   for each call，按并行/独占规则调度：
     pre-execute waterfall          # allow / deny / ask / 改写参数
     append ToolCallRequested { effective args }
+    if tool not in registry: append ToolResult{Failed, NotFound}; done
     approval policy                # Allow / Ask / Deny
     if Ask: await signal           # 可跨天、跨崩溃
     if Deny: append ToolResult{Failed, Denied}; done
@@ -94,6 +97,7 @@ AssistantMessage(tool_calls)
 阶段规则：
 
 - **每个模型发起的调用都会写 `ToolCallRequested`**，即使随后被拒绝；意图与终态一一对应（I2）。
+- 工具不在注册表时：pre-execute 照常运行；若未被拒绝，写意图（`replay = Unsafe`、`provenance = Unknown`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。模型幻觉、插件升级后移除工具都走这条路径。
 - pre-execute 在写意图前运行。它可以改写参数，日志记录改写后的 **effective args**；模型原始参数仍在 `AssistantMessage` 中。
 - pre-execute 崩溃或报错不产生副作用；恢复时重跑该调用的 pre-execute。
 - deny（来自 pre-execute、策略或审批）写 `ToolResult{Failed, error.kind = Denied}`，跳过执行与 post-execute。
@@ -149,6 +153,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 | `External` | 否 | `Deny` |
 
 - `side_effect` 只作为自定义策略的输入；默认策略不看它。
+- `Provenance::Unknown` 不进入审批：工具不存在，管线直接写 `NotFound`，不会发 `ApprovalRequested`。
 - 参考 CLI 的审批端与默认策略归 [#15](https://github.com/zibyn/asterpath/issues/15)。
 
 ## 5. 并行与独占
@@ -209,6 +214,7 @@ pub struct ToolErrorInfo {
 
 pub enum ToolErrorKind {
     InvalidArgs, Denied, Timeout, Cancelled, Panic, Transport, Internal,
+    NotFound,                        // 工具不在注册表；模型可见
 }
 ```
 
@@ -222,7 +228,7 @@ pub enum ToolErrorKind {
 - 截断在 UTF-8 边界进行，并在 content 末尾附 `"[output truncated: N bytes omitted]"`；`truncated = true`。
 - **完整输出不落日志**；日志是模型可见内容的有界记录，不是工具的原始输出存储。
 
-状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。
+状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。`NotFound` 由管线产生，不由工具返回：工具不存在时没有 `invoke`，因此 `ToolError` 不需要对应变体；`ToolErrorKind` 是事件级分类。
 
 ## 8. 结果去向
 
@@ -276,6 +282,7 @@ pub struct ToolConfig {
 | T11 | external 未声明 replay | 按 `Unsafe`；恢复写 `Interrupted` |
 | T12 | 未装审批端且策略为 Ask | 按 `Deny` 处理（fail closed） |
 | T13 | 结果进入下一次模型请求 | 投影顺序 = 调用顺序；不产生独立 token 记录 |
+| T14 | 模型请求注册表中不存在的工具 | 仍写 `ToolCallRequested`；`ToolResult{Failed, NotFound}`；不审批、不执行；恢复按 [plugins.md](plugins.md) §8 |
 
 ## 11. 扩展点（非内核）
 
@@ -292,6 +299,6 @@ pub struct ToolConfig {
 - **#12**：tool span 命名与属性；默认只记元数据。
 - **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
-- **#16**：工具名命名空间与重名策略、插件清单与加载、外部工具的版本协商。
+- **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
 - **#17**：`DurableExecutor::await_signal` 必须支持审批等待；signal name 约定由本文件定义。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。

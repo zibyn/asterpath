@@ -45,7 +45,7 @@
 `asterpath-scheduler` 模块提供两样东西：
 
 1. 进程内能力 `SubagentSpawner`（宿主也可用）；
-2. 模型可见的 spawn 工具（参考名 `spawn_agent`，最终命名归 #16），是 `SubagentSpawner` 的薄包装。
+2. 模型可见的 spawn 工具（`spawn_agent`；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突），是 `SubagentSpawner` 的薄包装。
 
 API 草图（最终签名归 #17）：
 
@@ -397,7 +397,7 @@ pub struct SubagentConfig {
 - **#12**：已定。父 `subagent` span 与子 trace 根 span 的链接、`caused_by` / `source_log` 映射见 [tracing.md](tracing.md)。
 - **#13**：已定。session 树 rollup、去重口径与子 usage 查询见 [usage.md](usage.md)；树边由 core 的 `SessionCatalog` 提供。
 - **#15**：spawn 工具的最终命名/参数 schema；`SubagentSpawner` 的打包位置。
-- **#16**：`spawn_agent` 的命名空间与重名策略。
+- **#16**：已定。`spawn_agent` 是进程内工具的裸名；外部工具一律 `<plugin_id>__<tool>`，`__` 保留，因此不与 `spawn_agent` 冲突。见 [plugins.md](plugins.md) §6。
 - **#17**：`SubagentSpawner` 精确签名、排队/唤醒实现、与 `DurableExecutor` 的接缝。
 - **#18**：保留/归档必须保证父子流在对方仍活跃时不被删除；违反时按 §9 的缺失策略处理。
 - **#19**：R1–R4 的崩溃注入点与确定性测试。

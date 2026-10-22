@@ -460,7 +460,7 @@ pub enum ProviderErrorKind {
 3. **epoch 不匹配**（压缩改变了前缀）：`Reasoning` 不进入请求；其他 item 不受影响。
 4. **model 变化但 provider 相同**：视为不匹配，`Reasoning` 不进入请求。
 5. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
-6. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责，#16）。
+6. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
 
 `prefix_epoch` 的定义：会话中截至请求水位已发生的 `CompactionApplied` 数量。`Reasoning.binding.prefix_epoch` 在产出时写入（取自 `request.prefix_epoch`）；压缩后旧 reasoning 自然失效，压缩后新产出的 reasoning 使用新代次。
 
@@ -662,7 +662,7 @@ pub enum ProviderErrorKind {
 - **#12**：`StreamEvent`、`ResponseStarted` / `ResponseEnded`、`protocol.dropped_items` 到 trace span 的命名与属性。
 - **#13**：已定。`Usage` 的聚合、桶、partial usage 与 session 树 rollup 见 [usage.md](usage.md)；`ProviderError.partial_usage` 与三个事件上的 `model` 字段已回写本文件与 #3。
 - **#15**：`ProviderId` / `ModelId` / `ToolName` / `JsonString` 的精确类型与打包；`Provider` 注册与模型解析；`max_output_tokens` 的宿主配置。
-- **#16**：provider 插件、模型 alias、`RawProviderData.kind` 的跨版本兼容责任。
+- **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。
 - **#8**：fork 复制规范 item 与 raw；跨 provider 丢弃规则同样适用。

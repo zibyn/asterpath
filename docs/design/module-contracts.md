@@ -176,6 +176,7 @@ pub trait Tool: Send + Sync + 'static {
 pub enum Provenance {
     InProcess,
     External { transport: TransportKind },
+    Unknown,                        // 仅用于 ToolCallRequested：请求的工具不在注册表
 }
 
 pub struct ToolDescriptor {
@@ -202,6 +203,7 @@ pub trait AgentRunner: Send + Sync {
 ```
 
 - 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定，见 [protocol.md](protocol.md)。
+- `Provenance::Unknown` 只出现在 `ToolCallRequested`；`ToolDescriptor.provenance` 必须是 `InProcess` 或 `External`，它不进入审批（见 [tools.md](tools.md) §3/§4）。
 - 工具执行管线与审批见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)；`ToolDescriptor` 的最终字段以那里为准。
 - `AgentRunner` 是 loop 契约；turn/step、取消、steering 由 #6 定。
 
@@ -239,7 +241,7 @@ pub trait AgentRunner: Send + Sync {
 - 进程内模块随宿主编译，`Module` 永远是进程内、受信的。
 - 外部插件是子进程或 MCP server；由进程内 adapter 模块连接，并把它们的工具注册为 `Provenance::External { transport }`。
 - 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）。
-- 动态发现、热替换不属于 v1；安装/分发是 host 责任；版本协商见 #16。
+- 动态发现、热替换不属于 v1；安装/分发是 host 责任；清单、加载与版本协商见 [plugins.md](plugins.md) §7。
 
 ## 7. 可检查的解耦
 
@@ -273,7 +275,7 @@ pub trait AgentRunner: Send + Sync {
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 最终 crate 列表、门面、CLI 打包 |
-| #16 插件分发 | 插件清单、发现、版本协商 |
+| #16 插件分发 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现出界 |
 
 ## 9. 明确留给下游的点
 
@@ -281,5 +283,5 @@ pub trait AgentRunner: Send + Sync {
 - `Storage` 方法与 SQLite schema：#4。
 - `LogEntry` 编码与 schema 版本：#3/#4。
 - 会话生命周期事件枚举：#3/#11。
-- 插件发现/分发/版本协商：#16。
+- 插件清单/加载/版本协商：已定，见 [plugins.md](plugins.md)；发现与分发出界。
 - 热替换、动态发现、WASM：v1 出界。
