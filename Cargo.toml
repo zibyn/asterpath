@@ -10,6 +10,7 @@ members = [
     "crates/asterpath-storage-sqlite",
     "crates/asterpath-provider-anthropic",
     "crates/asterpath-testing",
+    "crates/asterpath-acceptance",
     "crates/asterpath",
     "xtask",
 ]

@@ -5,14 +5,58 @@
 //! transport would happen. No network, no clock, no sleeping.
 
 use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use asterpath_protocol::{
     Item, ModelRequest, Part, PartDelta, Provider, ProviderCapabilities, ProviderError,
-    ProviderErrorKind, ProviderId, StopReason, StreamEvent, ToolChoice, Usage,
+    ProviderErrorKind, ProviderId, StopReason, StreamEvent, ToolChoice, ToolName, Usage,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
+use serde::Deserialize;
+
+/// One scripted model response in an acceptance fixture.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FixtureStep {
+    pub items: Vec<Item>,
+    pub stop_reason: StopReason,
+    #[serde(default)]
+    pub usage: Usage,
+}
+
+/// Acceptance fixture: the single source for a scripted session.
+///
+/// Only the provider and clock are scripted; tool assembly stays in
+/// `asterpath-acceptance`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Fixture {
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default)]
+    pub system: Vec<Part>,
+    #[serde(default)]
+    pub tools: Vec<ToolName>,
+    /// Stream half a response, print `stream_open`, then hang. Used by the
+    /// model-stream crash scenario on the first process only.
+    #[serde(default)]
+    pub stream_open_first_attempt: bool,
+    /// Cancel the turn on the first live delta, for cancellation windows.
+    #[serde(default)]
+    pub cancel_on_first_delta: bool,
+    pub steps: Vec<FixtureStep>,
+}
+
+fn default_provider() -> String {
+    "p".to_owned()
+}
+
+fn default_model() -> String {
+    "model-1".to_owned()
+}
 
 /// One scripted model attempt.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +79,8 @@ pub struct ScriptedProvider {
     capabilities: ProviderCapabilities,
     script: Mutex<VecDeque<ScriptedStep>>,
     requests: Mutex<Vec<ModelRequest>>,
+    stream_open_first_attempt: bool,
+    first_attempt: AtomicBool,
 }
 
 impl ScriptedProvider {
@@ -44,6 +90,35 @@ impl ScriptedProvider {
             capabilities: ProviderCapabilities::default(),
             script: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
+            stream_open_first_attempt: false,
+            first_attempt: AtomicBool::new(true),
+        }
+    }
+
+    /// Replay a fixture's responses in order.
+    pub fn from_fixture(fixture: &Fixture) -> Self {
+        let mut provider = Self::new(fixture.provider.clone());
+        for step in &fixture.steps {
+            provider = provider.respond(step.items.clone(), step.stop_reason.clone(), step.usage);
+        }
+        provider
+    }
+
+    /// On the first attempt only: emit the response without `ResponseEnded`,
+    /// print the `stream_open` marker and never finish. The parent test kills
+    /// this process.
+    #[must_use]
+    pub fn stream_open_on_first_attempt(mut self) -> Self {
+        self.stream_open_first_attempt = true;
+        self
+    }
+
+    /// Drop already-replayed steps after a crash; recovery resumes at the
+    /// first attempt not present in the committed prefix.
+    pub fn skip(&self, steps: usize) {
+        let mut script = self.script.lock().unwrap_or_else(PoisonError::into_inner);
+        for _ in 0..steps {
+            script.pop_front();
         }
     }
 
@@ -157,12 +232,18 @@ impl Provider for ScriptedProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front();
+        let open_on_this_attempt = matches!(step, Some(ScriptedStep::Respond { .. }))
+            && self.stream_open_first_attempt
+            && self.first_attempt.swap(false, Ordering::SeqCst);
         let events = match step {
             Some(ScriptedStep::Respond {
                 items,
                 stop_reason,
                 usage,
-            }) => item_events(items, Some((stop_reason, usage))),
+            }) => item_events(
+                items,
+                (!open_on_this_attempt).then_some((stop_reason, usage)),
+            ),
             Some(ScriptedStep::PartialThenFail { items, error }) => {
                 let mut events = item_events(items, None);
                 events.push(Err(error));
@@ -174,6 +255,12 @@ impl Provider for ScriptedProvider {
                 "scripted provider script is exhausted",
             ))],
         };
+        if open_on_this_attempt {
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{{\"event\":\"stream_open\"}}");
+            let _ = stdout.flush();
+            return stream::iter(events).chain(stream::pending()).boxed();
+        }
         stream::iter(events).boxed()
     }
 }
