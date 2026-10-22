@@ -29,6 +29,9 @@ use futures_util::StreamExt;
 pub use config::{AsterpathBuilder, AsterpathConfig};
 pub use error::AsterError;
 
+#[cfg(feature = "openai")]
+pub use asterpath_provider_openai as openai;
+
 #[cfg(feature = "sqlite")]
 use asterpath_storage_sqlite::SqliteStorageModule;
 

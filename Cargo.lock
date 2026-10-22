@@ -10,6 +10,7 @@ dependencies = [
  "asterpath-core",
  "asterpath-protocol",
  "asterpath-provider-anthropic",
+ "asterpath-provider-openai",
  "asterpath-storage-sqlite",
  "asterpath-testing",
  "futures-core",
@@ -63,6 +64,20 @@ dependencies = [
  "futures-core",
  "futures-util",
  "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-provider-openai"
+version = "0.1.0"
+dependencies = [
+ "asterpath-protocol",
+ "futures-core",
+ "futures-util",
+ "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
