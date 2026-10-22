@@ -2,7 +2,8 @@
 //! stream and the summed `AgentError`.
 
 use asterpath_core::{
-    InputId, LifecycleError, LogIdRange, SessionId, StepId, StorageError, ToolCallId, TurnId,
+    ExecutionError, InputId, LifecycleError, LogIdRange, SessionId, StepId, StorageError,
+    ToolCallId, TurnId,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -140,6 +141,8 @@ pub enum AgentError {
     Corrupt { session: SessionId, detail: String },
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
     #[error(transparent)]
