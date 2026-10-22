@@ -16,8 +16,9 @@ use asterpath_agent::Agent;
 use asterpath_core::{EventLog, InputId, LogQuery, ModuleHost, SessionCatalog, SessionId, Storage};
 use asterpath_protocol::{
     AgentEvent, AgentRunner, CompactResult, OpenIntents, ProviderCatalog, RunRequest, RunTrigger,
-    SessionEvent, SessionSpec, SessionState, ToolSelection, UserInput, dedup,
+    SessionEvent, SessionSpec, SessionState, ToolRegistry, ToolSelection, UserInput, dedup,
 };
+use asterpath_tools::ToolsModule;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
@@ -33,8 +34,9 @@ pub struct Asterpath {
     storage: Arc<dyn Storage>,
     session_catalog: Arc<dyn SessionCatalog>,
     providers: Arc<ProviderCatalog>,
+    tools: Arc<dyn ToolRegistry>,
     agent: Arc<dyn AgentRunner>,
-    host: Option<ModuleHost>,
+    host: ModuleHost,
 }
 
 impl std::fmt::Debug for Asterpath {
@@ -75,7 +77,10 @@ impl Asterpath {
         let event_log;
         let storage;
         let session_catalog;
-        let host;
+
+        let mut module_host = ModuleHost::new();
+        let tools_module = Arc::new(ToolsModule::new());
+        module_host.register(tools_module.clone());
 
         match (config.event_log, config.storage) {
             (Some(log), Some(store)) => {
@@ -85,7 +90,6 @@ impl Asterpath {
                     message: "session_catalog is required when event_log and storage are injected"
                         .to_owned(),
                 })?;
-                host = None;
             }
             (None, None) => {
                 #[cfg(feature = "sqlite")]
@@ -96,13 +100,10 @@ impl Asterpath {
                         });
                     }
                     let backend = asterpath_storage_sqlite::open(&config.database)?;
-                    let mut module_host = ModuleHost::new();
                     module_host.register(Arc::new(SqliteStorageModule::new(backend.clone())));
-                    module_host.init().await?;
                     event_log = backend.clone();
                     storage = backend.clone();
                     session_catalog = backend;
-                    host = Some(module_host);
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -120,8 +121,21 @@ impl Asterpath {
             }
         }
 
+        module_host.init().await?;
+        let tools = tools_module.registry();
+        for tool in config.tools {
+            tools.register(tool);
+        }
+        let hooks = tools_module.context();
+
         let agent = config.agent.unwrap_or_else(|| {
-            Arc::new(Agent::new(Arc::clone(&event_log), Arc::clone(&providers)))
+            Arc::new(Agent::new(
+                Arc::clone(&event_log),
+                Arc::clone(&providers),
+                Arc::clone(&tools),
+                config.tool.clone(),
+                hooks,
+            ))
         });
 
         Ok(Self {
@@ -129,8 +143,9 @@ impl Asterpath {
             storage,
             session_catalog,
             providers,
+            tools,
             agent,
-            host,
+            host: module_host,
         })
     }
 
@@ -155,15 +170,21 @@ impl Asterpath {
             });
         }
         let tools = match &spec.tools {
-            ToolSelection::All => Vec::new(),
-            ToolSelection::Names(names) if names.is_empty() => Vec::new(),
+            ToolSelection::All => self
+                .tools
+                .list()
+                .iter()
+                .map(|tool| tool.descriptor().clone())
+                .collect(),
             ToolSelection::Names(names) => {
-                return Err(AsterError::Config {
-                    message: format!(
-                        "unknown tool {}",
-                        names.first().expect("non-empty").as_str()
-                    ),
-                });
+                let mut selected = Vec::with_capacity(names.len());
+                for name in names {
+                    let tool = self.tools.get(name).ok_or_else(|| AsterError::Config {
+                        message: format!("unknown tool {}", name.as_str()),
+                    })?;
+                    selected.push(tool.descriptor().clone());
+                }
+                selected
             }
         };
 
@@ -198,9 +219,7 @@ impl Asterpath {
     }
 
     pub async fn shutdown(mut self) -> Result<(), AsterError> {
-        if let Some(mut host) = self.host.take() {
-            host.shutdown().await;
-        }
+        self.host.shutdown().await;
         Ok(())
     }
 

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use asterpath_core::{Clock, EventLog, SessionCatalog, Storage, SystemClock};
 use asterpath_protocol::{
-    AgentRunner, CompactionConfig, ModelAlias, ModelSpec, Provider, SubagentConfig, TurnConfig,
+    AgentRunner, CompactionConfig, ModelAlias, ModelSpec, Provider, SubagentConfig, Tool,
+    ToolConfig, TurnConfig,
 };
 
 use crate::error::AsterError;
@@ -15,6 +16,8 @@ use crate::error::AsterError;
 pub struct AsterpathConfig {
     pub database: PathBuf,
     pub providers: Vec<Arc<dyn Provider>>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub tool: ToolConfig,
     pub agent: Option<Arc<dyn AgentRunner>>,
     /// Overrides the `sqlite` feature; must be paired with `storage`.
     pub event_log: Option<Arc<dyn EventLog>>,
@@ -32,6 +35,8 @@ impl Default for AsterpathConfig {
         Self {
             database: PathBuf::new(),
             providers: Vec::new(),
+            tools: Vec::new(),
+            tool: ToolConfig::default(),
             agent: None,
             event_log: None,
             storage: None,
@@ -76,6 +81,18 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn providers(mut self, providers: Vec<Arc<dyn Provider>>) -> Self {
         self.config.providers = providers;
+        self
+    }
+
+    #[must_use]
+    pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.config.tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn tool(mut self, tool: ToolConfig) -> Self {
+        self.config.tool = tool;
         self
     }
 

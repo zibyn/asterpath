@@ -1,43 +1,71 @@
-//! Agent loop: the single-turn / single-step walking skeleton.
+//! Agent loop: multi-step turns, the fixed tool pipeline and log-derived state.
 //!
-//! One driver per session, model-attempt retries inside one step, the
-//! `StepStarted.seq` projection waterline, and log-derived state. Tools,
-//! steering, cancellation and compaction are deliberately out of scope here.
+//! One driver per session; model-attempt retries inside one step; the
+//! `StepStarted.seq` projection waterline; parallel/exclusive tool scheduling
+//! scoped to a step. Steering, cancellation and recovery are later tickets.
 
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use asterpath_core::{DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, TurnId};
+use asterpath_core::{
+    ApprovalGate, DedupKey, EventLog, LogEntry, LogId, LogQuery, ModuleCtx, SessionId, StepId,
+    ToolCallId, TurnId,
+};
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, AgentRunner, CompactResult, ConfigSnapshot, Item,
-    ModelRequest, OpenIntents, ProviderCatalog, ProviderError, ProviderErrorKind, RunRequest,
-    SessionEvent, SessionState, StopReason, StreamEvent, TurnConfig, TurnEndReason, Usage,
-    decode_entry, dedup,
+    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalPolicy, ApprovalRequest,
+    ApprovalVerdict, CancelToken, CompactResult, ConfigSnapshot, DefaultApprovalPolicy, Item,
+    ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism, PostExecuteError,
+    PostExecuteEvent, PreExecuteError, PreExecuteEvent, Provenance, ProviderCatalog, ProviderError,
+    ProviderErrorKind, ReplaySafety, RunRequest, SessionEvent, SessionState, StopReason,
+    StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
+    ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason,
+    Usage, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::{StreamExt, stream};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt, stream};
+
+const DENIED_WITHOUT_REASON: &str = "tool call denied";
 
 /// Default turn driver.
 pub struct Agent {
     log: Arc<dyn EventLog>,
     providers: Arc<ProviderCatalog>,
+    tools: Arc<dyn ToolRegistry>,
+    tool_config: ToolConfig,
+    approval: Arc<dyn ApprovalPolicy>,
+    gate: Arc<ApprovalGate>,
+    hooks: Option<ModuleCtx>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
 }
 
 impl Agent {
-    pub fn new(log: Arc<dyn EventLog>, providers: Arc<ProviderCatalog>) -> Self {
+    pub fn new(
+        log: Arc<dyn EventLog>,
+        providers: Arc<ProviderCatalog>,
+        tools: Arc<dyn ToolRegistry>,
+        tool_config: ToolConfig,
+        hooks: Option<ModuleCtx>,
+    ) -> Self {
+        let gate = Arc::new(ApprovalGate::new());
         Self {
             log,
             providers,
+            tools,
+            tool_config,
+            approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+            gate,
+            hooks,
             busy: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -119,45 +147,19 @@ impl Agent {
             }
             SessionState::TurnOpen { turn, .. } => {
                 // Resume from the log: never repeat TurnStarted.
-                let mut committed: HashSet<StepId> = HashSet::new();
-                let mut open_step: Option<(StepId, u64)> = None;
-                for (entry, event) in &decoded {
-                    match event {
-                        SessionEvent::StepStarted { turn_id, step_id } if *turn_id == turn => {
-                            open_step = Some((*step_id, entry.seq))
-                        }
-                        SessionEvent::StepCommitted { step_id, .. } => {
-                            committed.insert(*step_id);
-                            if open_step.is_some_and(|(open, _)| open == *step_id) {
-                                open_step = None;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
+                let open_step = open_step(&decoded, turn);
                 if let Some((step, _)) = open_step
-                    && decoded.iter().any(|(_, event)| {
-                        matches!(
-                            event,
-                            SessionEvent::AssistantMessage { turn_id, step_id, .. }
-                                if *turn_id == turn && *step_id == step
-                        )
-                    })
+                    && has_assistant_message(&decoded, turn, step)
                 {
-                    // The model call already committed; only the checkpoint is missing.
-                    self.append(
-                        session,
-                        SessionEvent::StepCommitted {
-                            turn_id: turn,
-                            step_id: step,
-                        },
-                        Some(dedup::step_committed(step)),
-                    )
-                    .await?;
-                    return self
-                        .commit_turn(session, turn, TurnEndReason::Completed, events)
-                        .await;
+                    // The model call already committed; finish its tools, commit,
+                    // then continue the turn exactly like a normal step.
+                    match self.resume_step(session, turn, step, events).await? {
+                        StepOutcome::Continue => {}
+                        StepOutcome::Turn(reason) => {
+                            return self.commit_turn(session, turn, reason, events).await;
+                        }
+                    }
+                    return self.run_steps(session, &config, turn, None, events).await;
                 }
 
                 self.run_steps(session, &config, turn, open_step, events)
@@ -277,7 +279,7 @@ impl Agent {
                     SessionEvent::AssistantMessage {
                         turn_id: turn,
                         step_id: step,
-                        items,
+                        items: items.clone(),
                         raw: None,
                         model: config.model.clone(),
                         usage,
@@ -286,23 +288,19 @@ impl Agent {
                     Some(dedup::assistant_message(turn, step)),
                 )
                 .await?;
-                self.append(
-                    session,
-                    SessionEvent::StepCommitted {
-                        turn_id: turn,
-                        step_id: step,
-                    },
-                    Some(dedup::step_committed(step)),
-                )
-                .await?;
 
-                return Ok(match stop_reason {
-                    StopReason::PauseTurn => StepOutcome::Continue,
-                    StopReason::ContextWindowExceeded => {
-                        StepOutcome::Turn(TurnEndReason::ContextExhausted)
-                    }
-                    _ => StepOutcome::Turn(TurnEndReason::Completed),
-                });
+                let calls = tool_calls(&items);
+                let had_calls = !calls.is_empty();
+                if had_calls {
+                    let decoded = decode_entries(self.scan(session).await?, session)?;
+                    let existing = existing_step(&decoded, turn, step);
+                    self.execute_tool_calls(session, turn, step, &existing, calls, events)
+                        .await?;
+                }
+
+                self.commit_step(session, turn, step).await?;
+                let pending_input = self.pending_input(session).await?;
+                return Ok(step_outcome(&stop_reason, had_calls, pending_input));
             }
 
             // A stream that ends without a terminal event violates S2/S8.
@@ -352,21 +350,527 @@ impl Agent {
                 continue;
             }
 
-            self.append(
-                session,
-                SessionEvent::StepCommitted {
-                    turn_id: turn,
-                    step_id: step,
-                },
-                Some(dedup::step_committed(step)),
-            )
-            .await?;
+            self.commit_step(session, turn, step).await?;
             return Ok(StepOutcome::Turn(if error.context_exceeded() {
                 TurnEndReason::ContextExhausted
             } else {
                 TurnEndReason::Failed
             }));
         }
+    }
+
+    /// Finish an open step whose `AssistantMessage` is already committed: run
+    /// every call without a `ToolResult`, reusing recorded intents verbatim.
+    async fn resume_step(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        events: &EventSink,
+    ) -> Result<StepOutcome, AgentError> {
+        let decoded = decode_entries(self.scan(session).await?, session)?;
+        let (items, stop_reason) = decoded
+            .iter()
+            .find_map(|(_, event)| match event {
+                SessionEvent::AssistantMessage {
+                    turn_id,
+                    step_id,
+                    items,
+                    stop_reason,
+                    ..
+                } if *turn_id == turn && *step_id == step => {
+                    Some((items.clone(), stop_reason.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| AgentError::Corrupt {
+                session,
+                detail: "open step has no AssistantMessage".to_owned(),
+            })?;
+
+        let existing = existing_step(&decoded, turn, step);
+        let calls = tool_calls(&items);
+        let had_calls = !calls.is_empty();
+        if had_calls {
+            self.execute_tool_calls(session, turn, step, &existing, calls, events)
+                .await?;
+        }
+
+        self.commit_step(session, turn, step).await?;
+        let pending_input = self.pending_input(session).await?;
+        Ok(step_outcome(&stop_reason, had_calls, pending_input))
+    }
+
+    /// The fixed pipeline: pre-execute, intent, registry, approval, scheduling,
+    /// invocation, truncation, post-execute, result.
+    async fn execute_tool_calls(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        existing: &ExistingStep,
+        calls: Vec<CallItem>,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.tool_config.max_parallel_calls.get(),
+        ));
+        let budget = Arc::new(Mutex::new(self.tool_config.max_output_bytes_per_step));
+        let mut runnable: Vec<Runnable> = Vec::new();
+
+        for call in calls {
+            if let Some(intent) = existing.intents.get(&call.provider_call_id) {
+                if existing.results.contains(&intent.tool_call_id) {
+                    continue;
+                }
+                match self.tools.get(&intent.name) {
+                    None => {
+                        self.append_tool_result(
+                            session,
+                            intent.tool_call_id,
+                            ToolResultStatus::Failed,
+                            None,
+                            Some(ToolErrorInfo {
+                                kind: ToolErrorKind::NotFound,
+                                message: format!("tool {} is not registered", intent.name),
+                            }),
+                            false,
+                        )
+                        .await?;
+                    }
+                    Some(tool) => {
+                        let descriptor = tool.descriptor().clone();
+                        if let Some(reason) = self.approval_failure(
+                            session,
+                            turn,
+                            step,
+                            intent.tool_call_id,
+                            &intent.name,
+                            &intent.args,
+                            &descriptor,
+                        ) {
+                            self.deny(session, intent.tool_call_id, reason).await?;
+                        } else {
+                            runnable.push(Runnable {
+                                tool,
+                                descriptor,
+                                tool_call_id: intent.tool_call_id,
+                                name: intent.name.clone(),
+                                args: intent.args.clone(),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // No recorded intent: pre-execute runs for this call only.
+            let tool_call_id = ToolCallId::from_bytes(fresh_id());
+            let mut args = call.raw_args;
+            let failure = self
+                .pre_execute(
+                    session,
+                    turn,
+                    step,
+                    tool_call_id,
+                    &call.provider_call_id,
+                    &call.name,
+                    &mut args,
+                )
+                .await?;
+
+            let tool = self.tools.get(&call.name);
+            let descriptor = tool.as_ref().map(|tool| tool.descriptor().clone());
+            let (replay, provenance) = match &descriptor {
+                Some(descriptor) => (descriptor.replay, descriptor.provenance),
+                None => (ReplaySafety::Unsafe, Provenance::Unknown),
+            };
+            self.append(
+                session,
+                SessionEvent::ToolCallRequested {
+                    turn_id: turn,
+                    step_id: step,
+                    tool_call_id,
+                    provider_call_id: call.provider_call_id,
+                    name: call.name.clone(),
+                    raw_args: args.clone(),
+                    replay,
+                    provenance,
+                },
+                Some(dedup::tool_call(tool_call_id)),
+            )
+            .await?;
+
+            match (failure, descriptor, tool) {
+                (Some(PreFailure::Denied(reason)), _, _) => {
+                    self.deny(session, tool_call_id, reason).await?;
+                }
+                (Some(PreFailure::Internal(message)), _, _) => {
+                    self.append_tool_result(
+                        session,
+                        tool_call_id,
+                        ToolResultStatus::Failed,
+                        None,
+                        Some(ToolErrorInfo {
+                            kind: ToolErrorKind::Internal,
+                            message,
+                        }),
+                        false,
+                    )
+                    .await?;
+                }
+                (None, None, _) => {
+                    self.append_tool_result(
+                        session,
+                        tool_call_id,
+                        ToolResultStatus::Failed,
+                        None,
+                        Some(ToolErrorInfo {
+                            kind: ToolErrorKind::NotFound,
+                            message: format!("tool {} is not registered", call.name),
+                        }),
+                        false,
+                    )
+                    .await?;
+                }
+                (None, Some(descriptor), Some(tool)) => {
+                    if let Some(reason) = self.approval_failure(
+                        session,
+                        turn,
+                        step,
+                        tool_call_id,
+                        &call.name,
+                        &args,
+                        &descriptor,
+                    ) {
+                        self.deny(session, tool_call_id, reason).await?;
+                    } else {
+                        runnable.push(Runnable {
+                            tool,
+                            descriptor,
+                            tool_call_id,
+                            name: call.name,
+                            args,
+                        });
+                    }
+                }
+                (None, Some(_), None) => unreachable!("descriptor comes from the registry entry"),
+            }
+        }
+
+        if runnable.is_empty() {
+            return Ok(());
+        }
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, Result<(), AgentError>>> =
+            FuturesUnordered::new();
+        for item in runnable {
+            futures.push(self.execute_one(
+                session,
+                turn,
+                step,
+                item,
+                Arc::clone(&semaphore),
+                Arc::clone(&lock),
+                Arc::clone(&budget),
+                events,
+            ));
+        }
+
+        let mut failure = None;
+        while let Some(result) = futures.next().await {
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_one<'a>(
+        &'a self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        item: Runnable,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        lock: Arc<tokio::sync::RwLock<()>>,
+        budget: Arc<Mutex<usize>>,
+        events: &'a EventSink,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("the semaphore is never closed");
+            let _guard = match item.descriptor.parallelism {
+                Parallelism::Parallel => StepLockGuard::Read(lock.read().await),
+                Parallelism::Exclusive => StepLockGuard::Write(lock.write().await),
+            };
+
+            events.push(Ok(AgentEvent::ToolStarted {
+                turn,
+                step,
+                call: item.tool_call_id,
+                tool: item.name.clone(),
+            }));
+
+            let cancel = CancelToken::new();
+            let context = ToolContext::new(session, turn, step, item.tool_call_id, cancel.clone());
+            let timeout = item
+                .descriptor
+                .timeout
+                .or(match item.descriptor.provenance {
+                    Provenance::External { .. } => self.tool_config.external_timeout,
+                    _ => None,
+                });
+            let invocation = invoke_tool(
+                item.tool,
+                item.args,
+                context,
+                cancel,
+                timeout,
+                self.tool_config.kill_grace,
+            )
+            .await;
+
+            let (mut status, mut output, mut error, mut truncated) = match invocation {
+                Invocation::Returned(Ok(output)) => (
+                    ToolResultStatus::Completed,
+                    Some(output.content),
+                    None,
+                    false,
+                ),
+                Invocation::Returned(Err(error)) => (
+                    ToolResultStatus::Failed,
+                    None,
+                    Some(ToolErrorInfo {
+                        kind: error.kind(),
+                        message: error.message().to_owned(),
+                    }),
+                    false,
+                ),
+                Invocation::Panic => (
+                    ToolResultStatus::Failed,
+                    None,
+                    Some(ToolErrorInfo {
+                        kind: ToolErrorKind::Panic,
+                        message: "tool panicked".to_owned(),
+                    }),
+                    false,
+                ),
+                Invocation::Timeout => (
+                    ToolResultStatus::Failed,
+                    None,
+                    Some(ToolErrorInfo {
+                        kind: ToolErrorKind::Timeout,
+                        message: "tool call timed out".to_owned(),
+                    }),
+                    false,
+                ),
+            };
+
+            if status == ToolResultStatus::Completed {
+                let limit = item
+                    .descriptor
+                    .max_output_bytes
+                    .unwrap_or(self.tool_config.max_output_bytes);
+                let (parts, was_truncated) =
+                    truncate_output(output.take().unwrap_or_default(), limit, &budget);
+                output = Some(parts);
+                truncated = was_truncated;
+            }
+
+            if let Some(hooks) = &self.hooks {
+                let event = PostExecuteEvent::new(
+                    session,
+                    turn,
+                    step,
+                    item.tool_call_id,
+                    item.name.clone(),
+                    status,
+                    output.clone().unwrap_or_default(),
+                    error.clone(),
+                    truncated,
+                );
+                match hooks.waterfall(event).await {
+                    Ok(event) => {
+                        // Status is not a post-execute concern; only content and
+                        // the model-visible error message are rewritable.
+                        if status == ToolResultStatus::Completed {
+                            output = Some(event.output);
+                        }
+                        error = event.error;
+                        truncated = event.truncated;
+                    }
+                    Err(PostExecuteError::Internal { message }) => {
+                        status = ToolResultStatus::Failed;
+                        output = None;
+                        error = Some(ToolErrorInfo {
+                            kind: ToolErrorKind::Internal,
+                            message,
+                        });
+                        truncated = false;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            self.append_tool_result(session, item.tool_call_id, status, output, error, truncated)
+                .await?;
+            events.push(Ok(AgentEvent::ToolFinished {
+                turn,
+                step,
+                call: item.tool_call_id,
+                status,
+            }));
+
+            drop(_guard);
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pre_execute(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        tool_call_id: ToolCallId,
+        provider_call_id: &str,
+        name: &ToolName,
+        args: &mut ToolArgs,
+    ) -> Result<Option<PreFailure>, AgentError> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(None);
+        };
+        let event = PreExecuteEvent::new(
+            session,
+            turn,
+            step,
+            tool_call_id,
+            provider_call_id.to_owned(),
+            name.clone(),
+            args.clone(),
+        );
+        match hooks.waterfall(event).await {
+            Ok(event) => {
+                *args = event.args;
+                Ok(None)
+            }
+            Err(PreExecuteError::Denied { reason }) => Ok(Some(PreFailure::Denied(
+                reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
+            ))),
+            Err(PreExecuteError::Internal { message }) => Ok(Some(PreFailure::Internal(message))),
+            Err(_) => Ok(Some(PreFailure::Internal("pre-execute failed".to_owned()))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn approval_failure(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        tool_call_id: ToolCallId,
+        name: &ToolName,
+        args: &ToolArgs,
+        descriptor: &ToolDescriptor,
+    ) -> Option<String> {
+        let request = ApprovalRequest::new(
+            session,
+            turn,
+            step,
+            tool_call_id,
+            name.clone(),
+            args.clone(),
+            descriptor.replay,
+            descriptor.side_effect,
+            descriptor.provenance,
+        );
+        match self.approval.classify(&request) {
+            ApprovalVerdict::Allow => None,
+            ApprovalVerdict::Deny { reason } => {
+                Some(reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()))
+            }
+            ApprovalVerdict::Ask => Some(if self.gate.is_open() {
+                "approval waiting is not supported yet".to_owned()
+            } else {
+                NO_APPROVAL_ENDPOINT.to_owned()
+            }),
+            _ => Some(DENIED_WITHOUT_REASON.to_owned()),
+        }
+    }
+
+    async fn deny(
+        &self,
+        session: SessionId,
+        tool_call_id: ToolCallId,
+        message: String,
+    ) -> Result<(), AgentError> {
+        self.append_tool_result(
+            session,
+            tool_call_id,
+            ToolResultStatus::Failed,
+            None,
+            Some(ToolErrorInfo {
+                kind: ToolErrorKind::Denied,
+                message,
+            }),
+            false,
+        )
+        .await
+    }
+
+    async fn append_tool_result(
+        &self,
+        session: SessionId,
+        tool_call_id: ToolCallId,
+        status: ToolResultStatus,
+        output: Option<Vec<asterpath_protocol::Part>>,
+        error: Option<ToolErrorInfo>,
+        truncated: bool,
+    ) -> Result<(), AgentError> {
+        self.append(
+            session,
+            SessionEvent::ToolResult {
+                tool_call_id,
+                status,
+                output,
+                error,
+                truncated,
+            },
+            Some(dedup::tool_result(tool_call_id)),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn commit_step(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+    ) -> Result<(), AgentError> {
+        self.append(
+            session,
+            SessionEvent::StepCommitted {
+                turn_id: turn,
+                step_id: step,
+            },
+            Some(dedup::step_committed(step)),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
+        let decoded = decode_entries(self.scan(session).await?, session)?;
+        Ok(has_pending_input(&decoded))
     }
 
     /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
@@ -487,8 +991,52 @@ impl AgentRunner for Agent {
     }
 }
 
+struct CallItem {
+    provider_call_id: String,
+    name: ToolName,
+    raw_args: ToolArgs,
+}
+
+struct RecordedIntent {
+    tool_call_id: ToolCallId,
+    name: ToolName,
+    args: ToolArgs,
+}
+
+#[derive(Default)]
+struct ExistingStep {
+    intents: HashMap<String, RecordedIntent>,
+    results: HashSet<ToolCallId>,
+}
+
+struct Runnable {
+    tool: Arc<dyn Tool>,
+    descriptor: ToolDescriptor,
+    tool_call_id: ToolCallId,
+    name: ToolName,
+    args: ToolArgs,
+}
+
+enum PreFailure {
+    Denied(String),
+    Internal(String),
+}
+
+enum Invocation {
+    Returned(Result<ToolOutput, ToolError>),
+    Panic,
+    Timeout,
+}
+
+// The guard variants exist only to hold a lock until end of scope.
+#[allow(dead_code)]
+enum StepLockGuard<'a> {
+    Read(tokio::sync::RwLockReadGuard<'a, ()>),
+    Write(tokio::sync::RwLockWriteGuard<'a, ()>),
+}
+
 enum StepOutcome {
-    /// `pause_turn`: continue the same turn with another step.
+    /// `pause_turn`, tool calls or pending input: continue the same turn.
     Continue,
     Turn(TurnEndReason),
 }
@@ -554,6 +1102,198 @@ impl Stream for DriveStream<'_> {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+/// Invoke one tool with pipeline-owned deadline and panic containment.
+async fn invoke_tool(
+    tool: Arc<dyn Tool>,
+    args: ToolArgs,
+    context: ToolContext,
+    cancel: CancelToken,
+    timeout: Option<Duration>,
+    kill_grace: Duration,
+) -> Invocation {
+    let future = AssertUnwindSafe(tool.invoke(args, context)).catch_unwind();
+    tokio::pin!(future);
+
+    match timeout {
+        None => match future.await {
+            Ok(result) => Invocation::Returned(result),
+            Err(_) => Invocation::Panic,
+        },
+        Some(limit) => match tokio::time::timeout(limit, future.as_mut()).await {
+            Ok(Ok(result)) => Invocation::Returned(result),
+            Ok(Err(_)) => Invocation::Panic,
+            Err(_) => {
+                // Signal cancellation, then let the tool report a real result
+                // within the grace window; dropping it yields `Timeout`.
+                cancel.cancel();
+                match tokio::time::timeout(kill_grace, future.as_mut()).await {
+                    Ok(Ok(result)) => Invocation::Returned(result),
+                    Ok(Err(_)) => Invocation::Panic,
+                    Err(_) => Invocation::Timeout,
+                }
+            }
+        },
+    }
+}
+
+/// Truncate model-visible content to `call_limit`, bounded by the step budget.
+/// Text is cut at a UTF-8 boundary; non-text parts are kept whole or dropped.
+fn truncate_output(
+    parts: Vec<asterpath_protocol::Part>,
+    call_limit: usize,
+    budget: &Mutex<usize>,
+) -> (Vec<asterpath_protocol::Part>, bool) {
+    let mut remaining = budget.lock().unwrap_or_else(PoisonError::into_inner);
+    let limit = call_limit.min(*remaining);
+    let total: usize = parts.iter().map(part_bytes).sum();
+    if total <= limit {
+        *remaining = remaining.saturating_sub(total);
+        return (parts, false);
+    }
+
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    let mut full = false;
+    for part in parts {
+        if full {
+            break;
+        }
+        let size = part_bytes(&part);
+        if used + size <= limit {
+            used += size;
+            kept.push(part);
+            continue;
+        }
+        // A non-text part is never split; it is skipped so later parts that
+        // still fit may be kept. A text part fills the remaining room and stops.
+        if let asterpath_protocol::Part::Text { text } = part {
+            let room = limit.saturating_sub(used);
+            let cut = floor_char_boundary(&text, room);
+            if cut > 0 {
+                let kept_text = text[..cut].to_owned();
+                used += kept_text.len();
+                kept.push(asterpath_protocol::Part::Text { text: kept_text });
+            }
+            full = true;
+        }
+    }
+
+    let omitted = total.saturating_sub(used);
+    let suffix = format!("[output truncated: {omitted} bytes omitted]");
+    used += suffix.len();
+    kept.push(asterpath_protocol::Part::Text { text: suffix });
+    *remaining = remaining.saturating_sub(used);
+    (kept, true)
+}
+
+fn part_bytes(part: &asterpath_protocol::Part) -> usize {
+    match part {
+        asterpath_protocol::Part::Text { text } => text.len(),
+        other => serde_json::to_vec(other)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0),
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn tool_calls(items: &[Item]) -> Vec<CallItem> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall {
+                call_id,
+                name,
+                raw_args,
+                ..
+            } => Some(CallItem {
+                provider_call_id: call_id.clone(),
+                name: name.clone(),
+                raw_args: raw_args.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> ExistingStep {
+    let mut existing = ExistingStep::default();
+    for (_, event) in decoded {
+        match event {
+            SessionEvent::ToolCallRequested {
+                turn_id,
+                step_id,
+                tool_call_id,
+                provider_call_id,
+                name,
+                raw_args,
+                ..
+            } if *turn_id == turn && *step_id == step => {
+                existing.intents.insert(
+                    provider_call_id.clone(),
+                    RecordedIntent {
+                        tool_call_id: *tool_call_id,
+                        name: name.clone(),
+                        args: raw_args.clone(),
+                    },
+                );
+            }
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                existing.results.insert(*tool_call_id);
+            }
+            _ => {}
+        }
+    }
+    existing
+}
+
+fn open_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId) -> Option<(StepId, u64)> {
+    let mut open = None;
+    for (entry, event) in decoded {
+        match event {
+            SessionEvent::StepStarted { turn_id, step_id } if *turn_id == turn => {
+                open = Some((*step_id, entry.seq));
+            }
+            SessionEvent::StepCommitted { step_id, .. }
+                if open.is_some_and(|(step, _)| step == *step_id) =>
+            {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+fn has_assistant_message(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> bool {
+    decoded.iter().any(|(_, event)| {
+        matches!(
+            event,
+            SessionEvent::AssistantMessage { turn_id, step_id, .. }
+                if *turn_id == turn && *step_id == step
+        )
+    })
+}
+
+fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {
+    if matches!(stop_reason, StopReason::ContextWindowExceeded) {
+        return StepOutcome::Turn(TurnEndReason::ContextExhausted);
+    }
+    if had_calls || matches!(stop_reason, StopReason::PauseTurn) || pending_input {
+        StepOutcome::Continue
+    } else {
+        StepOutcome::Turn(TurnEndReason::Completed)
     }
 }
 
