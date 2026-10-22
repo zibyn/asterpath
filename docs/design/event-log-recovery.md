@@ -7,6 +7,8 @@
 > **2026-10-22 #12 修订**：信封增加诊断时间 `recorded_at`（只供 trace/审计读取，不参与逻辑）；新增 `CompactionStarted` 与 `SignalAwaited` 意图记录。追踪模型见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 >
 > **2026-10-22 #13 修订**：`AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`；用量桶、聚合与去重口径见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md)。`UsageRecorded` 是事件总线上的瞬时通知，不是 session 事件，不落日志。
+>
+> **2026-10-22 #28 修订**：`ToolCallRequested` 增加 `provider_call_id`，与框架生成的 `tool_call_id` 分开；恢复不重跑已记录意图的 pre-execute。语义见 [tools.md](tools.md) §3/§6。
 
 ## 1. 决策摘要
 
@@ -63,7 +65,9 @@ pub enum SessionEvent {
                        model: ModelSpec,
                        usage: Option<Usage> },  // 非模型可见；usage 为 best-effort
     ToolCallRequested { turn_id: TurnId, step_id: StepId,
-                        tool_call_id: ToolCallId, name: ToolName,
+                        tool_call_id: ToolCallId,        // 框架生成的不透明身份
+                        provider_call_id: String,        // 模型响应里的原始 id
+                        name: ToolName,
                         raw_args: JsonString,   // pre-execute 之后的 effective args
                         replay: ReplaySafety, provenance: Provenance },
     ToolResult { tool_call_id: ToolCallId, status: ToolResultStatus,
@@ -111,6 +115,7 @@ pub enum TurnEndReason {
 
 - **没有通用 `Error` 事件**。错误是它所附着事件的终态（`ModelCallAborted`、`ToolResult::Failed`、`ChildOutcome`）。
 - `ToolResult` 是工具调用的唯一终态：`Failed` 必带 `error`；`Interrupted` 的 `output` / `error` 为 `None`。
+- `ToolCallRequested` 的两个 id 分工固定：`tool_call_id` 由框架生成，用于 dedup key、审批 signal 与 open intent；`provider_call_id` 是 `AssistantMessage.items` 中 `ToolCall.call_id` 的原值。投影与恢复按 `provider_call_id` 把意图对回 `ToolCall`，`ToolResult` 只引用 `tool_call_id`，不重复存 provider id。
 - `ToolCallRequested` 的 `provenance` 可以是 `Unknown`（请求的工具不在注册表），此时 `replay` 记 `Unsafe`；恢复按 [plugins.md](plugins.md) §8 处理。`NotFound` 是模型可见的工具错误类型，不新增 status。
 - 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
@@ -279,6 +284,8 @@ recover(session):
 | S12 | 同一 key、不同事件类型各 append 一次（六对共享 key 见 §4） | 两条记录都落盘，互不抑制 |
 | S13 | 在 open step 中到达 `InputRecorded`（steering）、`TimerFired`、`SignalReceived`（审批或匹配等待）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；启动恢复入队；`open_intents` 与日志折叠一致 |
 | S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
+| S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
+| S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
 
 ## 8. 留给下游
 

@@ -10,6 +10,8 @@
 > - `ToolCallRequested.raw_args` 明确为 pre-execute 之后的 **effective args**。
 > - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。
 >
+> 2026-10-22 #28 修订：`ToolCallRequested` 增加 `provider_call_id`；已有意图的调用恢复时不重跑 pre-execute；每个调用由单一 supervisor 写终态（真实结果 > 取消 > 超时）。
+>
 > 相关 ADR：[0007 审批是框架管线，隔离与内容安全是扩展模块责任](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
@@ -21,6 +23,9 @@
 - **并行/独占按 step 内锁调度**；结果完成即追加，模型投影按调用顺序重排。
 - **工具失败不重试**；超时、取消、panic、外部崩溃统一映射为 `ToolResult`。
 - **输出截断**：默认 64 KiB/调用、256 KiB/step；完整输出不落日志。
+- **两个 id 分工**：`ToolCallId` 由框架生成（dedup / 审批 / 意图），`provider_call_id` 保留模型响应原值，投影按后者绑定。
+- **已记录意图不可改写**：恢复不重跑该调用的 pre-execute，effective args 以日志为准。
+- **终态线性化**：每个调用只有一个 supervisor 写终态；真实结果 > 取消 > 超时。
 
 ## 2. Tool 契约
 
@@ -84,7 +89,7 @@ pub enum ToolError {
 AssistantMessage(tool_calls)
   for each call，按并行/独占规则调度：
     pre-execute waterfall          # allow / deny / ask / 改写参数
-    append ToolCallRequested { effective args }
+    append ToolCallRequested { tool_call_id, provider_call_id, effective args }
     if tool not in registry: append ToolResult{Failed, NotFound}; done
     approval policy                # Allow / Ask / Deny
     if Ask: await signal           # 可跨天、跨崩溃
@@ -101,7 +106,9 @@ AssistantMessage(tool_calls)
 - **每个模型发起的调用都会写 `ToolCallRequested`**，即使随后被拒绝；意图与终态一一对应（I2）。
 - 工具不在注册表时：pre-execute 照常运行；若未被拒绝，写意图（`replay = Unsafe`、`provenance = Unknown`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。模型幻觉、插件升级后移除工具都走这条路径。
 - pre-execute 在写意图前运行。它可以改写参数，日志记录改写后的 **effective args**；模型原始参数仍在 `AssistantMessage` 中。
+- `ToolCallRequested` 同时记录框架生成的 `tool_call_id` 与模型响应中的 `provider_call_id`（`ToolCall.call_id` 原值）；投影与恢复按 `provider_call_id` 配对，两个同名同参的并行调用不会串位。
 - pre-execute 崩溃或报错不产生副作用；恢复时重跑该调用的 pre-execute。
+- **已有 `ToolCallRequested` 的调用，恢复不重跑 pre-execute**：已记录的 effective args 是权威值。pre-execute 只对尚无意图的调用运行（例如崩溃于批量写意图之间）。
 - deny（来自 pre-execute、策略或审批）写 `ToolResult{Failed, error.kind = Denied}`，跳过执行与 post-execute。
 - **`ToolCallRequested` 是副作用的点无回退**：写完它之后，任何执行都必须以重放安全规则收尾。
 - post-execute 在结果落盘前运行，可以改写 `content` / `error.message`（格式化、脱敏、审计改写），但**不得产生副作用、不得写日志**。
@@ -196,6 +203,14 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - `Provenance::External` 默认 `ReplaySafety::Unsafe`，除非 adapter 明确声明 `Safe` 并承担重复副作用。
 - adapter 在跨进程边界前截断输出；管线再按统一上限截断（幂等）。
 
+**终态线性化**
+
+- 每个调用由一个 supervisor task 拥有唯一终态写入权；`ToolResult` 是该调用唯一的终态记录。
+- 判定顺序固定：工具返回（含 `Err`）、panic 或 transport 崩溃先到 → 记真实状态；否则已请求回合取消 → `Interrupted`；否则超时到期 → `Failed{Timeout}`。
+- 真实结果在 supervisor 决定终态前到达（含各宽限期内）即胜出。
+- 回合取消开始后，该调用的超时 deadline 由取消路径接管：不再触发第二次 kill，也不再产生 `Timeout`。
+- dedup key（`tool_call_id`）只是持久层兜底；恢复不依赖“谁先 append”。
+
 ## 7. 结果、错误与截断
 
 事件负载（修订 #3）：
@@ -285,6 +300,9 @@ pub struct ToolConfig {
 | T12 | 未装审批端且策略为 Ask | 按 `Deny` 处理（fail closed） |
 | T13 | 结果进入下一次模型请求 | 投影顺序 = 调用顺序；不产生独立 token 记录 |
 | T14 | 模型请求注册表中不存在的工具 | 仍写 `ToolCallRequested`；`ToolResult{Failed, NotFound}`；不审批、不执行；恢复按 [plugins.md](plugins.md) §8 |
+| T15 | 两个同名同参并行调用 | 两个 `ToolCallId` 不同；`provider_call_id` 各自对回 `ToolCall`；每条 `ToolResult` 绑定自己的调用 |
+| T16 | 崩溃于 `ToolCallRequested` 之后 | 恢复不重跑 pre-execute；按已记录 effective args 执行；尚无意图的兄弟调用才重跑 |
+| T17 | 超时与回合取消同时发生 | 只有一个 `ToolResult`；真实结果先到则记真实状态，否则记 `Interrupted`；不出现 `Failed{Timeout}`；子进程只被杀一次 |
 
 ## 11. 扩展点（非内核）
 

@@ -52,7 +52,7 @@
 pub struct ConfigSnapshot {
     pub model: ModelSpec,
     pub system: Vec<Part>,          // 只允许 Text
-    pub tools: Vec<ToolName>,       // 创建时解析后的固定集合
+    pub tools: Vec<ToolDescriptor>, // 创建时解析后的固定集合（name / description / schema / 执行声明）
     pub request: RequestConfig,     // 回合内模型调用的请求参数（#26）
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
@@ -60,7 +60,10 @@ pub struct ConfigSnapshot {
 }
 ```
 
-- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolName>`；之后注册表增删不影响该 session 的模型可见工具集。
+- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolDescriptor>`；之后注册表增删不影响该 session 的模型可见工具集。
+- 所有 `ModelRequest.tools` 只从快照渲染，恢复后重建出与崩溃前相同的工具定义。`timeout` / `parallelism` 等执行声明同样在 session 内固定；注册表升级只影响新 session。
+- 执行仍调用活注册表：工具已消失走 `NotFound`（[plugins.md](plugins.md) §8）；恢复按 `ToolCallRequested` 上已记录的 `replay` / `provenance` 决定是否重跑，不重新解析描述符。
+- `ReasoningBinding.tools_hash` 按快照 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9），因此同一 session 内稳定，fork 收窄工具集时自然不匹配。
 - 审批策略不进快照：它是宿主代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
 - MCP/插件配置不进快照：plugin-host 不在 v1 交付内；将来纳入时按 log schema 规则 bump 版本（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 

@@ -153,8 +153,12 @@ _Avoid_: token 数、消耗
 _Avoid_: 原始响应、provider payload
 
 **推理绑定（Reasoning Binding）**：
-推理条目与其产出供应商、模型及前缀代次的关联；任一不匹配即不可回放。
+推理条目与其产出供应商、模型、前缀代次及工具集指纹的关联；任一不匹配即不可回放。
 _Avoid_: 签名、reasoning key
+
+**工具集指纹（Tools Hash）**：
+一次请求中模型可见工具定义（名称、说明、参数 schema）的确定性摘要；推理条目据此判断能否在工具集相同的请求中回放。
+_Avoid_: 工具版本、schema hash
 
 **前缀代次（Prefix Epoch）**：
 会话中已发生压缩的次数；用于判断旧推理是否仍可回放。
@@ -193,8 +197,12 @@ _Avoid_: 打断、插话、中断输入
 _Avoid_: 函数、命令、action
 
 **工具调用（Tool Call）**：
-模型在一次响应中请求的一次工具执行；以 `ToolCallId` 标识，从请求到终态结果构成一个未闭合意图。
+模型在一次响应中请求的一次工具执行；以框架生成的 `ToolCallId` 标识，从请求到终态结果构成一个未闭合意图。模型响应里的原始标识另记为 `provider_call_id`。
 _Avoid_: 任务、job
+
+**提供方调用 ID（Provider Call ID）**：
+模型响应中工具调用的原始标识（Anthropic `tool_use.id` / OpenAI `call_id`）；与 `ToolCallId` 分开保存，只用于把意图对回模型历史。
+_Avoid_: call id（不加限定）、工具 id
 
 **有效参数（Effective Args）**：
 经过前置处理、实际写入意图记录并交给工具执行的参数。模型原始参数仍保留在其响应中。

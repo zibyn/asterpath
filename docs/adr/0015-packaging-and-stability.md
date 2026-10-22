@@ -2,7 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#15](https://github.com/zibyn/asterpath/issues/15)
-**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `SessionSpec` / `ConfigSnapshot` 增加 `request`；`providers` 在 `build()` 经 `ProviderCatalog` 去重；facade 暴露 `approval_gate()`。
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `SessionSpec` / `ConfigSnapshot` 增加 `request`；`providers` 在 `build()` 经 `ProviderCatalog` 去重；facade 暴露 `approval_gate()`。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— `ConfigSnapshot.tools` 存解析后的 `Vec<ToolDescriptor>`，模型请求只从快照渲染。
 
 ## Context
 
@@ -28,7 +28,7 @@
 - 稳定承诺只覆盖少数 crate，模块 crate 可以在 0.x 内演进；嵌入者要替换模块时依赖的是 core/protocol 的 trait，而不是模块的公开结构。
 - 显式驱动把调度责任交给宿主，框架不藏后台任务；崩溃与宿主放弃走同一条恢复路径，测试因此能用真 `SIGKILL`。
 - 验收测试需要单独的 `testdrive` 组装与 mock HTTP server，CI 时间增加；但三段 charter 验收因此可自动判定。
-- `ConfigSnapshot` 在 protocol 中定形（补齐 #11 的缺口）；之后加入插件/MCP 配置必须按 log schema 规则 bump 版本。
+- `ConfigSnapshot` 在 protocol 中定形（补齐 #11 的缺口）；`tools` 存创建时解析后的 `Vec<ToolDescriptor>`，session 内模型请求只从快照渲染（#28）；之后加入插件/MCP 配置必须按 log schema 规则 bump 版本。
 
 ## Considered alternatives
 

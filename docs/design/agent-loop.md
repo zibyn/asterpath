@@ -143,8 +143,8 @@ run_turn(session):
         calls = msg.tool_calls
         if !calls.is_empty():
             for call in calls:
-                append(ToolCallRequested{turn, step, tool_call_id, name,
-                                         raw_args, replay, provenance})
+                append(ToolCallRequested{turn, step, tool_call_id, provider_call_id,
+                                         name, raw_args, replay, provenance})
             results = execute_tools(calls)                 # #7：审批、并行/独占、超时、截断
             for r in results:
                 append(ToolResult{tool_call_id, status, output})
@@ -176,7 +176,7 @@ run_turn(session):
 
 - 不重复写 `TurnStarted`。
 - 若 frontier 落在 open step 内，不重复写 `StepStarted`，复用原 `StepStarted.seq` 作为投影水位。
-- 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。
+- 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。已存在的 `ToolCallRequested` 按 `provider_call_id` 对回 `AssistantMessage` 的 `ToolCall`；其 effective args 是权威值，不重跑 pre-execute。只有尚无意图的调用才重跑 pre-execute。
 - 若该 step 无 `AssistantMessage` 且最后一条 `ModelCallAborted` 是 `Crash` / `Transport`，按重试策略重调模型；`Transport` 耗尽则 `StepCommitted` + `TurnCommitted(Failed)`。
 - 若最后一条 abort 是 `Cancelled` / `Rejected`，按取消/失败收尾，不重试（#3 §6）。
 - 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态，再投影并重试同一 step。
@@ -254,7 +254,7 @@ StepCommitted
 - `SessionHandle::cancel()`：回合级、幂等。Idle 时是 no-op；取消后 session 仍接受新输入（新回合）。
 - **模型流中**：立即 abort，写 `ModelCallAborted{Cancelled}`，不重试；`StepCommitted`；`TurnCommitted(Cancelled)`。
 - **退避等待中**：打断 sleep，同上。
-- **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。已写入的结果不覆盖。外部子进程/MCP server 在宽限后强杀，见 [tools.md](tools.md) §6。
+- **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。一个调用只有一个终态写入者；取消接管后不再触发该调用的超时（[tools.md](tools.md) §6）。
 - **等待意图**：到期后由驱动方收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled{Parent}}`（正常运行时 scheduler 是父流子生命周期记录的唯一写者）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
 - 顺序：取消信号 → 宽限 → 收尾等待 → `StepCommitted` → `TurnCommitted(Cancelled)`。
 - 取消不重试、不恢复：已提交的取消记录让恢复跳过该 step。
