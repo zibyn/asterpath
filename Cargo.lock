@@ -3,6 +3,32 @@
 version = 4
 
 [[package]]
+name = "asterpath"
+version = "0.1.0"
+dependencies = [
+ "asterpath-agent",
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-storage-sqlite",
+ "asterpath-testing",
+ "futures-core",
+ "futures-util",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-agent"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "futures-core",
+ "futures-util",
+ "tokio",
+]
+
+[[package]]
 name = "asterpath-core"
 version = "0.1.0"
 dependencies = [
@@ -19,6 +45,7 @@ name = "asterpath-protocol"
 version = "0.1.0"
 dependencies = [
  "asterpath-core",
+ "futures-core",
  "futures-util",
  "serde",
  "serde_json",
