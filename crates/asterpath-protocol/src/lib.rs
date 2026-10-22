@@ -5,6 +5,7 @@
 //! construction, open-intent folding and projection.
 
 pub mod agent;
+pub mod compactor;
 pub mod config;
 pub mod decode;
 pub mod dedup;
@@ -24,6 +25,10 @@ pub use agent::{
     PreStepGateEvent, RunRequest, RunTrigger, SessionSpec, ToolSelection, UserInput,
 };
 
+pub use compactor::{
+    COMPACTOR_SERVICE, CompactPlan, CompactSummary, CompactionInput, CompactionJob, Compactor,
+    UsageAnchor,
+};
 pub use config::{
     CompactionConfig, ConfigSnapshot, ContextPolicy, ModelSpec, Parallelism, Provenance,
     ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig, SamplingParams, SideEffect,
