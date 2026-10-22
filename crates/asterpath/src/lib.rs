@@ -10,6 +10,11 @@
 pub mod config;
 pub mod error;
 
+/// Re-export of the Anthropic adapter when the `anthropic` feature is enabled.
+/// Providers stay host-injected: the facade never assembles one itself.
+#[cfg(feature = "anthropic")]
+pub use asterpath_provider_anthropic as anthropic;
+
 use std::sync::Arc;
 
 use asterpath_agent::Agent;
