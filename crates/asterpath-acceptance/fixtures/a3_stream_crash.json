@@ -1,0 +1,24 @@
+{
+  "provider": "p",
+  "model": "model-1",
+  "system": [{"Text": {"text": "be helpful"}}],
+  "tools": [],
+  "stream_open_first_attempt": true,
+  "steps": [
+    {
+      "items": [
+        {
+          "Message": {
+            "role": "Assistant",
+            "parts": [{"Text": {"text": "answer"}}]
+          }
+        }
+      ],
+      "stop_reason": "EndTurn",
+      "usage": {
+        "input": {"uncached": 10, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 4, "reasoning": 0}
+      }
+    }
+  ]
+}

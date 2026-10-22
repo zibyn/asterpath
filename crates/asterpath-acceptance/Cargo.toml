@@ -1,0 +1,24 @@
+[package]
+name = "asterpath-acceptance"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "testdrive"
+path = "src/bin/testdrive.rs"
+
+[dependencies]
+asterpath = { path = "../asterpath" }
+asterpath-core = { path = "../asterpath-core" }
+asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }
+asterpath-testing = { path = "../asterpath-testing" }
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+libc = "0.2"
+tempfile = "3"
