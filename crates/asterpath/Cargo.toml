@@ -17,6 +17,7 @@ asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-provider-anthropic = { path = "../asterpath-provider-anthropic", optional = true }
 asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }
 asterpath-runtime = { path = "../asterpath-runtime" }
+asterpath-scheduler = { path = "../asterpath-scheduler" }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
 asterpath-tools = { path = "../asterpath-tools" }
 futures-core = "0.3"

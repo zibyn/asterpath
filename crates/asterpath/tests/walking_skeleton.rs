@@ -81,7 +81,9 @@ fn spec(provider: &str) -> SessionSpec {
             context_window: Some(200_000),
         },
         system: vec![text("be helpful")],
-        tools: ToolSelection::All,
+        // This skeleton exercises the loop without tools; the facade still
+        // registers the built-in spawn tool for sessions that ask for tools.
+        tools: ToolSelection::Names(Vec::new()),
         request: RequestConfig::default(),
         turn: test_turn_config(),
         compaction: CompactionConfig::default(),

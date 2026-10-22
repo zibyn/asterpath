@@ -28,6 +28,7 @@ use asterpath_protocol::{
     ToolSelection, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
+use asterpath_scheduler::SchedulerModule;
 use asterpath_tools::ToolsModule;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -143,6 +144,17 @@ impl Asterpath {
             Arc::clone(&config.clock),
         ));
         module_host.register(Arc::new(RuntimeModule::new(Arc::clone(&runtime))));
+        let executor: Arc<dyn DurableExecutor> = runtime;
+
+        // The scheduler is assembled before the agent; the runner is bound
+        // afterwards so the two never form an ownership cycle.
+        let scheduler_module = Arc::new(SchedulerModule::new(
+            Arc::clone(&event_log),
+            Arc::clone(&session_catalog),
+            Arc::clone(&executor),
+            config.model_aliases.clone(),
+        ));
+        module_host.register(scheduler_module.clone());
 
         module_host.init().await?;
         let tools = tools_module.registry();
@@ -150,7 +162,6 @@ impl Asterpath {
             tools.register(tool);
         }
         let hooks = tools_module.context();
-        let executor: Arc<dyn DurableExecutor> = runtime;
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
@@ -172,6 +183,7 @@ impl Asterpath {
                 .with_cancellations(Arc::clone(&cancellations)),
             )
         });
+        scheduler_module.scheduler().set_runner(Arc::clone(&agent));
 
         Ok(Self {
             event_log,
