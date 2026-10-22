@@ -12,7 +12,7 @@ use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     CompactionConfig, Item, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, Role,
     SessionSpec, Span, SpanFilter, SpanKind, SpanStatus, SpanUpdate, StopReason, SubagentConfig,
-    ToolSelection, TurnConfig, Usage, UserInput,
+    ToolSelection, TraceError, TurnConfig, Usage, UserInput,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
@@ -203,6 +203,61 @@ async fn t14_tap_pairs_started_and_ended_without_touching_the_log() {
     let started_ids: Vec<_> = started.iter().map(|span| span.span).collect();
     let expected_ids: Vec<_> = expected.iter().map(|span| span.span).collect();
     assert_eq!(started_ids, expected_ids);
+
+    framework.shutdown().await.expect("shutdown");
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn retired_sessions_disappear_from_the_trace() {
+    let db = temp_db("retired");
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        response(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let framework = Asterpath::builder()
+        .database(&db)
+        .provider(provider as Arc<dyn Provider>)
+        .build()
+        .await
+        .expect("facade builds");
+
+    let handle = framework.create_session(spec()).await.expect("session");
+    let session = handle.id();
+    handle
+        .submit_input(UserInput {
+            id: InputId::from_bytes([0x78; 16]),
+            parts: vec![text("hi")],
+        })
+        .await
+        .expect("input");
+    let mut drive = handle.drive();
+    while let Some(event) = drive.next().await {
+        event.expect("drive");
+    }
+    drop(drive);
+
+    let log = framework.event_log();
+    let frontier = log.frontier(session).await.expect("frontier").expect("log");
+    framework
+        .session_retirement()
+        .expect("sqlite retirement")
+        .retire(session, frontier)
+        .await
+        .expect("retire");
+
+    let query = framework.trace();
+    let mut stream = query.spans(SpanFilter {
+        session: Some(session),
+        ..SpanFilter::default()
+    });
+    let error = stream
+        .next()
+        .await
+        .expect("one error")
+        .expect_err("retired");
+    assert!(matches!(error, TraceError::NotFound { session: s } if s == session));
 
     framework.shutdown().await.expect("shutdown");
     cleanup(&db);
