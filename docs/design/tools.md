@@ -293,4 +293,4 @@ pub struct ToolConfig {
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：工具名命名空间与重名策略、插件清单与加载、外部工具的版本协商。
 - **#17**：`DurableExecutor::await_signal` 必须支持审批等待；signal name 约定由本文件定义。
-- **#8**：子会话生成工具（spawn）沿用同一审批/等待/取消规则。
+- **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。

@@ -12,6 +12,7 @@
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
 - **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
 - **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件。工具语义见 [tools.md](tools.md)。
+- **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起。
@@ -33,8 +34,8 @@ pub struct ParentRef {
 - `SessionId` 就是流身份，不再有 `StreamId` 枚举。
 - 子智能体是**独立子 session**：独立日志、独立恢复与取消单位。
 - 父流记 `ChildSessionSpawned`，记录父子关系；子流首条 `SessionCreated` 的 `parent` 指回父会话、turn 与 tool call。
-- 子会话结束时，父流写终态 `ChildSessionCompleted`（幂等，key = child id）。
-- 父子之间没有原子性。关闭顺序、孤儿处理、结果形状归 [#8](https://github.com/zibyn/asterpath/issues/8)。
+- 子会话创建时，父流写 `ChildSessionSpawned`（携带子配置与上下文策略）；子结束时父流写终态 `ChildSessionCompleted`（幂等，key = child id）。二者在正常运行时由 scheduler 写，恢复时由父驱动方代写。
+- 父子之间没有原子性。关闭顺序、孤儿处理、结果形状见 [subagents.md](subagents.md)。
 - 等待原语（timer / signal）是 session 事件；不引入 activity / workflow 概念。
 
 ## 3. 事件枚举
@@ -42,6 +43,8 @@ pub struct ParentRef {
 ```rust
 pub enum SessionEvent {
     SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef> },
+    ContextForked { source: ParentRef, source_log: LogId,
+                    items: Vec<Item> },                           // fork 子会话的首个模型可见记录
     StreamResumed { from: LogId, reason: ResumeReason },          // 非模型可见
     InputRecorded { input: Vec<Item> },                           // 模型可见
     TurnStarted { turn_id: TurnId },
@@ -64,6 +67,7 @@ pub enum SessionEvent {
     CompactionApplied { first_kept: LogId, summary: Vec<Item>,
                         replaces: LogIdRange },
     ChildSessionSpawned { child: SessionId, task: Vec<Item>,
+                          config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
                           caused_by: LogId },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
@@ -84,7 +88,7 @@ pub enum TurnEndReason {
     Completed, Cancelled, Failed, Stopped { reason: String },
     MaxStepsExceeded, ContextExhausted, CompactionFailed,
 }
-// ChildOutcome 的形状归 #8。
+// ChildOutcome 的形状见 subagents.md §6。
 ```
 
 规则：
@@ -97,7 +101,7 @@ pub enum TurnEndReason {
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向开启等待的意图记录（通常是 `ToolCallRequested`）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
-- `Usage`、`Item`、`JsonString`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)。
+- `Usage`、`Item`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
 - timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)；存储投递归 #5。
 
@@ -120,6 +124,7 @@ pub struct LogEntry {
 | 事件 | dedup key |
 | --- | --- |
 | `SessionCreated` | session id |
+| `ContextForked` | child session id |
 | `InputRecorded` | 调用方提供的 input id |
 | `AssistantMessage` | `(turn_id, step_id)` |
 | `ToolCallRequested` | 意图提交时生成的 `tool_call_id` |
@@ -192,10 +197,11 @@ recover(session):
                         else if deadline 已过: 立即入队 fire
                         else: 重新挂起
         ChildSession -> if caused_by 已终结: append(ChildSessionCompleted{Cancelled})
-                        else 查询子会话最终状态：
+                        else 查询子会话最终状态（[subagents.md](subagents.md) §9）：
                               已完成 -> append(ChildSessionCompleted)
                               运行中 -> 重新挂起等待
-                              丢失/失败 -> 按 #8 的孤儿策略处理
+                              未物化 -> R2 物化并启动
+                              不可读 -> append(ChildSessionCompleted{Lost})
         Signal       -> 保持等待；到达时由投递方 append(SignalReceived)
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
@@ -235,7 +241,7 @@ recover(session):
 - **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0005](../adr/0005-storage-contract-and-sqlite.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
 - **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
-- **#8**：子会话完成结果、父子关闭顺序、孤儿恢复、fork session、并发与深度上限。
+- **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#9**：压缩触发条件、保留策略、摘要模型。
 - **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
 - **#12**：`StreamResumed` 与 `caused_by` 如何映射到 trace。

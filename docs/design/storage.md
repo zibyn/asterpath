@@ -266,7 +266,7 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 ## 10. 留给下游
 
 - **#6**：turn/step 的终止条件、取消宽限期，决定 `sessions.state` 的完整转移。
-- **#8**：子会话完成结果、孤儿策略；决定父流何时 `ChildSessionCompleted`、启动时子会话缺失怎么处理。
+- **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
 - **#17**：claim 循环、`TimerFired` 追加、signal 投递、租约时长。
 - **#18**：保留/归档扩展模块的 seam（导出/删除 API 或 storage admin capability）；策略不在内核。

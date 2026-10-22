@@ -257,7 +257,7 @@ pub trait AgentRunner: Send + Sync {
 | #5 存储与 SQLite | `Storage` 方法集与 schema；实现是模块 |
 | #6 agent loop | `AgentRunner` 在 protocol；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
 | #7 工具与审批 | 已定。`Tool` / `ToolRegistry` / `Provenance` 在 protocol；管线与审批见 [tools.md](tools.md)、[ADR-0007](../adr/0007-approval-and-sandbox-layers.md) |
-| #8 子智能体 | 基于 `AgentRunner` + `DurableExecutor`（timer/signal） |
+| #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) |
 | #9 上下文压缩 | 消费 `EventLog` 与 `Provider` |
 | #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
 | #11 协议模型 | 规范模型与 `Provider` 在 protocol |

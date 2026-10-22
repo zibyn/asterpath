@@ -232,7 +232,7 @@ StepCommitted
 - **模型流中**：立即 abort，写 `ModelCallAborted{Cancelled}`，不重试；`StepCommitted`；`TurnCommitted(Cancelled)`。
 - **退避等待中**：打断 sleep，同上。
 - **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。已写入的结果不覆盖。外部子进程/MCP server 在宽限后强杀，见 [tools.md](tools.md) §6。
-- **等待意图**：到期后由 loop 收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 写 `ChildSessionCompleted{Cancelled}` 并请求子会话取消（子会话自己的终态归 #8）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。
+- **等待意图**：到期后由驱动方收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled}`（正常运行时 scheduler 是父流子生命周期记录的唯一写者）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
 - 顺序：取消信号 → 宽限 → 收尾等待 → `StepCommitted` → `TurnCommitted(Cancelled)`。
 - 取消不重试、不恢复：已提交的取消记录让恢复跳过该 step。
 
@@ -318,7 +318,7 @@ pub struct TurnConfig {
 ## 12. 留给下游
 
 - **#7**：已定。工具契约、审批、并行/独占调度、超时与结果形状见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
-- **#8**：子会话取消、`ChildSessionCompleted{Cancelled}` 的形状、孤儿策略。
+- **#8**：已定。spawn 是同步工具调用；取消、`ChildSessionCompleted{Cancelled}` 与孤儿策略见 [subagents.md](subagents.md)。
 - **#9**：压缩触发条件与算法；loop 只定义 pre-step 调用与 `CompactionFailed`。
 - **#11**：`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）。
 - **#12**：span 命名与属性映射。
