@@ -1,0 +1,12 @@
+[package]
+name = "asterpath-agent"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterpath-core = { path = "../asterpath-core" }
+asterpath-protocol = { path = "../asterpath-protocol" }
+futures-core = "0.3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["time"] }
