@@ -13,11 +13,11 @@ use asterpath_core::{
 use asterpath_protocol::{
     AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item,
     JsonString, ModelId, ModelSpec, Parallelism, Part, PostExecuteError, PostExecuteEvent,
-    PreExecuteError, PreExecuteEvent, Provenance, Provider, ProviderCatalog, ProviderId,
-    ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect,
-    StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
-    decode_entry, encode_entry,
+    PreExecuteError, PreExecuteEvent, PreStepGateDecision, PreStepGateError, PreStepGateEvent,
+    Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role,
+    RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs,
+    ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry,
+    ToolResultStatus, TurnConfig, TurnEndReason, Usage, decode_entry, encode_entry,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -1079,4 +1079,188 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
         1,
         "the open step is not re-asked"
     );
+}
+
+// --- pre-step gate --------------------------------------------------------
+
+struct StopGate {
+    reason: String,
+}
+
+impl Middleware<PreStepGateEvent> for StopGate {
+    fn handle<'a>(
+        &'a self,
+        mut event: PreStepGateEvent,
+        next: Next<'a, PreStepGateEvent>,
+    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
+        event.decision = PreStepGateDecision::EndTurn {
+            reason: self.reason.clone(),
+        };
+        next.run(event)
+    }
+}
+
+struct StopAfter {
+    calls: Arc<AtomicUsize>,
+    skip: usize,
+    reason: String,
+}
+
+impl Middleware<PreStepGateEvent> for StopAfter {
+    fn handle<'a>(
+        &'a self,
+        mut event: PreStepGateEvent,
+        next: Next<'a, PreStepGateEvent>,
+    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.skip {
+            event.decision = PreStepGateDecision::EndTurn {
+                reason: self.reason.clone(),
+            };
+        }
+        next.run(event)
+    }
+}
+
+struct FailGate;
+
+impl Middleware<PreStepGateEvent> for FailGate {
+    fn handle<'a>(
+        &'a self,
+        _event: PreStepGateEvent,
+        _next: Next<'a, PreStepGateEvent>,
+    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
+        Box::pin(async {
+            Err(PreStepGateError::Internal {
+                message: "gate boom".to_owned(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_gate_stop_before_the_first_step_ends_a_zero_step_turn() {
+    let log = new_log(config(Vec::new())).await;
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let registry = TestRegistry::with(Vec::new());
+    let hooks = hooks_with(|ctx| {
+        ctx.intercept(StopGate {
+            reason: "budget".to_owned(),
+        });
+    })
+    .await;
+    let agent = agent(
+        log.clone(),
+        provider.clone(),
+        registry,
+        tool_config(),
+        Some(hooks),
+    );
+
+    let events = drive(&agent).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnCommitted {
+            reason: TurnEndReason::Stopped { reason },
+            ..
+        } if reason == "budget"
+    )));
+
+    let events = decoded(&log).await;
+    let kinds: Vec<_> = events.iter().map(SessionEvent::kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "SessionCreated",
+            "InputRecorded",
+            "TurnStarted",
+            "TurnCommitted",
+        ]
+    );
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "the gate runs before the model"
+    );
+}
+
+#[tokio::test]
+async fn a_gate_error_ends_the_turn_failed_with_no_step() {
+    let log = new_log(config(Vec::new())).await;
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let registry = TestRegistry::with(Vec::new());
+    let hooks = hooks_with(|ctx| {
+        ctx.intercept(FailGate);
+    })
+    .await;
+    let agent = agent(
+        log.clone(),
+        provider.clone(),
+        registry,
+        tool_config(),
+        Some(hooks),
+    );
+
+    let events = drive(&agent).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnCommitted {
+            reason: TurnEndReason::Failed,
+            ..
+        }
+    )));
+    let events = decoded(&log).await;
+    assert_eq!(events.last().map(SessionEvent::kind), Some("TurnCommitted"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::StepStarted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn the_gate_is_consulted_before_every_step() {
+    let log = new_log(config(Vec::new())).await;
+    let provider = provider(
+        assistant_text("one"),
+        StopReason::PauseTurn,
+        assistant_text("two"),
+    );
+    let registry = TestRegistry::with(Vec::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let hooks = hooks_with(move |ctx| {
+        ctx.intercept(StopAfter {
+            calls: Arc::clone(&counter),
+            skip: 1,
+            reason: "enough".to_owned(),
+        });
+    })
+    .await;
+    let agent = agent(
+        log.clone(),
+        provider.clone(),
+        registry,
+        tool_config(),
+        Some(hooks),
+    );
+
+    let events = drive(&agent).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnCommitted {
+            reason: TurnEndReason::Stopped { reason },
+            ..
+        } if reason == "enough"
+    )));
+    let events = decoded(&log).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::StepStarted { .. }))
+            .count(),
+        1,
+        "the gate stops the turn before the second step"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.requests().len(), 1);
 }

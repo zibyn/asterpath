@@ -21,9 +21,10 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
-    ApprovalRequest, ApprovalVerdict, CancelToken, CompactResult, ConfigSnapshot, Item,
-    ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism, PostExecuteError,
-    PostExecuteEvent, PreExecuteError, PreExecuteEvent, Provenance, ProviderCatalog, ProviderError,
+    ApprovalRequest, ApprovalVerdict, CancelRegistration, CancelToken, CancellationRegistry,
+    CompactResult, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents,
+    Parallelism, PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent,
+    PreStepGateDecision, PreStepGateEvent, Provenance, ProviderCatalog, ProviderError,
     ProviderErrorKind, ReplaySafety, RunRequest, SessionEvent, SessionState, StopReason,
     StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
     ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason,
@@ -48,6 +49,7 @@ pub struct Agent {
     executor: Arc<dyn DurableExecutor>,
     hooks: Option<ModuleCtx>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
+    cancellations: Arc<CancellationRegistry>,
 }
 
 impl Agent {
@@ -74,7 +76,16 @@ impl Agent {
             executor,
             hooks,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            cancellations: Arc::new(CancellationRegistry::new()),
         }
+    }
+
+    /// Share the facade's per-session cancellation registry. Without this the
+    /// agent keeps a private one, so direct `AgentRunner` users still work.
+    #[must_use]
+    pub fn with_cancellations(mut self, cancellations: Arc<CancellationRegistry>) -> Self {
+        self.cancellations = cancellations;
+        self
     }
 
     fn acquire(&self, session: SessionId) -> bool {
@@ -112,8 +123,8 @@ impl Agent {
         Ok(self.log.append(entry).await?)
     }
 
-    async fn execute(&self, session: SessionId, events: &EventSink) {
-        if let Err(error) = self.execute_inner(session, events).await {
+    async fn execute(&self, session: SessionId, cancel: &CancelToken, events: &EventSink) {
+        if let Err(error) = self.execute_inner(session, cancel, events).await {
             events.push(Err(error));
         }
     }
@@ -121,6 +132,7 @@ impl Agent {
     async fn execute_inner(
         &self,
         session: SessionId,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
@@ -150,7 +162,8 @@ impl Agent {
                 self.append(session, SessionEvent::TurnStarted { turn_id: turn }, None)
                     .await?;
                 events.push(Ok(AgentEvent::TurnStarted { turn }));
-                self.run_steps(session, &config, turn, None, events).await
+                self.run_steps(session, &config, turn, None, cancel, events)
+                    .await
             }
             SessionState::TurnOpen { turn, .. } => {
                 // Resume from the log: never repeat TurnStarted.
@@ -160,27 +173,34 @@ impl Agent {
                 {
                     // The model call already committed; finish its tools, commit,
                     // then continue the turn exactly like a normal step.
-                    match self.resume_step(session, turn, step, events).await? {
+                    match self
+                        .resume_step(session, &config, turn, step, cancel, events)
+                        .await?
+                    {
                         StepOutcome::Continue => {}
                         StepOutcome::Turn(reason) => {
                             return self.commit_turn(session, turn, reason, events).await;
                         }
                     }
-                    return self.run_steps(session, &config, turn, None, events).await;
+                    return self
+                        .run_steps(session, &config, turn, None, cancel, events)
+                        .await;
                 }
 
-                self.run_steps(session, &config, turn, open_step, events)
+                self.run_steps(session, &config, turn, open_step, cancel, events)
                     .await
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_steps(
         &self,
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
         existing_step: Option<(StepId, u64)>,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let mut pending = existing_step;
@@ -190,6 +210,36 @@ impl Agent {
             let (step, watermark) = match pending.take() {
                 Some(step) => step,
                 None => {
+                    // Between steps: cancellation closes the turn with no step.
+                    if cancel.is_cancelled() {
+                        return self
+                            .commit_turn(session, turn, TurnEndReason::Cancelled, events)
+                            .await;
+                    }
+                    // Compaction (#46) runs here, before the host gate.
+                    match self.pre_step_gate(session, turn).await {
+                        GateOutcome::Continue => {}
+                        GateOutcome::Stop(reason) => {
+                            return self
+                                .commit_turn(
+                                    session,
+                                    turn,
+                                    TurnEndReason::Stopped { reason },
+                                    events,
+                                )
+                                .await;
+                        }
+                        GateOutcome::Failed => {
+                            return self
+                                .commit_turn(session, turn, TurnEndReason::Failed, events)
+                                .await;
+                        }
+                    }
+                    if cancel.is_cancelled() {
+                        return self
+                            .commit_turn(session, turn, TurnEndReason::Cancelled, events)
+                            .await;
+                    }
                     if let Some(max) = config.turn.max_steps_per_turn
                         && steps_started >= max
                     {
@@ -215,7 +265,7 @@ impl Agent {
             };
 
             match self
-                .run_step(session, config, turn, step, watermark, events)
+                .run_step(session, config, turn, step, watermark, cancel, events)
                 .await?
             {
                 StepOutcome::Continue => {}
@@ -226,6 +276,23 @@ impl Agent {
         }
     }
 
+    /// Run the host's typed pre-step waterfall; no hooks means `Continue`.
+    async fn pre_step_gate(&self, session: SessionId, turn: TurnId) -> GateOutcome {
+        let Some(hooks) = &self.hooks else {
+            return GateOutcome::Continue;
+        };
+        match hooks.waterfall(PreStepGateEvent::new(session, turn)).await {
+            Ok(event) => match event.decision {
+                PreStepGateDecision::Continue => GateOutcome::Continue,
+                PreStepGateDecision::EndTurn { reason } => GateOutcome::Stop(reason),
+                // Forward-compatible decisions do not stop the turn.
+                _ => GateOutcome::Continue,
+            },
+            Err(_) => GateOutcome::Failed,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_step(
         &self,
         session: SessionId,
@@ -233,6 +300,7 @@ impl Agent {
         turn: TurnId,
         step: StepId,
         watermark: u64,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
         // The projection is computed once per step; retries reuse it (L12).
@@ -241,6 +309,14 @@ impl Agent {
         let mut attempt = 1u32;
 
         loop {
+            // A step still open when cancellation arrives never calls the model.
+            if cancel.is_cancelled() {
+                self.abort_cancelled(session, config, turn, step, attempt, None)
+                    .await?;
+                self.commit_step(session, turn, step).await?;
+                return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+            }
+
             let provider =
                 self.providers
                     .get(&config.model.provider)
@@ -253,31 +329,57 @@ impl Agent {
             let mut completed: BTreeMap<u32, Item> = BTreeMap::new();
             let mut terminal: Option<(StopReason, Usage)> = None;
             let mut failure: Option<ProviderError> = None;
+            let mut cancelled = false;
 
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(StreamEvent::PartDelta { delta, .. }) => {
-                        events.push(Ok(AgentEvent::ModelDelta { turn, step, delta }));
-                    }
-                    Ok(StreamEvent::ItemCompleted {
-                        output_index, item, ..
-                    }) => {
-                        completed.insert(output_index, item);
-                    }
-                    Ok(StreamEvent::ResponseEnded {
-                        stop_reason, usage, ..
-                    }) => {
-                        terminal = Some((stop_reason, usage));
+            let token = cancel.clone();
+            let cancel_wait = token.cancelled();
+            tokio::pin!(cancel_wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_wait => {
+                        cancelled = true;
                         break;
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
+                    event = stream.next() => match event {
+                        Some(Ok(StreamEvent::PartDelta { delta, .. })) => {
+                            events.push(Ok(AgentEvent::ModelDelta { turn, step, delta }));
+                        }
+                        Some(Ok(StreamEvent::ItemCompleted {
+                            output_index, item, ..
+                        })) => {
+                            completed.insert(output_index, item);
+                        }
+                        Some(Ok(StreamEvent::ResponseEnded {
+                            stop_reason, usage, ..
+                        })) => {
+                            terminal = Some((stop_reason, usage));
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            failure = Some(error);
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
             drop(stream);
+
+            if cancelled {
+                // Abort immediately: record the cancelled attempt, commit the
+                // step and end the turn without retrying (L3).
+                let partial = if completed.is_empty() {
+                    None
+                } else {
+                    Some(completed.into_values().collect())
+                };
+                self.abort_cancelled(session, config, turn, step, attempt, partial)
+                    .await?;
+                self.commit_step(session, turn, step).await?;
+                return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+            }
 
             if let Some((stop_reason, usage)) = terminal {
                 let items: Vec<Item> = completed.into_values().collect();
@@ -301,11 +403,29 @@ impl Agent {
                 if had_calls {
                     let decoded = decode_entries(self.scan(session).await?, session)?;
                     let existing = existing_step(&decoded, turn, step);
-                    self.execute_tool_calls(session, turn, step, &existing, calls, events)
+                    let outcome = self
+                        .execute_tool_calls(
+                            session,
+                            turn,
+                            step,
+                            watermark,
+                            &existing,
+                            calls,
+                            cancel,
+                            config.turn.cancel_grace,
+                            events,
+                        )
                         .await?;
+                    if outcome == ToolOutcome::Cancelled {
+                        self.commit_step(session, turn, step).await?;
+                        return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+                    }
                 }
 
                 self.commit_step(session, turn, step).await?;
+                if cancel.is_cancelled() {
+                    return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+                }
                 let pending_input = self.pending_input(session).await?;
                 return Ok(step_outcome(&stop_reason, had_calls, pending_input));
             }
@@ -351,14 +471,38 @@ impl Agent {
 
             if will_retry {
                 if !backoff.is_zero() {
-                    tokio::time::sleep(backoff).await;
+                    let token = cancel.clone();
+                    let cancel_wait = token.cancelled();
+                    tokio::pin!(cancel_wait);
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_wait => {
+                            // Cancellation interrupts the backoff sleep and is
+                            // the last abort the recovery classifier sees.
+                            self.abort_cancelled(
+                                session, config, turn, step, attempt + 1, None,
+                            )
+                            .await?;
+                            self.commit_step(session, turn, step).await?;
+                            return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+                        }
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                }
+                if cancel.is_cancelled() {
+                    self.abort_cancelled(session, config, turn, step, attempt + 1, None)
+                        .await?;
+                    self.commit_step(session, turn, step).await?;
+                    return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
                 }
                 attempt += 1;
                 continue;
             }
 
             self.commit_step(session, turn, step).await?;
-            return Ok(StepOutcome::Turn(if error.context_exceeded() {
+            return Ok(StepOutcome::Turn(if cancel.is_cancelled() {
+                TurnEndReason::Cancelled
+            } else if error.context_exceeded() {
                 TurnEndReason::ContextExhausted
             } else {
                 TurnEndReason::Failed
@@ -366,13 +510,45 @@ impl Agent {
         }
     }
 
+    /// Record one aborted attempt that will not be retried.
+    #[allow(clippy::too_many_arguments)]
+    async fn abort_cancelled(
+        &self,
+        session: SessionId,
+        config: &ConfigSnapshot,
+        turn: TurnId,
+        step: StepId,
+        attempt: u32,
+        partial: Option<Vec<Item>>,
+    ) -> Result<(), AgentError> {
+        self.append(
+            session,
+            SessionEvent::ModelCallAborted {
+                turn_id: turn,
+                step_id: step,
+                attempt,
+                kind: AbortKind::Cancelled,
+                partial,
+                model: config.model.clone(),
+                backoff_ms: 0,
+                usage: None,
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Finish an open step whose `AssistantMessage` is already committed: run
     /// every call without a `ToolResult`, reusing recorded intents verbatim.
+    #[allow(clippy::too_many_arguments)]
     async fn resume_step(
         &self,
         session: SessionId,
+        config: &ConfigSnapshot,
         turn: TurnId,
         step: StepId,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
@@ -396,39 +572,78 @@ impl Agent {
             })?;
 
         let existing = existing_step(&decoded, turn, step);
+        let watermark = decoded
+            .iter()
+            .find_map(|(entry, event)| match event {
+                SessionEvent::StepStarted { turn_id, step_id }
+                    if *turn_id == turn && *step_id == step =>
+                {
+                    Some(entry.seq)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
         let calls = tool_calls(&items);
         let had_calls = !calls.is_empty();
         if had_calls {
-            self.execute_tool_calls(session, turn, step, &existing, calls, events)
+            let outcome = self
+                .execute_tool_calls(
+                    session,
+                    turn,
+                    step,
+                    watermark,
+                    &existing,
+                    calls,
+                    cancel,
+                    config.turn.cancel_grace,
+                    events,
+                )
                 .await?;
+            if outcome == ToolOutcome::Cancelled {
+                self.commit_step(session, turn, step).await?;
+                return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+            }
         }
 
         self.commit_step(session, turn, step).await?;
+        if cancel.is_cancelled() {
+            return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+        }
         let pending_input = self.pending_input(session).await?;
         Ok(step_outcome(&stop_reason, had_calls, pending_input))
     }
 
     /// The fixed pipeline: pre-execute, intent, registry, approval, scheduling,
     /// invocation, truncation, post-execute, result.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tool_calls(
         &self,
         session: SessionId,
         turn: TurnId,
         step: StepId,
+        step_started_seq: u64,
         existing: &ExistingStep,
         calls: Vec<CallItem>,
+        cancel: &CancelToken,
+        cancel_grace: Duration,
         events: &EventSink,
-    ) -> Result<(), AgentError> {
+    ) -> Result<ToolOutcome, AgentError> {
         let lock = Arc::new(tokio::sync::RwLock::new(()));
         let semaphore = Arc::new(tokio::sync::Semaphore::new(
             self.tool_config.max_parallel_calls.get(),
         ));
         let budget = Arc::new(Mutex::new(self.tool_config.max_output_bytes_per_step));
         let mut runnable: Vec<Runnable> = Vec::new();
+        let mut cancelled = cancel.is_cancelled();
 
         for call in calls {
             if let Some(intent) = existing.intents.get(&call.provider_call_id) {
                 if existing.results.contains(&intent.tool_call_id) {
+                    continue;
+                }
+                if cancelled {
+                    self.interrupt(session, turn, step, intent.tool_call_id, events)
+                        .await?;
                     continue;
                 }
                 match self.tools.get(&intent.name) {
@@ -458,19 +673,39 @@ impl Agent {
                                 &intent.args,
                                 &descriptor,
                                 intent.log_id,
+                                cancel,
                                 events,
                             )
                             .await?
                         {
-                            ToolDecision::Allow => runnable.push(Runnable {
-                                tool,
-                                descriptor,
-                                tool_call_id: intent.tool_call_id,
-                                name: intent.name.clone(),
-                                args: intent.args.clone(),
-                            }),
+                            ToolDecision::Allow => {
+                                if cancel.is_cancelled() {
+                                    cancelled = true;
+                                    self.interrupt(
+                                        session,
+                                        turn,
+                                        step,
+                                        intent.tool_call_id,
+                                        events,
+                                    )
+                                    .await?;
+                                } else {
+                                    runnable.push(Runnable {
+                                        tool,
+                                        descriptor,
+                                        tool_call_id: intent.tool_call_id,
+                                        name: intent.name.clone(),
+                                        args: intent.args.clone(),
+                                    });
+                                }
+                            }
                             ToolDecision::Deny(reason) => {
                                 self.deny(session, intent.tool_call_id, reason).await?
+                            }
+                            ToolDecision::Cancelled => {
+                                cancelled = true;
+                                self.interrupt(session, turn, step, intent.tool_call_id, events)
+                                    .await?;
                             }
                         }
                     }
@@ -516,6 +751,12 @@ impl Agent {
                 )
                 .await?;
 
+            if cancelled {
+                self.interrupt(session, turn, step, tool_call_id, events)
+                    .await?;
+                continue;
+            }
+
             match (failure, descriptor, tool) {
                 (Some(PreFailure::Denied(reason)), _, _) => {
                     self.deny(session, tool_call_id, reason).await?;
@@ -559,19 +800,33 @@ impl Agent {
                             &args,
                             &descriptor,
                             caused_by,
+                            cancel,
                             events,
                         )
                         .await?
                     {
-                        ToolDecision::Allow => runnable.push(Runnable {
-                            tool,
-                            descriptor,
-                            tool_call_id,
-                            name: call.name,
-                            args,
-                        }),
+                        ToolDecision::Allow => {
+                            if cancel.is_cancelled() {
+                                cancelled = true;
+                                self.interrupt(session, turn, step, tool_call_id, events)
+                                    .await?;
+                            } else {
+                                runnable.push(Runnable {
+                                    tool,
+                                    descriptor,
+                                    tool_call_id,
+                                    name: call.name,
+                                    args,
+                                });
+                            }
+                        }
                         ToolDecision::Deny(reason) => {
                             self.deny(session, tool_call_id, reason).await?
+                        }
+                        ToolDecision::Cancelled => {
+                            cancelled = true;
+                            self.interrupt(session, turn, step, tool_call_id, events)
+                                .await?;
                         }
                     }
                 }
@@ -579,10 +834,18 @@ impl Agent {
             }
         }
 
+        if cancelled {
+            // Calls that passed approval but never started are interrupted too.
+            let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
+            self.finish_cancelled_step(session, turn, step, step_started_seq, &pending, events)
+                .await?;
+            return Ok(ToolOutcome::Cancelled);
+        }
         if runnable.is_empty() {
-            return Ok(());
+            return Ok(ToolOutcome::Done);
         }
 
+        let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
         let mut futures: FuturesUnordered<BoxFuture<'_, Result<(), AgentError>>> =
             FuturesUnordered::new();
         for item in runnable {
@@ -594,20 +857,130 @@ impl Agent {
                 Arc::clone(&semaphore),
                 Arc::clone(&lock),
                 Arc::clone(&budget),
+                cancel,
                 events,
             ));
         }
 
         let mut failure = None;
-        while let Some(result) = futures.next().await {
-            if let Err(error) = result {
-                failure.get_or_insert(error);
+        let token = cancel.clone();
+        let cancel_wait = token.cancelled();
+        tokio::pin!(cancel_wait);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancel_wait => break,
+                result = futures.next() => match result {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        failure.get_or_insert(error);
+                    }
+                    None => return match failure {
+                        Some(error) => Err(error),
+                        None => Ok(ToolOutcome::Done),
+                    },
+                }
             }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+
+        // Cancellation grace: in-flight tools may return a real result.
+        if !cancel_grace.is_zero() {
+            let deadline = tokio::time::sleep(cancel_grace);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline => break,
+                    result = futures.next() => match result {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            failure.get_or_insert(error);
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
+        drop(futures);
+
+        self.finish_cancelled_step(session, turn, step, step_started_seq, &pending, events)
+            .await?;
+        Ok(ToolOutcome::Cancelled)
+    }
+
+    /// Interrupt every call of this step that has no recorded result, then close
+    /// the step's open waits. Reading the log (not driver memory) makes a real
+    /// result that landed while its future was dropped still win.
+    async fn finish_cancelled_step(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        step_started_seq: u64,
+        pending: &[ToolCallId],
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let decoded = decode_entries(self.scan(session).await?, session)?;
+        let mut recorded = HashSet::new();
+        let mut open_timers: BTreeMap<asterpath_core::TimerId, u64> = BTreeMap::new();
+        for (entry, event) in &decoded {
+            if let SessionEvent::ToolResult { tool_call_id, .. } = event {
+                recorded.insert(*tool_call_id);
+            }
+            if entry.seq <= step_started_seq {
+                continue;
+            }
+            match event {
+                SessionEvent::TimerScheduled { timer_id, .. } => {
+                    open_timers.insert(*timer_id, entry.seq);
+                }
+                SessionEvent::TimerFired { timer_id }
+                | SessionEvent::TimerCancelled { timer_id } => {
+                    open_timers.remove(timer_id);
+                }
+                // #48: child waits are closed by the scheduler's own terminal.
+                _ => {}
+            }
+        }
+        for tool_call_id in pending {
+            if !recorded.contains(tool_call_id) {
+                self.interrupt(session, turn, step, *tool_call_id, events)
+                    .await?;
+            }
+        }
+        for timer in open_timers.into_keys() {
+            // A failed close must not turn cancellation into an error; the
+            // runtime remains the single writer of timer terminals.
+            let _ = self.executor.cancel_timer(session, timer).await;
+        }
+        Ok(())
+    }
+
+    /// One interrupted `ToolResult`; the dedup key makes a racing real result win.
+    async fn interrupt(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        tool_call_id: ToolCallId,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        self.append_tool_result(
+            session,
+            tool_call_id,
+            ToolResultStatus::Interrupted,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        events.push(Ok(AgentEvent::ToolFinished {
+            turn,
+            step,
+            call: tool_call_id,
+            status: ToolResultStatus::Interrupted,
+        }));
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -620,6 +993,7 @@ impl Agent {
         semaphore: Arc<tokio::sync::Semaphore>,
         lock: Arc<tokio::sync::RwLock<()>>,
         budget: Arc<Mutex<usize>>,
+        turn_cancel: &'a CancelToken,
         events: &'a EventSink,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
@@ -639,7 +1013,9 @@ impl Agent {
                 tool: item.name.clone(),
             }));
 
-            let cancel = CancelToken::new();
+            // A child of the turn token: the turn broadcasts to every tool, and
+            // a per-call timeout cancels only this call.
+            let cancel = turn_cancel.child();
             let context = ToolContext::new(session, turn, step, item.tool_call_id, cancel.clone());
             let timeout = item
                 .descriptor
@@ -653,6 +1029,7 @@ impl Agent {
                 item.args,
                 context,
                 cancel,
+                turn_cancel.clone(),
                 timeout,
                 self.tool_config.kill_grace,
             )
@@ -806,6 +1183,7 @@ impl Agent {
         args: &ToolArgs,
         descriptor: &ToolDescriptor,
         caused_by: LogId,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolDecision, AgentError> {
         if let Some(payload) = self.recorded_approval(session, tool_call_id).await? {
@@ -833,16 +1211,23 @@ impl Agent {
                     return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
                 }
                 events.push(Ok(AgentEvent::ApprovalRequested(request)));
-                let payload = self
-                    .executor
-                    .await_signal(AwaitSignal {
-                        session,
-                        signal: approval_signal_id(tool_call_id),
-                        name: approval_signal_name(tool_call_id),
-                        caused_by,
-                        intent: SignalIntent::AlreadyRecorded,
-                    })
-                    .await?;
+                let wait = self.executor.await_signal(AwaitSignal {
+                    session,
+                    signal: approval_signal_id(tool_call_id),
+                    name: approval_signal_name(tool_call_id),
+                    caused_by,
+                    intent: SignalIntent::AlreadyRecorded,
+                });
+                tokio::pin!(wait);
+                let token = cancel.clone();
+                let cancel_wait = token.cancelled();
+                tokio::pin!(cancel_wait);
+                let payload = tokio::select! {
+                    biased;
+                    // The interrupted ToolResult closes this call's intent.
+                    _ = &mut cancel_wait => return Ok(ToolDecision::Cancelled),
+                    payload = &mut wait => payload?,
+                };
                 approval_decision(session, payload)
             }
             _ => Ok(ToolDecision::Deny(DENIED_WITHOUT_REASON.to_owned())),
@@ -1024,11 +1409,13 @@ impl AgentRunner for Agent {
         let guard = BusyGuard {
             busy: Arc::clone(&self.busy),
             session,
+            _cancel: self.cancellations.register(session),
         };
+        let cancel = guard._cancel.token();
         let sink = Arc::new(EventSink::default());
         let future_sink = Arc::clone(&sink);
         let future: BoxFuture<'_, ()> = Box::pin(async move {
-            self.execute(session, &future_sink).await;
+            self.execute(session, &cancel, &future_sink).await;
         });
 
         Box::pin(DriveStream {
@@ -1096,6 +1483,7 @@ enum PreFailure {
 enum ToolDecision {
     Allow,
     Deny(String),
+    Cancelled,
 }
 
 fn approval_decision(
@@ -1139,9 +1527,23 @@ enum StepOutcome {
     Turn(TurnEndReason),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolOutcome {
+    Done,
+    Cancelled,
+}
+
+enum GateOutcome {
+    Continue,
+    Stop(String),
+    Failed,
+}
+
 struct BusyGuard {
     busy: Arc<Mutex<HashSet<SessionId>>>,
     session: SessionId,
+    /// Removes the session's active cancel token when the drive ends.
+    _cancel: CancelRegistration,
 }
 
 impl Drop for BusyGuard {
@@ -1216,33 +1618,49 @@ async fn invoke_tool(
     args: ToolArgs,
     context: ToolContext,
     cancel: CancelToken,
+    turn_cancel: CancelToken,
     timeout: Option<Duration>,
     kill_grace: Duration,
 ) -> Invocation {
     let future = AssertUnwindSafe(tool.invoke(args, context)).catch_unwind();
     tokio::pin!(future);
 
-    match timeout {
-        None => match future.await {
+    let Some(limit) = timeout else {
+        return match future.await {
+            Ok(result) => Invocation::Returned(result),
+            Err(_) => Invocation::Panic,
+        };
+    };
+
+    let deadline = tokio::time::sleep(limit);
+    tokio::pin!(deadline);
+    let cancel_wait = turn_cancel.cancelled();
+    tokio::pin!(cancel_wait);
+
+    tokio::select! {
+        biased;
+        // Turn cancellation takes over the deadline: await the tool ourselves;
+        // the supervisor's grace drops it if it never settles.
+        _ = &mut cancel_wait => match future.as_mut().await {
             Ok(result) => Invocation::Returned(result),
             Err(_) => Invocation::Panic,
         },
-        Some(limit) => match tokio::time::timeout(limit, future.as_mut()).await {
-            Ok(Ok(result)) => Invocation::Returned(result),
-            Ok(Err(_)) => Invocation::Panic,
-            Err(_) => {
-                // Cancellation took the deadline first: the cancel path owns
-                // the terminal, so no `Timeout` may be written.
-                let already_cancelled = cancel.is_cancelled();
-                cancel.cancel();
-                match tokio::time::timeout(kill_grace, future.as_mut()).await {
-                    Ok(Ok(result)) => Invocation::Returned(result),
-                    Ok(Err(_)) => Invocation::Panic,
-                    Err(_) if already_cancelled => Invocation::Cancelled,
-                    Err(_) => Invocation::Timeout,
-                }
-            }
+        result = &mut future => match result {
+            Ok(result) => Invocation::Returned(result),
+            Err(_) => Invocation::Panic,
         },
+        _ = &mut deadline => {
+            let already_cancelled = cancel.is_cancelled();
+            cancel.cancel();
+            match tokio::time::timeout(kill_grace, future.as_mut()).await {
+                Ok(Ok(result)) => Invocation::Returned(result),
+                Ok(Err(_)) => Invocation::Panic,
+                Err(_) if already_cancelled || turn_cancel.is_cancelled() => {
+                    Invocation::Cancelled
+                }
+                Err(_) => Invocation::Timeout,
+            }
+        }
     }
 }
 

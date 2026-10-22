@@ -1,9 +1,12 @@
 //! Driver-facing contracts: session spec, `AgentRunner`, live `AgentEvent`
 //! stream and the summed `AgentError`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use asterpath_core::{
-    ExecutionError, InputId, LifecycleError, LogIdRange, SessionId, StepId, StorageError,
-    ToolCallId, TurnId,
+    Event, ExecutionError, InputId, LifecycleError, LogIdRange, SessionId, StepId, StorageError,
+    ToolCallId, TurnId, WaterfallEvent,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -16,6 +19,7 @@ use crate::event::{ToolResultStatus, TurnEndReason};
 use crate::ids::{JsonString, ToolName};
 use crate::item::{Part, RawProviderData};
 use crate::provider::{PartDelta, ProviderError};
+use crate::tool::CancelToken;
 use crate::usage::Usage;
 
 /// Session construction input; resolved into a persisted `ConfigSnapshot`.
@@ -181,6 +185,116 @@ pub struct CompactionOutcome {
 pub trait AgentRunner: Send + Sync {
     fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>>;
     fn compact_now(&self, session: SessionId) -> BoxFuture<'_, Result<CompactResult, AgentError>>;
+}
+
+/// Process-local map from a driven session to its active turn token.
+///
+/// The facade and the default runner share one registry, so `SessionHandle`
+/// cancellation reaches the active drive without widening `AgentRunner`.
+/// Custom runners that do not register degrade to a no-op cancel.
+#[derive(Default)]
+pub struct CancellationRegistry {
+    active: Mutex<HashMap<SessionId, CancelToken>>,
+}
+
+impl CancellationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a fresh turn token. The returned guard clears the entry when
+    /// the drive ends; sessions are single-flight, so entries never stack.
+    pub fn register(self: &Arc<Self>, session: SessionId) -> CancelRegistration {
+        let token = CancelToken::new();
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session, token.clone());
+        CancelRegistration {
+            registry: Arc::clone(self),
+            session,
+            token,
+        }
+    }
+
+    /// Cancel the active turn, if any. Idle sessions are a no-op.
+    pub fn cancel(&self, session: SessionId) {
+        if let Some(token) = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session)
+            .cloned()
+        {
+            token.cancel();
+        }
+    }
+}
+
+/// RAII registration for one driven turn.
+pub struct CancelRegistration {
+    registry: Arc<CancellationRegistry>,
+    session: SessionId,
+    token: CancelToken,
+}
+
+impl CancelRegistration {
+    pub fn token(&self) -> CancelToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        self.registry
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.session);
+    }
+}
+
+/// Host policy consulted before every step. `Continue` runs the step; the
+/// middleware sets `EndTurn` to stop the turn with `TurnEndReason::Stopped`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PreStepGateDecision {
+    #[default]
+    Continue,
+    EndTurn {
+        reason: String,
+    },
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreStepGateEvent {
+    pub session: SessionId,
+    pub turn: TurnId,
+    pub decision: PreStepGateDecision,
+}
+
+impl PreStepGateEvent {
+    pub fn new(session: SessionId, turn: TurnId) -> Self {
+        Self {
+            session,
+            turn,
+            decision: PreStepGateDecision::Continue,
+        }
+    }
+}
+
+impl Event for PreStepGateEvent {}
+impl WaterfallEvent for PreStepGateEvent {
+    type Error = PreStepGateError;
+}
+
+/// A gate error ends the turn with `TurnEndReason::Failed`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PreStepGateError {
+    #[error("pre-step gate failed: {message}")]
+    Internal { message: String },
 }
 
 impl SessionSpec {

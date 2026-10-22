@@ -131,6 +131,8 @@ impl ToolError {
 struct CancelState {
     cancelled: AtomicBool,
     wakers: Mutex<Vec<Waker>>,
+    /// Child tokens cancelled with this one (turn token → per-call token).
+    children: Mutex<Vec<std::sync::Weak<CancelState>>>,
 }
 
 /// Per-call cancellation handle. Clones share one state.
@@ -145,8 +147,11 @@ impl CancelToken {
     }
 
     /// Broadcast cancellation; later calls to `is_cancelled` observe it.
+    /// Idempotent, and it propagates to every child token.
     pub fn cancel(&self) {
-        self.state.cancelled.store(true, Ordering::SeqCst);
+        if self.state.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let wakers = std::mem::take(
             &mut *self
                 .state
@@ -157,6 +162,36 @@ impl CancelToken {
         for waker in wakers {
             waker.wake();
         }
+        let children: Vec<CancelToken> = {
+            let mut children = self
+                .state
+                .children
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            children
+                .drain(..)
+                .filter_map(|weak| weak.upgrade().map(|state| CancelToken { state }))
+                .collect()
+        };
+        for child in children {
+            child.cancel();
+        }
+    }
+
+    /// A token that is cancelled whenever this one is. The child can be
+    /// cancelled on its own without affecting the parent (per-call timeouts).
+    pub fn child(&self) -> CancelToken {
+        let child = CancelToken::default();
+        self.state
+            .children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::downgrade(&child.state));
+        // Re-check after registration so a concurrent cancel cannot be missed.
+        if self.is_cancelled() {
+            child.cancel();
+        }
+        child
     }
 
     pub fn is_cancelled(&self) -> bool {
