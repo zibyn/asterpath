@@ -16,8 +16,8 @@ use asterpath_protocol::{
     ChildOutcome, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId, ModelRequest,
     ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCapabilities, ProviderError,
     ProviderErrorKind, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec,
-    SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
-    ToolDescriptor, ToolError, ToolErrorKind, ToolName, ToolOutput, ToolResultStatus,
+    SessionState, SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolConfig,
+    ToolContext, ToolDescriptor, ToolError, ToolErrorKind, ToolName, ToolOutput, ToolResultStatus,
     ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath_testing::ScriptedProvider;
@@ -1138,6 +1138,88 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
             ..
         })
     ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn cancel_with_zero_grace_closes_the_open_child_wait() {
+    let db = temp_db("cancel-zero-grace");
+    let quota = Arc::new(Quota::default());
+    let child: ChildReply =
+        Arc::new(|_task| response_events(assistant("never"), StopReason::EndTurn));
+    let provider = Arc::new(RoutingProvider {
+        first: vec![spawn_call("call-wait", r#"{"task":"task-wait"}"#)],
+        child,
+        quota: Some(Arc::clone(&quota)),
+    });
+    let subagents = SubagentConfig {
+        cancel_grace: Duration::ZERO,
+        ..SubagentConfig::default()
+    };
+    let asterpath = open(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .await;
+    let handle = asterpath
+        .create_session(spec_with(
+            subagents,
+            TurnConfig {
+                cancel_grace: Duration::ZERO,
+                ..TurnConfig::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    let driver = tokio::spawn({
+        let handle = handle.clone();
+        async move { drive_all(&handle).await }
+    });
+
+    wait_for(&asterpath, parent, "one admitted child", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+    })
+    .await;
+    handle.cancel().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("delivers cancellation")
+        .expect("driver task");
+
+    let entries = scan(asterpath.event_log(), parent).await;
+    assert_eq!(
+        completions(&entries),
+        vec![ChildOutcome::Cancelled {
+            reason: asterpath_protocol::CancelReason::Parent
+        }],
+        "the dropped spawn future still closes the child wait"
+    );
+    assert_eq!(
+        all_tool_results(&entries)
+            .into_iter()
+            .map(|(status, _, _)| status)
+            .collect::<Vec<_>>(),
+        vec![ToolResultStatus::Interrupted]
+    );
+    assert_eq!(handle.state().await.unwrap(), SessionState::Idle);
+    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("folds");
+    assert!(intents.is_idle(), "no waiting intent survives cancellation");
+    assert!(
+        !matches!(
+            handle.compact_now().await,
+            Err(asterpath::AsterError::Agent(
+                asterpath_protocol::AgentError::Busy { .. }
+            ))
+        ),
+        "an idle session is not stuck behind the closed wait"
+    );
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);

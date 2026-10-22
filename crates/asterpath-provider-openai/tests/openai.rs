@@ -392,6 +392,7 @@ async fn interleaved_items_are_normalized_by_output_index() {
             | StreamEvent::PartDelta { sequence, .. }
             | StreamEvent::ItemCompleted { sequence, .. }
             | StreamEvent::ResponseEnded { sequence, .. } => sequence,
+            other => panic!("unknown stream event: {other:?}"),
         };
         if let Some(previous) = last_sequence {
             assert!(sequence > previous, "sequences must increase");

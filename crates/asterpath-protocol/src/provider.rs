@@ -59,6 +59,7 @@ impl ModelRequest {
 }
 
 /// Normalized streaming response events. Only `ItemCompleted` is persisted.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     ResponseStarted {

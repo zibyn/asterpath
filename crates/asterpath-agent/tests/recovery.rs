@@ -732,6 +732,104 @@ async fn transport_abort_retries_without_adding_a_crash_abort() {
 }
 
 #[tokio::test]
+async fn recovered_transport_exhaustion_fails_without_another_call() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    // The last committed attempt already consumed every retry.
+    let max = config(Vec::new()).turn.max_attempts.get();
+    append_event(
+        &log,
+        SessionEvent::ModelCallAborted {
+            turn_id: TURN,
+            step_id: STEP,
+            attempt: max,
+            kind: AbortKind::Transport,
+            partial: None,
+            model: model(),
+            backoff_ms: 0,
+            usage: None,
+        },
+        None,
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert!(
+        provider.requests().is_empty(),
+        "exhausted recovery never calls the model again"
+    );
+    assert_eq!(aborts(&entries), vec![(max, AbortKind::Transport)]);
+    assert_eq!(count(&entries, "StepCommitted"), 1);
+    assert_eq!(count(&entries, "AssistantMessage"), 0);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Failed]);
+}
+
+#[tokio::test]
+async fn recovered_forced_compaction_retries_the_same_step() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::ModelCallAborted {
+            turn_id: TURN,
+            step_id: STEP,
+            attempt: 1,
+            kind: AbortKind::Rejected,
+            partial: None,
+            model: model(),
+            backoff_ms: 0,
+            usage: None,
+        },
+        None,
+    )
+    .await;
+    // The forced compaction landed before the crash.
+    append_event(
+        &log,
+        SessionEvent::CompactionApplied {
+            first_kept: LogId::from_i64(2),
+            summary: vec![text("compacted")],
+            replaces: asterpath_core::LogIdRange {
+                first: LogId::from_i64(1),
+                last: LogId::from_i64(2),
+            },
+            model: model(),
+            usage: Usage::default(),
+            raw: None,
+        },
+        None,
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the same step is retried once, without a second compaction"
+    );
+    assert_eq!(count(&entries, "CompactionApplied"), 1);
+    assert_eq!(count(&entries, "AssistantMessage"), 1);
+    assert_eq!(count(&entries, "StepStarted"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+#[tokio::test]
 async fn cancelled_abort_finishes_the_turn_without_calling_the_model() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;

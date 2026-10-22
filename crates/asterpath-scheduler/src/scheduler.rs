@@ -7,6 +7,7 @@ use std::time::Duration;
 use asterpath_core::{
     Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, ModuleCtx,
     SessionCatalog, SessionId, SystemClock, TimerId, TimerRequest, ToolCallId, WakeCause,
+    unique_bytes,
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
@@ -181,11 +182,21 @@ impl SubagentSpawner for Scheduler {
             let subagents = parent_config.subagents.clone();
             // Per-call wins; otherwise the inherited default (None by default).
             let timeout = req.timeout.or(subagents.spawn_timeout);
+            // The tool leaves context at `Fresh`; a `Fork` snapshot default
+            // wins and anchors at this spawn step's `StepStarted`.
+            let context = resolve_context(
+                &req.context,
+                &subagents.default_context,
+                &parent_events,
+                req.caused_by,
+            );
 
-            // Rebuild this parent's queue and Running count from the log first.
+            // Rebuild this parent's queue and Running count from the log first;
+            // a result that landed since then also closes its queue entry.
             self.recover_parent(req.parent.session, &parent_events)
                 .await
                 .map_err(SpawnError::Execution)?;
+            self.prune_queue(req.parent.session, &parent_events);
 
             // R1: one child per parent tool call, ever.
             if let Some(record) = find_spawn(&parent_events, req.parent.tool_call) {
@@ -273,7 +284,7 @@ impl SubagentSpawner for Scheduler {
             .await;
             drop(queue_guard);
 
-            let child = fresh_session_id();
+            let child = SessionId::from_bytes(unique_bytes(self.clock.now()));
             let spawn_log = self
                 .append(
                     req.parent.session,
@@ -281,7 +292,7 @@ impl SubagentSpawner for Scheduler {
                         child,
                         task: req.task.clone(),
                         config: config.clone(),
-                        context: req.context.clone(),
+                        context: context.clone(),
                         parent_tool_call_id: req.parent.tool_call,
                         caused_by: req.caused_by,
                     },
@@ -294,7 +305,7 @@ impl SubagentSpawner for Scheduler {
                 .await
                 .map_err(SpawnError::Execution)?;
 
-            self.materialize(req.parent.clone(), child, &req.task, &config, &req.context)
+            self.materialize(req.parent.clone(), child, &req.task, &config, &context)
                 .await
                 .map_err(SpawnError::Execution)?;
 
@@ -393,9 +404,13 @@ impl SubagentSpawner for Scheduler {
                                 .await
                             {
                                 Ok(()) => {
-                                    self.time_out(&child, record.config.subagents.cancel_grace)
-                                        .await?;
-                                    return Err(WaitError::Timeout);
+                                    match self
+                                        .time_out(&child, record.config.subagents.cancel_grace)
+                                        .await?
+                                    {
+                                        Some(outcome) => return wait_outcome(&outcome),
+                                        None => return Err(WaitError::Timeout),
+                                    }
                                 }
                                 // Another writer cancelled the timer.
                                 Err(ExecutionError::Cancelled) => None,
@@ -408,9 +423,13 @@ impl SubagentSpawner for Scheduler {
                         }
                     }
                     Some(TimeoutTimer::Fired) => {
-                        self.time_out(&child, record.config.subagents.cancel_grace)
-                            .await?;
-                        return Err(WaitError::Timeout);
+                        return match self
+                            .time_out(&child, record.config.subagents.cancel_grace)
+                            .await?
+                        {
+                            Some(outcome) => wait_outcome(&outcome),
+                            None => Err(WaitError::Timeout),
+                        };
                     }
                     _ => None,
                 };
@@ -495,6 +514,7 @@ impl Scheduler {
 
         let mut spawned: HashMap<ToolCallId, SessionId> = HashMap::new();
         let mut completed: HashSet<SessionId> = HashSet::new();
+        let mut finished: HashSet<ToolCallId> = HashSet::new();
         for (_, event) in events {
             match event {
                 SessionEvent::ChildSessionSpawned {
@@ -507,6 +527,9 @@ impl Scheduler {
                 SessionEvent::ChildSessionCompleted { child, .. } => {
                     completed.insert(*child);
                 }
+                SessionEvent::ToolResult { tool_call_id, .. } => {
+                    finished.insert(*tool_call_id);
+                }
                 _ => {}
             }
         }
@@ -517,6 +540,7 @@ impl Scheduler {
             } = event
                 && name.as_str() == SPAWN_TOOL_NAME
                 && !spawned.contains_key(tool_call_id)
+                && !finished.contains(tool_call_id)
             {
                 queue.insert(entry.seq, *tool_call_id);
             }
@@ -549,6 +573,28 @@ impl Scheduler {
         }
         state.live += started;
         Ok(())
+    }
+
+    /// Drop queue entries whose tool call already has a `ToolResult`: a spawn
+    /// cancelled before admission is closed and must not hold the FIFO head.
+    fn prune_queue(&self, parent: SessionId, events: &[(LogEntry, SessionEvent)]) {
+        let finished: HashSet<ToolCallId> = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                SessionEvent::ToolResult { tool_call_id, .. } => Some(*tool_call_id),
+                _ => None,
+            })
+            .collect();
+        if finished.is_empty() {
+            return;
+        }
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = state.parents.get_mut(&parent) {
+            entry.queue.retain(|_, call| !finished.contains(call));
+        }
     }
 
     /// Block until this spawn is the lowest-seq queued call and a slot is free.
@@ -657,17 +703,34 @@ impl Scheduler {
         }
     }
 
-    /// Timeout wins: cancel the child and record `Cancelled{Timeout}`. The
-    /// parent's tool then maps this wait to `Failed{Timeout}`.
-    async fn time_out(&self, child: &ChildRef, grace: Duration) -> Result<(), WaitError> {
+    /// Timeout: cancel the child and give it `grace` to close. R3 is rechecked
+    /// after the drain; a terminal that landed in the window wins over
+    /// `Cancelled{Timeout}`. Returns that outcome, or `None` for the timeout.
+    async fn time_out(
+        &self,
+        child: &ChildRef,
+        grace: Duration,
+    ) -> Result<Option<ChildOutcome>, WaitError> {
         self.drain_child(child.child, grace).await;
+        let child_events = scan(&*self.log, child.child)
+            .await
+            .map_err(WaitError::Execution)?;
+        if let Some(outcome) = child_outcome(&child_events)
+            // A `Cancelled{Host}` is the child reacting to our own drain, not a
+            // terminal that beat the timeout.
+            && !matches!(outcome, ChildOutcome::Cancelled { .. })
+        {
+            self.record_completion(child, outcome.clone()).await?;
+            return Ok(Some(outcome));
+        }
         self.record_completion(
             child,
             ChildOutcome::Cancelled {
                 reason: CancelReason::Timeout,
             },
         )
-        .await
+        .await?;
+        Ok(None)
     }
 
     /// Parent cancellation: signal the child through the shared registry, give
@@ -916,6 +979,49 @@ struct SpawnRecord {
     task: Vec<Part>,
     config: ConfigSnapshot,
     context: ContextPolicy,
+}
+
+/// A `Fork` snapshot default replaces the tool's implicit `Fresh`; an explicit
+/// `Fork` request always wins. The default's `at` is a placeholder: the spawn
+/// step's `StepStarted` LogId is the watermark.
+fn resolve_context(
+    requested: &ContextPolicy,
+    default: &ContextPolicy,
+    events: &[(LogEntry, SessionEvent)],
+    caused_by: LogId,
+) -> ContextPolicy {
+    if !matches!(requested, ContextPolicy::Fresh) {
+        return requested.clone();
+    }
+    let ContextPolicy::Fork { .. } = default else {
+        return ContextPolicy::Fresh;
+    };
+    let Some(caused_at) = events
+        .iter()
+        .position(|(entry, _)| entry.log_id == caused_by)
+    else {
+        return ContextPolicy::Fresh;
+    };
+    let SessionEvent::ToolCallRequested {
+        turn_id, step_id, ..
+    } = &events[caused_at].1
+    else {
+        return ContextPolicy::Fresh;
+    };
+    let at = events[..caused_at]
+        .iter()
+        .rev()
+        .find_map(|(entry, event)| match event {
+            SessionEvent::StepStarted {
+                turn_id: started_turn,
+                step_id: started_step,
+            } if started_turn == turn_id && started_step == step_id => Some(entry.log_id),
+            _ => None,
+        });
+    match at {
+        Some(at) => ContextPolicy::Fork { at },
+        None => ContextPolicy::Fresh,
+    }
 }
 
 fn find_spawn(events: &[(LogEntry, SessionEvent)], tool_call: ToolCallId) -> Option<SpawnRecord> {
@@ -1168,22 +1274,4 @@ async fn scan(
 
 fn backend(error: impl std::fmt::Display) -> ExecutionError {
     ExecutionError::Backend(error.to_string())
-}
-
-/// Process-local unique id source; session scoping makes collisions moot.
-fn fresh_session_id() -> SessionId {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut bytes = [0u8; 16];
-    bytes[..8]
-        .copy_from_slice(&(nanos ^ (std::process::id() as u64).rotate_left(17)).to_le_bytes());
-    bytes[8..].copy_from_slice(&counter.to_le_bytes());
-    SessionId::from_bytes(bytes)
 }

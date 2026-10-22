@@ -245,7 +245,7 @@ fn append(
 }
 
 fn append_raw(log: &dyn EventLog, entry: NewEntry) -> Result<LogId, StorageError> {
-    futures_executor::block_on(log.append(entry))
+    futures::executor::block_on(log.append(entry))
 }
 
 fn scan(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
@@ -261,7 +261,8 @@ fn scan(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
 
 fn scan_query(log: &dyn EventLog, query: LogQuery) -> Vec<LogEntry> {
     let stream = log.scan(query);
-    let results: Vec<Result<LogEntry, StorageError>> = futures_executor::block_on(stream.collect());
+    let results: Vec<Result<LogEntry, StorageError>> =
+        futures::executor::block_on(stream.collect());
     results
         .into_iter()
         .map(|result| result.expect("scan should succeed"))
@@ -269,7 +270,7 @@ fn scan_query(log: &dyn EventLog, query: LogQuery) -> Vec<LogEntry> {
 }
 
 fn frontier(log: &dyn EventLog, session: SessionId) -> Option<LogId> {
-    futures_executor::block_on(log.frontier(session)).expect("frontier should succeed")
+    futures::executor::block_on(log.frontier(session)).expect("frontier should succeed")
 }
 
 fn idempotent_append(log: &dyn EventLog) {
@@ -914,7 +915,7 @@ fn pending_and_timers(entries: &[LogEntry]) -> (bool, BTreeMap<TimerId, Timestam
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    futures_executor::block_on(future)
+    futures::executor::block_on(future)
 }
 
 fn hard_errors(log: &dyn EventLog) {

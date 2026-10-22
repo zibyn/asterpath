@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_core::{Clock, EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, CompactionConfig, InputTokens, Item, ModelId, ModelSpec,
     OutputTokens, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind,
@@ -17,7 +17,7 @@ use asterpath_protocol::{
     StopReason, SubagentConfig, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath_testing::ScriptedProvider;
+use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -666,6 +666,70 @@ async fn submit_input_records_but_never_starts_a_turn() {
     assert_eq!(kinds(&entries), ["SessionCreated", "InputRecorded"]);
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
     assert!(provider.requests().is_empty());
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn manual_clock_ids_are_deterministic_and_unique() {
+    let db = temp_db("manual-clock-ids");
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        assistant_items("hello"),
+        StopReason::EndTurn,
+        usage(1, 1),
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .clock(clock.clone())
+        .build()
+        .await
+        .expect("facade builds");
+    let first = asterpath.create_session(spec("p")).await.unwrap();
+    let second = asterpath.create_session(spec("p")).await.unwrap();
+    first
+        .submit_input(input(1, "hi"))
+        .await
+        .expect("input recorded");
+    drive_all(&first).await;
+
+    // The clock-derived half is the deterministic prefix: every id starts with
+    // the injected timestamp, and the counter half keeps them unique.
+    let stamp = (clock.now() as u64) ^ u64::from(std::process::id()).rotate_left(17);
+    let expected = stamp.to_le_bytes();
+    let events = decoded(&scan(asterpath.event_log(), first.id()).await);
+    let turn = events
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::TurnStarted { turn_id } => Some(*turn_id),
+            _ => None,
+        })
+        .expect("turn");
+    let step = events
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::StepStarted { step_id, .. } => Some(*step_id),
+            _ => None,
+        })
+        .expect("step");
+    for id in [
+        first.id().as_bytes().as_slice(),
+        second.id().as_bytes(),
+        turn.as_bytes(),
+        step.as_bytes(),
+    ] {
+        assert_eq!(&id[..8], &expected[..]);
+    }
+    let unique: std::collections::HashSet<_> = [
+        first.id().to_hex(),
+        second.id().to_hex(),
+        turn.to_hex(),
+        step.to_hex(),
+    ]
+    .into();
+    assert_eq!(unique.len(), 4, "ids are unique under a fixed clock");
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);

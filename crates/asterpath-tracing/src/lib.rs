@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
-    EventLog, LifecycleError, LogEntry, LogId, LogIdRange, LogQuery, Module, ModuleCtx, SessionId,
-    SignalId, StepId, StorageError, TimerId, Timestamp, ToolCallId, TurnId,
+    EventLog, Fnv, LifecycleError, LogEntry, LogId, LogIdRange, LogQuery, Module, ModuleCtx,
+    SessionId, SignalId, StepId, StorageError, TimerId, Timestamp, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
@@ -994,22 +994,7 @@ fn span_id(session: SessionId, log_id: LogId, kind: SpanKind) -> SpanId {
     hash.write(session.as_bytes());
     hash.write(&log_id.as_i64().to_be_bytes());
     hash.write(&[kind_tag(kind)]);
-    SpanId::from_bytes(hash.0.to_be_bytes())
-}
-
-struct Fnv(u64);
-
-impl Fnv {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
+    SpanId::from_bytes(hash.finish_64().to_be_bytes())
 }
 
 /// Real-time seam: diffs the projection after each committed record.

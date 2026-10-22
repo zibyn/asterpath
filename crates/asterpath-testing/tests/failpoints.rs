@@ -220,7 +220,7 @@ fn fixture_parses_and_replays_after_a_committed_prefix() {
         vec![],
         &asterpath_protocol::RequestConfig::default(),
     );
-    let events: Vec<_> = futures_executor::block_on(async {
+    let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;
         provider.stream(request).collect::<Vec<_>>().await
     });

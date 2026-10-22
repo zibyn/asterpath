@@ -140,6 +140,7 @@ async fn normalizes_the_full_stream_into_s1_to_s10() {
             | StreamEvent::PartDelta { sequence, .. }
             | StreamEvent::ItemCompleted { sequence, .. }
             | StreamEvent::ResponseEnded { sequence, .. } => *sequence,
+            other => panic!("unknown stream event: {other:?}"),
         })
         .collect();
     assert!(
