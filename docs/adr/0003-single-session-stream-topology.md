@@ -17,7 +17,7 @@
 - 子智能体是**子 session**：独立流、独立恢复与取消单位。父流记 `ChildSessionSpawned` 与终态 `ChildSessionCompleted`。
 - **持久等待是 session 事件**：`TimerScheduled` / `TimerFired` / `SignalReceived`。人工审批、跨天等待、子会话完成唤醒都走这三种记录。
 - **没有确定性重放**：不做 action 序列比对、`WorkflowVersion` 栅栏、`continue_as_new`、activity。
-- 恢复沿用 #3 的检查点算法：截断 torn tail → 定位检查点 → 折叠投影 → 处理未闭合意图；等待类意图重新挂起，而不是重做。
+- 恢复沿用 #3 的检查点算法：截断 torn tail → 定位检查点 → 折叠投影 → 处理未闭合意图；等待类意图重新挂起，而不是重做。（物理层由 [ADR-0005](0005-storage-contract-and-sqlite.md) 落实：SQLite 提交原子，没有 torn tail；该步骤只对非原子后端有意义。）
 - ADR-0002 的其余决定（append-only、终态提交、日志层无 ack、检查点 = 最后一个 `StepCommitted`、幂等 append）**原样保留**。
 - 子会话的完成结果形状、父子关闭顺序、孤儿策略归 [#8](https://github.com/zibyn/asterpath/issues/8)；调度 API 归 [#17](https://github.com/zibyn/asterpath/issues/17)。
 
