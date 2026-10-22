@@ -1,0 +1,1510 @@
+//! Recovery from a committed prefix: open intents only, no full replay.
+//!
+//! Each test fabricates the exact log a `SIGKILL` would leave behind, opens a
+//! fresh runner over that log and asserts the terminal records it appends.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use asterpath_core::{
+    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LifecycleError,
+    LogEntry, LogId, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId, SignalDelivery,
+    SignalPayload, StepId, TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
+};
+use asterpath_protocol::{
+    AbortKind, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
+    ApprovalVerdict, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item, JsonString,
+    ModelId, ModelSpec, Parallelism, Part, PreExecuteError, PreExecuteEvent, Provenance, Provider,
+    ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger,
+    SessionEvent, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
+    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
+    TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
+    encode_entry,
+};
+use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
+use futures_core::future::BoxFuture;
+use futures_util::StreamExt;
+
+const SESSION: SessionId = SessionId::from_bytes([9; 16]);
+
+fn text(value: &str) -> Part {
+    Part::Text {
+        text: value.to_owned(),
+    }
+}
+
+fn model() -> ModelSpec {
+    ModelSpec {
+        provider: ProviderId::new("p"),
+        model: ModelId::new("model-1"),
+        context_window: None,
+    }
+}
+
+fn descriptor(name: &str, replay: ReplaySafety) -> ToolDescriptor {
+    ToolDescriptor {
+        name: ToolName::new(name),
+        description: String::new(),
+        schema: serde_json::json!({"type": "object"}),
+        parallelism: Parallelism::Parallel,
+        replay,
+        side_effect: SideEffect::ReadOnly,
+        provenance: Provenance::InProcess,
+        timeout: None,
+        max_output_bytes: None,
+    }
+}
+
+fn turn_config() -> TurnConfig {
+    TurnConfig {
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        ..TurnConfig::default()
+    }
+}
+
+fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
+    ConfigSnapshot {
+        model: model(),
+        system: vec![text("be helpful")],
+        tools,
+        request: RequestConfig::default(),
+        turn: turn_config(),
+        compaction: CompactionConfig::default(),
+        subagents: SubagentConfig::default(),
+    }
+}
+
+fn tool_call(call_id: &str, name: &str) -> Item {
+    Item::ToolCall {
+        call_id: call_id.to_owned(),
+        provider_item_id: None,
+        name: ToolName::new(name),
+        raw_args: JsonString::new("{}"),
+        raw: None,
+    }
+}
+
+fn assistant(call_id: &str, name: &str) -> SessionEvent {
+    SessionEvent::AssistantMessage {
+        turn_id: TURN,
+        step_id: STEP,
+        items: vec![tool_call(call_id, name)],
+        raw: None,
+        model: model(),
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }
+}
+
+const TURN: TurnId = TurnId::from_bytes([1; 16]);
+const STEP: StepId = StepId::from_bytes([2; 16]);
+const CALL: ToolCallId = ToolCallId::from_bytes([3; 16]);
+
+async fn seed(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
+    let log = Arc::new(InMemoryEventLog::new());
+    append_event(
+        &log,
+        SessionEvent::SessionCreated {
+            config,
+            parent: None,
+        },
+        Some(dedup::session_created(SESSION)),
+    )
+    .await;
+    log
+}
+
+async fn append_event(
+    log: &Arc<InMemoryEventLog>,
+    event: SessionEvent,
+    key: Option<DedupKey>,
+) -> LogId {
+    let entry = encode_entry(SESSION, key, &event).expect("encode");
+    log.append(entry).await.expect("append")
+}
+
+async fn open_turn(log: &Arc<InMemoryEventLog>) {
+    append_event(log, SessionEvent::TurnStarted { turn_id: TURN }, None).await;
+    append_event(
+        log,
+        SessionEvent::StepStarted {
+            turn_id: TURN,
+            step_id: STEP,
+        },
+        None,
+    )
+    .await;
+}
+
+fn intent(
+    call: ToolCallId,
+    provider_call_id: &str,
+    name: &str,
+    replay: ReplaySafety,
+) -> SessionEvent {
+    SessionEvent::ToolCallRequested {
+        turn_id: TURN,
+        step_id: STEP,
+        tool_call_id: call,
+        provider_call_id: provider_call_id.to_owned(),
+        name: ToolName::new(name),
+        raw_args: JsonString::new("{}"),
+        replay,
+        provenance: Provenance::InProcess,
+    }
+}
+
+type InvokeFn = Arc<
+    dyn Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
+        + Send
+        + Sync,
+>;
+
+struct TestTool {
+    descriptor: ToolDescriptor,
+    calls: Arc<Mutex<Vec<ToolArgs>>>,
+    invoke: InvokeFn,
+}
+
+impl TestTool {
+    fn build(
+        name: &str,
+        replay: ReplaySafety,
+        calls: Arc<Mutex<Vec<ToolArgs>>>,
+        invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<dyn Tool> {
+        Arc::new(Self {
+            descriptor: descriptor(name, replay),
+            calls,
+            invoke: Arc::new(invoke),
+        })
+    }
+}
+
+impl Tool for TestTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke(
+        &self,
+        args: ToolArgs,
+        ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        self.calls.lock().unwrap().push(args.clone());
+        (self.invoke)(args, ctx)
+    }
+}
+
+fn echo(name: &str, replay: ReplaySafety) -> (Arc<dyn Tool>, Arc<Mutex<Vec<ToolArgs>>>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tool = TestTool::build(name, replay, Arc::clone(&calls), |_args, _ctx| {
+        Box::pin(async { Ok(ToolOutput::new(vec![text("tool done")])) })
+    });
+    (tool, calls)
+}
+
+struct AlwaysAsk;
+
+impl ApprovalPolicy for AlwaysAsk {
+    fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
+        ApprovalVerdict::Ask
+    }
+}
+
+struct InitModule(Arc<dyn Fn(&ModuleCtx) + Send + Sync>);
+
+impl Module for InitModule {
+    fn name(&self) -> &'static str {
+        "recovery-test-hooks"
+    }
+
+    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
+        (self.0)(ctx);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn hooks_with(init: impl Fn(&ModuleCtx) + Send + Sync + 'static) -> ModuleCtx {
+    let slot: Arc<Mutex<Option<ModuleCtx>>> = Arc::new(Mutex::new(None));
+    let capture = Arc::clone(&slot);
+    let mut host = asterpath_core::ModuleHost::new();
+    host.register(Arc::new(InitModule(Arc::new(move |ctx: &ModuleCtx| {
+        *capture.lock().unwrap() = Some(ctx.clone());
+        init(ctx);
+    }))));
+    host.init().await.expect("module init");
+    slot.lock().unwrap().clone().expect("ctx captured")
+}
+
+struct Harness {
+    agent: Box<dyn AgentRunner>,
+}
+
+#[derive(Default)]
+struct Registry {
+    tools: Mutex<HashMap<ToolName, Arc<dyn Tool>>>,
+}
+
+impl ToolRegistry for Registry {
+    fn register(&self, tool: Arc<dyn Tool>) -> asterpath_core::Effect {
+        self.tools
+            .lock()
+            .unwrap()
+            .entry(tool.descriptor().name.clone())
+            .or_insert(tool);
+        asterpath_core::Effect
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        self.tools.lock().unwrap().get(name).cloned()
+    }
+
+    fn list(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.lock().unwrap().values().cloned().collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_with(
+    log: Arc<InMemoryEventLog>,
+    provider: Arc<ScriptedProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+    approval: Arc<dyn ApprovalPolicy>,
+    gate: Arc<ApprovalGate>,
+    executor: Arc<dyn DurableExecutor>,
+    clock: Arc<ManualClock>,
+    hooks: Option<ModuleCtx>,
+) -> Box<dyn AgentRunner> {
+    let registry = Arc::new(Registry::default());
+    for tool in tools {
+        registry.register(tool);
+    }
+    let provider: Arc<dyn Provider> = provider;
+    Box::new(asterpath_agent::Agent::new(
+        log,
+        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
+        registry,
+        ToolConfig::default(),
+        approval,
+        gate,
+        executor,
+        clock,
+        hooks,
+    ))
+}
+
+fn harness(
+    log: Arc<InMemoryEventLog>,
+    provider: Arc<ScriptedProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+) -> Harness {
+    let gate = Arc::new(ApprovalGate::new());
+    let clock = Arc::new(ManualClock::new());
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        tools,
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        Arc::new(NoopExecutor),
+        clock,
+        None,
+    );
+    Harness { agent }
+}
+
+struct NoopExecutor;
+
+impl DurableExecutor for NoopExecutor {
+    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn cancel_timer(
+        &self,
+        _session: SessionId,
+        _timer: TimerId,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn await_signal(
+        &self,
+        _req: AwaitSignal,
+    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn deliver_signal(
+        &self,
+        _delivery: SignalDelivery,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn await_wake(
+        &self,
+        _session: SessionId,
+        _cause: WakeCause,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+}
+
+/// In-process executor for approval waits: records delivered decisions and
+/// wakes the waiter. Approvals write no `SignalAwaited` record.
+#[derive(Default)]
+struct TestExecutor {
+    signals: Mutex<HashMap<asterpath_core::SignalId, SignalPayload>>,
+    wake: tokio::sync::Notify,
+}
+
+impl DurableExecutor for TestExecutor {
+    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn cancel_timer(
+        &self,
+        _session: SessionId,
+        _timer: TimerId,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn await_signal(
+        &self,
+        req: AwaitSignal,
+    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
+        Box::pin(async move {
+            loop {
+                if let Some(payload) = self.signals.lock().unwrap().get(&req.signal).cloned() {
+                    return Ok(payload);
+                }
+                let notified = self.wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(payload) = self.signals.lock().unwrap().get(&req.signal).cloned() {
+                    return Ok(payload);
+                }
+                notified.await;
+            }
+        })
+    }
+
+    fn deliver_signal(
+        &self,
+        delivery: SignalDelivery,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async move {
+            self.signals
+                .lock()
+                .unwrap()
+                .insert(delivery.signal, delivery.payload);
+            self.wake.notify_waiters();
+            Ok(())
+        })
+    }
+
+    fn await_wake(
+        &self,
+        _session: SessionId,
+        _cause: WakeCause,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+}
+
+#[allow(clippy::borrowed_box)]
+async fn drive(agent: &Box<dyn AgentRunner>) -> Vec<AgentEvent> {
+    let mut stream = agent.run(RunRequest {
+        session: SESSION,
+        trigger: RunTrigger::Resume,
+    });
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("drive"));
+    }
+    events
+}
+
+async fn scan(log: &Arc<InMemoryEventLog>) -> Vec<LogEntry> {
+    let mut stream = log.scan(LogQuery {
+        session: SESSION,
+        after: None,
+        limit: None,
+    });
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        entries.push(entry.expect("scan"));
+    }
+    entries
+}
+
+fn events(entries: &[LogEntry]) -> Vec<SessionEvent> {
+    entries
+        .iter()
+        .map(|entry| decode_entry(entry).expect("decodes"))
+        .collect()
+}
+
+fn kinds(entries: &[LogEntry]) -> Vec<&'static str> {
+    events(entries).iter().map(SessionEvent::kind).collect()
+}
+
+fn count(entries: &[LogEntry], kind: &str) -> usize {
+    kinds(entries)
+        .iter()
+        .filter(|value| **value == kind)
+        .count()
+}
+
+fn results(entries: &[LogEntry]) -> Vec<(ToolCallId, ToolResultStatus, Option<&'static str>)> {
+    events(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult {
+                tool_call_id,
+                status,
+                error,
+                ..
+            } => Some((
+                tool_call_id,
+                status,
+                error.map(|error| match error.kind {
+                    asterpath_protocol::ToolErrorKind::NotFound => "NotFound",
+                    asterpath_protocol::ToolErrorKind::Denied => "Denied",
+                    _ => "other",
+                }),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn turn_reasons(entries: &[LogEntry]) -> Vec<TurnEndReason> {
+    events(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::TurnCommitted { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+fn aborts(entries: &[LogEntry]) -> Vec<(u32, AbortKind)> {
+    events(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ModelCallAborted { attempt, kind, .. } => Some((attempt, kind)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn completed() -> Vec<Item> {
+    vec![Item::Message {
+        role: Role::Assistant,
+        parts: vec![text("done")],
+    }]
+}
+
+// --- S10 / L11: AssistantMessage committed, step and tools open -------------
+
+#[tokio::test]
+async fn assistant_message_prefix_skips_the_model_and_finishes_a_safe_tool() {
+    let (tool, calls) = echo("echo", ReplaySafety::Safe);
+    let log = seed(config(vec![descriptor("echo", ReplaySafety::Safe)])).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "echo"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        intent(CALL, "c1", "echo", ReplaySafety::Safe),
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), vec![tool]);
+    let events = drive(&harness.agent).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished {
+            status: ToolResultStatus::Completed,
+            ..
+        }
+    )));
+
+    assert_eq!(calls.lock().unwrap().len(), 1, "the safe tool runs once");
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "StreamResumed"), 1);
+    assert_eq!(
+        count(&entries, "AssistantMessage"),
+        2,
+        "the committed message is reused; only the next step calls the model"
+    );
+    assert_eq!(
+        count(&entries, "StepCommitted"),
+        2,
+        "resumed step + next step"
+    );
+    assert_eq!(results(&entries)[0].1, ToolResultStatus::Completed);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "only the following step calls the model"
+    );
+}
+
+#[tokio::test]
+async fn assistant_message_prefix_does_not_rerun_an_unsafe_tool() {
+    let (tool, calls) = echo("side_effect", ReplaySafety::Unsafe);
+    let log = seed(config(vec![descriptor(
+        "side_effect",
+        ReplaySafety::Unsafe,
+    )]))
+    .await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "side_effect"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        intent(CALL, "c1", "side_effect", ReplaySafety::Unsafe),
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), vec![tool]);
+    let _ = drive(&harness.agent).await;
+
+    assert!(calls.lock().unwrap().is_empty(), "unsafe tools never rerun");
+    let entries = scan(&log).await;
+    assert_eq!(
+        results(&entries),
+        vec![(CALL, ToolResultStatus::Interrupted, None)]
+    );
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+#[tokio::test]
+async fn usage_survives_the_recovered_step() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    let usage = Usage {
+        input: asterpath_protocol::InputTokens {
+            uncached: 11,
+            cache_read: 2,
+            cache_write: 0,
+        },
+        output: asterpath_protocol::OutputTokens {
+            total: 7,
+            reasoning: 0,
+        },
+    };
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items: vec![Item::Message {
+                role: Role::Assistant,
+                parts: vec![text("answer")],
+            }],
+            raw: None,
+            model: model(),
+            usage,
+            stop_reason: StopReason::EndTurn,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    let usage_after = events(&entries)
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::AssistantMessage { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .expect("assistant message");
+    assert_eq!(usage_after, usage);
+    assert!(provider.requests().is_empty());
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+// --- S3: model stream crash before any attempt terminal --------------------
+
+#[tokio::test]
+async fn step_without_an_abort_gets_a_crash_abort_and_retries() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    // A crash during the stream leaves no abort and no AssistantMessage.
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(aborts(&entries), vec![(1, AbortKind::Crash)]);
+    assert_eq!(count(&entries, "AssistantMessage"), 1);
+    assert_eq!(count(&entries, "StepCommitted"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+    assert_eq!(count(&entries, "StreamResumed"), 1);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the same step is retried once"
+    );
+}
+
+#[tokio::test]
+async fn transport_abort_retries_without_adding_a_crash_abort() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::ModelCallAborted {
+            turn_id: TURN,
+            step_id: STEP,
+            attempt: 1,
+            kind: AbortKind::Transport,
+            partial: None,
+            model: model(),
+            backoff_ms: 0,
+            usage: None,
+        },
+        None,
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(aborts(&entries), vec![(1, AbortKind::Transport)]);
+    assert_eq!(count(&entries, "AssistantMessage"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+#[tokio::test]
+async fn cancelled_abort_finishes_the_turn_without_calling_the_model() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::ModelCallAborted {
+            turn_id: TURN,
+            step_id: STEP,
+            attempt: 1,
+            kind: AbortKind::Cancelled,
+            partial: None,
+            model: model(),
+            backoff_ms: 0,
+            usage: None,
+        },
+        None,
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(aborts(&entries), vec![(1, AbortKind::Cancelled)]);
+    assert_eq!(count(&entries, "StepCommitted"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Cancelled]);
+    assert!(provider.requests().is_empty());
+    assert_eq!(count(&entries, "StreamResumed"), 1);
+}
+
+#[tokio::test]
+async fn rejected_abort_finishes_the_turn_failed() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::ModelCallAborted {
+            turn_id: TURN,
+            step_id: STEP,
+            attempt: 2,
+            kind: AbortKind::Rejected,
+            partial: None,
+            model: model(),
+            backoff_ms: 0,
+            usage: None,
+        },
+        None,
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "StepCommitted"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Failed]);
+    assert!(provider.requests().is_empty());
+}
+
+// --- Idle and StreamResumed boundaries -------------------------------------
+
+#[tokio::test]
+async fn idle_session_writes_no_resume_record() {
+    let log = seed(config(Vec::new())).await;
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let events = drive(&harness.agent).await;
+    assert!(matches!(events.as_slice(), [AgentEvent::Idle { .. }]));
+    assert_eq!(count(&scan(&log).await, "StreamResumed"), 0);
+}
+
+#[tokio::test]
+async fn stream_resumed_points_at_the_last_committed_record() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    // AssistantMessage with no tool calls only needs the step terminal.
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items: completed(),
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    let frontier = log.frontier(SESSION).await.unwrap().unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    let resumed = events(&entries)
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::StreamResumed { from, .. } => Some(from),
+            _ => None,
+        })
+        .expect("resume record");
+    assert_eq!(resumed, frontier);
+}
+
+// --- S17 / T14: unknown tool intent ---------------------------------------
+
+#[tokio::test]
+async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "ghost"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::ToolCallRequested {
+            turn_id: TURN,
+            step_id: STEP,
+            tool_call_id: CALL,
+            provider_call_id: "c1".to_owned(),
+            name: ToolName::new("ghost"),
+            raw_args: JsonString::new("{}"),
+            replay: ReplaySafety::Unsafe,
+            provenance: Provenance::Unknown,
+        },
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+
+    let gate = Arc::new(ApprovalGate::new());
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        Vec::new(),
+        Arc::new(AlwaysAsk),
+        Arc::clone(&gate),
+        Arc::new(NoopExecutor),
+        clock,
+        None,
+    );
+    let events = drive(&agent).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ApprovalRequested(_))),
+        "unknown provenance never enters approval"
+    );
+    let entries = scan(&log).await;
+    assert_eq!(
+        results(&entries),
+        vec![(CALL, ToolResultStatus::Failed, Some("NotFound"))]
+    );
+    assert_eq!(count(&entries, "SignalReceived"), 0);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+// --- S15: batch intent window ---------------------------------------------
+
+#[tokio::test]
+async fn missing_batch_intent_is_filled_by_provider_call_id_without_crossing() {
+    let (alpha, alpha_calls) = echo("alpha", ReplaySafety::Safe);
+    let (beta, beta_calls) = echo("beta", ReplaySafety::Safe);
+    let log = seed(config(vec![
+        descriptor("alpha", ReplaySafety::Safe),
+        descriptor("beta", ReplaySafety::Safe),
+    ]))
+    .await;
+    open_turn(&log).await;
+    let items = vec![tool_call("c1", "alpha"), tool_call("c2", "beta")];
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items,
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    let first = ToolCallId::from_bytes([10; 16]);
+    append_event(
+        &log,
+        intent(first, "c1", "alpha", ReplaySafety::Safe),
+        Some(dedup::tool_call(first)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), vec![alpha, beta]);
+    let _ = drive(&harness.agent).await;
+
+    assert_eq!(alpha_calls.lock().unwrap().len(), 1);
+    assert_eq!(beta_calls.lock().unwrap().len(), 1);
+
+    let entries = scan(&log).await;
+    let intents: Vec<_> = events(&entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolCallRequested {
+                tool_call_id,
+                provider_call_id,
+                name,
+                ..
+            } => Some((tool_call_id, provider_call_id, name.to_string())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intents.len(), 2, "one intent per call, no duplicates");
+    assert_eq!(intents[0], (first, "c1".to_owned(), "alpha".to_owned()));
+    let second = intents
+        .iter()
+        .find(|(call, _, _)| *call != first)
+        .expect("filled sibling");
+    assert_eq!(second.1, "c2");
+    assert_eq!(second.2, "beta");
+
+    let results = results(&entries);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .all(|(_, status, _)| *status == ToolResultStatus::Completed)
+    );
+    assert_eq!(
+        results.iter().map(|(call, _, _)| *call).collect::<Vec<_>>(),
+        vec![first, second.0],
+        "each result binds its own call, in intent order"
+    );
+}
+
+// --- S16: pre-execute window ----------------------------------------------
+
+struct RewriteAndCount {
+    count: Arc<AtomicUsize>,
+}
+
+impl Middleware<PreExecuteEvent> for RewriteAndCount {
+    fn handle<'a>(
+        &'a self,
+        mut event: PreExecuteEvent,
+        next: Next<'a, PreExecuteEvent>,
+    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        let hit = self.count.fetch_add(1, Ordering::SeqCst);
+        event.args = JsonString::new(format!(r#"{{"pre":{hit}}}"#));
+        next.run(event)
+    }
+}
+
+#[tokio::test]
+async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
+    let (alpha, alpha_calls) = echo("alpha", ReplaySafety::Safe);
+    let (beta, beta_calls) = echo("beta", ReplaySafety::Safe);
+    let log = seed(config(vec![
+        descriptor("alpha", ReplaySafety::Safe),
+        descriptor("beta", ReplaySafety::Safe),
+    ]))
+    .await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items: vec![tool_call("c1", "alpha"), tool_call("c2", "beta")],
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    // The recorded intent keeps its effective args; pre-execute must not rerun.
+    let first = ToolCallId::from_bytes([10; 16]);
+    append_event(
+        &log,
+        SessionEvent::ToolCallRequested {
+            turn_id: TURN,
+            step_id: STEP,
+            tool_call_id: first,
+            provider_call_id: "c1".to_owned(),
+            name: ToolName::new("alpha"),
+            raw_args: JsonString::new(r#"{"recorded":true}"#),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+        Some(dedup::tool_call(first)),
+    )
+    .await;
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let middleware_count = Arc::clone(&count);
+    let hooks = hooks_with(move |ctx| {
+        ctx.intercept(RewriteAndCount {
+            count: Arc::clone(&middleware_count),
+        });
+    })
+    .await;
+
+    let gate = Arc::new(ApprovalGate::new());
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        vec![alpha, beta],
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        Arc::new(NoopExecutor),
+        clock,
+        Some(hooks),
+    );
+    let _ = drive(&agent).await;
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "only the call without an intent"
+    );
+    let alpha_args = alpha_calls.lock().unwrap().clone();
+    assert_eq!(
+        alpha_args[0].as_str(),
+        r#"{"recorded":true}"#,
+        "recorded effective args are authoritative"
+    );
+    let beta_args = beta_calls.lock().unwrap().clone();
+    assert_eq!(
+        beta_args[0].as_str(),
+        r#"{"pre":0}"#,
+        "missing intent reruns pre-execute"
+    );
+}
+
+// --- T3 / T4: approval across a crash -------------------------------------
+
+#[tokio::test]
+async fn recorded_allow_executes_without_reprompting_on_recovery() {
+    let (tool, calls) = echo("guarded", ReplaySafety::Unsafe);
+    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Unsafe)])).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "guarded"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::ToolCallRequested {
+            turn_id: TURN,
+            step_id: STEP,
+            tool_call_id: CALL,
+            provider_call_id: "c1".to_owned(),
+            name: ToolName::new("guarded"),
+            raw_args: JsonString::new("{}"),
+            replay: ReplaySafety::Unsafe,
+            provenance: Provenance::External {
+                transport: asterpath_protocol::TransportKind::Stdio,
+            },
+        },
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::SignalReceived {
+            signal_id: approval_signal_id(CALL),
+            name: approval_signal_name(CALL),
+            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+        },
+        Some(dedup::signal(approval_signal_id(CALL))),
+    )
+    .await;
+
+    let gate = Arc::new(ApprovalGate::new());
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        vec![tool],
+        Arc::new(AlwaysAsk),
+        gate,
+        Arc::new(NoopExecutor),
+        clock,
+        None,
+    );
+    let events = drive(&agent).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a recorded allow executes an unsafe tool"
+    );
+    let entries = scan(&log).await;
+    assert_eq!(results(&entries)[0].1, ToolResultStatus::Completed);
+}
+
+#[tokio::test]
+async fn undecided_ask_resuspends_then_executes_after_delivery() {
+    let (tool, calls) = echo("guarded", ReplaySafety::Safe);
+    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Safe)])).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "guarded"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::ToolCallRequested {
+            turn_id: TURN,
+            step_id: STEP,
+            tool_call_id: CALL,
+            provider_call_id: "c1".to_owned(),
+            name: ToolName::new("guarded"),
+            raw_args: JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::External {
+                transport: asterpath_protocol::TransportKind::Stdio,
+            },
+        },
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+
+    let gate = Arc::new(ApprovalGate::new());
+    let _endpoint = gate.register();
+    let clock = Arc::new(ManualClock::new());
+    let executor = Arc::new(TestExecutor::default());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        vec![tool],
+        Arc::new(AlwaysAsk),
+        Arc::clone(&gate),
+        executor.clone(),
+        clock,
+        None,
+    );
+
+    let mut stream = agent.run(RunRequest {
+        session: SESSION,
+        trigger: RunTrigger::Resume,
+    });
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("approval requested")
+            .expect("event")
+            .expect("no error");
+        if matches!(event, AgentEvent::ApprovalRequested(_)) {
+            break;
+        }
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(
+        results(&scan(&log).await).len(),
+        0,
+        "no terminal while waiting"
+    );
+
+    executor
+        .deliver_signal(SignalDelivery {
+            session: SESSION,
+            signal: approval_signal_id(CALL),
+            name: approval_signal_name(CALL),
+            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+        })
+        .await
+        .expect("deliver");
+    while let Some(event) = stream.next().await {
+        event.expect("drive");
+    }
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let entries = scan(&log).await;
+    assert_eq!(results(&entries)[0].1, ToolResultStatus::Completed);
+    assert_eq!(count(&entries, "SignalAwaited"), 0);
+}
+
+#[tokio::test]
+async fn undecided_ask_with_a_closed_gate_denies() {
+    let (tool, calls) = echo("guarded", ReplaySafety::Safe);
+    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Safe)])).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        assistant("c1", "guarded"),
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        intent(CALL, "c1", "guarded", ReplaySafety::Safe),
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+
+    let gate = Arc::new(ApprovalGate::new());
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        vec![tool],
+        Arc::new(AlwaysAsk),
+        gate,
+        Arc::new(NoopExecutor),
+        clock,
+        None,
+    );
+    let _ = drive(&agent).await;
+
+    assert!(calls.lock().unwrap().is_empty());
+    let entries = scan(&log).await;
+    assert_eq!(
+        results(&entries),
+        vec![(CALL, ToolResultStatus::Failed, Some("Denied"))]
+    );
+}
+
+// --- waits ----------------------------------------------------------------
+
+#[tokio::test]
+async fn due_timer_fires_exactly_once_and_an_invalidated_timer_is_cancelled() {
+    let log = seed(config(Vec::new())).await;
+    let step_started = {
+        append_event(&log, SessionEvent::TurnStarted { turn_id: TURN }, None).await;
+        append_event(
+            &log,
+            SessionEvent::StepStarted {
+                turn_id: TURN,
+                step_id: STEP,
+            },
+            None,
+        )
+        .await
+    };
+    // Terminal source: a tool intent + result.
+    let call_log = append_event(
+        &log,
+        intent(CALL, "c1", "echo", ReplaySafety::Safe),
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::ToolResult {
+            tool_call_id: CALL,
+            status: ToolResultStatus::Completed,
+            output: None,
+            error: None,
+            truncated: false,
+        },
+        Some(dedup::tool_result(CALL)),
+    )
+    .await;
+    let due = TimerId::from_bytes([1; 16]);
+    let invalidated = TimerId::from_bytes([2; 16]);
+    append_event(
+        &log,
+        SessionEvent::TimerScheduled {
+            timer_id: due,
+            deadline: ManualClock::BASE,
+            caused_by: step_started,
+        },
+        Some(dedup::timer(due)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::TimerScheduled {
+            timer_id: invalidated,
+            deadline: ManualClock::BASE + 60_000,
+            caused_by: call_log,
+        },
+        Some(dedup::timer(invalidated)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "TimerFired"), 1);
+    assert_eq!(count(&entries, "TimerCancelled"), 1);
+
+    // A second drive must not mint another terminal.
+    let _ = drive(&harness.agent).await;
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "TimerFired"), 1);
+    assert_eq!(count(&entries, "TimerCancelled"), 1);
+}
+
+#[tokio::test]
+async fn signal_waits_stay_waiting() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    let signal = asterpath_core::SignalId::from_bytes([5; 16]);
+    append_event(
+        &log,
+        SessionEvent::SignalAwaited {
+            signal_id: signal,
+            name: asterpath_core::SignalName::new("external"),
+            caused_by: LogId::from_i64(1),
+        },
+        Some(dedup::signal(signal)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "SignalReceived"), 0);
+    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
+    assert!(!intents.is_idle(), "the signal wait remains open");
+}
+
+#[tokio::test]
+async fn child_deadline_timers_are_left_to_spawn_replay() {
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    let child = SessionId::from_bytes([7; 16]);
+    let spawned = append_event(
+        &log,
+        SessionEvent::ChildSessionSpawned {
+            child,
+            task: vec![text("child task")],
+            config: config(Vec::new()),
+            context: asterpath_protocol::ContextPolicy::Fresh,
+            parent_tool_call_id: CALL,
+            caused_by: LogId::from_i64(1),
+        },
+        Some(dedup::child_session(child)),
+    )
+    .await;
+    let timer = TimerId::from_bytes([8; 16]);
+    append_event(
+        &log,
+        SessionEvent::TimerScheduled {
+            timer_id: timer,
+            // Already past: a due timer would normally fire on recovery.
+            deadline: ManualClock::BASE,
+            caused_by: spawned,
+        },
+        Some(dedup::timer(timer)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "TimerFired"), 0);
+    assert_eq!(count(&entries, "TimerCancelled"), 0);
+    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
+    assert!(!intents.is_idle(), "the child wait is still open");
+}
+
+#[tokio::test]
+async fn unclosed_compaction_keeps_the_session_idle_and_untouched() {
+    let log = seed(config(Vec::new())).await;
+    let frontier = log.frontier(SESSION).await.unwrap().unwrap();
+    append_event(
+        &log,
+        SessionEvent::CompactionStarted {
+            trigger: asterpath_protocol::CompactionTrigger::Manual,
+            replaces_from: frontier,
+            caused_by: frontier,
+        },
+        Some(dedup::compaction(frontier)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let events = drive(&harness.agent).await;
+    assert!(matches!(events.as_slice(), [AgentEvent::Idle { .. }]));
+
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "CompactionApplied"), 0);
+    assert_eq!(count(&entries, "CompactionAborted"), 0);
+    assert_eq!(count(&entries, "StreamResumed"), 0);
+    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
+    assert!(intents.is_idle());
+    assert!(intents.compactions_are_open());
+}
+
+#[tokio::test]
+async fn no_tool_call_after_assistant_message_commits_without_model_or_rerun() {
+    // Sanity: an open step whose tools are all terminal simply commits.
+    let log = seed(config(Vec::new())).await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items: completed(),
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "StepCommitted"), 1);
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+    assert!(provider.requests().is_empty());
+}

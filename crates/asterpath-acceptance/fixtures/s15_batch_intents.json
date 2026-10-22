@@ -1,0 +1,50 @@
+{
+  "provider": "p",
+  "model": "model-1",
+  "system": [{"Text": {"text": "be helpful"}}],
+  "tools": ["append_line"],
+  "steps": [
+    {
+      "items": [
+        {
+          "ToolCall": {
+            "call_id": "call-1",
+            "provider_item_id": null,
+            "name": "append_line",
+            "raw_args": "{}",
+            "raw": null
+          }
+        },
+        {
+          "ToolCall": {
+            "call_id": "call-2",
+            "provider_item_id": null,
+            "name": "append_line",
+            "raw_args": "{}",
+            "raw": null
+          }
+        }
+      ],
+      "stop_reason": "ToolUse",
+      "usage": {
+        "input": {"uncached": 10, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 5, "reasoning": 0}
+      }
+    },
+    {
+      "items": [
+        {
+          "Message": {
+            "role": "Assistant",
+            "parts": [{"Text": {"text": "done"}}]
+          }
+        }
+      ],
+      "stop_reason": "EndTurn",
+      "usage": {
+        "input": {"uncached": 20, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 3, "reasoning": 0}
+      }
+    }
+  ]
+}
