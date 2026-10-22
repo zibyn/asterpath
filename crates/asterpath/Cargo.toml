@@ -5,13 +5,15 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "openai"]
+openai = ["dep:asterpath-provider-openai"]
 sqlite = ["dep:asterpath-storage-sqlite"]
 
 [dependencies]
 asterpath-agent = { path = "../asterpath-agent" }
 asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
 asterpath-tools = { path = "../asterpath-tools" }
 futures-core = "0.3"

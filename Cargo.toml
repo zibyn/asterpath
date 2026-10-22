@@ -5,6 +5,7 @@ members = [
     "crates/asterpath-protocol",
     "crates/asterpath-agent",
     "crates/asterpath-tools",
+    "crates/asterpath-provider-openai",
     "crates/asterpath-storage-sqlite",
     "crates/asterpath-testing",
     "crates/asterpath",
