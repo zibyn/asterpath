@@ -160,7 +160,7 @@ CREATE TABLE writer_lease (
 ```
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
-- `log_id` 用 `AUTOINCREMENT`：未来若有归档删除，id 不复用。
+- `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
 - 无外键：单写者 + 派生索引，外键只会增加写放大。
 - 物理 DDL 迁移用 `PRAGMA user_version`，前向逐级；打开时发现更高版本 → `SchemaTooNew`。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0004）。
 
@@ -219,7 +219,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - `busy_timeout=0`：任何 `SQLITE_BUSY` 立即以 `Backend` 暴露，不静默等待。
 - 连接模型：一个 `Mutex<Connection>`，所有操作经 `spawn_blocking`。ops 串行化；扫描长到阻塞写路径时，再升级为 writer 线程 + WAL 只读连接（模块内优化，不动 trait）。
 - 文件创建时权限 `0600`。
-- 不做手动 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；保留策略见 #18。
+- 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档由扩展模块或 host 负责，seam 见 #18。
 
 ## 7. 唤醒队列与 timer
 
@@ -266,8 +266,8 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 ## 10. 留给下游
 
 - **#6**：turn/step 的终止条件、取消宽限期，决定 `sessions.state` 的完整转移。
-- **#8**：子会话完成结果、孤儿策略；决定父流何时 `ChildSessionCompleted`、启动时子会话缺失怎么处理。
+- **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
 - **#17**：claim 循环、`TimerFired` 追加、signal 投递、租约时长。
-- **#18**：日志保留、归档与 DB 增长控制（本文件选择不删除记录）。
+- **#18**：保留/归档扩展模块的 seam（导出/删除 API 或 storage admin capability）；策略不在内核。
 - **#19**：六个注入点的工具链与 CI 场景。

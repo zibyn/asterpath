@@ -26,7 +26,7 @@ modules (each crate; no module→module edges)
   asterpath-runtime          DurableExecutor impl
   asterpath-storage-sqlite   EventLog + Storage impl
   asterpath-agent            AgentRunner impl (turn/step loop)
-  asterpath-tools            ToolRegistry impl + built-in tools
+  asterpath-tools            ToolRegistry impl (+ optional built-in tools)
   asterpath-provider-anthropic
   asterpath-provider-openai
   asterpath-tracing
@@ -158,7 +158,7 @@ pub trait Provider: Send + Sync {
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>>;
 }
 
-pub trait Tool: Send + Sync {
+pub trait Tool: Send + Sync + 'static {
     fn descriptor(&self) -> &ToolDescriptor;
     fn invoke(&self, args: ToolArgs, ctx: ToolContext)
         -> BoxFuture<'_, Result<ToolOutput, ToolError>>;
@@ -171,11 +171,14 @@ pub enum Provenance {
 
 pub struct ToolDescriptor {
     pub name: ToolName,
+    pub description: String,
     pub schema: JsonSchema,
     pub parallelism: Parallelism,   // Parallel | Exclusive
     pub replay: ReplaySafety,       // Safe | Unsafe
+    pub side_effect: SideEffect,    // ReadOnly | Mutating
     pub provenance: Provenance,
     pub timeout: Option<Duration>,
+    pub max_output_bytes: Option<usize>,
 }
 
 pub trait ToolRegistry: Send + Sync {
@@ -190,8 +193,24 @@ pub trait AgentRunner: Send + Sync {
 ```
 
 - 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定。
-- 工具执行管线、审批、沙箱由 #7 定；`ToolDescriptor` 只是最小 seam。
+- 工具执行管线与审批见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)；`ToolDescriptor` 的最终字段以那里为准。
 - `AgentRunner` 是 loop 契约；turn/step、取消、steering 由 #6 定。
+
+### 4.1 扩展模块（非内核）
+
+参照 Pi / Codex / DeepSeek Harness 的分层：内核只留 seam，能力由模块/插件提供。以下能力以模块/插件实现，内核只提供接入点：
+
+| 扩展 | 接入方式 | 内核提供的 seam |
+| --- | --- | --- |
+| 沙箱/隔离 | adapter 或工具包装模块 | `Provenance`、pre/post-execute hook、`Tool` 包装 |
+| 成本/预算 | 消费 usage 的模块 + pre-step gate | `AssistantMessage.usage`、pre-step waterfall |
+| trace 导出/采样 | exporter 模块订阅 tracing 模块 | 原生 trace 模型/查询、事件日志 |
+| 日志保留/归档 | storage admin 扩展 | `EventLog` / `Storage` 的扩展能力（#18） |
+| 内容脱敏/密钥 | host 或 post-execute 模块 | `post-execute` hook |
+| 内置工具 | 可选模块或参考 CLI | `ToolRegistry` |
+| 插件安装/分发 | 生态工具或 host | 插件清单/加载（#16） |
+
+这些扩展不是内核职责，也不出界；它们通过合约 trait/事件接入。内核不内置策略、价格表、沙箱实现或脱敏规则。
 
 ## 5. 生命周期规则
 
@@ -210,8 +229,8 @@ pub trait AgentRunner: Send + Sync {
 
 - 进程内模块随宿主编译，`Module` 永远是进程内、受信的。
 - 外部插件是子进程或 MCP server；由进程内 adapter 模块连接，并把它们的工具注册为 `Provenance::External { transport }`。
-- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。审批、沙箱、UI 与日志消费 provenance（#7）。
-- 动态发现、分发、版本协商不属于 v1：见 #16。
+- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）。
+- 动态发现、热替换不属于 v1；安装/分发是 host 责任；版本协商见 #16。
 
 ## 7. 可检查的解耦
 
@@ -237,8 +256,8 @@ pub trait AgentRunner: Send + Sync {
 | #4 日志版本与迁移 | `LogEntry.schema_version`、upcasting、重放兼容 |
 | #5 存储与 SQLite | `Storage` 方法集与 schema；实现是模块 |
 | #6 agent loop | `AgentRunner` 在 protocol；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
-| #7 工具与审批 | `Tool` / `ToolRegistry` / `Provenance` 在 protocol；adapter 是模块 |
-| #8 子智能体 | 基于 `AgentRunner` + `DurableExecutor`（timer/signal） |
+| #7 工具与审批 | 已定。`Tool` / `ToolRegistry` / `Provenance` 在 protocol；管线与审批见 [tools.md](tools.md)、[ADR-0007](../adr/0007-approval-and-sandbox-layers.md) |
+| #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) |
 | #9 上下文压缩 | 消费 `EventLog` 与 `Provider` |
 | #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
 | #11 协议模型 | 规范模型与 `Provider` 在 protocol |
