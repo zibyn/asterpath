@@ -4,8 +4,8 @@
 //! A single writer connection owns the file: `EventLog::append` writes the log
 //! row and its derived index rows in one transaction. The process takes a
 //! non-blocking `flock` at open, so a second process gets `WriterBusy`.
-//! `retired_sessions` exists for the retirement seam; retirement behaviour
-//! itself is not implemented here.
+//! `SessionRetirement` writes the tombstone and deletes the log and every
+//! derived row in one immediate transaction.
 
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io;
@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_core::{
     Clock, DedupKey, DueTimer, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId,
-    LogQuery, Module, ModuleCtx, NewEntry, SESSION_CATALOG_SERVICE, STORAGE_SERVICE, ServiceId,
-    SessionCatalog, SessionId, Storage, StorageError, SystemClock, TimerId, Timestamp,
+    LogQuery, Module, ModuleCtx, NewEntry, RetirementError, SESSION_CATALOG_SERVICE,
+    SESSION_RETIREMENT_SERVICE, STORAGE_SERVICE, ServiceId, SessionCatalog, SessionId,
+    SessionRetirement, Storage, StorageError, SystemClock, TimerId, Timestamp,
 };
 use asterpath_protocol::{OpenIntent, OpenIntents, SessionEvent, decode_payload};
 use futures_core::future::BoxFuture;
@@ -186,7 +187,9 @@ impl SqliteStorage {
         let after = query.after.map(LogId::as_i64).unwrap_or(0);
         let mut statement = match conn.prepare(
             "SELECT log_id, session_id, seq, recorded_at, schema_version, dedup_key, payload \
-             FROM log WHERE session_id = ?1 AND log_id > ?2 ORDER BY seq ASC LIMIT ?3",
+             FROM log WHERE session_id = ?1 AND log_id > ?2 \
+             AND NOT EXISTS (SELECT 1 FROM retired_sessions WHERE session_id = ?1) \
+             ORDER BY seq ASC LIMIT ?3",
         ) {
             Ok(statement) => statement,
             Err(error) => return vec![Err(backend(error))],
@@ -227,7 +230,8 @@ impl SqliteStorage {
         let conn = self.conn();
         let frontier: Option<i64> = conn
             .query_row(
-                "SELECT MAX(log_id) FROM log WHERE session_id = ?1",
+                "SELECT MAX(log_id) FROM log WHERE session_id = ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM retired_sessions WHERE session_id = ?1)",
                 [session.as_bytes()],
                 |row| row.get(0),
             )
@@ -235,14 +239,140 @@ impl SqliteStorage {
         Ok(frontier.map(LogId::from_i64))
     }
 
+    /// Session retirement; the check order is the contract in retention.md §5.
+    fn retire_sync(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> Result<(), RetirementError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+
+        // An existing tombstone is the truth: the log is already gone.
+        let tombstone: Option<i64> = tx
+            .query_row(
+                "SELECT last_log_id FROM retired_sessions WHERE session_id = ?1",
+                [session.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(last_log_id) = tombstone {
+            return if last_log_id == expected_frontier.as_i64() {
+                Ok(())
+            } else {
+                Err(RetirementError::FrontierMoved {
+                    expected: expected_frontier,
+                    actual: Some(LogId::from_i64(last_log_id)),
+                })
+            };
+        }
+
+        let parent: Option<Option<Vec<u8>>> = tx
+            .query_row(
+                "SELECT parent_id FROM sessions WHERE session_id = ?1",
+                [session.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(parent) = parent else {
+            return Err(RetirementError::NotFound);
+        };
+
+        if has_open_intent(&tx, session.as_bytes())? {
+            return Err(RetirementError::NotIdle);
+        }
+
+        let actual: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(log_id) FROM log WHERE session_id = ?1",
+                [session.as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if actual != Some(expected_frontier.as_i64()) {
+            return Err(RetirementError::FrontierMoved {
+                expected: expected_frontier,
+                actual: actual.map(LogId::from_i64),
+            });
+        }
+
+        // Live children: a sessions row whose parent is this session and that
+        // has not itself been retired.
+        let children: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.parent_id = ?1 \
+                 AND NOT EXISTS \
+                     (SELECT 1 FROM retired_sessions r WHERE r.session_id = s.session_id))",
+                [session.as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if children != 0 {
+            return Err(RetirementError::HasChildren);
+        }
+
+        if let Some(parent_bytes) = parent.as_deref() {
+            let parent = session_from_blob(parent_bytes.to_vec())?;
+            if has_open_intent(&tx, parent.as_bytes())? {
+                return Err(RetirementError::ParentNotIdle);
+            }
+        }
+
+        let retired_at = self.clock.now();
+        tx.execute(
+            "INSERT INTO retired_sessions (session_id, parent_id, last_log_id, retired_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session.as_bytes(),
+                parent.as_deref(),
+                expected_frontier.as_i64(),
+                retired_at
+            ],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM log WHERE session_id = ?1",
+            [session.as_bytes()],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM open_intents WHERE session_id = ?1",
+            [session.as_bytes()],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM timers WHERE session_id = ?1",
+            [session.as_bytes()],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM pending_inputs WHERE session_id = ?1",
+            [session.as_bytes()],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            [session.as_bytes()],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(())
+    }
+
     fn wakeable_sync(&self, now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
         let conn = self.conn();
         let mut statement = conn
             .prepare(
-                "SELECT session_id FROM open_intents WHERE kind <> 'compaction' \
-                 UNION SELECT session_id FROM pending_inputs \
-                 UNION SELECT session_id FROM timers \
-                     WHERE fired_at IS NULL AND deadline <= ?1 \
+                "SELECT session_id FROM ( \
+                     SELECT session_id FROM open_intents WHERE kind <> 'compaction' \
+                     UNION SELECT session_id FROM pending_inputs \
+                     UNION SELECT session_id FROM timers \
+                         WHERE fired_at IS NULL AND deadline <= ?1 \
+                 ) WHERE session_id NOT IN (SELECT session_id FROM retired_sessions) \
                  ORDER BY 1",
             )
             .map_err(backend)?;
@@ -262,6 +392,7 @@ impl SqliteStorage {
             .prepare(
                 "SELECT timer_id, session_id, deadline FROM timers \
                  WHERE fired_at IS NULL AND deadline <= ?1 \
+                 AND session_id NOT IN (SELECT session_id FROM retired_sessions) \
                  ORDER BY deadline ASC, timer_id ASC LIMIT ?2",
             )
             .map_err(backend)?;
@@ -336,6 +467,16 @@ impl EventLog for SqliteStorage {
     }
 }
 
+impl SessionRetirement for SqliteStorage {
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        Box::pin(async move { self.retire_sync(session, expected_frontier) })
+    }
+}
+
 impl Storage for SqliteStorage {
     fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
         Box::pin(async move { self.wakeable_sync(now) })
@@ -371,10 +512,11 @@ impl SqliteStorageModule {
     }
 }
 
-const PROVIDED: [ServiceId; 3] = [
+const PROVIDED: [ServiceId; 4] = [
     EVENT_LOG_SERVICE.id(),
     STORAGE_SERVICE.id(),
     SESSION_CATALOG_SERVICE.id(),
+    SESSION_RETIREMENT_SERVICE.id(),
 ];
 
 impl Module for SqliteStorageModule {
@@ -394,6 +536,8 @@ impl Module for SqliteStorageModule {
             ctx.provide(STORAGE_SERVICE, storage)?;
             let catalog: Arc<dyn SessionCatalog> = self.backend.clone();
             ctx.provide(SESSION_CATALOG_SERVICE, catalog)?;
+            let retirement: Arc<dyn SessionRetirement> = self.backend.clone();
+            ctx.provide(SESSION_RETIREMENT_SERVICE, retirement)?;
             Ok(())
         })
     }
@@ -641,6 +785,19 @@ fn timer_from_blob(bytes: Vec<u8>) -> Result<TimerId, StorageError> {
         detail: "timer id must be 16 bytes".to_owned(),
     })?;
     Ok(TimerId::from_bytes(bytes))
+}
+
+/// `idle` is the absence of a non-compaction open intent (storage.md §5).
+fn has_open_intent(tx: &Transaction<'_>, session: &[u8]) -> Result<bool, StorageError> {
+    let found: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM open_intents \
+             WHERE session_id = ?1 AND kind <> 'compaction')",
+            [session],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    Ok(found != 0)
 }
 
 fn backend(error: impl std::fmt::Display) -> StorageError {

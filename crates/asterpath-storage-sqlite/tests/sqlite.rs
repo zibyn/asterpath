@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use asterpath_core::{
     DedupKey, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId, LogQuery, Module,
-    ModuleCtx, ModuleHost, NewEntry, SESSION_CATALOG_SERVICE, STORAGE_SERVICE, ServiceId,
-    SessionCatalog, SessionId, StorageError, ToolCallId, TurnId,
+    ModuleCtx, ModuleHost, NewEntry, SESSION_CATALOG_SERVICE, SESSION_RETIREMENT_SERVICE,
+    STORAGE_SERVICE, ServiceId, SessionCatalog, SessionId, StorageError, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent,
@@ -433,10 +433,11 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
 
 struct Probe;
 
-const PROBE_DEPS: [ServiceId; 3] = [
+const PROBE_DEPS: [ServiceId; 4] = [
     EVENT_LOG_SERVICE.id(),
     STORAGE_SERVICE.id(),
     SESSION_CATALOG_SERVICE.id(),
+    SESSION_RETIREMENT_SERVICE.id(),
 ];
 
 impl Module for Probe {
@@ -453,13 +454,14 @@ impl Module for Probe {
             ctx.require(EVENT_LOG_SERVICE)?;
             ctx.require(STORAGE_SERVICE)?;
             ctx.require(SESSION_CATALOG_SERVICE)?;
+            ctx.require(SESSION_RETIREMENT_SERVICE)?;
             Ok(())
         })
     }
 }
 
 #[test]
-fn module_provides_the_three_capabilities() {
+fn module_provides_the_four_capabilities() {
     let dir = TempDir::new("module");
     let backend = open(dir.db()).expect("open");
     let module = SqliteStorageModule::new(Arc::clone(&backend));
