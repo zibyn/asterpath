@@ -1,0 +1,97 @@
+# Dependency allowlist for the Asterpath v1 workspace.
+#
+# Machine-readable source of truth; docs/design/packaging.md §2 is the normative
+# human-readable copy. `cargo xtask check-deps` enforces:
+#   - every workspace member is listed here;
+#   - every normal dependency on another workspace member is in that member's `allow`
+#     list ("*" = any workspace member);
+#   - module crates have no normal dependency on another module crate;
+#   - contract crates (`asterpath-core`, `asterpath-protocol`) declare no features.
+#
+# Only normal dependencies are checked. Dev-dependencies are intentionally exempt
+# (module crates may dev-depend on `asterpath-testing` for contract suites).
+
+[[package]]
+name = "asterpath-core"
+role = "contract"
+allow = []
+
+[[package]]
+name = "asterpath-protocol"
+role = "contract"
+allow = ["asterpath-core"]
+
+[[package]]
+name = "asterpath-agent"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-tools"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-storage-sqlite"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-runtime"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-scheduler"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-compaction"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-provider-anthropic"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-provider-openai"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-tracing"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-usage"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-testing"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath"
+role = "app"
+allow = ["*"]
+
+[[package]]
+name = "asterpath-cli"
+role = "app"
+allow = ["*"]
+
+[[package]]
+name = "asterpath-acceptance"
+role = "app"
+allow = ["*"]
+
+[[package]]
+name = "xtask"
+role = "tool"
+allow = []
