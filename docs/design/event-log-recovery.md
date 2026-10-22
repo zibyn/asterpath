@@ -19,6 +19,7 @@
 - **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
 - **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件。工具语义见 [tools.md](tools.md)。
 - **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
+- **2026-10-22 #29 修订**：`caused_by` 指向 `ChildSessionSpawned` 的 timer 不在恢复预扫描里收尾，交给 spawn 重放（先 R3 查子终态，再处理 deadline）；排队按 open spawn `ToolCallRequested` 重建。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
@@ -235,6 +236,10 @@ recover(session):
 
     # 2. 等待意图
     for wait in open_waits, 按 seq:
+        Timer with caused_by = ChildSessionSpawned
+                     -> 不在本步骤收尾；交给 spawn 工具重放（subagents.md §9）：
+                        重放先查子终态（R3），有终态则记 Completed + TimerCancelled，
+                        无终态且已过期则补 TimerFired 并取消子会话
         Timer        -> if caused_by 已终结: append(TimerCancelled{timer_id})
                         else if deadline 已过: 立即入队 fire
                         else: 重新挂起

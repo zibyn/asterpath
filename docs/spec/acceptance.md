@@ -99,7 +99,7 @@
 
 - 子会话恰好两个；父日志每个 `parent_tool_call_id` 恰一条 `ChildSessionSpawned`。
 - 恢复不创建第三个子会话；`ChildSessionSpawned` / `ChildSessionCompleted` 不重复。
-- 每个子会话日志：`SessionCreated` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`。
+- 每个子会话日志：`SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`。
 - 父日志：恰两条 `ChildSessionCompleted`；两个 spawn 工具结果都是 `Completed`；恰一条 `TurnCommitted(Completed)`。
 - 父的第二次模型请求包含两个子任务总结，不含子会话完整 transcript。
 - `UsageQuery`：父 `Session` scope 的 `own` 等于父自身模型调用之和；`SessionSubtree` 的 `descendants` 等于两个子会话之和；`total` 不重复计数。

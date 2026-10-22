@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#17](https://github.com/zibyn/asterpath/issues/17)
+**2026-10-22 #29 修订**: 排队按 open spawn `ToolCallRequested` 的 `seq` 重建；spawn timeout timer 归 spawn 重放收尾，先查子终态（R3）再处理 deadline。
 
 ## Context
 
@@ -12,7 +13,7 @@
 ## Decision
 
 - **spawn / await 分离。** `spawn` 记录 `ChildSessionSpawned`、按 `parent_tool_call_id` 去重（R1）、物化子流（R2）并返回 `ChildRef`；它不等待完成。`await_completion(&ChildRef)` 先读已记录的 `ChildSessionCompleted`（R3），再幂等补齐 R2，然后 `DurableExecutor::await_wake` 持久等待。`cancel(&ChildRef)` 请求取消、等 `cancel_grace`，未完成则写 `ChildSessionCompleted{Cancelled{Parent}}`。v1 没有后台句柄。
-- **等待是已记录事件，超时也是。** `SpawnRequest.timeout` 由 `DurableExecutor::schedule_timer` 写成父流的 `TimerScheduled`（`caused_by` = `ChildSessionSpawned` 的 `LogId`），deadline 是绝对时间；停机期间到期，恢复后补 `TimerFired` 一次。到期时子流已有终态则用子终态，否则写 `Cancelled{Timeout}`。超时不续跑子会话。
+- **等待是已记录事件，超时也是。** `SpawnRequest.timeout` 由 `DurableExecutor::schedule_timer` 写成父流的 `TimerScheduled`（`caused_by` = `ChildSessionSpawned` 的 `LogId`），deadline 是绝对时间。停机期间到期的 timer 不在通用 timer 预扫描里收尾，而是交给 spawn 重放：先查子终态（R3），有则记 `Completed` + `TimerCancelled`；无且已过期则补 `TimerFired`、取消子会话并写 `Cancelled{Timeout}`。超时不续跑子会话。
 - **取消必须带原因。** `ChildOutcome::Cancelled { reason: CancelReason }`，`CancelReason = Parent | Host | Timeout`。这使恢复能稳定还原 `ToolResult{Interrupted}`（父取消）、`Completed` + cancelled（子宿主取消）与 `Failed{Timeout}`（超时），而不必从 timer 记录反推。#8 的裸 `Cancelled` 由此修订。
 - **恢复委托给 spawn 工具重放。** 父恢复不单独预收尾 child 等待（#3 §6.2 的 child 分支改为委托）：open 的 spawn 工具是 `ReplaySafety::Safe`，照常重放；`spawn` 吸收 R1/R2，`await_completion` 吸收 R3。写者仍只有 scheduler（正常）或经 spawner 被驱动方调用（恢复），不存在两条并发写路径。不新增 `recover()` 入口。
 - **fan-out 没有框架 API。** 同一 `AssistantMessage` 的多个 spawn 调用由 #7 的并行工具管线执行，scheduler 只提供 FIFO 准入（每父 8 / 全局 32）；每个调用独立 outcome，部分失败互不影响，汇总由父模型或宿主完成。不提供 `spawn_many` / join / gather。
@@ -41,7 +42,7 @@ pub enum WaitError  { Cancelled, Timeout, Execution(ExecutionError) }
 - 持久 timer 让超时跨崩溃可重现；代价是每次带 timeout 的 spawn 多两条记录（`TimerScheduled` + `TimerFired`/`TimerCancelled`）。
 - `CancelReason` 是日志 schema 的字段增量；旧记录 upcast 为 `Host`（v1 之前没有带原因的超时记录，且 #17 之前未实现）。
 - 恢复不再走 #3 §6.2 的预收尾分支；驱动方只需重放 open 工具。子等待若没有对应 open 工具（不应出现），视为日志损坏。
-- 排队状态、并发计数、wake 注册表都在内存；崩溃后按 open `ChildSessionSpawned` 的 `seq` 重建 FIFO，不新增事件。
+- 排队状态、并发计数、wake 注册表都在内存；崩溃后按 open spawn `ToolCallRequested`（无对应 `ChildSessionSpawned`）的 `seq` 重建 FIFO，不新增事件。`ChildSessionSpawned` 只表示已准入。
 - 原型证明了 R1–R3 在同一对方法里闭合，但也暴露出：`await_completion` 必须再次执行 R2，否则「`ChildSessionSpawned` 已写、子流未写」的窗口无法靠工具重放覆盖。
 
 ## Considered alternatives
