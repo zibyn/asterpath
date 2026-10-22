@@ -88,8 +88,8 @@ run_turn(session):
         if cancelled:
             append(TurnCommitted(Cancelled)); return      # 零 step 取消
         # pre-step：压缩（#9）→ 宿主 gate
-        match compact_if_needed(session):                 # 可写 CompactionApplied / CompactionAborted
-            Ok(NotNeeded | NothingToDo | Applied) -> {}
+        match compact_if_needed(session):                 # 可写 CompactionStarted / CompactionApplied / CompactionAborted
+            Ok(NotNeeded | NothingToDo | NotConfigured | Applied) -> {}
             Ok(Insufficient) -> append(TurnCommitted(ContextExhausted)); return
             Err(_)           -> append(TurnCommitted(CompactionFailed)); return
         match pre_step_gate(session):                     # waterfall
@@ -125,7 +125,7 @@ run_turn(session):
                     # 上下文超限且本 step 未强制压缩过：压缩一次，重试同一 step
                     if err.context_exceeded && !force_compacted:
                         force_compacted = true
-                        match compact_forced(session):    # 可写 CompactionApplied / CompactionAborted
+                        match compact_forced(session):    # 可写 CompactionStarted / CompactionApplied / CompactionAborted
                             Ok(Applied):
                                 projection = project(frontier,
                                                      visible_before = StepStarted.seq)
@@ -165,6 +165,7 @@ run_turn(session):
 ```
 
 - `call_model` 的每次失败都写 `ModelCallAborted`；只有成功的 attempt 写 `AssistantMessage`。重试不新开 step，投影不变。
+- 未装配 Compactor 时 `compact_if_needed` 返回 `NotConfigured` 并继续；`compact_forced` 返回 `NotConfigured`，按内层 `Ok(_)` 分支收尾为 `ContextExhausted`（[compaction.md](compaction.md) §6）。
 - `has_pending_input` = 本回合最后一个 `StepStarted` 之后存在 `InputRecorded`。
 - 工具审批 `Ask` 会让 step 在 `Waiting` 中跨天保持 open；决定记录为 `SignalReceived`，恢复与调度见 [tools.md](tools.md)。
 - 工具执行中取消的收尾顺序见 §6。
@@ -348,3 +349,4 @@ pub struct TurnConfig {
 - **#13**：已定。token 聚合、`partial` 桶、`UsageRecorded` 发射点见 [usage.md](usage.md)。
 - **#15**：已定。`AgentRunner::run` / `SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
 - **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、`DurableExecutor` 接缝见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#27**：已定。`Compactor` 契约、未装配时的 `NotConfigured` 路径见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。

@@ -240,8 +240,10 @@ recover(session):
 
     # 2b. 未完成的压缩：CompactionStarted 无终态
     for started in open compactions, 按 seq:
-        -> 重做摘要（同一意图键）；成功 append(CompactionApplied)，
-           失败 append(CompactionAborted)，再由驱动方按 [compaction.md](compaction.md) 收尾
+        -> 若装配了 Compactor：重新 plan 后重做摘要（同一意图键）；
+           成功 append(CompactionApplied)，失败 append(CompactionAborted)，
+           再由驱动方按 [compaction.md](compaction.md) 收尾
+        -> 未装配 Compactor：跳过并保持 open；它不影响 Idle（§6）
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
     #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；

@@ -3,6 +3,7 @@
 **Status**: accepted (2026-10-22)
 **来源**: [#9](https://github.com/zibyn/asterpath/issues/9)
 **2026-10-22 #24 审计修订**: 强制压缩改为同 step 内层重试；压缩失败以 `CompactionAborted` 闭合；摘要输入只保留文本；窗口唯一来源是 `ModelSpec.context_window`；恢复次数上限归宿主。
+**2026-10-22 #27 审计修订**: `Compactor` 改为两段式 `plan` / `compact`；默认实现可选装配（M0 为 `None`）；意图由 agent 在 `plan` 判定 `Summarize` 后写；`CompactionOutcome` 携带摘要调用实际使用的 `model`。
 
 ## Context
 
@@ -10,7 +11,7 @@
 
 ## Decision
 
-- **压缩是 `Compactor` 能力模块**（trait 在 protocol，默认实现 `asterpath-compaction`，`asterpath-agent` 必需依赖）；loop 只在 BetweenSteps 调用，内核不含策略。Compactor 只读、返回结果，由 agent 追加 `CompactionApplied`。
+- **压缩是可选 `Compactor` 能力模块**（trait 在 protocol，默认实现 `asterpath-compaction`；`asterpath-agent` 只依赖 trait，默认实现由组装根注入，`None` = 压缩不可用）；loop 只在 BetweenSteps 调用，内核不含策略。Compactor 分 `plan`（纯函数，决定切点）与 `compact`（摘要调用）两段，只读、返回结果；agent 在 `plan` 返回 `Summarize` 后写 `CompactionStarted`，并写终态。
 - **v1 只做摘要**：被替换区间内的一切（含工具输出）由单条摘要代表；不单独折叠工具输出，也不引入第二种压缩事件。
 - **压缩不是 step**：不写 `StepStarted` / `StepCommitted`；成功只追加一条 `CompactionApplied`，扩展携带 `usage` 与 `raw`；失败的摘要 attempt 不落日志。意图 `CompactionStarted` 由 `CompactionApplied` 或 `CompactionAborted{SummaryFailed|Insufficient}` 闭合，终态 append 是唯一提交点，崩溃在 append 前重做。
 - **窗口显式配置**（`ModelSpec.context_window` 是唯一来源，`CompactionConfig` 不重复定义），不从 API 探测；token 用最近一次 usage + `bytes/3` 保守估算，不引入 tokenizer。
@@ -24,6 +25,7 @@
 ## Consequences
 
 - 宿主必须配置窗口，否则压缩不可用；框架不做模型知识表。
+- 宿主可以完全不装配 Compactor（M0 即如此）：压缩返回 `NotConfigured`，强制压缩路径直接 `ContextExhausted`，框架不因此启动失败。
 - 错误路径多一次强制压缩，回合可能因此在原错误后存活；这是对 #6 L9 的唯一修订。
 - 每次压缩至少一次摘要调用成本与一次缓存写；多次压缩不会累积多条摘要。失败或 `Insufficient` 的摘要调用成本不进入统计，只在 trace tap 可见。
 - 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。

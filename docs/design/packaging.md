@@ -27,7 +27,7 @@
 | `asterpath-storage-sqlite` | `EventLog` + `Storage` + `SessionCatalog` + `SessionRetirement` 的 SQLite 实现 | `core`, `protocol` | 是 |
 | `asterpath-runtime` | `DurableExecutor` 实现（timer / signal / wake） | `core`, `protocol` | 是 |
 | `asterpath-scheduler` | `SubagentSpawner` 实现；子会话准入与等待 | `core`, `protocol` | 是 |
-| `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | 是 |
+| `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | 是；**可选装配**，M0 不引入 |
 | `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol` | 是 |
 | `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol` | 是 |
 | `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | 是 |
@@ -66,7 +66,7 @@ pub struct ConfigSnapshot {
 
 ## 3. 公共 API
 
-类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。
+类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `Compactor` / `CompactResult` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。
 
 ### 3.1 稳定层级与版本
 
@@ -89,7 +89,7 @@ pub struct AsterpathConfig {
     pub tools: Vec<Arc<dyn Tool>>,
     pub default_model: Option<ModelSpec>,
     pub agent: Option<Arc<dyn AgentRunner>>,
-    pub compactor: Option<Arc<dyn Compactor>>,
+    pub compactor: Option<Arc<dyn Compactor>>,   // None = 压缩不可用
     pub event_log: Option<Arc<dyn EventLog>>,   // 覆盖 sqlite feature
     pub storage: Option<Arc<dyn Storage>>,
     pub turn: TurnConfig,
@@ -141,6 +141,7 @@ impl SessionHandle {
     pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>>;
     pub async fn cancel(&self) -> Result<(), AsterError>;
     pub async fn state(&self) -> Result<SessionState, AsterError>;
+    pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
     ) -> Result<(), AsterError>;
@@ -151,6 +152,7 @@ impl SessionHandle {
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（timer / signal / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 是 `DurableExecutor::deliver_signal` 的便捷封装（signal name = `tool.approval.<tool_call_id>`，payload = `Allow | Deny { reason }`）。
+- `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 `AgentRunner::compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。
 
@@ -178,10 +180,13 @@ pub enum AgentError {
     Corrupt { session: SessionId, detail: String },
     Storage(StorageError),
     Lifecycle(LifecycleError),
+    Compaction(CompactionError),
 }
 
 pub trait AgentRunner: Send + Sync {
     fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>>;
+    fn compact_now(&self, session: SessionId)
+        -> BoxFuture<'_, Result<CompactResult, AgentError>>;
 }
 ```
 
@@ -189,6 +194,7 @@ pub trait AgentRunner: Send + Sync {
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
+- `compact_now` 只在 Idle 时执行；`Busy` 表示 session 正在被驱动或回合未闭合。它与 pre-step 压缩共用同一 `Compactor` 与事件路径（[compaction.md](compaction.md) §5）。
 
 ### 3.5 错误
 
@@ -307,6 +313,7 @@ default = "ask"               # ask | allow | deny
 | M4 CLI | `asterpath-cli` 七命令、配置、审批端 | CLI 场景测试通过 |
 
 - `asterpath-plugin-host` 与扩展 crate 不参与 M0–M4 的通过条件；[#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21) 已定，各自实现时再加闸门。
+- M0 组装 `compactor: None`；`asterpath-compaction` 不在 M0 crate 列表，压缩从后续里程碑接入（[compaction.md](compaction.md) §2）。
 - CI 顺序：`cargo xtask check-deps` → `cargo fmt --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --workspace` → `cargo test -p asterpath-acceptance --test acceptance` → `cargo doc --workspace --no-deps`。
 - 另跑 feature 矩阵：`cargo check -p asterpath --no-default-features` 与 `--features anthropic` / `openai` / `sqlite` 各自组合。
 - CI 分层与超时（[testing.md](testing.md) §6）：`cargo test --workspace` 预算 5 分钟；进程级验收预算 5 分钟、单 marker 等待上限 15 秒；feature 矩阵 5 分钟。

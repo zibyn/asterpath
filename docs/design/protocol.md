@@ -277,7 +277,7 @@ pub struct ProviderCapabilities {
 - `image_input = false` 时，请求中的 user/assistant `Part::Image` 返回 `Unsupported`；工具结果图像按 §10.4 渲染为占位。
 - 能力匹配不在 `create_session` 预检；adapter 是唯一权威（#26）。
 
-## 6. 流式事件模型
+## 6. Provider 与 Compactor 契约
 
 ```rust
 pub trait Provider: Send + Sync {
@@ -376,6 +376,105 @@ pub enum StopReason {
 | S10 | `ResponseStarted` / `ResponseEnded` 命名属于模型响应，不是 session 的 `TurnStarted` / `TurnCommitted`。 |
 
 `ItemCompleted` 可以按 provider 的完成顺序到达；loop 按 `output_index` 排序后写入 `AssistantMessage.items`。adapter 负责把供应商的交错事件归一化；顺序不变量违反时返回 `StreamProtocol`。
+
+### 6.1 Compactor 契约（#27）
+
+压缩是**可选能力模块**：`asterpath-agent` 只依赖本节的 trait，默认实现 `asterpath-compaction` 由组装根注入；`None` 表示压缩不可用。摘要调用独立构造请求，不继承 `RequestConfig`（[compaction.md](compaction.md) §4）。
+
+```rust
+pub trait Compactor: Send + Sync {
+    /// 纯函数：按配置与投影决定是否压缩、切点在哪；不读日志、不调用模型。
+    fn plan(&self, input: &CompactionInput) -> CompactPlan;
+
+    /// 只为 `CompactPlan::Summarize` 调用；执行摘要调用与压后校验。
+    fn compact<'a>(&'a self, job: CompactionJob)
+        -> BoxFuture<'a, Result<CompactSummary, CompactionError>>;
+}
+
+pub struct CompactionInput {
+    pub trigger: CompactionTrigger,
+    pub model: ModelSpec,                 // 下一次请求的模型；usable window 的来源
+    pub config: CompactionConfig,
+    pub turn: TurnConfig,                 // 摘要调用的 attempt / 退避沿用回合配置
+    pub history: Vec<ProjectedEntry>,     // 模型可见投影，按序
+    pub step_starts: Vec<LogId>,          // 可切割边界的 StepStarted LogId（已提交 step），升序
+    pub last_usage: Option<UsageAnchor>,  // 最近一次 AssistantMessage
+}
+
+pub struct UsageAnchor {
+    pub origin: LogId,                    // 该 AssistantMessage 的 LogId
+    pub usage: Usage,
+}
+
+pub struct ProjectedEntry {
+    pub origin: ProjectedOrigin,
+    pub items: Vec<Item>,
+}
+
+#[non_exhaustive]
+pub enum ProjectedOrigin {
+    Log(LogId),
+    Summary(LogIdRange),
+}
+
+#[non_exhaustive]
+pub enum CompactPlan {
+    NotNeeded,                            // 仅 Threshold 触发可能返回
+    NothingToDo,
+    NotConfigured,                        // 未配置 ModelSpec.context_window
+    Summarize(CompactionJob),
+}
+
+pub struct CompactionJob {
+    pub first_kept: LogId,                // 某个已提交 step 的 StepStarted LogId
+    pub replaces: LogIdRange,
+    pub model: ModelSpec,                 // 摘要模型
+    pub summary_input: Vec<Item>,         // 已剥 reasoning/raw/非文本的文本视图
+    pub max_summary_tokens: u32,
+    pub usable_window: u32,               // 由会话模型算出，不是摘要模型
+    pub retained_tokens: u64,             // first_kept 之后的估算
+}
+
+#[non_exhaustive]
+pub enum CompactSummary {
+    Applied(CompactionOutcome),
+    Insufficient,
+}
+
+pub struct CompactionOutcome {
+    pub first_kept: LogId,
+    pub summary: Vec<Part>,
+    pub replaces: LogIdRange,
+    pub model: ModelSpec,
+    pub usage: Usage,
+    pub raw: Option<RawProviderData>,
+}
+
+#[non_exhaustive]
+pub enum CompactResult {
+    NotNeeded,
+    NothingToDo,
+    NotConfigured,
+    Applied(CompactionOutcome),
+    Insufficient,
+}
+
+#[non_exhaustive]
+pub enum CompactionError {
+    Provider(ProviderError),
+}
+```
+
+规则：
+
+- **单一写入者**：`Compactor` 只读、返回结果；agent 在 `plan` 返回 `Summarize` 后写 `CompactionStarted`，再用 `compact` 的结果写终态。
+- `ProviderCatalog` 在构造 Compactor 时注入；`CompactionInput` 不携带 provider。
+- `CompactionOutcome.model` 是摘要调用实际使用的模型；`CompactionApplied.model` 直接取它（#13 的用量归因）。
+- `plan` 不产生 I/O：读入投影、算切点与估算；`compact` 只做摘要调用与压后校验。`compact` 只返回 `Applied` / `Insufficient`。
+- `first_kept` 必须是 `step_starts` 中的某个 `LogId`；`replaces.first` = `history` 首条的 origin 起点；`replaces.last` = `first_kept` 之前**最后一个模型可见 origin**（不是原始日志的前一条）。见 [compaction.md](compaction.md) §4。
+- 估算：`estimated_input = last_usage.usage.input_total() + bytes/3(history 中 origin > last_usage.origin 的条目)`；无 `last_usage` 时不做自动压缩。
+- `CompactResult` 是 `SessionHandle::compact_now` 与 loop 的公开展示；`NotConfigured` / `NothingToDo` / `Insufficient` 是状态，不是错误。
+- 类型归属：本节 trait 与值类型在 `asterpath-protocol`；`LogIdRange` 在 `core`；`CompactionConfig` 见 [compaction.md](compaction.md) §8。
 
 ## 7. Usage 归一化
 
