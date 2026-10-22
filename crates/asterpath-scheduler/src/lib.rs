@@ -12,10 +12,12 @@
 use std::time::Duration;
 
 use asterpath_core::{
-    ExecutionError, LogId, Module, ModuleCtx, ServiceId, ServiceKey, SessionId, service_key,
+    Clock, ExecutionError, LogId, Module, ModuleCtx, ServiceId, ServiceKey, SessionId, SystemClock,
+    service_key,
 };
 use asterpath_protocol::{
-    ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part, TOOL_REGISTRY_SERVICE, ToolName,
+    CancellationRegistry, ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part,
+    TOOL_REGISTRY_SERVICE, ToolName,
 };
 use futures_core::future::BoxFuture;
 
@@ -107,8 +109,38 @@ impl SchedulerModule {
         executor: std::sync::Arc<dyn asterpath_core::DurableExecutor>,
         model_aliases: std::collections::BTreeMap<ModelAlias, asterpath_protocol::ModelSpec>,
     ) -> Self {
+        Self::with_runtime(
+            log,
+            catalog,
+            executor,
+            model_aliases,
+            std::sync::Arc::new(SystemClock),
+            asterpath_protocol::SubagentConfig::default(),
+            std::sync::Arc::new(CancellationRegistry::new()),
+        )
+    }
+
+    /// Full wiring, used by the facade: injected clock, scheduler-wide
+    /// `SubagentConfig` and the registry the agent shares.
+    pub fn with_runtime(
+        log: std::sync::Arc<dyn asterpath_core::EventLog>,
+        catalog: std::sync::Arc<dyn asterpath_core::SessionCatalog>,
+        executor: std::sync::Arc<dyn asterpath_core::DurableExecutor>,
+        model_aliases: std::collections::BTreeMap<ModelAlias, asterpath_protocol::ModelSpec>,
+        clock: std::sync::Arc<dyn Clock>,
+        config: asterpath_protocol::SubagentConfig,
+        cancellations: std::sync::Arc<CancellationRegistry>,
+    ) -> Self {
         Self {
-            scheduler: std::sync::Arc::new(Scheduler::new(log, catalog, executor, model_aliases)),
+            scheduler: std::sync::Arc::new(Scheduler::with_runtime(
+                log,
+                catalog,
+                executor,
+                model_aliases,
+                clock,
+                config,
+                cancellations,
+            )),
         }
     }
 

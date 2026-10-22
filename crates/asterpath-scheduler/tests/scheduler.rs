@@ -3,12 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use asterpath_core::{
-    AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery,
-    SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, TimerId, TimerRequest,
-    ToolCallId, TurnId, WakeCause,
+    AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId,
+    LogQuery, SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, SystemClock,
+    TimerId, TimerRequest, Timestamp, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, CancelReason, ChildFailure, ChildOutcome,
@@ -17,7 +19,9 @@ use asterpath_protocol::{
     SessionEvent, SideEffect, StopReason, SubagentConfig, Summary, ToolDescriptor, ToolName,
     TurnConfig, TurnEndReason, Usage, dedup, encode_entry,
 };
-use asterpath_protocol::{CancelToken, Tool, ToolArgs, ToolContext, ToolError};
+use asterpath_protocol::{
+    CancelToken, CancellationRegistry, Tool, ToolArgs, ToolContext, ToolError,
+};
 use asterpath_scheduler::{
     ChildRef, Scheduler, SpawnError, SpawnRequest, SpawnTool, SubagentSpawner, WaitError,
 };
@@ -192,6 +196,24 @@ fn new_scheduler(
         catalog,
         Arc::new(NoopExecutor),
         aliases,
+    ))
+}
+
+fn new_scheduler_with(
+    log: Arc<dyn EventLog>,
+    catalog: Arc<dyn SessionCatalog>,
+    executor: Arc<dyn DurableExecutor>,
+    clock: Arc<dyn Clock>,
+    subagents: SubagentConfig,
+) -> Arc<Scheduler> {
+    Arc::new(Scheduler::with_runtime(
+        log,
+        catalog,
+        executor,
+        BTreeMap::new(),
+        clock,
+        subagents,
+        Arc::new(CancellationRegistry::new()),
     ))
 }
 
@@ -1808,5 +1830,471 @@ async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
             .filter(|event| matches!(event, SessionEvent::ContextForked { .. }))
             .count(),
         1
+    );
+}
+// --- #48: admission, recovery, cancellation and timeout -------------------
+
+fn config_with(max_depth: u8, subagents: SubagentConfig) -> ConfigSnapshot {
+    let mut config = config(max_depth);
+    config.subagents = subagents;
+    config
+}
+
+fn limit(per_parent: usize) -> SubagentConfig {
+    SubagentConfig {
+        max_concurrent_children: NonZeroUsize::new(per_parent).expect("non-zero"),
+        cancel_grace: Duration::ZERO,
+        ..SubagentConfig::default()
+    }
+}
+
+async fn seed_parent_with(
+    log: &InMemoryEventLog,
+    subagents: &SubagentConfig,
+    calls: &[ToolCallId],
+) -> (asterpath_protocol::ParentRef, Vec<LogId>) {
+    let parent = SessionId::from_bytes([1; 16]);
+    append(
+        log,
+        parent,
+        SessionEvent::SessionCreated {
+            config: config_with(3, subagents.clone()),
+            parent: None,
+        },
+    )
+    .await;
+    let reference = asterpath_protocol::ParentRef {
+        session: parent,
+        turn: TurnId::from_bytes([2; 16]),
+        tool_call: calls[0],
+    };
+    let mut caused_by = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        caused_by.push(
+            append(
+                log,
+                parent,
+                SessionEvent::ToolCallRequested {
+                    turn_id: reference.turn,
+                    step_id: asterpath_core::StepId::from_bytes([4; 16]),
+                    tool_call_id: *call,
+                    provider_call_id: format!("call-{index}"),
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: asterpath_protocol::JsonString::new("{}"),
+                    replay: ReplaySafety::Safe,
+                    provenance: Provenance::InProcess,
+                },
+            )
+            .await,
+        );
+    }
+    (reference, caused_by)
+}
+
+fn request_for(
+    reference: &asterpath_protocol::ParentRef,
+    call: ToolCallId,
+    caused_by: LogId,
+) -> SpawnRequest {
+    let mut parent = reference.clone();
+    parent.tool_call = call;
+    SpawnRequest::new(parent, caused_by, vec![text("task")])
+}
+
+async fn spawned_calls(log: &dyn EventLog, parent: SessionId) -> Vec<ToolCallId> {
+    events(log, parent)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionSpawned {
+                parent_tool_call_id,
+                ..
+            } => Some(parent_tool_call_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let calls = [
+        ToolCallId::from_bytes([0x31; 16]),
+        ToolCallId::from_bytes([0x32; 16]),
+        ToolCallId::from_bytes([0x33; 16]),
+    ];
+    let subagents = limit(1);
+    let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        Arc::new(SystemClock),
+        subagents.clone(),
+    );
+
+    // The first call takes the only slot.
+    let first = scheduler
+        .spawn(request_for(&reference, calls[0], caused_by[0]))
+        .await
+        .expect("first admitted");
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0]]
+    );
+
+    // Enqueue the higher seq first; the lower seq must still go first.
+    let queued_high = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let request = request_for(&reference, calls[2], caused_by[2]);
+        async move { scheduler.spawn(request).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let queued_low = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let request = request_for(&reference, calls[1], caused_by[1]);
+        async move { scheduler.spawn(request).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0]],
+        "queued spawns are open ToolCallRequested only"
+    );
+
+    // Releasing the slot admits the lower seq next, not the earlier arrival.
+    scheduler.cancel(&first).await.expect("release slot");
+    let second = tokio::time::timeout(Duration::from_secs(5), queued_low)
+        .await
+        .expect("admitted")
+        .expect("task")
+        .expect("spawn");
+    assert_eq!(second.parent.tool_call, calls[1]);
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0], calls[1]]
+    );
+
+    scheduler.cancel(&second).await.expect("release slot");
+    let third = tokio::time::timeout(Duration::from_secs(5), queued_high)
+        .await
+        .expect("admitted")
+        .expect("task")
+        .expect("spawn");
+    assert_eq!(third.parent.tool_call, calls[2]);
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0], calls[1], calls[2]]
+    );
+}
+
+#[tokio::test]
+async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let calls = [
+        ToolCallId::from_bytes([0x41; 16]),
+        ToolCallId::from_bytes([0x42; 16]),
+        ToolCallId::from_bytes([0x43; 16]),
+    ];
+    let subagents = limit(1);
+    let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
+    // call A was admitted before the crash; calls B and C stayed open.
+    append(
+        &*log,
+        reference.session,
+        SessionEvent::ChildSessionSpawned {
+            child: SessionId::from_bytes([0x50; 16]),
+            task: vec![text("task")],
+            config: config_with(3, subagents.clone()),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: calls[0],
+            caused_by: caused_by[0],
+        },
+    )
+    .await;
+
+    // A new process: empty in-memory admission state over the same log.
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        Arc::new(SystemClock),
+        subagents.clone(),
+    );
+
+    // R1: replay reuses the admitted child and writes no second record.
+    let admitted = scheduler
+        .spawn(request_for(&reference, calls[0], caused_by[0]))
+        .await
+        .expect("replay");
+    assert_eq!(admitted.child, SessionId::from_bytes([0x50; 16]));
+
+    let queued_b = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let request = request_for(&reference, calls[1], caused_by[1]);
+        async move { scheduler.spawn(request).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let queued_c = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let request = request_for(&reference, calls[2], caused_by[2]);
+        async move { scheduler.spawn(request).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0]],
+        "the admitted child counts as Running and open spawns wait"
+    );
+
+    scheduler.cancel(&admitted).await.expect("release slot");
+    let b = tokio::time::timeout(Duration::from_secs(5), queued_b)
+        .await
+        .expect("admitted")
+        .expect("task")
+        .expect("spawn");
+    assert_eq!(b.parent.tool_call, calls[1]);
+    scheduler.cancel(&b).await.expect("release slot");
+    let c = tokio::time::timeout(Duration::from_secs(5), queued_c)
+        .await
+        .expect("admitted")
+        .expect("task")
+        .expect("spawn");
+    assert_eq!(c.parent.tool_call, calls[2]);
+
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[0], calls[1], calls[2]],
+        "no admitted child is recreated"
+    );
+}
+
+#[tokio::test]
+async fn cancel_after_a_child_terminal_still_records_cancelled_parent() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let child = SessionId::from_bytes([9; 16]);
+    append(
+        &*log,
+        parent,
+        SessionEvent::ChildSessionSpawned {
+            child,
+            task: vec![text("task")],
+            config: config(3),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: reference.tool_call,
+            caused_by,
+        },
+    )
+    .await;
+    // The child committed its own terminal, but the parent did not record the
+    // outcome before entering cancelling.
+    completed_child(&log, child, "finished", TurnEndReason::Completed).await;
+
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+    let child_ref = ChildRef {
+        parent: reference,
+        child,
+    };
+    scheduler.cancel(&child_ref).await.expect("cancel");
+
+    assert_eq!(
+        events(&*log, parent)
+            .await
+            .into_iter()
+            .find_map(|event| match event {
+                SessionEvent::ChildSessionCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            }),
+        Some(ChildOutcome::Cancelled {
+            reason: CancelReason::Parent
+        })
+    );
+}
+
+/// Timer executor that only supports what the R3 timeout test needs.
+struct TestExecutor {
+    log: Arc<InMemoryEventLog>,
+    clock: Arc<dyn Clock>,
+    timers: Mutex<HashMap<TimerId, TestTimer>>,
+}
+
+enum TestTimer {
+    Pending(Timestamp),
+    Fired,
+    Cancelled,
+}
+
+impl TestExecutor {
+    fn new(log: Arc<InMemoryEventLog>, clock: Arc<dyn Clock>) -> Arc<Self> {
+        Arc::new(Self {
+            log,
+            clock,
+            timers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn append(&self, session: SessionId, event: SessionEvent) {
+        self.log
+            .append(encode_entry(session, None, &event).expect("encodes"))
+            .await
+            .expect("appends");
+    }
+}
+
+impl DurableExecutor for TestExecutor {
+    fn schedule_timer(&self, req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
+        Box::pin(async move {
+            if self.timers.lock().unwrap().contains_key(&req.timer) {
+                return Ok(req.timer);
+            }
+            self.append(
+                req.session,
+                SessionEvent::TimerScheduled {
+                    timer_id: req.timer,
+                    deadline: req.deadline,
+                    caused_by: req.caused_by,
+                },
+            )
+            .await;
+            self.timers
+                .lock()
+                .unwrap()
+                .insert(req.timer, TestTimer::Pending(req.deadline));
+            Ok(req.timer)
+        })
+    }
+
+    fn cancel_timer(
+        &self,
+        session: SessionId,
+        timer: TimerId,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async move {
+            let pending = matches!(
+                self.timers.lock().unwrap().get(&timer),
+                Some(TestTimer::Pending(_))
+            );
+            if pending {
+                self.timers
+                    .lock()
+                    .unwrap()
+                    .insert(timer, TestTimer::Cancelled);
+                self.append(session, SessionEvent::TimerCancelled { timer_id: timer })
+                    .await;
+            }
+            Ok(())
+        })
+    }
+
+    fn await_signal(
+        &self,
+        _req: AwaitSignal,
+    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn deliver_signal(
+        &self,
+        _delivery: SignalDelivery,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn await_wake(
+        &self,
+        session: SessionId,
+        cause: WakeCause,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async move {
+            let WakeCause::Timer(timer) = cause else {
+                return std::future::pending().await;
+            };
+            let deadline = match self.timers.lock().unwrap().get(&timer) {
+                Some(TestTimer::Pending(deadline)) => *deadline,
+                Some(TestTimer::Fired | TestTimer::Cancelled) => return Ok(()),
+                None => return Err(ExecutionError::NotFound { session }),
+            };
+            if deadline > self.clock.now() {
+                return std::future::pending().await;
+            }
+            self.timers.lock().unwrap().insert(timer, TestTimer::Fired);
+            self.append(session, SessionEvent::TimerFired { timer_id: timer })
+                .await;
+            Ok(())
+        })
+    }
+
+    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+}
+
+#[tokio::test]
+async fn a_committed_child_terminal_wins_over_an_expired_spawn_timer() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let child = SessionId::from_bytes([9; 16]);
+    let spawn_log = append(
+        &*log,
+        parent,
+        SessionEvent::ChildSessionSpawned {
+            child,
+            task: vec![text("task")],
+            config: config(3),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: reference.tool_call,
+            caused_by,
+        },
+    )
+    .await;
+    let executor = TestExecutor::new(log.clone(), Arc::clone(&clock));
+    executor
+        .schedule_timer(TimerRequest {
+            session: parent,
+            timer: TimerId::from_bytes([0x61; 16]),
+            caused_by: spawn_log,
+            deadline: clock.now() - 1,
+        })
+        .await
+        .expect("timer");
+    // The child finished before the parent noticed the deadline.
+    completed_child(&log, child, "finished", TurnEndReason::Completed).await;
+
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        executor,
+        clock,
+        SubagentConfig::default(),
+    );
+    let outcome = scheduler
+        .await_completion(&ChildRef {
+            parent: reference,
+            child,
+        })
+        .await
+        .expect("terminal wins");
+    assert!(matches!(outcome, ChildOutcome::Completed { .. }));
+
+    let kinds = events(&*log, parent)
+        .await
+        .iter()
+        .map(SessionEvent::kind)
+        .collect::<Vec<_>>();
+    assert!(!kinds.contains(&"TimerFired"), "R3 produces no TimerFired");
+    assert!(kinds.contains(&"TimerCancelled"));
+    assert!(
+        kinds
+            .iter()
+            .position(|kind| *kind == "ChildSessionCompleted")
+            .expect("completion")
+            < kinds
+                .iter()
+                .position(|kind| *kind == "TimerCancelled")
+                .expect("cancelled")
     );
 }

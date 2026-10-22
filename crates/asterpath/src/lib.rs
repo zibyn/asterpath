@@ -157,16 +157,20 @@ impl Asterpath {
         module_host.register(Arc::new(RuntimeModule::new(Arc::clone(&runtime))));
         let executor: Arc<dyn DurableExecutor> = runtime;
 
+        let cancellations = Arc::new(CancellationRegistry::new());
         let tracing_module = Arc::new(TracingModule::new(Arc::clone(&event_log)));
         module_host.register(tracing_module.clone());
 
         // The scheduler is assembled before the agent; the runner is bound
         // afterwards so the two never form an ownership cycle.
-        let scheduler_module = Arc::new(SchedulerModule::new(
+        let scheduler_module = Arc::new(SchedulerModule::with_runtime(
             Arc::clone(&event_log),
             Arc::clone(&session_catalog),
             Arc::clone(&executor),
             config.model_aliases.clone(),
+            Arc::clone(&config.clock),
+            config.subagents.clone(),
+            Arc::clone(&cancellations),
         ));
         module_host.register(scheduler_module.clone());
 
@@ -187,7 +191,6 @@ impl Asterpath {
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
-        let cancellations = Arc::new(CancellationRegistry::new());
 
         let agent = config.agent.unwrap_or_else(|| {
             Arc::new(
