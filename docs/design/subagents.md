@@ -324,7 +324,7 @@ recover(child):
 
 ## 10. 追踪与 token
 
-- trace：子 session span 挂在父的 spawn tool span 下；关联键 `parent_tool_call_id` / `caused_by`。`ContextForked.source_log` 记录 fork 水位的 trace 关联。
+- trace：子会话是独立 trace；父 trace 的 `subagent` span 挂在 spawn 的 tool span 下，子 trace 的根 span 用 `parent_trace` / `parent_span` 指回它。关联键 `parent_tool_call_id` / `caused_by`；`ContextForked.source_log` 记在子 session span 上。见 [tracing.md](tracing.md)。
 - usage：子的 `AssistantMessage.usage` 只写子流；父日志不复制。
 - 聚合：session 总量 = 自身 + 后代，查询时按 session 树 rollup；不存冗余、不重复计数。口径与查询 API 归 #13。
 - `ChildSessionCompleted` 不携带 usage；避免"父日志 + 子日志"双重计数。
@@ -394,7 +394,7 @@ pub struct SubagentConfig {
 
 - **#9**：子会话内的压缩策略；fork 快照尊重父的 `CompactionApplied`，但物化后与父压缩解耦。
 - **#11**：已定。`Item` / `Part`、`ConfigSnapshot`、`ContextPolicy`、`ChildOutcome` 的最终类型与 summary 的渲染见 [protocol.md](protocol.md)。
-- **#12**：子 session span 与父 spawn tool span 的命名/属性；`caused_by` / `source_log` 映射。
+- **#12**：已定。父 `subagent` span 与子 trace 根 span 的链接、`caused_by` / `source_log` 映射见 [tracing.md](tracing.md)。
 - **#13**：session 树 rollup、去重口径、子 usage 是否单独查询。
 - **#15**：spawn 工具的最终命名/参数 schema；`SubagentSpawner` 的打包位置。
 - **#16**：`spawn_agent` 的命名空间与重名策略。

@@ -44,6 +44,7 @@ pub struct LogEntry {
     pub log_id: LogId,
     pub session: SessionId,
     pub seq: u64,
+    pub recorded_at: Timestamp,   // 存储层写入；仅 trace/审计可读
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
     pub payload: serde_json::Value,
@@ -126,6 +127,7 @@ CREATE TABLE log (
     log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      BLOB    NOT NULL,
     seq             INTEGER NOT NULL,
+    recorded_at     INTEGER NOT NULL,           -- 诊断时间，仅 trace/审计可读
     schema_version  INTEGER NOT NULL,
     dedup_key       TEXT,                       -- NULL = 无幂等键
     payload         TEXT    NOT NULL,           -- JSON
@@ -161,6 +163,7 @@ CREATE TABLE writer_lease (
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
+- `recorded_at` 由 `append` 分配，不接受调用方传入；只供 trace/审计读取，不参与派生索引或任何逻辑。
 - 无外键：单写者 + 派生索引，外键只会增加写放大。
 - 物理 DDL 迁移用 `PRAGMA user_version`，前向逐级；打开时发现更高版本 → `SchemaTooNew`。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0004）。
 
@@ -174,7 +177,8 @@ BEGIN IMMEDIATE
       SELECT log_id FROM log WHERE session_id=? AND dedup_key=?
       if 命中: ROLLBACK; return 原 log_id        -- 不写、不派生
   seq = COALESCE((SELECT MAX(seq) FROM log WHERE session_id=?), 0) + 1
-  INSERT INTO log (...)
+  recorded_at = now_ms()                        -- 存储层本地时钟
+  INSERT INTO log (..., recorded_at, ...)
   event = decode(payload)                        -- 失败 -> InvalidEntry
   apply_derived(event)                           -- sessions/timers/runnable，同一事务
 COMMIT                                           -- FULL 下返回时已 fsync
@@ -195,7 +199,9 @@ COMMIT                                           -- FULL 下返回时已 fsync
 | `ChildSessionSpawned` | `waiting` | — |
 | `ChildSessionCompleted` | `idle` | 入队父会话 `runnable` |
 | `TurnCommitted` | `idle` | — |
-| `ModelCallAborted` / `StreamResumed` / `CompactionApplied` | 不变 | — |
+| `SignalAwaited` | `waiting` | — |
+| `CompactionStarted` / `CompactionApplied` | 不变 | — |
+| `ModelCallAborted` / `StreamResumed` | 不变 | — |
 
 入队是 upsert：`generation = generation + 1`，`not_before = min(现在, 事件时间)`，`reason` 取最新来源。
 
@@ -259,7 +265,7 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 
 | 场景 | 归属 |
 | --- | --- |
-| S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`ts` 不参与逻辑；S9 timer 恰触发一次；claim/ack 不丢唤醒；启动回收租约 | 存储 crate 单测 |
+| S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；S9 timer 恰触发一次；claim/ack 不丢唤醒；启动回收租约 | 存储 crate 单测 |
 | S1 `Safe` 工具中 kill、S2 `Unsafe` 工具中 kill、S3 模型流中 kill、S6 父等子时 kill | #6 / #17 的进程级验收；本轮只固定注入点契约 |
 | S7 `CompactionApplied` 投影 | #9 / #6 |
 

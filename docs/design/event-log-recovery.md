@@ -3,6 +3,8 @@
 > 来源：[#3](https://github.com/zibyn/asterpath/issues/3)。本文件定义日志的**逻辑语义**；物理持久性归 [#5](https://github.com/zibyn/asterpath/issues/5)，schema 版本与 upcasting 归 [#4](https://github.com/zibyn/asterpath/issues/4)。
 >
 > **2026-10-22 范围调整**：移除 `Workflow` 流、确定性重放与 activity/timer 编排引擎，见 [ADR-0003](../adr/0003-single-session-stream-topology.md)。本文件只描述 session 流；子智能体是子 session。
+>
+> **2026-10-22 #12 修订**：信封增加诊断时间 `recorded_at`（只供 trace/审计读取，不参与逻辑）；新增 `CompactionStarted` 与 `SignalAwaited` 意图记录。追踪模型见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 
 ## 1. 决策摘要
 
@@ -15,9 +17,10 @@
 - **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
-- **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起。
+- **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起；signal 等待的意图记录是 `SignalAwaited`。
+- **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合。
 - 幂等：`LogEntry.dedup_key` 在 session 内唯一，重复 append 返回原 `LogId`。
-- 信封不含墙钟时间；`seq` 是唯一排序依据。
+- 信封的 `recorded_at` 是诊断时间，只供 trace/审计读取；任何恢复、投影或分支逻辑不得读取它。`seq` 仍是唯一排序依据。
 - session 恢复写一条非模型可见的 `StreamResumed`。
 - compaction 的事件形状由本文件定，策略、算法与参数归 [#9](https://github.com/zibyn/asterpath/issues/9)，见 [compaction.md](compaction.md)。
 
@@ -64,6 +67,8 @@ pub enum SessionEvent {
                  error: Option<ToolErrorInfo>, truncated: bool },
     StepCommitted { turn_id: TurnId, step_id: StepId },  // 检查点标记
     TurnCommitted { turn_id: TurnId, reason: TurnEndReason },
+    CompactionStarted { trigger: CompactionTrigger,
+                        replaces_from: LogId, caused_by: LogId },
     CompactionApplied { first_kept: LogId, summary: Vec<Part>,
                         replaces: LogIdRange,
                         usage: Usage, raw: Option<RawProviderData> },
@@ -76,10 +81,12 @@ pub enum SessionEvent {
                      caused_by: LogId },
     TimerFired { timer_id: TimerId },
     TimerCancelled { timer_id: TimerId },
+    SignalAwaited { signal_id: SignalId, name: SignalName, caused_by: LogId },
     SignalReceived { signal_id: SignalId, name: SignalName, payload: JsonValue },
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
+pub enum CompactionTrigger { Threshold, Manual, ProviderError }
 pub enum ToolResultStatus { Completed, Failed, Interrupted }
 pub struct ToolErrorInfo { kind: ToolErrorKind, message: String }
 pub enum ToolErrorKind {
@@ -99,12 +106,12 @@ pub enum TurnEndReason {
 - 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。
-- `CompactionApplied` 不是 step：可在回合内 BetweenSteps 或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上，失败的摘要 attempt 不落日志。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
+- `CompactionStarted` 是摘要调用的意图记录，`CompactionApplied` 是它的终态；失败的摘要 attempt 不落日志。`CompactionApplied` 不是 step：可在回合内 BetweenSteps 或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
-- 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向开启等待的意图记录（通常是 `ToolCallRequested`）。
+- 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向触发该等待或压缩的日志记录（例如开启审批的 `ToolCallRequested`、声明等待的 `SignalAwaited`、触发压缩的 frontier 记录）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
-- `SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
+- `SignalAwaited` 是 signal 等待的意图记录；审批不走它，因为 open 的 `ToolCallRequested` 已经承担意图（[tools.md](tools.md)）。`SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
 - timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)；存储投递归 #5。
 
 ## 4. 信封与幂等键
@@ -114,13 +121,14 @@ pub struct LogEntry {
     pub session: SessionId,
     pub seq: u64,                 // 存储层按 session 单调分配
     pub log_id: LogId,
+    pub recorded_at: Timestamp,   // 存储层写入；仅 trace/审计可读
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
     pub payload: SessionEvent,
 }
 ```
 
-- `ts` 不在信封里。诊断事件（`StreamResumed`、`ModelCallAborted`、`TimerScheduled`）可在 payload 带时间，**任何逻辑都不得读取它**。
+- `recorded_at` 只由 trace/审计读取，**任何恢复、投影或分支逻辑都不得读取它**。`TimerScheduled.deadline` 是调度逻辑使用的截止时间，不属于诊断时间。
 - `dedup_key` 在 `(session, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。
 
 | 事件 | dedup key |
@@ -132,10 +140,10 @@ pub struct LogEntry {
 | `ToolCallRequested` | 意图提交时生成的 `tool_call_id` |
 | `ToolResult` | `tool_call_id` |
 | `StepCommitted` / `TurnCommitted` | step / turn id |
-| `CompactionApplied` | `compaction:<append 前 frontier LogId>` |
+| `CompactionStarted` / `CompactionApplied` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
-| `SignalReceived` | 生产者提供的 signal id（审批用 `tool_call_id`） |
+| `SignalAwaited` / `SignalReceived` | signal id（审批用 `tool_call_id`） |
 
 表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。
 
@@ -146,7 +154,7 @@ pub struct LogEntry {
 - **I1 模型可见即已记录**：投影所需的一切都在日志里；内存不得补写历史。
 - **I2 只有终态**：任何意图最终要么有终态记录，要么保持未闭合；不存在第三种状态。
 - **I3 顺序**：`seq` 在 session 内严格单调；逻辑只按 `seq` 排序。
-- **I4 时间无关**：`ts` 不参与任何分支、比较或投影。
+- **I4 时间无关**：`recorded_at` 只影响 trace/审计的耗时呈现，不参与任何恢复、分支、比较或投影。
 - **I5 恢复只处理未闭合意图**：已闭合的历史不重做。
 - **I6 等待是已记录的**：每个等待都有意图记录与最终终态（fire / receive / complete / cancel）；恢复不依赖内存中的等待者。
 - **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 丢弃 `replaces` 区间（含旧 summary）并在 `first_kept` 之前插入新 summary；原始记录保留。
@@ -169,7 +177,7 @@ pub enum StepState {
 }
 ```
 
-「未闭合意图」的精确定义：`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；已声明等待的 signal 尚未到达。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
+「未闭合意图」的精确定义：`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`SignalAwaited` 无 `SignalReceived`；`CompactionStarted` 无 `CompactionApplied`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
 ### 算法
 
@@ -205,7 +213,12 @@ recover(session):
                               运行中 -> 重新挂起等待
                               未物化 -> R2 物化并启动
                               不可读 -> append(ChildSessionCompleted{Lost})
-        Signal       -> 保持等待；到达时由投递方 append(SignalReceived)
+        SignalAwaited -> 保持等待；到达时由投递方 append(SignalReceived)
+
+    # 2b. 未完成的压缩：CompactionStarted 无 CompactionApplied
+    for started in open compactions, 按 seq:
+        -> 重做摘要（同一意图键）；成功 append(CompactionApplied)，
+           失败由驱动方按 [compaction.md](compaction.md) 收尾
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
     #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；
@@ -233,7 +246,7 @@ recover(session):
 | S5 | 同 `dedup_key` append 两次 | 只有一条记录；两次返回同一 `LogId` |
 | S6 | 父会话等待子会话时崩溃 | 重启后重新挂起；子完成后恰有一条 `ChildSessionCompleted`，父 history 正确 |
 | S7 | 含 `CompactionApplied` 的历史投影 | 模型只看到最新 summary + `first_kept` 之后的内容；旧 summary 被覆盖；原始记录仍可扫描 |
-| S8 | 任意恢复路径 | `seq` 严格单调；`ts` 不改变任何输出 |
+| S8 | 任意恢复路径 | `seq` 严格单调；`recorded_at` 不改变恢复或投影输出，只改变 trace 耗时 |
 | S9 | timer 在进程停机期间到期 | 重启后恰好触发一次 `TimerFired` |
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
@@ -247,5 +260,5 @@ recover(session):
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
-- **#12**：`StreamResumed` 与 `caused_by` 如何映射到 trace。
+- **#12**：已定。trace 是日志的确定性投影；`recorded_at`、`CompactionStarted`、`SignalAwaited` 的追踪挂接见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 - **#16**：插件发现与外部能力边界。

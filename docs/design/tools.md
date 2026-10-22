@@ -137,6 +137,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
 - 不引入独立的 `Approver` trait：host 通过订阅 `ApprovalRequested` 并投递 signal 来充当审批端；等待由 `DurableExecutor` 承担（#17）。
 - signal name 只在会话内唯一；`DurableExecutor` 的实现必须按 session 作用域等待（#17）。
+- 非审批的 `await_signal` 在等待开始前写 `SignalAwaited`（#3）；审批不写，因为 open 的 `ToolCallRequested` 已承担意图记录。
 - 未安装任何审批端时，`Ask` 按 `Deny` 处理（fail closed）。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：

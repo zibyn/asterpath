@@ -273,7 +273,7 @@ StepCommitted
 
 ## 9. 追踪与 token 对齐
 
-- span 层级：session → turn → step → model attempt / tool call；具体命名与属性归 #12。
+- span 层级：session → turn → step → model_call / tool_call / wait；transport attempt 折叠为 `model_call` span 上的 event。见 [tracing.md](tracing.md)。
 - 成功的模型调用在 `AssistantMessage` 收尾，`usage` 挂在这里；失败的 attempt 在 `ModelCallAborted` 收尾。
 - step 在 `StepCommitted` 收尾，回合在 `TurnCommitted` 收尾。
 - token 总量 = 该范围内 `AssistantMessage.usage` 求和；中断 attempt 的 partial usage 单独标注（#13）。

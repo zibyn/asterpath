@@ -10,7 +10,7 @@
 - 触发：pre-step 自动阈值、手动、provider 错误路径的**每 step 一次**强制压缩；`stop_reason` 超限不重试；不做 mid-step 触发。
 - 窗口大小**显式配置**，不从 API 探测；token 估算复用最近一次 `usage` + 保守估算，不引入 tokenizer。
 - v1 **只做摘要**，不单独折叠旧工具输出。
-- 压缩**不是 step**：只写一条 `CompactionApplied`，append 是唯一提交点；崩溃在 append 前重做，无副作用。
+- 压缩**不是 step**：摘要调用前写 `CompactionStarted` 意图，成功由 `CompactionApplied` 闭合；append 是唯一提交点，崩溃在 append 前重做，无副作用。
 - 保留最近一个完整 step，目标为 `0.5 × usable window`；每回合最多 1 次自动压缩。
 - 压缩后仍超窗 → `ContextExhausted`，不再压第二次。
 - 接受每次压缩带来一次前缀缓存未命中。
@@ -90,6 +90,12 @@ pub enum CompactResult {
 ### 事件
 
 ```rust
+CompactionStarted {
+    trigger: CompactionTrigger,   // Threshold | Manual | ProviderError
+    replaces_from: LogId,         // 本次将被替换区间的起点
+    caused_by: LogId,             // 触发点的日志锚点
+}
+
 CompactionApplied {
     first_kept: LogId,
     summary: Vec<Part>,
@@ -100,9 +106,9 @@ CompactionApplied {
 ```
 
 - 压缩不是 step：不写 `StepStarted` / `StepCommitted`，可以发生在回合内（BetweenSteps）或回合外的 Idle。
-- 成功 attempt 的 usage 与原始 provider 数据挂在事件上；**失败的摘要 attempt 不落日志**（模型调用无副作用，只有 trace span）。
-- 唯一提交点是 append；崩溃在 append 之前等于什么都没发生，恢复后重新压缩（会重复消耗摘要 token，可接受）。
-- dedup key = `compaction:<append 前的 frontier LogId>`；同一 frontier 重放得到同一 `LogId`。
+- `CompactionStarted` 是意图记录，`CompactionApplied` 是它的终态；失败 attempt 的 usage 与原始数据不落日志（只有 trace tap 可见）。
+- 唯一提交点是 `CompactionApplied` 的 append；崩溃在 append 之前等于什么都没发生，恢复后重做压缩（会重复消耗摘要 token，可接受）。
+- dedup key = `compaction:<意图提交前的 frontier LogId>`；`CompactionStarted` 与 `CompactionApplied` 共用该键（按事件类型隔离），同一 frontier 重放得到同一条记录。
 
 ### 投影
 
@@ -130,7 +136,7 @@ project(entries):
 
 ### 恢复
 
-- 压缩不产生未闭合意图，恢复路径不需要额外分支。
+- `CompactionStarted` 无 `CompactionApplied` 是未闭合意图：恢复后重做摘要并补写 `CompactionApplied`；失败按本文件 §6 收尾。
 - 崩溃在摘要调用中 → 重新进入 pre-step，重新压缩；崩溃在 append 后 → 事件已提交，投影与下一次请求一致。
 
 ## 6. 失败映射
@@ -147,7 +153,7 @@ project(entries):
 ## 7. 缓存、追踪与统计
 
 - **前缀缓存**：压缩必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
-- **追踪**：一次 `compaction` span，挂 session（或当前 turn）下；属性与命名归 [#12](https://github.com/zibyn/asterpath/issues/12)。失败 attempt 只有 span，没有日志事件。
+- **追踪**：`CompactionStarted` → `CompactionApplied` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
 - **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。最终口径归 [#13](https://github.com/zibyn/asterpath/issues/13)。
 
 ## 8. 默认配置
@@ -180,14 +186,14 @@ pub struct CompactionConfig {
 | --- | --- | --- |
 | C1 | 投影超 usable window | 恰一条 `CompactionApplied`；下一次请求只含 summary + `first_kept` 之后内容；原始日志仍可扫描 |
 | C2 | 只有最近一个 step | `NothingToDo`；仍超窗则 `TurnCommitted(ContextExhausted)`，无事件 |
-| C3 | 摘要调用中 `kill -9` | 无 `CompactionApplied`；恢复后重新压缩；最终恰一条 |
+| C3 | 摘要调用中 `kill -9` | 有 `CompactionStarted`、无 `CompactionApplied`；恢复后重做；最终恰一条 `CompactionApplied` |
 | C4 | append 后 `kill -9` | 事件保留；恢复不再压缩；投影包含 summary |
 | C5 | provider 错误 `context_exceeded`（无 `AssistantMessage`） | 同一 step 强制压缩一次并重试；成功则回合继续；同一 step 第二次超限 → `ContextExhausted` |
 | C6 | `stop_reason` 超限（已有 `AssistantMessage`） | 不写 `CompactionApplied`；`TurnCommitted(ContextExhausted)` |
 | C7 | 手动压缩：Idle / TurnOpen | Idle 写一条事件、无回合记录；TurnOpen 返回错误、日志不变 |
 | C8 | 连续两次压缩 | 投影只含最新 summary + 保留内容；旧 summary 被覆盖；原始记录仍在 |
 | C9 | `max_auto_compactions_per_turn = 1` 且压后仍超 | 不压缩第二次；`ContextExhausted` |
-| C10 | 同一 frontier 重放 append | 返回同一 `LogId`；恰一条事件 |
+| C10 | 同一 frontier 重放 append | 返回同一 `LogId`；`CompactionStarted` / `CompactionApplied` 各恰一条 |
 | C11 | token 归因 | 摘要 usage 在 `compaction` 桶；不计入任何 step |
 | C12 | fork 快照 | 子会话物化父的投影（含压缩结果）；之后父子压缩互不影响 |
 | C13 | 未配置 `context_window` | 自动 / 手动压缩返回 `NotConfigured`；错误路径直接 `ContextExhausted` |
@@ -195,7 +201,7 @@ pub struct CompactionConfig {
 ## 10. 留给下游
 
 - **#11**：已定。`Item::Compaction` 的形状与双协议渲染、`ModelSpec.context_window`、`Usage`、`Compactor` trait 见 [protocol.md](protocol.md)。
-- **#12**：`compaction` span 的命名与属性；失败 attempt 的 trace。
+- **#12**：已定。`CompactionStarted` → `CompactionApplied` 的 span 见 [tracing.md](tracing.md)。
 - **#13**：`compaction` 桶与 turn / session / 子会话 rollup 的最终口径；估算与 usage 归一化的关系。
 - **#15**：`Compactor`、`SessionHandle::compact_now()` 的精确签名与错误类型。
 - **#19**：C3 / C4 / C10 的崩溃注入点与确定性测试。
