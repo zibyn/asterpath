@@ -98,7 +98,7 @@ pub struct UsageRecord {
 }
 
 /// Per-bucket sums. `partial` never contributes to [`Self::total`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub model_calls: Usage,
     pub compaction: Usage,
@@ -114,7 +114,7 @@ impl UsageTotals {
 }
 
 /// Own usage and, for `SessionSubtree`, its descendants.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReport {
     pub own: UsageTotals,
     pub descendants: UsageTotals,

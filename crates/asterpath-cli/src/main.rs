@@ -1,19 +1,21 @@
-//! Reference CLI: `run`, `inspect` and `config check`.
+//! Reference CLI: `run`, `resume`, `inspect`, `trace`, `usage` and `config check`.
 //!
-//! The binary owns host policy (exit codes, stdout/stderr) and error reporting;
-//! it composes the same facade an embedder would.
+//! The binary owns host policy (exit codes, stdout/stderr, approval prompts) and
+//! error reporting; it composes the same facade an embedder would.
 
 mod config;
 
 use std::collections::BTreeSet;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath::{AsterError, Asterpath};
+use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
-    AgentEvent, Item, OpenIntent, OpenIntents, Part, Role, SessionState, TurnEndReason, UserInput,
-    decode_entry, history,
+    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
+    Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, TurnEndReason,
+    UsageFilter, UsageScope, UsageTotals, UserInput, decode_entry, history,
 };
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
@@ -29,8 +31,14 @@ struct Cli {
 enum Command {
     /// Create a session, run one turn, and print the final assistant text.
     Run(RunArgs),
+    /// Open a session and continue its open turn or pending input.
+    Resume(SessionArgs),
     /// Print a projection summary and the open intents of a session.
-    Inspect(InspectArgs),
+    Inspect(SessionArgs),
+    /// Print the span tree of a session.
+    Trace(SessionArgs),
+    /// Print own and descendant token usage of a session.
+    Usage(SessionArgs),
     /// Configuration commands.
     Config(ConfigArgs),
 }
@@ -44,7 +52,7 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct InspectArgs {
+struct SessionArgs {
     #[command(flatten)]
     common: Common,
     /// Session id in hex.
@@ -100,6 +108,7 @@ impl Common {
     }
 }
 
+#[derive(Debug)]
 struct CliError {
     code: i32,
     message: String,
@@ -138,7 +147,10 @@ async fn main() {
 async fn dispatch(cli: Cli) -> CliResult<()> {
     match cli.command {
         Command::Run(args) => run(args).await,
+        Command::Resume(args) => resume(args).await,
         Command::Inspect(args) => inspect(args).await,
+        Command::Trace(args) => trace(args).await,
+        Command::Usage(args) => usage(args).await,
         Command::Config(args) => match args.command {
             ConfigCommand::Check(args) => config_check(args),
         },
@@ -151,6 +163,31 @@ fn load(common: &Common) -> CliResult<config::Settings> {
     Ok(settings)
 }
 
+/// Resolve the approval mode the drive will use.
+///
+/// `ask` needs a live prompt, so without a TTY a configured or default `ask`
+/// degrades to `deny`; an explicit `--approval ask` is a usage error because it
+/// cannot be honoured.
+fn effective_approval(
+    resolved: config::ApprovalMode,
+    explicit: Option<config::ApprovalMode>,
+    tty: bool,
+) -> CliResult<config::ApprovalMode> {
+    if matches!(resolved, config::ApprovalMode::Ask) && !tty {
+        if matches!(explicit, Some(config::ApprovalMode::Ask)) {
+            return Err(CliError::config(
+                "--approval ask requires an interactive terminal",
+            ));
+        }
+        return Ok(config::ApprovalMode::Deny);
+    }
+    Ok(resolved)
+}
+
+fn tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
 fn config_check(args: CheckArgs) -> CliResult<()> {
     load(&args.common)?;
     println!("config ok");
@@ -159,9 +196,10 @@ fn config_check(args: CheckArgs) -> CliResult<()> {
 
 async fn run(args: RunArgs) -> CliResult<()> {
     let settings = load(&args.common)?;
+    let approval = effective_approval(settings.approval, args.common.approval, tty())?;
     let spec = config::session_spec(&settings).map_err(CliError::config)?;
     let providers = config::providers(&settings).map_err(CliError::config)?;
-    let asterpath = assemble(&settings, providers).await?;
+    let asterpath = assemble(&settings, providers, approval).await?;
 
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
@@ -173,49 +211,58 @@ async fn run(args: RunArgs) -> CliResult<()> {
         .await
         .map_err(aster_error)?;
 
-    let mut reason = None;
-    {
-        let mut stream = handle.drive();
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(AgentEvent::TurnCommitted { reason: ended, .. }) => reason = Some(ended),
-                Ok(_) => {}
-                Err(error) => return Err(CliError::run(format!("drive failed: {error}"))),
-            }
-        }
-    }
-
-    let entries = scan(asterpath.event_log(), handle.id())
-        .await
-        .map_err(CliError::run)?;
-    if let Some(text) = final_assistant_text(&entries) {
+    let outcome = drive_approving(&asterpath, &handle, approval).await?;
+    if let Some(text) = final_text(&asterpath, &handle).await? {
         println!("{text}");
     }
     asterpath.shutdown().await.map_err(aster_error)?;
 
-    match reason {
+    match outcome.reason {
         None | Some(TurnEndReason::Completed) => Ok(()),
         Some(other) => Err(CliError::run(format!("turn ended with {other:?}"))),
     }
 }
 
-async fn inspect(args: InspectArgs) -> CliResult<()> {
+async fn resume(args: SessionArgs) -> CliResult<()> {
+    let settings = load(&args.common)?;
+    let session = parse_session(&args.session)?;
+    let snapshot = session_snapshot(&settings, session).await?;
+    let approval = effective_approval(settings.approval, args.common.approval, tty())?;
+
+    // The session's model provider is fixed at creation; the flag cannot move it.
+    let mut settings = settings;
+    settings.provider = Some(snapshot.model.provider.as_str().to_owned());
+    let providers = config::providers(&settings).map_err(CliError::config)?;
+    let asterpath = assemble(&settings, providers, approval).await?;
+    let handle = asterpath.open_session(session).await.map_err(aster_error)?;
+
+    let outcome = drive_approving(&asterpath, &handle, approval).await?;
+    if outcome.idle {
+        println!("idle");
+    } else if let Some(text) = final_text(&asterpath, &handle).await? {
+        println!("{text}");
+    }
+    asterpath.shutdown().await.map_err(aster_error)?;
+
+    match outcome.reason {
+        None | Some(TurnEndReason::Completed) => Ok(()),
+        Some(other) => Err(CliError::run(format!("turn ended with {other:?}"))),
+    }
+}
+
+async fn inspect(args: SessionArgs) -> CliResult<()> {
     let settings = load(&args.common)?;
     let session = parse_session(&args.session)?;
     if !settings.db.exists() {
-        return Err(CliError::run(format!("session {session:?} not found")));
+        return Err(not_found(session));
     }
-    let asterpath = Asterpath::builder()
-        .database(&settings.db)
-        .build()
-        .await
-        .map_err(aster_error)?;
+    let asterpath = bare(&settings).await?;
 
     let entries = scan(asterpath.event_log(), session)
         .await
         .map_err(CliError::run)?;
     if entries.is_empty() {
-        return Err(CliError::run(format!("session {session:?} not found")));
+        return Err(not_found(session));
     }
 
     let (open, state) = fold_open_intents(&entries).map_err(CliError::run)?;
@@ -244,9 +291,245 @@ async fn inspect(args: InspectArgs) -> CliResult<()> {
     Ok(())
 }
 
+async fn trace(args: SessionArgs) -> CliResult<()> {
+    let settings = load(&args.common)?;
+    let session = parse_session(&args.session)?;
+    if !settings.db.exists() {
+        return Err(not_found(session));
+    }
+    let asterpath = bare(&settings).await?;
+
+    let trace = asterpath.trace();
+    let mut spans = Vec::new();
+    let mut stream = trace.spans(SpanFilter {
+        session: Some(session),
+        ..SpanFilter::default()
+    });
+    while let Some(span) = stream.next().await {
+        match span {
+            Ok(span) => spans.push(span),
+            Err(error) => {
+                let _ = asterpath.shutdown().await;
+                return Err(CliError::run(error.to_string()));
+            }
+        }
+    }
+    asterpath.shutdown().await.map_err(aster_error)?;
+
+    if args.common.json {
+        let json = serde_json::to_string_pretty(&spans)
+            .map_err(|error| CliError::run(error.to_string()))?;
+        println!("{json}");
+    } else {
+        print!("{}", render_tree(&spans));
+    }
+    Ok(())
+}
+
+async fn usage(args: SessionArgs) -> CliResult<()> {
+    let settings = load(&args.common)?;
+    let session = parse_session(&args.session)?;
+    if !settings.db.exists() {
+        return Err(not_found(session));
+    }
+    let asterpath = bare(&settings).await?;
+
+    let report = asterpath
+        .usage()
+        .totals(UsageFilter {
+            scope: UsageScope::SessionSubtree(session),
+            bucket: None,
+            model: None,
+            since: None,
+            until: None,
+            limit: None,
+        })
+        .await;
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = asterpath.shutdown().await;
+            return Err(CliError::run(error.to_string()));
+        }
+    };
+    asterpath.shutdown().await.map_err(aster_error)?;
+
+    if args.common.json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|error| CliError::run(error.to_string()))?;
+        println!("{json}");
+    } else {
+        print_totals("own", &report.own);
+        print_totals("descendants", &report.descendants);
+    }
+    Ok(())
+}
+
+fn print_totals(label: &str, totals: &UsageTotals) {
+    let input = totals.model_calls.input_total() + totals.compaction.input_total();
+    let output = totals.model_calls.output.total + totals.compaction.output.total;
+    println!(
+        "{label}: input={input} output={output} total={}",
+        totals.total()
+    );
+}
+
+fn render_tree(spans: &[Span]) -> String {
+    fn walk(spans: &[Span], parent: Option<SpanId>, depth: usize, out: &mut String) {
+        for span in spans.iter().filter(|span| span.parent_span == parent) {
+            out.push_str(&"  ".repeat(depth));
+            out.push_str(kind_label(span.kind));
+            out.push(' ');
+            out.push_str(&span.name);
+            if !matches!(span.status, SpanStatus::Ok | SpanStatus::Unset) {
+                out.push_str(" [");
+                out.push_str(&format!("{:?}", span.status).to_lowercase());
+                out.push(']');
+            }
+            out.push('\n');
+            walk(spans, Some(span.span), depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    walk(spans, None, 0, &mut out);
+    out
+}
+
+fn kind_label(kind: SpanKind) -> &'static str {
+    match kind {
+        SpanKind::Session => "session",
+        SpanKind::Turn => "turn",
+        SpanKind::Step => "step",
+        SpanKind::ModelCall => "model_call",
+        SpanKind::ToolCall => "tool_call",
+        SpanKind::Subagent => "subagent",
+        SpanKind::Wait => "wait",
+        SpanKind::Compaction => "compaction",
+        _ => "span",
+    }
+}
+
+/// One drive with the approval endpoint registered only when a prompt will
+/// actually happen; otherwise the framework's `Ask` (gate closed) fails closed.
+async fn drive_approving(
+    asterpath: &Asterpath,
+    handle: &SessionHandle,
+    approval: config::ApprovalMode,
+) -> CliResult<DriveOutcome> {
+    let _endpoint =
+        matches!(approval, config::ApprovalMode::Ask).then(|| asterpath.approval_gate().register());
+    let mut prompt = if matches!(approval, config::ApprovalMode::Ask) {
+        Some(PromptIo {
+            reader: io::stdin().lock(),
+            writer: io::stderr(),
+        })
+    } else {
+        None
+    };
+    drive(handle, prompt.as_mut()).await
+}
+
+#[derive(Default)]
+struct DriveOutcome {
+    idle: bool,
+    reason: Option<TurnEndReason>,
+}
+
+/// Drive to `TurnCommitted` or `Idle`. Injected prompt IO keeps the endpoint
+/// unit-testable; there is no exit code for "stopped at a wait".
+async fn drive<R: BufRead, W: Write>(
+    handle: &SessionHandle,
+    mut prompt: Option<&mut PromptIo<R, W>>,
+) -> CliResult<DriveOutcome> {
+    let mut outcome = DriveOutcome::default();
+    {
+        let mut stream = handle.drive();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(AgentEvent::ApprovalRequested(request)) => {
+                    let decision = match prompt.as_deref_mut() {
+                        Some(io) => prompt_decision(io, &request),
+                        None => ApprovalDecision::Deny { reason: None },
+                    };
+                    handle
+                        .approve(request.tool_call_id, decision)
+                        .await
+                        .map_err(aster_error)?;
+                }
+                Ok(AgentEvent::TurnCommitted { reason, .. }) => outcome.reason = Some(reason),
+                Ok(AgentEvent::Idle { .. }) => outcome.idle = true,
+                Ok(_) => {}
+                Err(error) => return Err(CliError::run(format!("drive failed: {error}"))),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+struct PromptIo<R, W> {
+    reader: R,
+    writer: W,
+}
+
+/// Ask the operator; anything other than yes (including EOF) denies.
+fn prompt_decision<R: BufRead, W: Write>(
+    io: &mut PromptIo<R, W>,
+    request: &ApprovalRequest,
+) -> ApprovalDecision {
+    let _ = writeln!(io.writer, "tool: {}", request.tool.as_str());
+    let _ = writeln!(io.writer, "args: {}", request.args.as_str());
+    let _ = writeln!(io.writer, "replay: {:?}", request.replay);
+    let _ = writeln!(io.writer, "side_effect: {:?}", request.side_effect);
+    let _ = writeln!(io.writer, "provenance: {:?}", request.provenance);
+    let _ = write!(io.writer, "allow? [y/N] ");
+    let _ = io.writer.flush();
+
+    let mut answer = String::new();
+    let allowed = io.reader.read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if allowed {
+        ApprovalDecision::Allow
+    } else {
+        ApprovalDecision::Deny { reason: None }
+    }
+}
+
+async fn final_text(asterpath: &Asterpath, handle: &SessionHandle) -> CliResult<Option<String>> {
+    let entries = scan(asterpath.event_log(), handle.id())
+        .await
+        .map_err(CliError::run)?;
+    Ok(final_assistant_text(&entries))
+}
+
+async fn session_snapshot(
+    settings: &config::Settings,
+    session: SessionId,
+) -> CliResult<ConfigSnapshot> {
+    if !settings.db.exists() {
+        return Err(not_found(session));
+    }
+    let asterpath = bare(settings).await?;
+    if let Err(error) = asterpath.open_session(session).await {
+        let _ = asterpath.shutdown().await;
+        return Err(aster_error(error));
+    }
+    let entries = scan(asterpath.event_log(), session)
+        .await
+        .map_err(CliError::run)?;
+    let snapshot = entries
+        .iter()
+        .find_map(|entry| match decode_entry(entry).ok()? {
+            asterpath_protocol::SessionEvent::SessionCreated { config, .. } => Some(config),
+            _ => None,
+        });
+    asterpath.shutdown().await.map_err(aster_error)?;
+    snapshot.ok_or_else(|| CliError::run(format!("session {session:?} has no SessionCreated")))
+}
+
 async fn assemble(
     settings: &config::Settings,
     providers: Vec<Arc<dyn asterpath_protocol::Provider>>,
+    approval: config::ApprovalMode,
 ) -> CliResult<Asterpath> {
     let mut builder = Asterpath::builder()
         .database(&settings.db)
@@ -256,10 +539,19 @@ async fn assemble(
         .compaction(config::compaction_config(settings))
         .subagents(config::subagent_config(settings))
         .model_aliases(config::model_aliases(settings));
-    if let Some(policy) = config::approval_policy(settings.approval) {
+    if let Some(policy) = config::approval_policy(approval) {
         builder = builder.approval(policy);
     }
     builder.build().await.map_err(aster_error)
+}
+
+/// No providers and no drive: enough for log-derived projections.
+async fn bare(settings: &config::Settings) -> CliResult<Asterpath> {
+    Asterpath::builder()
+        .database(&settings.db)
+        .build()
+        .await
+        .map_err(aster_error)
 }
 
 async fn scan(event_log: Arc<dyn EventLog>, session: SessionId) -> Result<Vec<LogEntry>, String> {
@@ -323,6 +615,10 @@ fn final_assistant_text(entries: &[LogEntry]) -> Option<String> {
     None
 }
 
+fn not_found(session: SessionId) -> CliError {
+    CliError::run(format!("session {session:?} not found"))
+}
+
 fn parse_session(value: &str) -> CliResult<SessionId> {
     serde_json::from_value(serde_json::Value::String(value.to_owned()))
         .map_err(|_| CliError::config(format!("invalid session id {value}")))
@@ -350,4 +646,365 @@ fn fresh_input_id() -> InputId {
         .copy_from_slice(&(nanos ^ (std::process::id() as u64).rotate_left(17)).to_le_bytes());
     bytes[8..].copy_from_slice(&counter.to_le_bytes());
     InputId::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use asterpath_core::ToolCallId;
+    use asterpath_protocol::{
+        ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, JsonString, ModelId,
+        ModelSpec, Parallelism, Provenance, Provider, ProviderId, ReplaySafety, RequestConfig,
+        SessionEvent, SessionSpec, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs,
+        ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
+        TurnConfig, Usage,
+    };
+    use asterpath_testing::ScriptedProvider;
+    use futures_util::future::BoxFuture;
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest::new(
+            SessionId::from_bytes([1; 16]),
+            asterpath_core::TurnId::from_bytes([2; 16]),
+            asterpath_core::StepId::from_bytes([3; 16]),
+            ToolCallId::from_bytes([4; 16]),
+            ToolName::new("echo"),
+            JsonString::new(r#"{"q":"hi"}"#),
+            ReplaySafety::Safe,
+            SideEffect::ReadOnly,
+            Provenance::InProcess,
+        )
+    }
+
+    #[test]
+    fn prompt_prints_every_approval_field_and_maps_the_answer() {
+        for (answer, expected) in [
+            ("y\n", ApprovalDecision::Allow),
+            ("yes\n", ApprovalDecision::Allow),
+            ("n\n", ApprovalDecision::Deny { reason: None }),
+            ("\n", ApprovalDecision::Deny { reason: None }),
+        ] {
+            let mut io = PromptIo {
+                reader: Cursor::new(answer.as_bytes()),
+                writer: Vec::new(),
+            };
+            assert_eq!(prompt_decision(&mut io, &request()), expected);
+            let rendered = String::from_utf8(io.writer).unwrap();
+            for field in [
+                "tool: echo",
+                r#"args: {"q":"hi"}"#,
+                "replay: Safe",
+                "side_effect: ReadOnly",
+                "provenance: InProcess",
+            ] {
+                assert!(rendered.contains(field), "missing {field}: {rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_tty_ask_degrades_but_explicit_ask_is_a_usage_error() {
+        use config::ApprovalMode;
+        assert!(matches!(
+            effective_approval(ApprovalMode::Ask, None, false).expect("configured ask degrades"),
+            ApprovalMode::Deny
+        ));
+        let error = effective_approval(ApprovalMode::Ask, Some(ApprovalMode::Ask), false)
+            .expect_err("explicit ask without a TTY");
+        assert_eq!(error.code, 2);
+        assert!(matches!(
+            effective_approval(ApprovalMode::Ask, None, true).unwrap(),
+            ApprovalMode::Ask
+        ));
+        assert!(matches!(
+            effective_approval(ApprovalMode::Deny, None, false).unwrap(),
+            ApprovalMode::Deny
+        ));
+    }
+
+    struct EchoTool {
+        descriptor: ToolDescriptor,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Tool for EchoTool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        fn invoke(
+            &self,
+            _args: ToolArgs,
+            _ctx: ToolContext,
+        ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ToolOutput::new(vec![Part::Text { text: "ok".into() }])) })
+        }
+    }
+
+    fn echo_tool(calls: Arc<AtomicUsize>) -> Arc<dyn Tool> {
+        Arc::new(EchoTool {
+            descriptor: ToolDescriptor {
+                name: ToolName::new("echo"),
+                description: String::new(),
+                schema: serde_json::json!({"type": "object"}),
+                parallelism: Parallelism::Parallel,
+                replay: ReplaySafety::Safe,
+                side_effect: SideEffect::ReadOnly,
+                provenance: Provenance::InProcess,
+                timeout: None,
+                max_output_bytes: None,
+            },
+            calls,
+        })
+    }
+
+    struct AlwaysAsk;
+
+    impl ApprovalPolicy for AlwaysAsk {
+        fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
+            ApprovalVerdict::Ask
+        }
+    }
+
+    fn tool_call() -> Item {
+        Item::ToolCall {
+            call_id: "call-1".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("echo"),
+            raw_args: JsonString::new(r#"{"q":"hi"}"#),
+            raw: None,
+        }
+    }
+
+    fn final_message() -> Item {
+        Item::Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text {
+                text: "done".into(),
+            }],
+        }
+    }
+
+    fn spec() -> SessionSpec {
+        SessionSpec {
+            model: ModelSpec {
+                provider: ProviderId::new("p"),
+                model: ModelId::new("model-1"),
+                context_window: None,
+            },
+            system: Vec::new(),
+            tools: ToolSelection::All,
+            request: RequestConfig::default(),
+            turn: TurnConfig {
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                ..TurnConfig::default()
+            },
+            compaction: CompactionConfig::default(),
+            subagents: SubagentConfig::default(),
+        }
+    }
+
+    fn temp_db(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "asterpath-cli-approval-{tag}-{}-{}.db",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn cleanup(db: &Path) {
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(format!("{}-wal", db.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db.display()));
+    }
+
+    fn script() -> Arc<ScriptedProvider> {
+        Arc::new(
+            ScriptedProvider::new("p")
+                .respond(vec![tool_call()], StopReason::ToolUse, Usage::default())
+                .respond(vec![final_message()], StopReason::EndTurn, Usage::default()),
+        )
+    }
+
+    async fn build(db: &Path, provider: Arc<ScriptedProvider>, tool: Arc<dyn Tool>) -> Asterpath {
+        Asterpath::builder()
+            .database(db)
+            .providers(vec![provider as Arc<dyn Provider>])
+            .tools(vec![tool])
+            .tool(ToolConfig::default())
+            .approval(Arc::new(AlwaysAsk))
+            .build()
+            .await
+            .expect("build")
+    }
+
+    #[tokio::test]
+    async fn allow_prompt_is_delivered_and_executes_the_tool() {
+        let db = temp_db("allow");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
+        let _endpoint = asterpath.approval_gate().register();
+        let handle = asterpath.create_session(spec()).await.unwrap();
+        handle
+            .submit_input(UserInput {
+                id: InputId::from_bytes([1; 16]),
+                parts: vec![Part::Text { text: "go".into() }],
+            })
+            .await
+            .unwrap();
+
+        let mut io = PromptIo {
+            reader: Cursor::new(b"y\n"),
+            writer: Vec::new(),
+        };
+        let outcome = drive(&handle, Some(&mut io)).await.expect("drive");
+
+        assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
+        assert!(!outcome.idle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8(io.writer).unwrap().contains("tool: echo"));
+        assert_eq!(signal_count(&asterpath, handle.id()).await, 1);
+
+        asterpath.shutdown().await.unwrap();
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn deny_prompt_records_denied_and_skips_the_tool() {
+        let db = temp_db("deny");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ScriptedProvider::new("p").respond(
+            vec![tool_call()],
+            StopReason::ToolUse,
+            Usage::default(),
+        ));
+        let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
+        let _endpoint = asterpath.approval_gate().register();
+        let handle = asterpath.create_session(spec()).await.unwrap();
+        handle
+            .submit_input(UserInput {
+                id: InputId::from_bytes([1; 16]),
+                parts: vec![Part::Text { text: "go".into() }],
+            })
+            .await
+            .unwrap();
+
+        let mut io = PromptIo {
+            reader: Cursor::new(b"n\n"),
+            writer: Vec::new(),
+        };
+        let outcome = drive(&handle, Some(&mut io)).await.expect("drive");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let values = tool_result_values(&asterpath, handle.id()).await;
+        assert_eq!(values.len(), 1);
+        assert!(values[0].to_lowercase().contains("denied"), "{values:?}");
+        assert!(outcome.reason.is_some() || outcome.idle);
+
+        asterpath.shutdown().await.unwrap();
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn recorded_decision_is_reused_on_restart_without_prompting() {
+        let db = temp_db("reuse");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // Phase 1: reach the approval, record Allow, then drop the drive.
+        let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
+        let _endpoint = asterpath.approval_gate().register();
+        let handle = asterpath.create_session(spec()).await.unwrap();
+        handle
+            .submit_input(UserInput {
+                id: InputId::from_bytes([1; 16]),
+                parts: vec![Part::Text { text: "go".into() }],
+            })
+            .await
+            .unwrap();
+        let mut stream = handle.drive();
+        let request = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("approval requested")
+                .expect("event")
+                .expect("no error");
+            if let AgentEvent::ApprovalRequested(request) = event {
+                break request;
+            }
+        };
+        handle
+            .approve(request.tool_call_id, ApprovalDecision::Allow)
+            .await
+            .unwrap();
+        drop(stream);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "not executed before crash");
+        let session = handle.id();
+        drop(handle);
+        asterpath.shutdown().await.unwrap();
+
+        // Phase 2: restart with a provider that can only answer the final step.
+        let provider = Arc::new(ScriptedProvider::new("p").respond(
+            vec![final_message()],
+            StopReason::EndTurn,
+            Usage::default(),
+        ));
+        let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
+        let _endpoint = asterpath.approval_gate().register();
+        let handle = asterpath.open_session(session).await.unwrap();
+
+        let mut io = PromptIo {
+            reader: Cursor::new(b"n\n"),
+            writer: Vec::new(),
+        };
+        let outcome = drive(&handle, Some(&mut io)).await.expect("resume");
+
+        assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the recorded Allow ran the tool"
+        );
+        assert!(
+            io.writer.is_empty(),
+            "a recorded decision must not re-prompt"
+        );
+        assert_eq!(signal_count(&asterpath, handle.id()).await, 1);
+
+        asterpath.shutdown().await.unwrap();
+        cleanup(&db);
+    }
+
+    async fn signal_count(asterpath: &Asterpath, session: SessionId) -> usize {
+        scan(asterpath.event_log(), session)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|entry| decode_entry(entry).is_ok_and(|event| event.kind() == "SignalReceived"))
+            .count()
+    }
+
+    async fn tool_result_values(asterpath: &Asterpath, session: SessionId) -> Vec<String> {
+        scan(asterpath.event_log(), session)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|entry| match decode_entry(entry).ok()? {
+                SessionEvent::ToolResult { status, error, .. } => {
+                    Some(format!("{status:?} {:?}", error.map(|error| error.message)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
