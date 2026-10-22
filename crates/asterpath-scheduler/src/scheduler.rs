@@ -10,9 +10,9 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
-    RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
-    encode_entry,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, ProviderId, Role,
+    RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry,
+    dedup, encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -233,13 +233,6 @@ impl SubagentSpawner for Scheduler {
             };
 
             let tools = narrow_tools(&parent_config.tools, req.tool_allowlist.as_deref())?;
-
-            // #49 owns fork materialization; erroring is explicit, never Fresh.
-            if matches!(req.context, ContextPolicy::Fork { .. }) {
-                return Err(SpawnError::InvalidArgs {
-                    message: "fork context is not available yet".to_owned(),
-                });
-            }
 
             let config = ConfigSnapshot {
                 model,
@@ -725,6 +718,37 @@ impl Scheduler {
         }
     }
 
+    /// Projection of the parent stream at the spawn step's `StepStarted`.
+    /// `CompactionApplied` folds regardless of the waterline, mirroring the
+    /// agent's request projection; nothing after the waterline is visible.
+    async fn fork_snapshot(
+        &self,
+        parent: ParentRef,
+        at: LogId,
+        provider: &ProviderId,
+    ) -> Result<Vec<Item>, ExecutionError> {
+        let entries = scan(&*self.log, parent.session).await?;
+        let Some(at_seq) = entries
+            .iter()
+            .find(|(entry, _)| entry.log_id == at)
+            .map(|(entry, _)| entry.seq)
+        else {
+            return Err(backend(format!(
+                "fork point LogId({}) is not in the parent log",
+                at.as_i64()
+            )));
+        };
+        let prefix: Vec<LogEntry> = entries
+            .into_iter()
+            .filter(|(entry, event)| {
+                entry.seq <= at_seq || matches!(event, SessionEvent::CompactionApplied { .. })
+            })
+            .map(|(entry, _)| entry)
+            .collect();
+        let items = asterpath_protocol::history(&prefix).map_err(backend)?;
+        Ok(drop_foreign_items(items, provider))
+    }
+
     /// R2: create the child log's records from the parent record. Every write
     /// is deduplicated by the child id, so replay fills gaps without doubling.
     async fn materialize(
@@ -750,7 +774,7 @@ impl Scheduler {
                     child,
                     SessionEvent::SessionCreated {
                         config: config.clone(),
-                        parent: Some(parent),
+                        parent: Some(parent.clone()),
                     },
                     Some(dedup::session_created(child)),
                 )
@@ -758,8 +782,27 @@ impl Scheduler {
             }
         }
 
-        if matches!(context, ContextPolicy::Fork { .. }) {
-            return Err(backend("fork context materialization is not implemented"));
+        // #49: the fork snapshot is materialized once into the child log; it is
+        // never a live reference to the parent stream.
+        if let ContextPolicy::Fork { at } = context
+            && !events
+                .iter()
+                .any(|(_, event)| matches!(event, SessionEvent::ContextForked { .. }))
+        {
+            let items = self
+                .fork_snapshot(parent.clone(), *at, &config.model.provider)
+                .await?;
+            append(
+                &*self.log,
+                child,
+                SessionEvent::ContextForked {
+                    source: parent,
+                    source_log: *at,
+                    items,
+                },
+                Some(dedup::context_forked(child)),
+            )
+            .await?;
         }
 
         if !events
@@ -997,6 +1040,57 @@ fn wait_outcome(outcome: &ChildOutcome) -> Result<ChildOutcome, WaitError> {
         } => Err(WaitError::Timeout),
         other => Ok(other.clone()),
     }
+}
+
+/// Cross-provider rule (#11 §11): opaque items from another provider are not
+/// copied into the fork snapshot at all; there is no translation.
+fn drop_foreign_items(items: Vec<Item>, provider: &ProviderId) -> Vec<Item> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Reasoning { raw, .. } if &raw.provider != provider => None,
+            Item::ProviderOpaque {
+                provider: item_provider,
+                ..
+            }
+            | Item::ServerToolCall {
+                provider: item_provider,
+                ..
+            }
+            | Item::ServerToolResult {
+                provider: item_provider,
+                ..
+            } if &item_provider != provider => None,
+            Item::Message { role, parts } => Some(Item::Message {
+                role,
+                parts: drop_foreign_parts(parts, provider),
+            }),
+            Item::ToolResult {
+                call_id,
+                provider_item_id,
+                parts,
+                is_error,
+                raw,
+            } => Some(Item::ToolResult {
+                call_id,
+                provider_item_id,
+                parts: drop_foreign_parts(parts, provider),
+                is_error,
+                raw,
+            }),
+            other => Some(other),
+        })
+        .collect()
+}
+
+fn drop_foreign_parts(parts: Vec<Part>, provider: &ProviderId) -> Vec<Part> {
+    parts
+        .into_iter()
+        .filter(|part| {
+            !matches!(part, Part::ProviderOpaque { provider: item_provider, .. }
+                if item_provider != provider)
+        })
+        .collect()
 }
 
 fn narrow_tools(

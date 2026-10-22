@@ -9,7 +9,7 @@
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,16 +24,17 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
-    ApprovalRequest, ApprovalVerdict, CancelRegistration, CancelToken, CancellationRegistry,
-    CompactPlan, CompactResult, CompactSummary, CompactionAbortReason, CompactionError,
-    CompactionInput, CompactionOutcome, CompactionTrigger, Compactor, ConfigSnapshot, Item,
-    ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism, PostExecuteError,
-    PostExecuteEvent, PreExecuteError, PreExecuteEvent, PreStepGateDecision, PreStepGateEvent,
-    ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorKind, ReplaySafety,
-    ResumeReason, RunRequest, SessionEvent, SessionState, StopReason, StreamEvent, Tool, ToolArgs,
-    ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind, ToolName,
-    ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor,
-    approval_signal_id, approval_signal_name, decode_entry, dedup,
+    ApprovalRequest, ApprovalVerdict, CancelReason, CancelRegistration, CancelToken,
+    CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
+    CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
+    Compactor, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism,
+    PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent, PreStepGateDecision,
+    PreStepGateEvent, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
+    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState,
+    StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
+    ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
+    TurnEndReason, Usage, UsageAnchor, UsageBucket, UsageRecorded, approval_signal_id,
+    approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -132,13 +133,96 @@ impl Agent {
         event: SessionEvent,
         key: Option<DedupKey>,
     ) -> Result<LogId, AgentError> {
-        let entry = asterpath_protocol::encode_entry(session, key, &event).map_err(|error| {
-            AgentError::Corrupt {
+        let entry =
+            asterpath_protocol::encode_entry(session, key.clone(), &event).map_err(|error| {
+                AgentError::Corrupt {
+                    session,
+                    detail: error.to_string(),
+                }
+            })?;
+        let log_id = self.log.append(entry).await?;
+        // The loop is the unique writer of every usage terminal, so it is the
+        // only emitter. Awaiting keeps the event ordered before the next gate.
+        if let Some(hooks) = &self.hooks {
+            let recorded = match &event {
+                SessionEvent::AssistantMessage {
+                    turn_id,
+                    step_id,
+                    model,
+                    usage,
+                    ..
+                } => Some(UsageRecorded {
+                    session,
+                    turn: Some(*turn_id),
+                    step: Some(*step_id),
+                    model: model.clone(),
+                    bucket: UsageBucket::ModelCall,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                SessionEvent::CompactionApplied { model, usage, .. } => Some(UsageRecorded {
+                    session,
+                    turn: self.compaction_turn(session, key.as_ref()).await?,
+                    step: None,
+                    model: model.clone(),
+                    bucket: UsageBucket::Compaction,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                SessionEvent::ModelCallAborted {
+                    turn_id,
+                    step_id,
+                    model,
+                    usage: Some(usage),
+                    ..
+                } => Some(UsageRecorded {
+                    session,
+                    turn: Some(*turn_id),
+                    step: Some(*step_id),
+                    model: model.clone(),
+                    bucket: UsageBucket::Partial,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                _ => None,
+            };
+            if let Some(recorded) = recorded {
+                hooks.emit(recorded).await;
+            }
+        }
+        Ok(log_id)
+    }
+
+    /// The turn a compaction belongs to: the open turn at its
+    /// `CompactionStarted`, which is the turn of the `caused_by` frontier.
+    async fn compaction_turn(
+        &self,
+        session: SessionId,
+        key: Option<&DedupKey>,
+    ) -> Result<Option<TurnId>, AgentError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let mut current = None;
+        for entry in self.scan(session).await? {
+            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
+            })?;
+            match &event {
+                SessionEvent::TurnStarted { turn_id } => current = Some(*turn_id),
+                SessionEvent::TurnCommitted { turn_id, .. } => {
+                    if current == Some(*turn_id) {
+                        current = None;
+                    }
+                }
+                SessionEvent::CompactionStarted { .. } if entry.dedup_key.as_ref() == Some(key) => {
+                    return Ok(current);
+                }
+                _ => {}
             }
-        })?;
-        Ok(self.log.append(entry).await?)
+        }
+        Ok(None)
     }
 
     async fn execute(&self, session: SessionId, cancel: &CancelToken, events: &EventSink) {
@@ -168,6 +252,14 @@ impl Agent {
         let mut intents = OpenIntents::default();
         for (entry, event) in &decoded {
             intents.apply(event, entry.dedup_key.as_ref());
+        }
+
+        // R4: a child whose parent already stopped waiting is an orphan; close
+        // its open intents as cancelled and never open another turn.
+        if self.parent_recorded_completion(session, &decoded).await? {
+            return self
+                .close_orphan(session, &decoded, intents.state(), events)
+                .await;
         }
 
         // A dangling compaction intent is redone only when a compactor is
@@ -312,6 +404,122 @@ impl Agent {
             events,
         )
         .await
+    }
+
+    /// R4: the parent stream already carries a terminal for this child. A
+    /// missing parent stream (retired) is not an orphan; an undecodable parent
+    /// record is a hard error and classification never runs.
+    async fn parent_recorded_completion(
+        &self,
+        session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
+    ) -> Result<bool, AgentError> {
+        let Some(parent) = decoded.iter().find_map(|(_, event)| match event {
+            SessionEvent::SessionCreated {
+                parent: Some(parent),
+                ..
+            } => Some(parent.session),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        let parent_decoded = decode_entries(self.scan(parent).await?, parent)?;
+        Ok(parent_decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::ChildSessionCompleted { child, .. } if *child == session
+            )
+        }))
+    }
+
+    /// Close an orphan: `StreamResumed`, the still-open intents as cancelled
+    /// terminals, then `StepCommitted` + `TurnCommitted(Cancelled)`. An orphan
+    /// that already closed its turn only stops; it does not open a new one.
+    async fn close_orphan(
+        &self,
+        session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
+        state: SessionState,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let SessionState::TurnOpen { turn, .. } = state else {
+            events.push(Ok(AgentEvent::Idle { session }));
+            return Ok(());
+        };
+        let from = decoded
+            .last()
+            .map(|(entry, _)| entry.log_id)
+            .unwrap_or_else(|| LogId::from_i64(0));
+        self.append(
+            session,
+            SessionEvent::StreamResumed {
+                from,
+                reason: ResumeReason::Crash,
+            },
+            None,
+        )
+        .await?;
+
+        let mut tools = BTreeSet::new();
+        let mut timers = BTreeSet::new();
+        let mut children = BTreeSet::new();
+        for (_, event) in decoded {
+            match event {
+                SessionEvent::ToolCallRequested { tool_call_id, .. } => {
+                    tools.insert(*tool_call_id);
+                }
+                SessionEvent::ToolResult { tool_call_id, .. } => {
+                    tools.remove(tool_call_id);
+                }
+                SessionEvent::TimerScheduled { timer_id, .. } => {
+                    timers.insert(*timer_id);
+                }
+                SessionEvent::TimerFired { timer_id }
+                | SessionEvent::TimerCancelled { timer_id } => {
+                    timers.remove(timer_id);
+                }
+                SessionEvent::ChildSessionSpawned { child, .. } => {
+                    children.insert(*child);
+                }
+                SessionEvent::ChildSessionCompleted { child, .. } => {
+                    children.remove(child);
+                }
+                _ => {}
+            }
+        }
+        for tool_call_id in tools {
+            self.append_tool_result(
+                session,
+                tool_call_id,
+                ToolResultStatus::Interrupted,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        }
+        for timer_id in timers {
+            // The runtime remains the single writer of timer terminals.
+            let _ = self.executor.cancel_timer(session, timer_id).await;
+        }
+        for child in children {
+            self.append(
+                session,
+                SessionEvent::ChildSessionCompleted {
+                    child,
+                    outcome: ChildOutcome::Cancelled {
+                        reason: CancelReason::Parent,
+                    },
+                },
+                Some(dedup::child_session(child)),
+            )
+            .await?;
+        }
+        if let Some((step, _)) = open_step(decoded, turn) {
+            self.commit_step(session, turn, step).await?;
+        }
+        self.commit_turn(session, turn, TurnEndReason::Cancelled, events)
+            .await
     }
 
     /// Close or refresh wait intents. Timers are recovered here; signal waits

@@ -9,16 +9,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath_core::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LifecycleError,
-    LogEntry, LogId, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId, SignalDelivery,
-    SignalPayload, StepId, TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
+    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
+    LifecycleError, LogEntry, LogId, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId,
+    SignalDelivery, SignalPayload, StepId, TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
-    AbortKind, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item, JsonString,
-    ModelId, ModelSpec, Parallelism, Part, PreExecuteError, PreExecuteEvent, Provenance, Provider,
-    ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger,
-    SessionEvent, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
+    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
+    ApprovalRequest, ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot,
+    ContextPolicy, DefaultApprovalPolicy, Item, JsonString, ModelId, ModelSpec, Parallelism,
+    ParentRef, Part, PreExecuteError, PreExecuteEvent, Provenance, Provider, ProviderCatalog,
+    ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent,
+    SideEffect, StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
     TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
     encode_entry,
@@ -272,8 +273,8 @@ impl ToolRegistry for Registry {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agent_with(
-    log: Arc<InMemoryEventLog>,
+fn agent_with<L: EventLog + 'static>(
+    log: Arc<L>,
     provider: Arc<ScriptedProvider>,
     tools: Vec<Arc<dyn Tool>>,
     approval: Arc<dyn ApprovalPolicy>,
@@ -282,6 +283,7 @@ fn agent_with(
     clock: Arc<ManualClock>,
     hooks: Option<ModuleCtx>,
 ) -> Box<dyn AgentRunner> {
+    let log: Arc<dyn EventLog> = log;
     let registry = Arc::new(Registry::default());
     for tool in tools {
         registry.register(tool);
@@ -1507,4 +1509,556 @@ async fn no_tool_call_after_assistant_message_commits_without_model_or_rerun() {
     assert_eq!(count(&entries, "StepCommitted"), 1);
     assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
     assert!(provider.requests().is_empty());
+}
+
+// --- #49: fork first request and R4 orphan recovery -----------------------
+
+const PARENT: SessionId = SessionId::from_bytes([8; 16]);
+const GRANDCHILD: SessionId = SessionId::from_bytes([7; 16]);
+const CHILD_INPUT: InputId = InputId::from_bytes([0x44; 16]);
+
+fn parent_ref() -> ParentRef {
+    ParentRef {
+        session: PARENT,
+        turn: TURN,
+        tool_call: CALL,
+    }
+}
+
+async fn append_to(
+    log: &Arc<InMemoryEventLog>,
+    session: SessionId,
+    event: SessionEvent,
+    key: Option<DedupKey>,
+) -> LogId {
+    let entry = encode_entry(session, key, &event).expect("encode");
+    log.append(entry).await.expect("append")
+}
+
+async fn scan_session(log: &Arc<InMemoryEventLog>, session: SessionId) -> Vec<LogEntry> {
+    let mut stream = log.scan(LogQuery {
+        session,
+        after: None,
+        limit: None,
+    });
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        entries.push(entry.expect("scan"));
+    }
+    entries
+}
+
+async fn seed_child(log: &Arc<InMemoryEventLog>, parent: Option<ParentRef>) {
+    append_to(
+        log,
+        SESSION,
+        SessionEvent::SessionCreated {
+            config: config(Vec::new()),
+            parent,
+        },
+        Some(dedup::session_created(SESSION)),
+    )
+    .await;
+}
+
+async fn seed_parent_waiting(log: &Arc<InMemoryEventLog>) {
+    append_to(
+        log,
+        PARENT,
+        SessionEvent::SessionCreated {
+            config: config(Vec::new()),
+            parent: None,
+        },
+        Some(dedup::session_created(PARENT)),
+    )
+    .await;
+    append_to(
+        log,
+        PARENT,
+        SessionEvent::ChildSessionSpawned {
+            child: SESSION,
+            task: vec![text("do the task")],
+            config: config(Vec::new()),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: CALL,
+            caused_by: LogId::from_i64(1),
+        },
+        Some(dedup::child_session(SESSION)),
+    )
+    .await;
+}
+
+async fn complete_parent(log: &Arc<InMemoryEventLog>, outcome: ChildOutcome) {
+    append_to(
+        log,
+        PARENT,
+        SessionEvent::ChildSessionCompleted {
+            child: SESSION,
+            outcome,
+        },
+        Some(dedup::child_session(SESSION)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fork_child_first_request_is_the_snapshot_plus_the_task() {
+    let log = Arc::new(InMemoryEventLog::new());
+    // The parent still waits: no orphan classification on the first drive.
+    seed_parent_waiting(&log).await;
+
+    // Exactly the stream the scheduler materializes for `context: fork`.
+    seed_child(&log, Some(parent_ref())).await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::ContextForked {
+            source: parent_ref(),
+            source_log: LogId::from_i64(2),
+            items: vec![Item::Message {
+                role: Role::User,
+                parts: vec![text("parent context")],
+            }],
+        },
+        Some(dedup::context_forked(SESSION)),
+    )
+    .await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::InputRecorded {
+            input: vec![text("do the task")],
+        },
+        Some(dedup::input_recorded(CHILD_INPUT)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let events = drive(&harness.agent).await;
+    assert!(
+        matches!(events.last(), Some(AgentEvent::TurnCommitted { .. })),
+        "the child runs its first turn"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].items,
+        vec![
+            Item::Message {
+                role: Role::User,
+                parts: vec![text("parent context")],
+            },
+            Item::Message {
+                role: Role::User,
+                parts: vec![text("do the task")],
+            },
+        ],
+        "the first request is the fork snapshot plus the task, nothing else"
+    );
+}
+
+#[tokio::test]
+async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
+    let log = Arc::new(InMemoryEventLog::new());
+    seed_parent_waiting(&log).await;
+    seed_child(&log, Some(parent_ref())).await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::ContextForked {
+            source: parent_ref(),
+            source_log: LogId::from_i64(2),
+            items: vec![Item::Message {
+                role: Role::User,
+                parts: vec![text("parent context")],
+            }],
+        },
+        Some(dedup::context_forked(SESSION)),
+    )
+    .await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::InputRecorded {
+            input: vec![text("do the task")],
+        },
+        Some(dedup::input_recorded(CHILD_INPUT)),
+    )
+    .await;
+    open_turn(&log).await;
+    append_event(
+        &log,
+        intent(CALL, "c1", "echo", ReplaySafety::Unsafe),
+        Some(dedup::tool_call(CALL)),
+    )
+    .await;
+    let timer = TimerId::from_bytes([1; 16]);
+    append_event(
+        &log,
+        SessionEvent::TimerScheduled {
+            timer_id: timer,
+            deadline: ManualClock::BASE + 60_000,
+            caused_by: LogId::from_i64(1),
+        },
+        Some(dedup::timer(timer)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::ChildSessionSpawned {
+            child: GRANDCHILD,
+            task: vec![text("grandchild task")],
+            config: config(Vec::new()),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: ToolCallId::from_bytes([0x55; 16]),
+            caused_by: LogId::from_i64(1),
+        },
+        Some(dedup::child_session(GRANDCHILD)),
+    )
+    .await;
+    // Window: parent recorded the cancellation but the child never closed.
+    complete_parent(
+        &log,
+        ChildOutcome::Cancelled {
+            reason: CancelReason::Parent,
+        },
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let gate = Arc::new(ApprovalGate::new());
+    let executor = Arc::new(TimerCancellingExecutor {
+        log: Arc::clone(&log),
+    });
+    let agent = agent_with(
+        Arc::clone(&log),
+        Arc::clone(&provider),
+        Vec::new(),
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        executor,
+        Arc::new(ManualClock::new()),
+        None,
+    );
+    let agent_events = drive(&agent).await;
+
+    assert!(provider.requests().is_empty(), "no new model request");
+    assert!(
+        matches!(
+            agent_events.last(),
+            Some(AgentEvent::TurnCommitted {
+                reason: TurnEndReason::Cancelled,
+                ..
+            })
+        ),
+        "the orphan turn closes as cancelled"
+    );
+
+    let entries = scan(&log).await;
+    assert_eq!(
+        kinds(&entries),
+        [
+            "SessionCreated",
+            "ContextForked",
+            "InputRecorded",
+            "TurnStarted",
+            "StepStarted",
+            "ToolCallRequested",
+            "TimerScheduled",
+            "ChildSessionSpawned",
+            "StreamResumed",
+            "ToolResult",
+            "TimerCancelled",
+            "ChildSessionCompleted",
+            "StepCommitted",
+            "TurnCommitted",
+        ]
+    );
+    let results = results(&entries);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].1, ToolResultStatus::Interrupted);
+    assert_eq!(count(&entries, "TurnStarted"), 1, "no new turn is opened");
+    assert_eq!(count(&entries, "TurnCommitted"), 1);
+    let grandchild = events(&entries)
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionCompleted { child, outcome } => Some((child, outcome)),
+            _ => None,
+        })
+        .expect("own child is closed");
+    assert_eq!(grandchild.0, GRANDCHILD);
+    assert_eq!(
+        grandchild.1,
+        ChildOutcome::Cancelled {
+            reason: CancelReason::Parent
+        }
+    );
+}
+
+#[tokio::test]
+async fn orphan_child_with_a_committed_turn_stays_idle() {
+    let log = seed(config(Vec::new())).await;
+    // The child already finished its turn; only the parent completion is new.
+    open_turn(&log).await;
+    append_event(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: TURN,
+            step_id: STEP,
+            items: completed(),
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        },
+        Some(dedup::assistant_message(TURN, STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::StepCommitted {
+            turn_id: TURN,
+            step_id: STEP,
+        },
+        Some(dedup::step_committed(STEP)),
+    )
+    .await;
+    append_event(
+        &log,
+        SessionEvent::TurnCommitted {
+            turn_id: TURN,
+            reason: TurnEndReason::Completed,
+        },
+        Some(dedup::turn_committed(TURN)),
+    )
+    .await;
+    complete_parent(
+        &log,
+        ChildOutcome::Completed {
+            summary: asterpath_protocol::Summary {
+                items: vec![text("done")],
+            },
+        },
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let events = drive(&harness.agent).await;
+    assert!(matches!(events.as_slice(), [AgentEvent::Idle { .. }]));
+    assert!(provider.requests().is_empty());
+    let entries = scan(&log).await;
+    assert_eq!(count(&entries, "TurnStarted"), 1);
+    assert_eq!(count(&entries, "TurnCommitted"), 1);
+}
+
+#[tokio::test]
+async fn missing_parent_continues_as_an_independent_session() {
+    let log = Arc::new(InMemoryEventLog::new());
+    // No parent stream at all: the parent was retired.
+    seed_child(&log, Some(parent_ref())).await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::InputRecorded {
+            input: vec![text("continue alone")],
+        },
+        Some(dedup::input_recorded(CHILD_INPUT)),
+    )
+    .await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    assert_eq!(provider.requests().len(), 1);
+    let entries = scan(&log).await;
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+}
+
+#[tokio::test]
+async fn an_open_parent_wait_does_not_orphan_the_child() {
+    // Window: the parent's cancellation was requested but no terminal record
+    // landed; #6 semantics resume the turn.
+    let log = Arc::new(InMemoryEventLog::new());
+    seed_parent_waiting(&log).await;
+    seed_child(&log, Some(parent_ref())).await;
+    append_to(
+        &log,
+        SESSION,
+        SessionEvent::InputRecorded {
+            input: vec![text("do the task")],
+        },
+        Some(dedup::input_recorded(CHILD_INPUT)),
+    )
+    .await;
+    open_turn(&log).await;
+
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        completed(),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
+    let _ = drive(&harness.agent).await;
+
+    assert_eq!(provider.requests().len(), 1, "the turn continues");
+    let entries = scan(&log).await;
+    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
+    assert_eq!(count(&entries, "StreamResumed"), 1);
+}
+
+#[tokio::test]
+async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
+    let inner = Arc::new(InMemoryEventLog::new());
+    seed_child(&inner, Some(parent_ref())).await;
+    append_to(
+        &inner,
+        SESSION,
+        SessionEvent::InputRecorded {
+            input: vec![text("do the task")],
+        },
+        Some(dedup::input_recorded(CHILD_INPUT)),
+    )
+    .await;
+    let corrupt = LogEntry {
+        log_id: LogId::from_i64(1),
+        session: PARENT,
+        seq: 1,
+        recorded_at: 0,
+        schema_version: 1,
+        dedup_key: None,
+        payload: serde_json::json!({"NoSuchEvent": {}}),
+    };
+    let log = Arc::new(CorruptParentLog {
+        inner: Arc::clone(&inner),
+        corrupt,
+    });
+
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let gate = Arc::new(ApprovalGate::new());
+    let agent = agent_with(
+        log,
+        provider,
+        Vec::new(),
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        Arc::new(NoopExecutor),
+        Arc::new(ManualClock::new()),
+        None,
+    );
+    let mut stream = agent.run(RunRequest {
+        session: SESSION,
+        trigger: RunTrigger::Resume,
+    });
+    let error = stream
+        .next()
+        .await
+        .expect("one event")
+        .expect_err("the corrupt parent is a hard error");
+    assert!(
+        matches!(error, AgentError::Corrupt { session, .. } if session == PARENT),
+        "got {error:?}"
+    );
+    // Orphan classification never ran, so no turn was opened or closed.
+    let entries = scan_session(&inner, SESSION).await;
+    assert_eq!(count(&entries, "TurnStarted"), 0);
+    assert_eq!(count(&entries, "StreamResumed"), 0);
+}
+
+/// Emits `TimerCancelled` like the runtime executor's `cancel_timer`.
+struct TimerCancellingExecutor {
+    log: Arc<InMemoryEventLog>,
+}
+
+impl DurableExecutor for TimerCancellingExecutor {
+    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn cancel_timer(
+        &self,
+        session: SessionId,
+        timer: TimerId,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        let log = Arc::clone(&self.log);
+        Box::pin(async move {
+            let entry = encode_entry(
+                session,
+                Some(dedup::timer(timer)),
+                &SessionEvent::TimerCancelled { timer_id: timer },
+            )
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            log.append(entry)
+                .await
+                .map(|_| ())
+                .map_err(|error| ExecutionError::Backend(error.to_string()))
+        })
+    }
+
+    fn await_signal(
+        &self,
+        _req: AwaitSignal,
+    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn deliver_signal(
+        &self,
+        _delivery: SignalDelivery,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn await_wake(
+        &self,
+        _session: SessionId,
+        _cause: WakeCause,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+}
+
+/// Delegating event log with one undecodable record on the parent stream.
+struct CorruptParentLog {
+    inner: Arc<InMemoryEventLog>,
+    corrupt: LogEntry,
+}
+
+impl EventLog for CorruptParentLog {
+    fn append(
+        &self,
+        entry: asterpath_core::NewEntry,
+    ) -> BoxFuture<'_, Result<LogId, asterpath_core::StorageError>> {
+        self.inner.append(entry)
+    }
+
+    fn scan(
+        &self,
+        query: LogQuery,
+    ) -> futures_core::stream::BoxStream<'_, Result<LogEntry, asterpath_core::StorageError>> {
+        if query.session == PARENT {
+            return futures_util::stream::once(async move { Ok(self.corrupt.clone()) }).boxed();
+        }
+        self.inner.scan(query)
+    }
+
+    fn frontier(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'_, Result<Option<LogId>, asterpath_core::StorageError>> {
+        self.inner.frontier(session)
+    }
 }

@@ -25,11 +25,13 @@ use asterpath_core::{
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
     OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
-    ToolRegistry, ToolSelection, UserInput, approval_signal_id, approval_signal_name, dedup,
+    ToolRegistry, ToolSelection, UsageQuery, UserInput, approval_signal_id, approval_signal_name,
+    dedup,
 };
 use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
 use asterpath_scheduler::SchedulerModule;
 use asterpath_tools::ToolsModule;
+use asterpath_usage::UsageModule;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
@@ -51,6 +53,7 @@ pub struct Asterpath {
     providers: Arc<ProviderCatalog>,
     tools: Arc<dyn ToolRegistry>,
     agent: Arc<dyn AgentRunner>,
+    usage: Arc<dyn UsageQuery>,
     executor: Arc<dyn DurableExecutor>,
     gate: Arc<ApprovalGate>,
     cancellations: Arc<CancellationRegistry>,
@@ -165,7 +168,14 @@ impl Asterpath {
         ));
         module_host.register(scheduler_module.clone());
 
+        let usage_module = Arc::new(UsageModule::new(
+            Arc::clone(&event_log),
+            Arc::clone(&session_catalog),
+        ));
+        module_host.register(usage_module.clone());
+
         module_host.init().await?;
+        let usage = usage_module.query();
         let tools = tools_module.registry();
         for tool in config.tools {
             tools.register(tool);
@@ -202,6 +212,7 @@ impl Asterpath {
             providers,
             tools,
             agent,
+            usage,
             executor,
             gate,
             cancellations,
@@ -302,6 +313,11 @@ impl Asterpath {
 
     pub fn session_catalog(&self) -> Arc<dyn SessionCatalog> {
         Arc::clone(&self.session_catalog)
+    }
+
+    /// Pull-side usage accounting over the assembled event log.
+    pub fn usage(&self) -> Arc<dyn UsageQuery> {
+        Arc::clone(&self.usage)
     }
 
     /// `None` when the injected backend does not implement retirement.
