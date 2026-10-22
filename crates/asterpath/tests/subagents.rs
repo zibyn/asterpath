@@ -304,6 +304,17 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     );
 
     let (child, spawned_config) = spawn_event(&parent_entries);
+    let spawn_tool = spawned_config
+        .tools
+        .iter()
+        .find(|tool| tool.name.as_str() == "spawn_agent")
+        .expect("the scheduler registers the spawn tool");
+    assert_eq!(spawn_tool.parallelism, Parallelism::Parallel);
+    assert_eq!(spawn_tool.replay, ReplaySafety::Safe);
+    assert_eq!(spawn_tool.side_effect, SideEffect::Mutating);
+    assert_eq!(spawn_tool.provenance, Provenance::InProcess);
+    assert_eq!(spawn_tool.timeout, None);
+
     let child_entries = scan(asterpath.event_log(), child).await;
     assert_eq!(
         kinds(&child_entries),
