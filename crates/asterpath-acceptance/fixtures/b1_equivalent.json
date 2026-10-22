@@ -1,0 +1,58 @@
+{
+  "provider": "p",
+  "model": "model-1",
+  "system": [{"Text": {"text": "be helpful"}}],
+  "tools": ["set_marker"],
+  "steps": [
+    {
+      "items": [
+        {
+          "Reasoning": {
+            "summary": [{"Text": {"text": "think"}}],
+            "binding": {
+              "provider": "p",
+              "model": "model-1",
+              "prefix_epoch": 0,
+              "tools_hash": ""
+            },
+            "raw": {
+              "provider": "p",
+              "model": "model-1",
+              "kind": "fixture.thinking",
+              "json": "{}"
+            }
+          }
+        },
+        {
+          "ToolCall": {
+            "call_id": "call-1",
+            "provider_item_id": null,
+            "name": "set_marker",
+            "raw_args": "{\"key\":\"k\",\"value\":\"v\"}",
+            "raw": null
+          }
+        }
+      ],
+      "stop_reason": "ToolUse",
+      "usage": {
+        "input": {"uncached": 10, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 5, "reasoning": 1}
+      }
+    },
+    {
+      "items": [
+        {
+          "Message": {
+            "role": "Assistant",
+            "parts": [{"Text": {"text": "done"}}]
+          }
+        }
+      ],
+      "stop_reason": "EndTurn",
+      "usage": {
+        "input": {"uncached": 20, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 3, "reasoning": 0}
+      }
+    }
+  ]
+}

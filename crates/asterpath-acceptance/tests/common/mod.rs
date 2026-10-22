@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod mock;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -81,6 +83,27 @@ pub struct Scenario<'a> {
 
 impl Testdrive {
     pub fn start(scenario: Scenario<'_>) -> Self {
+        let name = scenario.fixture.to_owned();
+        let command = Self::command(&scenario);
+        Self::spawn(command, name)
+    }
+
+    /// Scenario (b): the same binary and fixture, with a real adapter pointed at
+    /// a loopback mock. Both provider keys are set so the helper stays neutral.
+    pub fn start_provider(scenario: Scenario<'_>, provider: &str, base_url: &str) -> Self {
+        let name = scenario.fixture.to_owned();
+        let mut command = Self::command(&scenario);
+        command
+            .arg("--provider")
+            .arg(provider)
+            .arg("--base-url")
+            .arg(base_url)
+            .env("ANTHROPIC_API_KEY", "test-key")
+            .env("OPENAI_API_KEY", "test-key");
+        Self::spawn(command, name)
+    }
+
+    fn command(scenario: &Scenario<'_>) -> Command {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("testdrive"));
         command
             .arg(if scenario.run { "run" } else { "resume" })
@@ -95,6 +118,10 @@ impl Testdrive {
         for failpoint in &scenario.failpoints {
             command.arg("--failpoint").arg(failpoint);
         }
+        command
+    }
+
+    fn spawn(mut command: Command, name: String) -> Self {
         let mut child = command.spawn().expect("spawn testdrive");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
@@ -117,7 +144,6 @@ impl Testdrive {
             let _ = BufReader::new(stderr).read_to_string(&mut buffer);
             buffer
         });
-        let name = scenario.fixture.to_owned();
         Self {
             child,
             rx,
