@@ -129,6 +129,7 @@ dependencies = [
  "asterpath",
  "asterpath-core",
  "asterpath-protocol",
+ "asterpath-testing",
  "clap",
  "futures-util",
  "serde",

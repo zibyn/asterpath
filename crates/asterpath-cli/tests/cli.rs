@@ -1,11 +1,18 @@
-//! Reference CLI behaviour: run, inspect and config check.
+//! Reference CLI behaviour: run, resume, inspect, trace, usage and config check.
 
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use assert_cmd::Command;
+use asterpath::{Asterpath, anthropic::AnthropicProvider};
+use asterpath_core::{InputId, TurnId};
+use asterpath_protocol::{
+    CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionEvent,
+    SessionSpec, SubagentConfig, ToolSelection, TurnConfig, UserInput, encode_entry,
+};
 use common::MockServer;
 
 fn bin() -> Command {
@@ -364,6 +371,295 @@ fn db_flag_wins_over_the_environment() {
         ])
         .assert()
         .code(1);
+}
+
+#[test]
+fn resume_prints_idle_for_a_finished_session() {
+    let (dir, session) = completed_session("resume-idle");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args(["resume", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run resume");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "idle");
+}
+
+#[test]
+fn resume_continues_an_open_turn() {
+    let server = MockServer::start(common::text_sse("Resumed turn"));
+    let (dir, session) = prepared_session("resume-open", &server, true);
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args(["resume", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run resume");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Resumed turn"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn resume_continues_pending_input() {
+    let server = MockServer::start(common::text_sse("Pending input ran"));
+    let (dir, session) = prepared_session("resume-pending", &server, false);
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args(["resume", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run resume");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Pending input ran"
+    );
+}
+
+#[test]
+fn resume_unknown_session_exits_one() {
+    let dir = TestDir::new("resume-missing");
+    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+
+    bin()
+        .args([
+            "resume",
+            "--config",
+            config.to_str().unwrap(),
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn trace_prints_the_span_tree() {
+    let (dir, session) = completed_session("trace-tree");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args(["trace", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run trace");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for prefix in [
+        "session session",
+        "  turn turn",
+        "    step step",
+        "      model_call chat",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line.starts_with(prefix)),
+            "missing {prefix:?} in:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn trace_json_prints_the_full_spans() {
+    let (dir, session) = completed_session("trace-json");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args([
+            "trace",
+            "--json",
+            "--config",
+            config.to_str().unwrap(),
+            &session,
+        ])
+        .output()
+        .expect("run trace");
+    assert!(output.status.success());
+    let spans: serde_json::Value = serde_json::from_slice(&output.stdout).expect("span json");
+    let spans = spans.as_array().expect("span list");
+    for kind in ["Session", "Turn", "Step", "ModelCall"] {
+        assert!(
+            spans.iter().any(|span| span["kind"] == kind),
+            "missing {kind}: {spans:?}"
+        );
+    }
+    assert!(spans.iter().all(|span| span["session"].is_string()));
+}
+
+#[test]
+fn trace_unknown_session_exits_one() {
+    let dir = TestDir::new("trace-missing");
+    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+
+    bin()
+        .args([
+            "trace",
+            "--config",
+            config.to_str().unwrap(),
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn usage_lists_own_and_descendants_totals() {
+    let (dir, session) = completed_session("usage-text");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args(["usage", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run usage");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("own: input=5 output=2 total=7"), "{stdout}");
+    assert!(
+        stdout.contains("descendants: input=0 output=0 total=0"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn usage_json_prints_the_report() {
+    let (dir, session) = completed_session("usage-json");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .args([
+            "usage",
+            "--json",
+            "--config",
+            config.to_str().unwrap(),
+            &session,
+        ])
+        .output()
+        .expect("run usage");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("usage json");
+    assert_eq!(report["own"]["model_calls"]["input"]["uncached"], 5);
+    assert_eq!(report["own"]["model_calls"]["output"]["total"], 2);
+    assert_eq!(report["descendants"]["model_calls"]["input"]["uncached"], 0);
+}
+
+#[test]
+fn usage_unknown_session_exits_one() {
+    let dir = TestDir::new("usage-missing");
+    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+
+    bin()
+        .args([
+            "usage",
+            "--config",
+            config.to_str().unwrap(),
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn explicit_ask_without_a_tty_is_a_usage_error() {
+    let dir = TestDir::new("ask-non-tty");
+    let config = dir.config("");
+
+    bin()
+        .args([
+            "run",
+            "--config",
+            config.to_str().unwrap(),
+            "--approval",
+            "ask",
+            "hi",
+        ])
+        .assert()
+        .code(2);
+}
+
+/// Create a session through the library: pending input, optionally with an
+/// already-open turn. No drive happens, so the CLI must resume it.
+fn prepared_session(name: &str, server: &MockServer, turn_started: bool) -> (TestDir, String) {
+    let dir = TestDir::new(name);
+    dir.config(&config_body(server, &dir.db()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let session = runtime.block_on(async {
+        let provider = AnthropicProvider::new("test-key").with_base_url(server.base_url());
+        let asterpath = Asterpath::builder()
+            .database(dir.db())
+            .provider(Arc::new(provider))
+            .build()
+            .await
+            .expect("build");
+        let handle = asterpath
+            .create_session(SessionSpec {
+                model: ModelSpec {
+                    provider: ProviderId::new("anthropic"),
+                    model: ModelId::new("claude-test"),
+                    context_window: None,
+                },
+                system: Vec::new(),
+                tools: ToolSelection::All,
+                request: RequestConfig::default(),
+                turn: TurnConfig::default(),
+                compaction: CompactionConfig::default(),
+                subagents: SubagentConfig::default(),
+            })
+            .await
+            .expect("create session");
+        handle
+            .submit_input(UserInput {
+                id: InputId::from_bytes([7; 16]),
+                parts: vec![Part::Text {
+                    text: "hi".to_owned(),
+                }],
+            })
+            .await
+            .expect("submit input");
+        if turn_started {
+            let entry = encode_entry(
+                handle.id(),
+                None,
+                &SessionEvent::TurnStarted {
+                    turn_id: TurnId::from_bytes([9; 16]),
+                },
+            )
+            .expect("encode turn");
+            asterpath
+                .event_log()
+                .append(entry)
+                .await
+                .expect("append turn");
+        }
+        let session = handle.id().to_hex();
+        asterpath.shutdown().await.expect("shutdown");
+        session
+    });
+    (dir, session)
 }
 
 /// Run one successful turn and return the directory and session id.
