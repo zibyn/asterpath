@@ -10,7 +10,8 @@ use crate::ids::{LogId, SessionId, SignalId, TimerId};
 use crate::time::Timestamp;
 
 /// Key used to make a log append idempotent within one session stream.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct DedupKey(String);
 
 impl DedupKey {
@@ -30,7 +31,8 @@ impl fmt::Debug for DedupKey {
 }
 
 /// Name of a durable signal within a session.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct SignalName(String);
 
 impl SignalName {

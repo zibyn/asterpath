@@ -18,7 +18,9 @@ pub use contracts::{
 };
 pub use error::{ExecutionError, LifecycleError, RetirementError, StorageError};
 pub use event::{Event, Handler, Middleware, Next, WaterfallEvent};
-pub use ids::{InputId, LogId, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId};
+pub use ids::{
+    InputId, LogId, LogIdRange, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId,
+};
 pub use module::{Effect, Module, ModuleCtx, ModuleHost};
 pub use service::{ServiceId, ServiceKey, service_key};
 pub use time::{Clock, SystemClock, Timestamp};
