@@ -343,3 +343,29 @@ _Avoid_: 失败消耗、估算用量
 **自身用量 / 子树用量（Own / Subtree Usage）**：
 自身用量是单个会话日志内的用量；子树用量是自身加全部后代会话的用量，两者分开返回。
 _Avoid_: 父总量、累计用量
+
+## 打包与交付
+
+**门面（Facade）**：
+把合约与默认模块组装成一个稳定入口的 crate；嵌入者只依赖它就能创建并驱动 session。
+_Avoid_: SDK、入口库
+
+**稳定面（Stability Surface）**：
+明确承诺 semver 的公开 API 集合；不在其中的公开项不构成兼容承诺。
+_Avoid_: 公共 API
+
+**配置快照（Config Snapshot）**：
+session 创建时解析并持久化的配置投影；之后宿主配置变化不影响该 session。
+_Avoid_: session 配置、运行时配置
+
+**验收场景（Acceptance Scenario）**：
+以真实进程、真实日志与真实副作用验证恢复、协议与子会话不变量的一段可执行测试。
+_Avoid_: 集成测试、E2E
+
+**测试驱动（Testdrive）**：
+验收专用、随测试构建的组装二进制；用脚本化 provider 驱动真实模块，可被强杀并重启。
+_Avoid_: 测试服务器
+
+**骨架（Walking Skeleton）**：
+端到端最小可运行实现：一次模型调用、一次工具调用、日志提交与恢复；用于验证 spec 可开工。
+_Avoid_: 原型、MVP

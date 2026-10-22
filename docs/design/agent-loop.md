@@ -332,5 +332,5 @@ pub struct TurnConfig {
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
 - **#13**：已定。token 聚合、`partial` 桶、`UsageRecorded` 发射点见 [usage.md](usage.md)。
-- **#15**：`AgentRunner::run` / `SessionHandle` 的精确签名。
+- **#15**：已定。`AgentRunner::run` / `SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
 - **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、`DurableExecutor` 接缝见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。

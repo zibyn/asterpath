@@ -266,6 +266,7 @@ pub trait AgentRunner: Send + Sync {
 | 门面 / CLI | 任意 workspace 成员 |
 | 测试替身 | `asterpath-core`、`asterpath-protocol` |
 
+- 最终成员列表、每个 crate 的职责与 v1 交付边界见 [packaging.md](packaging.md) §2。M0 起根目录 `deps-allowlist.toml` 是白名单的机器可读来源，由 `cargo xtask check-deps` 校验；`asterpath-testing` 只依赖合约，需要真实组装的验收测试放 `asterpath-acceptance`。
 - core/protocol 不带 feature flags；feature 只出现在边缘/后端 crate，且不得改变公共契约类型。
 - 跨模块类型只有两条路：进合约 crate，或变成 trait/事件。"加一个模块依赖"不是选项。
 
@@ -284,7 +285,7 @@ pub trait AgentRunner: Send + Sync {
 | #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
-| #15 打包 | 最终 crate 列表、门面、CLI 打包 |
+| #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
 | #16 插件分发 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现出界 |
 
 ## 9. 明确留给下游的点
