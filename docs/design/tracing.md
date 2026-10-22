@@ -10,7 +10,7 @@
 >
 > - `LogEntry` 增加诊断时间 `recorded_at`；I4 改为“时间只影响 trace/审计，不参与逻辑”（#3 / ADR-0002）。
 > - 新增 `CompactionStarted` 意图记录（#9）。
-> - 新增 `SignalAwaited` 意图记录（#3；API 归 #17）。
+> - 新增 `SignalAwaited` 意图记录（#3；API 见 ADR-0014）。
 > - `asterpath-storage-sqlite` 的 `log` 表增加 `recorded_at` 列（#5）。
 
 ## 1. 决策摘要

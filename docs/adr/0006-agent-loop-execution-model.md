@@ -13,7 +13,7 @@
 - **`StepCommitted` 是 step 的通用终态**：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达。不新增 `StepCancelled` / `StepFailed`。
 - **模型请求的投影水位是 `StepStarted.seq`**：只投影它之前的记录；重试复用同一投影；新输入只在下一个 step 可见。
 - **steering 只排队，不打断模型流**：输入到达即 `InputRecorded`，在 step 边界 drain；无工具调用时若有 pending input，同一回合继续。
-- **取消是回合级、协作式**：模型流立即 abort；工具给 `cancel_grace`（默认 10s），到期 drop 并写 `Interrupted`；等待意图由 loop 收尾（`TimerCancelled` / `ChildSessionCompleted{Cancelled}`）。
+- **取消是回合级、协作式**：模型流立即 abort；工具给 `cancel_grace`（默认 10s），到期 drop 并写 `Interrupted`；等待意图由 loop 收尾（`TimerCancelled` / `ChildSessionCompleted{Cancelled{Parent}}`）。
 - **模型失败在 step 内按 attempt 重试**；工具失败不重试，作为模型可见结果。默认 `max_attempts = 3`，指数退避 + jitter。
 - **usage 与 stop_reason 记在 `AssistantMessage`**，`StepCommitted` 只作检查点标记；恢复时若 `AssistantMessage` 已存在则不重调模型。
 - **默认不设 step 上限**；宿主通过 pre-step waterfall gate 实施停止策略；`MaxTurns` 改名 `MaxStepsExceeded`，并新增 `ContextExhausted`、`CompactionFailed`。

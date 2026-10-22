@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#8](https://github.com/zibyn/asterpath/issues/8)
+**2026-10-22 #17 修订**: `ChildOutcome::Cancelled` 携带 `CancelReason { Parent, Host, Timeout }`；API 与持久超时见 [ADR-0014](0014-subagent-scheduling-api.md)。
 
 ## Context
 
@@ -16,9 +17,9 @@
 - **spawn 是一次同步工具调用。** 模型可见的 spawn 工具由 `asterpath-scheduler` 提供，走 #7 的 pre-execute → 意图 → 审批 → 执行管线；调用在子会话完成前保持 open，父 step 处于 `Waiting`，崩溃后重新挂起。fan-out = 同一 `AssistantMessage` 里多个 spawn 调用并行。v1 不做后台/异步 spawn。
 - **子智能体是独立子会话。** 独立日志流、独立恢复与取消单位；父流只记 spawn 的 `ToolCallRequested`、`ChildSessionSpawned`、`ChildSessionCompleted` 与 spawn 的 `ToolResult`。子的 step、工具与计划只在子流。
 - **默认 fresh，fork 是物化快照。** 子默认只拿到任务与继承的 system prompt；`context: fork` 按次 opt-in，快照为父会话在 spawn 所在 step 水位的投影，物化进子流的 `ContextForked`，不是对父日志的活引用。父后续压缩/归档不影响子。
-- **结果是状态 + 任务总结。** `ChildOutcome { Completed | Failed | Cancelled | Lost }` 携带子最后一条已提交助手消息的 text/refusal。任务失败仍是成功的工具结果；只有基础设施问题（参数、深度、丢失、超时）才是工具失败。完整 transcript 不自动进入父上下文。
+- **结果是状态 + 任务总结。** `ChildOutcome { Completed | Failed | Cancelled{reason} | Lost }` 携带子最后一条已提交助手消息的 text/refusal；`CancelReason` 区分父取消、子宿主取消与超时。任务失败仍是成功的工具结果；只有基础设施问题（参数、深度、丢失、超时）才是工具失败。完整 transcript 不自动进入父上下文。
 - **配置在 spawn 时刻快照继承。** 子会话的 `ConfigSnapshot` 同时写入 `SessionCreated` 与父流的 `ChildSessionSpawned`；之后父配置变化不影响子。模型可见参数只能收窄（宿主 alias 集合、工具 allowlist），不能放宽审批或替换 system prompt。沙箱仍归扩展模块/宿主。
-- **取消传播，父先收尾。** 父取消向子发取消并等 `cancel_grace`；进入 cancelling 的等待一律记 `Cancelled`，父在 `ToolResult` 之前写 `ChildSessionCompleted`。父不写子流，子不写父流。
+- **取消传播，父先收尾。** 父取消向子发取消并等 `cancel_grace`；进入 cancelling 的等待一律记 `Cancelled{Parent}`，父在 `ToolResult` 之前写 `ChildSessionCompleted`。父不写子流，子不写父流。
 - **孤儿 = 父已不再等待。** 子恢复时若父流已有针对自己的 `ChildSessionCompleted`，按取消收尾并停止，不再开新 turn。spawn 按 `parent_tool_call_id` 查找幂等，恢复绝不重复创建子会话。
 - **usage 不复制。** 子的 usage 只写子流；父子归因靠 session 树，查询时 rollup，`ChildSessionCompleted` 不携带 usage。
 

@@ -39,7 +39,7 @@ pub struct ParentRef {
 - `SessionId` 就是流身份，不再有 `StreamId` 枚举。
 - 子智能体是**独立子 session**：独立日志、独立恢复与取消单位。
 - 父流记 `ChildSessionSpawned`，记录父子关系；子流首条 `SessionCreated` 的 `parent` 指回父会话、turn 与 tool call。
-- 子会话创建时，父流写 `ChildSessionSpawned`（携带子配置与上下文策略）；子结束时父流写终态 `ChildSessionCompleted`（幂等，key = child id）。二者在正常运行时由 scheduler 写，恢复时由父驱动方代写。
+- 子会话创建时，父流写 `ChildSessionSpawned`（携带子配置与上下文策略）；子结束时父流写终态 `ChildSessionCompleted`（幂等，key = child id）。二者在正常运行时由 scheduler 写，恢复时由 spawn 工具重放经 `SubagentSpawner` 代写（#17）。
 - 父子之间没有原子性。关闭顺序、孤儿处理、结果形状见 [subagents.md](subagents.md)。
 - 等待原语（timer / signal）是 session 事件；不引入 activity / workflow 概念。
 
@@ -119,7 +119,7 @@ pub enum TurnEndReason {
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `SignalAwaited` 是 signal 等待的意图记录；审批不走它，因为 open 的 `ToolCallRequested` 已经承担意图（[tools.md](tools.md)）。`SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
-- timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)；存储投递归 #5。
+- timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0014](../adr/0014-subagent-scheduling-api.md)）；存储投递归 #5。
 
 ## 4. 信封与幂等键
 
@@ -214,12 +214,9 @@ recover(session):
         Timer        -> if caused_by 已终结: append(TimerCancelled{timer_id})
                         else if deadline 已过: 立即入队 fire
                         else: 重新挂起
-        ChildSession -> if caused_by 已终结: append(ChildSessionCompleted{Cancelled})
-                        else 查询子会话最终状态（[subagents.md](subagents.md) §9）：
-                              已完成 -> append(ChildSessionCompleted)
-                              运行中 -> 重新挂起等待
-                              未物化 -> R2 物化并启动
-                              不可读 -> append(ChildSessionCompleted{Lost})
+        ChildSession -> 不在本步骤预收尾；交给 spawn 工具重放：
+                          spawn 做 R1/R2，await_completion 查子终态、
+                          写 ChildSessionCompleted 或重新挂起（subagents.md §9）
         SignalAwaited -> 保持等待；到达时由投递方 append(SignalReceived)
 
     # 2b. 未完成的压缩：CompactionStarted 无 CompactionApplied
@@ -266,6 +263,6 @@ recover(session):
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
-- **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
+- **#17**：已定。子等待恢复委托给 spawn 工具重放；`DurableExecutor` 接缝与 spawner API 见 [subagents.md](subagents.md) §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#12**：已定。trace 是日志的确定性投影；`recorded_at`、`CompactionStarted`、`SignalAwaited` 的追踪挂接见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 - **#16**：已定。插件清单、加载、版本协商与外部能力边界见 [plugins.md](plugins.md)；v1 不做插件发现。`Provenance` 新增 `Unknown`，只用于工具不存在的请求记录。

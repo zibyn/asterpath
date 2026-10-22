@@ -132,7 +132,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ```
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
-- `Ask` 时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `await_signal("tool.approval.<tool_call_id>")`。
+- `Ask` 时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { intent: SignalIntent::AlreadyRecorded, name: "tool.approval.<tool_call_id>", .. })`。
 - 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: {Allow | Deny, reason?} }`。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
 - Deny 的 `reason` 写入 `ToolResult.error.message`；没有 reason 时用固定文本。
@@ -140,7 +140,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。host 不得在调用 open 期间热换策略（v1 无热替换，#2）。
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
 - 不引入独立的 `Approver` trait：host 通过订阅 `ApprovalRequested` 并投递 signal 来充当审批端；等待由 `DurableExecutor` 承担（#17）。
-- signal name 只在会话内唯一；`DurableExecutor` 的实现必须按 session 作用域等待（#17）。
+- signal name 只在会话内唯一；signal id 由 `(session, name)` 确定性派生（审批 name 为 `tool.approval.<tool_call_id>`），重复注册/投递不会产生第二个等待。`DurableExecutor` 按 session 作用域等待（#17）。
 - 非审批的 `await_signal` 在等待开始前写 `SignalAwaited`（#3）；审批不写，因为 open 的 `ToolCallRequested` 已承担意图记录。
 - 未安装任何审批端时，`Ask` 按 `Deny` 处理（fail closed）。
 
@@ -300,5 +300,5 @@ pub struct ToolConfig {
 - **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
-- **#17**：`DurableExecutor::await_signal` 必须支持审批等待；signal name 约定由本文件定义。
+- **#17**：已定。`DurableExecutor::await_signal` 以 `SignalIntent::AlreadyRecorded` 支持审批等待，不写 `SignalAwaited`；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。

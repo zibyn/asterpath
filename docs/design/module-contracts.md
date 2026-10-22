@@ -133,16 +133,26 @@ pub trait SessionCatalog: Send + Sync {
 }
 
 pub trait DurableExecutor: Send + Sync {
-    fn schedule_timer(&self, deadline: Timestamp)
+    fn schedule_timer(&self, req: TimerRequest)
         -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
-    fn await_signal(&self, name: SignalName)
+    fn cancel_timer(&self, session: SessionId, timer: TimerId)
+        -> BoxFuture<'_, Result<(), ExecutionError>>;
+    fn await_signal(&self, req: AwaitSignal)
         -> BoxFuture<'_, Result<SignalPayload, ExecutionError>>;
+    fn deliver_signal(&self, delivery: SignalDelivery)
+        -> BoxFuture<'_, Result<(), ExecutionError>>;
+    fn await_wake(&self, session: SessionId, cause: WakeCause)
+        -> BoxFuture<'_, Result<(), ExecutionError>>;
+    fn wake(&self, session: SessionId, cause: WakeCause);   // 仅内存
 }
 ```
 
 - `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
-- `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定。v1 没有 activity / workflow。
+- `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定（[ADR-0014](../adr/0014-subagent-scheduling-api.md)）。v1 没有 activity / workflow。
+- timer id 由 `(session, caused_by, slot)` 确定性派生；审批 signal id 即 `tool_call_id`，通用 signal id 由 `(session, name)` 派生。重复注册返回同一 id，恢复重放不会制造第二个等待。
+- `await_signal` 的 `SignalIntent` 区分 `Record`（写 `SignalAwaited`）与 `AlreadyRecorded`（审批：open `ToolCallRequested` 已是意图记录）。
+- `wake` 只在内存；终态记录的写者先 append 再 wake。注册表不持久化，恢复靠扫描日志重建。
 - `LogEntry` 是 `{ kind, schema_version, payload }`；带类型的会话事件在 protocol，core 不依赖 protocol。
 
 ### 3.5 错误与 ID
@@ -268,9 +278,9 @@ pub trait AgentRunner: Send + Sync {
 | #5 存储与 SQLite | `Storage` 方法集与 schema；实现是模块 |
 | #6 agent loop | `AgentRunner` 在 protocol；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
 | #7 工具与审批 | 已定。`Tool` / `ToolRegistry` / `Provenance` 在 protocol；管线与审批见 [tools.md](tools.md)、[ADR-0007](../adr/0007-approval-and-sandbox-layers.md) |
-| #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) |
+| #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md) |
 | #9 上下文压缩 | 已定。`Compactor` 在 protocol，默认实现 `asterpath-compaction`；见 [compaction.md](compaction.md) |
-| #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
+| #17 调度 API | 已定。`DurableExecutor` 在 core，`SubagentSpawner` 在 scheduler；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；不做通用 workflow |
 | #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
@@ -279,7 +289,7 @@ pub trait AgentRunner: Send + Sync {
 
 ## 9. 明确留给下游的点
 
-- `DurableExecutor` 的完整方法集与重放绑定：#3/#10。
+- `DurableExecutor` 的方法集与等待 id 派生：已定，见 §3.4 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；等待语义归 #3。
 - `Storage` 方法与 SQLite schema：#4。
 - `LogEntry` 编码与 schema 版本：#3/#4。
 - 会话生命周期事件枚举：#3/#11。

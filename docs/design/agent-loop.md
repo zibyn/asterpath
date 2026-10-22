@@ -166,6 +166,7 @@ run_turn(session):
 - 若该 step 无 `AssistantMessage` 且最后一条 `ModelCallAborted` 是 `Crash` / `Transport`，按重试策略重调模型；`Transport` 耗尽则 `StepCommitted` + `TurnCommitted(Failed)`。
 - 若最后一条 abort 是 `Cancelled` / `Rejected`，按取消/失败收尾，不重试（#3 §6）。
 - 工具完成后写 `StepCommitted`，再按 §4 的继续规则决定下一个 step 或 `TurnCommitted`。
+- open 的 spawn 工具按 `Safe` 重放；`spawn` / `await_completion` 吸收 R1–R3（[subagents.md](subagents.md) §9）。恢复不为 child 等待另设预收尾路径。
 
 ### 4.2 事件序列示例
 
@@ -239,7 +240,7 @@ StepCommitted
 - **模型流中**：立即 abort，写 `ModelCallAborted{Cancelled}`，不重试；`StepCommitted`；`TurnCommitted(Cancelled)`。
 - **退避等待中**：打断 sleep，同上。
 - **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。已写入的结果不覆盖。外部子进程/MCP server 在宽限后强杀，见 [tools.md](tools.md) §6。
-- **等待意图**：到期后由驱动方收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled}`（正常运行时 scheduler 是父流子生命周期记录的唯一写者）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
+- **等待意图**：到期后由驱动方收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled{Parent}}`（正常运行时 scheduler 是父流子生命周期记录的唯一写者）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
 - 顺序：取消信号 → 宽限 → 收尾等待 → `StepCommitted` → `TurnCommitted(Cancelled)`。
 - 取消不重试、不恢复：已提交的取消记录让恢复跳过该 step。
 
@@ -332,4 +333,4 @@ pub struct TurnConfig {
 - **#12**：span 命名与属性映射。
 - **#13**：已定。token 聚合、`partial` 桶、`UsageRecorded` 发射点见 [usage.md](usage.md)。
 - **#15**：`AgentRunner::run` / `SessionHandle` 的精确签名。
-- **#17**：timer/signal API；`TimerScheduled.caused_by` 与等待归属；取消如何触发。
+- **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、`DurableExecutor` 接缝见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
