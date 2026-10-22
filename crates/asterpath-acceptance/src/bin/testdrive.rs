@@ -43,6 +43,9 @@ struct Args {
     fixture: Option<PathBuf>,
     session: Option<String>,
     failpoints: Vec<Failpoint>,
+    /// When set, use the real adapter for this id instead of the scripted one.
+    provider: Option<String>,
+    base_url: Option<String>,
 }
 
 fn usage_error(message: &str) -> i32 {
@@ -53,19 +56,23 @@ fn usage_error(message: &str) -> i32 {
 fn run() -> Result<i32, String> {
     let Some(command) = std::env::args().nth(1) else {
         return Ok(usage_error(
-            "usage: testdrive <run|resume|inspect> --db <path> [--fixture <path>]",
+            "usage: testdrive <run|resume|inspect> --db <path> [--fixture <path>] [--provider <id> --base-url <url>]",
         ));
     };
     let mut db = None;
     let mut fixture = None;
     let mut session = None;
     let mut specs = Vec::new();
+    let mut provider = None;
+    let mut base_url = None;
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => db = args.next().map(PathBuf::from),
             "--fixture" => fixture = args.next().map(PathBuf::from),
             "--session" => session = args.next(),
+            "--provider" => provider = args.next(),
+            "--base-url" => base_url = args.next(),
             "--failpoint" => match args.next() {
                 Some(spec) => specs.push(spec),
                 None => return Ok(usage_error("--failpoint needs a value")),
@@ -78,6 +85,11 @@ fn run() -> Result<i32, String> {
     let Some(db) = db else {
         return Ok(usage_error("--db is required"));
     };
+    if provider.is_some() != base_url.is_some() {
+        return Ok(usage_error(
+            "--provider and --base-url are required together",
+        ));
+    }
     let failpoints = match parse_failpoints(&specs) {
         Ok(failpoints) => failpoints,
         Err(error) => return Ok(usage_error(&error)),
@@ -88,6 +100,8 @@ fn run() -> Result<i32, String> {
         fixture,
         session,
         failpoints,
+        provider,
+        base_url,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -144,6 +158,45 @@ fn hold_millis(run_mode: bool) -> u64 {
     }
 }
 
+/// Real adapters differ only in this table row: an id, its key variable and its
+/// constructor. The scenario code below never branches on the provider.
+struct Adapter {
+    id: &'static str,
+    key_env: &'static str,
+    build: fn(&str, &str) -> Arc<dyn Provider>,
+}
+
+fn build_anthropic(api_key: &str, base_url: &str) -> Arc<dyn Provider> {
+    Arc::new(asterpath::anthropic::AnthropicProvider::new(api_key).with_base_url(base_url))
+}
+
+fn build_openai(api_key: &str, base_url: &str) -> Arc<dyn Provider> {
+    Arc::new(asterpath::openai::OpenAiProvider::new(api_key).with_base_url(base_url))
+}
+
+const ADAPTERS: &[Adapter] = &[
+    Adapter {
+        id: "anthropic",
+        key_env: "ANTHROPIC_API_KEY",
+        build: build_anthropic,
+    },
+    Adapter {
+        id: "openai",
+        key_env: "OPENAI_API_KEY",
+        build: build_openai,
+    },
+];
+
+fn real_provider(id: &str, base_url: &str) -> Result<Arc<dyn Provider>, String> {
+    let adapter = ADAPTERS
+        .iter()
+        .find(|adapter| adapter.id == id)
+        .ok_or_else(|| format!("unknown provider {id}"))?;
+    let api_key = std::env::var(adapter.key_env)
+        .map_err(|_| format!("{} is required for provider {id}", adapter.key_env))?;
+    Ok((adapter.build)(&api_key, base_url))
+}
+
 fn effect_file() -> Result<PathBuf, String> {
     std::env::var("ASTERPATH_EFFECT_FILE")
         .map(PathBuf::from)
@@ -184,7 +237,7 @@ async fn scan(
 async fn assemble(
     args: &Args,
     fixture: &Fixture,
-    provider: Arc<ScriptedProvider>,
+    provider: Arc<dyn Provider>,
 ) -> Result<Asterpath, String> {
     let clock = Arc::new(ManualClock::new());
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
@@ -232,15 +285,26 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
         .ok_or_else(|| "--fixture is required".to_owned())?;
     let fixture = fixture_from(path)?;
 
-    let mut provider = ScriptedProvider::from_fixture(&fixture);
-    if run_mode && fixture.stream_open_first_attempt {
-        provider = provider.stream_open_on_first_attempt();
-    }
-    let provider = Arc::new(provider);
-    let asterpath = assemble(args, &fixture, Arc::clone(&provider)).await?;
+    let scripted = if args.provider.is_none() {
+        let mut provider = ScriptedProvider::from_fixture(&fixture);
+        if run_mode && fixture.stream_open_first_attempt {
+            provider = provider.stream_open_on_first_attempt();
+        }
+        Some(Arc::new(provider))
+    } else {
+        None
+    };
+    let provider: Arc<dyn Provider> = match &scripted {
+        Some(scripted) => Arc::clone(scripted) as Arc<dyn Provider>,
+        None => real_provider(
+            args.provider.as_deref().expect("provider parsed"),
+            args.base_url.as_deref().expect("base url parsed"),
+        )?,
+    };
+    let asterpath = assemble(args, &fixture, provider).await?;
 
     let session = if run_mode {
-        let spec = session_spec(&fixture);
+        let spec = session_spec(&fixture, args.provider.as_deref());
         let handle = asterpath
             .create_session(spec)
             .await
@@ -288,7 +352,9 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
                 _ => false,
             })
             .count();
-        provider.skip(committed_attempts);
+        if let Some(scripted) = &scripted {
+            scripted.skip(committed_attempts);
+        }
         emit(json!({"event": "session", "id": session.to_hex()}));
         asterpath
             .open_session(session)
@@ -314,13 +380,15 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
     }
     drop(stream);
 
-    for (index, request) in provider.requests().iter().enumerate() {
-        let tool_results = request
-            .items
-            .iter()
-            .filter(|item| matches!(item, Item::ToolResult { .. }))
-            .count();
-        emit(json!({"event": "model_request", "index": index, "tool_results": tool_results}));
+    if let Some(scripted) = &scripted {
+        for (index, request) in scripted.requests().iter().enumerate() {
+            let tool_results = request
+                .items
+                .iter()
+                .filter(|item| matches!(item, Item::ToolResult { .. }))
+                .count();
+            emit(json!({"event": "model_request", "index": index, "tool_results": tool_results}));
+        }
     }
     marker("drive_complete");
     asterpath
@@ -330,10 +398,10 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
     Ok(0)
 }
 
-fn session_spec(fixture: &Fixture) -> SessionSpec {
+fn session_spec(fixture: &Fixture, provider: Option<&str>) -> SessionSpec {
     SessionSpec {
         model: ModelSpec {
-            provider: ProviderId::new(fixture.provider.clone()),
+            provider: ProviderId::new(provider.unwrap_or(&fixture.provider)),
             model: ModelId::new(fixture.model.clone()),
             context_window: None,
         },

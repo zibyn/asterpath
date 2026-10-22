@@ -133,6 +133,8 @@ pub trait SessionRetirement: Send + Sync {
 pub const EVENT_LOG_SERVICE: ServiceKey<dyn EventLog> = service_key("EventLog");
 pub const STORAGE_SERVICE: ServiceKey<dyn Storage> = service_key("Storage");
 pub const SESSION_CATALOG_SERVICE: ServiceKey<dyn SessionCatalog> = service_key("SessionCatalog");
+pub const SESSION_RETIREMENT_SERVICE: ServiceKey<dyn SessionRetirement> =
+    service_key("SessionRetirement");
 pub const DURABLE_EXECUTOR_SERVICE: ServiceKey<dyn DurableExecutor> =
     service_key("DurableExecutor");
 
