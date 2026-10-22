@@ -33,6 +33,7 @@ dependencies = [
  "asterpath-provider-anthropic",
  "asterpath-provider-openai",
  "asterpath-runtime",
+ "asterpath-scheduler",
  "asterpath-storage-sqlite",
  "asterpath-testing",
  "asterpath-tools",
@@ -136,6 +137,21 @@ dependencies = [
  "futures-core",
  "futures-util",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-scheduler"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-testing",
+ "futures-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
 ]
 
