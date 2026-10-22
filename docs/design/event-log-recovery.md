@@ -11,7 +11,7 @@
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
-- 恢复 = 截断 torn tail → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
+- 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起。
 - 幂等：`LogEntry.dedup_key` 在 session 内唯一，重复 append 返回原 `LogId`。
 - 信封不含墙钟时间；`seq` 是唯一排序依据。
@@ -143,13 +143,13 @@ pub enum StreamState {
 
 ```
 recover(session):
-    tail      = storage.truncate_torn_tail(session)        # 物理细节归 #5
-    entries   = event_log.scan(session, ..=tail)
+    entries   = event_log.scan(session)                    # 后端保证只返回已提交前缀（#5）
     history   = project(entries)                          # 折叠，尊重 CompactionApplied
     open      = entries.unclosed_intents()
     state     = classify(entries)
 
-    append(StreamResumed { from: tail, reason: Crash })   # 非模型可见
+    append(StreamResumed { from: entries.last().log_id,
+                           reason: Crash })               # 非模型可见
 
     for intent in open, 按 seq 顺序:
         match intent:
@@ -181,7 +181,7 @@ recover(session):
 | S1 | `kill -9` 于 `Safe` 工具执行中 | 重启后该工具恰好多执行一次；history 中恰有一条 `ToolResult::Completed` |
 | S2 | `kill -9` 于 `Unsafe` 工具执行中 | 重启后不重跑；history 含一条 `ToolResult::Interrupted`，模型可见 |
 | S3 | `kill -9` 于模型流中途 | 补记 `ModelCallAborted{Crash}`；该 step 重试；最终恰有一条 `AssistantMessage` |
-| S4 | 日志尾部写一半崩溃 | torn tail 被截断；前缀完整；不存在半条记录 |
+| S4 | 后端只暴露已提交前缀；payload 损坏 | SQLite 上不存在半条记录，坏 payload 报 `Corrupt`；非原子后端自行截断 |
 | S5 | 同 `dedup_key` append 两次 | 只有一条记录；两次返回同一 `LogId` |
 | S6 | 父会话等待子会话时崩溃 | 重启后重新挂起；子完成后恰有一条 `ChildSessionCompleted`，父 history 正确 |
 | S7 | 含 `CompactionApplied` 的历史投影 | 模型只看到 summary + `first_kept` 之后的内容；原始记录仍可扫描 |
@@ -191,7 +191,7 @@ recover(session):
 ## 8. 留给下游
 
 - **#4**：`schema_version`、upcasting 时机、未知事件与未知字段、兼容性测试（ADR-0004）。
-- **#5**：单写者租约、原子提交、WAL/fsync、torn-tail 截断、队列表、SQLite DDL、故障注入工具、timer 投递。
+- **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0005](../adr/0005-storage-contract-and-sqlite.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
 - **#6**：turn/step 的终止条件、steering 注入点、取消宽限期、signal 如何变成模型输入。
 - **#7**：审批/沙箱管线；tool 的 `ReplaySafety` 声明与执行语义。
 - **#8**：子会话完成结果、父子关闭顺序、孤儿恢复、fork session、并发与深度上限。
