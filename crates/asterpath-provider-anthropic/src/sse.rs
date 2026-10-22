@@ -506,11 +506,9 @@ impl Decoder {
                 parts: vec![Part::Text { text: block.text }],
             }),
             "thinking" => {
-                let raw = json!({
-                    "type": "thinking",
-                    "thinking": &block.thinking,
-                    "signature": &block.signature,
-                });
+                let mut raw = block.start;
+                raw["thinking"] = json!(&block.thinking);
+                raw["signature"] = json!(&block.signature);
                 Ok(Item::Reasoning {
                     summary: vec![Part::Text {
                         text: block.thinking,
