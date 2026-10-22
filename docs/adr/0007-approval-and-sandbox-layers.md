@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#7](https://github.com/zibyn/asterpath/issues/7)
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— 「有审批端」由 `ApprovalGate` 的 RAII 注册门表达；门关闭时 `Ask` 立即 `Denied`，不发 `ApprovalRequested`、不挂起。
 
 ## Context
 

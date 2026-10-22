@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#15](https://github.com/zibyn/asterpath/issues/15)
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `SessionSpec` / `ConfigSnapshot` 增加 `request`；`providers` 在 `build()` 经 `ProviderCatalog` 去重；facade 暴露 `approval_gate()`。
 
 ## Context
 

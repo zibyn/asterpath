@@ -11,6 +11,12 @@
 > - 引入 `Part`：`ToolOutput.content`、`ToolResult.output`、`InputRecorded.input`、`CompactionApplied.summary`、`SpawnRequest.task`、`Summary.items` 由 `Vec<Item>` 改为 `Vec<Part>`；`ContextForked.items`、`AssistantMessage.items`、`ModelCallAborted.partial` 仍是 `Vec<Item>`。
 > - `Provider::capabilities` 接收 `&ModelSpec`。
 > - `ModelRequest` 增加 `prefix_epoch` 与 `reasoning`；`Reasoning` 增加 `binding`。
+>
+> 2026-10-22 补齐（[#26](https://github.com/zibyn/asterpath/issues/26)）：
+>
+> - 新增 `RequestConfig`，作为 `ModelRequest` 五个请求参数的唯一来源（`SessionSpec.request` / `ConfigSnapshot.request`）。
+> - `Provider` 增加 `id()`；新增 `ProviderCatalog` 值类型，按 `ProviderId` 解析并拒绝重复 id。
+> - 能力匹配不在 `create_session` 预检，仍由 adapter 在发 HTTP 前返回 `Unsupported`。
 
 ## 1. 决策摘要
 
@@ -22,7 +28,7 @@
 - **usage 统一为 exclusive 口径**：未缓存输入、缓存读、缓存写、输出、推理分开；原始 usage 留在 raw。聚合口径见 [usage.md](usage.md)（#13）。
 - **错误由 adapter 分类**为 `ProviderError`；loop 只读 `retryable` 与 `ContextExceeded`，不映射 HTTP 状态。
 - **跨 provider / 压缩后旧 reasoning 不回放**；规范可见部分保留，不把 summary 伪装成文本。trace 记录丢弃项。
-- **`Provider` 只有 `capabilities` + `stream`**；adapter 管传输、格式、归一化、raw；loop 管重试、日志、工具、投影、压缩。
+- **`Provider` 只有 `id` + `capabilities` + `stream`**；adapter 管传输、格式、归一化、raw；loop 管重试、日志、工具、投影、压缩。
 - **v1 不做服务端状态**：OpenAI 恒 `store:false`，始终发送完整历史；不使用 `previous_response_id` / `conversation`。
 
 ## 2. 分层与术语
@@ -171,6 +177,15 @@ pub struct ModelSpec {
     pub context_window: Option<u32>,
 }
 
+// 会话级请求配置；只用于回合内的模型调用，压缩摘要请求独立构造（compaction.md §4）。
+pub struct RequestConfig {
+    pub max_output_tokens: NonZeroU32,      // 默认 8192
+    pub tool_choice: ToolChoice,            // 默认 Auto
+    pub disable_parallel_tool_use: bool,    // 默认 false
+    pub sampling: Option<SamplingParams>,   // 默认 None
+    pub reasoning: Option<ReasoningParams>, // 默认 None
+}
+
 pub struct ModelRequest {
     pub spec: ModelSpec,
     pub prefix_epoch: u32,              // 当前压缩代次
@@ -226,6 +241,9 @@ pub enum ReasoningEffort {
 | R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。 |
 
+- `RequestConfig` 在 `create_session` 时随 `SessionSpec` 写入 `ConfigSnapshot`；loop 每次都从快照读取，恢复后重建出同一请求。
+- `create_session` 只做结构校验（provider 已注册、`system` 全为 `Part::Text`、工具名可解析）；`sampling` / `reasoning` / `Required` / `disable_parallel_tool_use` 的能力不匹配不在创建时预检，由 adapter 按 R5–R8 返回 `Unsupported`。
+
 `ReasoningParams` 映射：
 
 | 字段 | Anthropic | OpenAI |
@@ -257,14 +275,23 @@ pub struct ProviderCapabilities {
 - `citations` / `cache_control` 在 v1 仅用于告知宿主；typed citations 与宿主指定断点出界，供应商数据仍保留在 `raw`。
 - `builtin_tools` 为 `true` 时，`ServerToolCall` / `ServerToolResult` 是普通历史 item；loop 不执行它们。
 - `image_input = false` 时，请求中的 user/assistant `Part::Image` 返回 `Unsupported`；工具结果图像按 §10.4 渲染为占位。
+- 能力匹配不在 `create_session` 预检；adapter 是唯一权威（#26）。
 
 ## 6. 流式事件模型
 
 ```rust
 pub trait Provider: Send + Sync {
+    fn id(&self) -> ProviderId;
     fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities;
     fn stream(&self, request: ModelRequest)
         -> BoxStream<'_, Result<StreamEvent, ProviderError>>;
+}
+
+// 静态 provider 集合：组装根构造，loop 与 compactor 按 id 解析。
+pub struct ProviderCatalog(BTreeMap<ProviderId, Arc<dyn Provider>>);
+impl ProviderCatalog {
+    pub fn new(providers: Vec<Arc<dyn Provider>>) -> Result<Self, DuplicateProviderId>;
+    pub fn get(&self, id: &ProviderId) -> Option<Arc<dyn Provider>>;
 }
 
 pub enum StreamEvent {
@@ -311,6 +338,10 @@ pub enum StopReason {
     Other { provider_label: String },
 }
 ```
+
+- `ProviderId` 实现 `Ord` 与 `Hash`（opaque newtype，仅用于索引，不暴露内部表示）。
+- `ProviderCatalog::new` 的重复 id 是组装错误；`create_session` / `spawn` 查不到 provider 时是配置错误。
+- `ProviderCatalog` 由组装根构造并注入 agent loop 与 compactor；模块不自行发现 provider。
 
 终止原因映射：
 
@@ -663,7 +694,7 @@ pub enum ProviderErrorKind {
 
 - **#12**：`StreamEvent`、`ResponseStarted` / `ResponseEnded`、`protocol.dropped_items` 到 trace span 的命名与属性。
 - **#13**：已定。`Usage` 的聚合、桶、partial usage 与 session 树 rollup 见 [usage.md](usage.md)；`ProviderError.partial_usage` 与三个事件上的 `model` 字段已回写本文件与 #3。
-- **#15**：`ProviderId` / `ModelId` / `ToolName` / `JsonString` 的精确类型与打包；`Provider` 注册与模型解析；`max_output_tokens` 的宿主配置。
+- **#15**：`ProviderId` / `ModelId` / `ToolName` / `JsonString` 的精确类型与打包。#26 已定 `Provider::id()` + `ProviderCatalog` 与 `RequestConfig`。
 - **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。

@@ -134,25 +134,25 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ```
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
-- `Ask` 时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { intent: SignalIntent::AlreadyRecorded, name: "tool.approval.<tool_call_id>", .. })`。
+- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { intent: SignalIntent::AlreadyRecorded, name: "tool.approval.<tool_call_id>", .. })`。
 - 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: {Allow | Deny, reason?} }`。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
 - Deny 的 `reason` 写入 `ToolResult.error.message`；没有 reason 时用固定文本。
-- **恢复**：open `ToolCallRequested` + 无决定信号 + 策略为 `Ask` → 重新挂起并重新发 `ApprovalRequested`；有决定信号则按记录执行，**不再看当前策略**。
+- **恢复**：open `ToolCallRequested` + 无决定信号 + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有决定信号则按记录执行，**不再看当前策略**。
 - 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。host 不得在调用 open 期间热换策略（v1 无热替换，#2）。
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
-- 不引入独立的 `Approver` trait：host 通过订阅 `ApprovalRequested` 并投递 signal 来充当审批端；等待由 `DurableExecutor` 承担（#17）。
+- 不引入独立的 `Approver` trait：host 在能够应答时用 `Asterpath::approval_gate().register()` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并投递 signal 来回答；等待由 `DurableExecutor` 承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - signal name 只在会话内唯一；signal id 由 `(session, name)` 确定性派生（审批 name 为 `tool.approval.<tool_call_id>`），重复注册/投递不会产生第二个等待。`DurableExecutor` 按 session 作用域等待（#17）。
 - 非审批的 `await_signal` 在等待开始前写 `SignalAwaited`（#3）；审批不写，因为 open 的 `ToolCallRequested` 已承担意图记录。
-- 未安装任何审批端时，`Ask` 按 `Deny` 处理（fail closed）。
+- 未注册审批端点时，`Ask` 按 `Deny` 处理（fail closed），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：
 
-| provenance | 有审批端 | 默认 |
+| provenance | 审批端点 | 默认 |
 | --- | --- | --- |
 | `InProcess` | 任意 | `Allow` |
-| `External` | 是 | `Ask` |
-| `External` | 否 | `Deny` |
+| `External` | 打开 | `Ask` |
+| `External` | 关闭 | `Deny` |
 
 - `side_effect` 只作为自定义策略的输入；默认策略不看它。
 - `Provenance::Unknown` 不进入审批：工具不存在，管线直接写 `NotFound`，不会发 `ApprovalRequested`。

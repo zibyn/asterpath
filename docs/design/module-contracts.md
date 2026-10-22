@@ -151,8 +151,19 @@ pub trait Clock: Send + Sync {
 }
 
 pub struct SystemClock;
+
+// 审批端点的存活声明：core 机制，不是决策者（#26）。
+pub struct ApprovalGate;
+impl ApprovalGate {
+    pub fn register(&self) -> ApprovalEndpoint;   // RAII；drop 注销
+    pub fn is_open(&self) -> bool;
+}
+pub struct ApprovalEndpoint;
 ```
 
+- `ApprovalGate` 由宿主经 facade 的 `Asterpath::approval_gate()` 取得；宿主在能够应答审批时 `register()`，句柄 drop 即失效。
+- agent 管线在 `Ask` 前查 `is_open()`；关闭时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4）。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
+- 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
 - `Clock` 是时间来源接缝：`runtime` / `scheduler` 注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
 - `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。

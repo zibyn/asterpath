@@ -53,6 +53,7 @@ pub struct ConfigSnapshot {
     pub model: ModelSpec,
     pub system: Vec<Part>,          // 只允许 Text
     pub tools: Vec<ToolName>,       // 创建时解析后的固定集合
+    pub request: RequestConfig,     // 回合内模型调用的请求参数（#26）
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
@@ -106,14 +107,16 @@ impl Asterpath {
     pub fn storage(&self) -> Arc<dyn Storage>;
     pub fn session_catalog(&self) -> Arc<dyn SessionCatalog>;
     pub fn session_retirement(&self) -> Option<Arc<dyn SessionRetirement>>;  // 后端未提供时为 None
+    pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
     pub fn usage(&self) -> Arc<dyn UsageQuery>;
     pub fn trace(&self) -> Arc<dyn TraceQuery>;
 }
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 替换超过一个模块、或需要自定义 `Module` 生命周期的嵌入者，直接使用 `asterpath-core` 的 `ModuleHost`；facade 不覆盖该场景。
-- `create_session` 先解析 `SessionSpec`（未知工具名 = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
+- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider` = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
 
 ### 3.3 Session 驱动
 
@@ -122,6 +125,7 @@ pub struct SessionSpec {
     pub model: ModelSpec,
     pub system: Vec<Part>,
     pub tools: ToolSelection,
+    pub request: RequestConfig,
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
@@ -237,7 +241,7 @@ pub enum AsterError {
 
 - `run` 不接受 `--session`；要续跑已有 session 用 `resume`。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
-- 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。TTY 上默认 `ask`，提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 默认 `deny`，显式传 `ask` 是用法错误。`allow` / `deny` 只由显式 flag 启用。
+- 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。TTY 上默认 `ask`，提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 默认 `deny`，显式传 `ask` 是用法错误。`allow` / `deny` 只由显式 flag 启用。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
 ### 4.1 配置
@@ -256,6 +260,13 @@ base_url = "https://api.openai.com/v1"
 
 [turn]
 max_steps_per_turn = 0        # 0 = 不设上限；其余字段用默认值
+
+[request]
+max_output_tokens = 8192      # RequestConfig；缺省字段用 Default
+tool_choice = "auto"          # auto | none | required | <tool name>
+disable_parallel_tool_use = false
+# [request.sampling] temperature / top_p / top_k / seed
+# [request.reasoning] effort / budget_tokens / summary
 
 [compaction]
 # CompactionConfig 字段

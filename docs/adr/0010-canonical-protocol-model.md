@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#11](https://github.com/zibyn/asterpath/issues/11)
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `Provider` 增加 `id()`；新增 `ProviderCatalog`；请求参数由 `RequestConfig` 提供（`SessionSpec` / `ConfigSnapshot`），能力匹配仍由 adapter 判定。
 
 ## Context
 
@@ -14,7 +15,7 @@ Anthropic Messages 与 OpenAI Responses 的结构不兼容：前者是角色消�
 - **流式结果规范化为 `ResponseStarted → ItemStarted / PartDelta / ItemCompleted → ResponseEnded`**，adapter 负责供应商事件交错与顺序归一，只有 `ItemCompleted` 落日志。
 - **能力标志按 `ModelSpec` 声明**；loop 只按标志分支，不按 provider 身份分支；请求需要而能力不支持时返回 `Unsupported`，不静默降级。
 - **usage 统一为 exclusive 口径**（未缓存输入 + 缓存读 + 缓存写），原始 usage 留在 raw；错误由 adapter 归一化为带 `retryable` / `retry_after` / `request_id` 的 `ProviderError`，loop 只消费规范分类。
-- **`Provider` 只有 `capabilities` + `stream`**；adapter 管传输、格式、归一化与 raw，loop 管重试、日志、工具、投影与压缩。
+- **`Provider` 只有 `id` + `capabilities` + `stream`**；adapter 管传输、格式、归一化与 raw，loop 管重试、日志、工具、投影与压缩。
 
 ## Consequences
 

@@ -230,10 +230,10 @@ ContextForked {
 
 ## 5. 配置继承
 
-- **spawn 时刻快照**：provider、model、system prompt、工具集、审批策略标识、MCP 配置、limits 解析进子会话的 `ConfigSnapshot`，写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`。
+- **spawn 时刻快照**：provider、model、system prompt、工具集、请求配置（`RequestConfig`）、审批策略标识、MCP 配置、limits 解析进子会话的 `ConfigSnapshot`，写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`。
 - 之后父配置变化不影响已 spawn 的子；子配置变化也不回写父。
 - 模型可见的 spawn 参数只能收窄：
-  - `model_alias` 必须来自宿主提供的 alias 集合（pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。
+  - `model_alias` 必须来自宿主提供的 alias 集合（pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（v1 provider 在 session 创建时快照，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
   - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
 - 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionCatalog` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
