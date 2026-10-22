@@ -5,7 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["sqlite", "openai"]
+default = ["anthropic", "openai", "sqlite"]
+anthropic = ["dep:asterpath-provider-anthropic"]
 openai = ["dep:asterpath-provider-openai"]
 sqlite = ["dep:asterpath-storage-sqlite"]
 
@@ -13,6 +14,7 @@ sqlite = ["dep:asterpath-storage-sqlite"]
 asterpath-agent = { path = "../asterpath-agent" }
 asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-provider-anthropic = { path = "../asterpath-provider-anthropic", optional = true }
 asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
 asterpath-tools = { path = "../asterpath-tools" }

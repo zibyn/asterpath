@@ -1,0 +1,498 @@
+//! Request rendering: `ModelRequest` -> Anthropic Messages HTTP body.
+
+mod common;
+
+use asterpath_protocol::{
+    ImageSource, Item, JsonString, ModelId, ModelRequest, Part, ProviderErrorKind, ProviderId,
+    RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role, SamplingParams,
+    ToolChoice, ToolName,
+};
+use common::{
+    MockServer, Reply, base_request, descriptor, drain, empty_sse, model, provider, text,
+};
+
+fn user_message(parts: Vec<Part>) -> Item {
+    Item::Message {
+        role: Role::User,
+        parts,
+    }
+}
+
+fn assistant_message(parts: Vec<Part>) -> Item {
+    Item::Message {
+        role: Role::Assistant,
+        parts,
+    }
+}
+
+async fn one_request(
+    server: &MockServer,
+    request: ModelRequest,
+) -> asterpath_protocol::ProviderError {
+    let provider = provider(server);
+    let events = drain(&provider, request).await;
+    match events.into_iter().next().expect("one event") {
+        Err(error) => error,
+        Ok(event) => panic!("expected an error, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn renders_system_tools_sampling_tool_choice_and_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let mut request = base_request();
+    request.system = vec![text("be helpful"), text("be terse")];
+    request.items = vec![user_message(vec![text("hi")])];
+    request.tools = vec![descriptor("search")];
+    request.tool_choice = ToolChoice::Required;
+    request.disable_parallel_tool_use = true;
+    request.sampling = Some(SamplingParams {
+        temperature: Some(0.4),
+        top_p: Some(0.9),
+        top_k: Some(5),
+        seed: None,
+    });
+    request.reasoning = Some(ReasoningParams {
+        budget_tokens: Some(2048),
+        ..ReasoningParams::default()
+    });
+    request.max_output_tokens = 512;
+
+    drain(&provider(&server), request).await;
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        recorded[0]
+            .head
+            .to_ascii_lowercase()
+            .contains("x-api-key: test-key"),
+        "API key header sent: {}",
+        recorded[0].head
+    );
+    assert!(
+        recorded[0]
+            .head
+            .to_ascii_lowercase()
+            .contains("anthropic-version: 2023-06-01")
+    );
+
+    let body = recorded[0].json_body();
+    assert_eq!(body["model"], "claude-test");
+    assert_eq!(body["max_tokens"], 512);
+    assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["system"],
+        serde_json::json!([
+            {"type": "text", "text": "be helpful"},
+            {"type": "text", "text": "be terse"}
+        ])
+    );
+    assert_eq!(body["tools"][0]["name"], "search");
+    assert_eq!(body["tools"][0]["description"], "search tool");
+    assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["properties"]["q"]["type"],
+        "string"
+    );
+    assert_eq!(
+        body["tool_choice"],
+        serde_json::json!({"type": "any", "disable_parallel_tool_use": true})
+    );
+    assert_eq!(body["temperature"], 0.4);
+    assert_eq!(body["top_p"], 0.9);
+    assert_eq!(body["top_k"], 5);
+    assert_eq!(
+        body["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert!(body.get("seed").is_none(), "seed has no Anthropic mapping");
+    assert_eq!(
+        body["messages"],
+        serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    );
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|message| message["role"] != "system"),
+        "system never appears in messages"
+    );
+}
+
+#[tokio::test]
+async fn renders_every_tool_choice_variant() {
+    let server = MockServer::start(vec![
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ])
+    .await;
+    let provider = provider(&server);
+    for choice in [
+        ToolChoice::Auto,
+        ToolChoice::None,
+        ToolChoice::Tool(ToolName::new("search")),
+    ] {
+        let mut request = base_request();
+        request.tools = vec![descriptor("search")];
+        request.tool_choice = choice;
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(
+        recorded[0].json_body()["tool_choice"],
+        serde_json::json!({"type": "auto"})
+    );
+    assert_eq!(
+        recorded[1].json_body()["tool_choice"],
+        serde_json::json!({"type": "none"})
+    );
+    assert_eq!(
+        recorded[2].json_body()["tool_choice"],
+        serde_json::json!({"type": "tool", "name": "search"})
+    );
+}
+
+#[tokio::test]
+async fn renders_tool_calls_and_merges_consecutive_results_before_text() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let mut request = base_request();
+    request.items = vec![
+        assistant_message(vec![text("thinking aloud")]),
+        Item::ToolCall {
+            call_id: "toolu_a".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("search"),
+            raw_args: JsonString::new(r#"{"q": "a"}"#),
+            raw: None,
+        },
+        Item::ToolCall {
+            call_id: "toolu_b".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("search"),
+            raw_args: JsonString::new(r#"{"q": "b"}"#),
+            raw: None,
+        },
+        Item::ToolResult {
+            call_id: "toolu_a".to_owned(),
+            provider_item_id: None,
+            parts: vec![text("first")],
+            is_error: false,
+            raw: None,
+        },
+        Item::ToolResult {
+            call_id: "toolu_b".to_owned(),
+            provider_item_id: None,
+            parts: vec![text("second")],
+            is_error: true,
+            raw: None,
+        },
+        user_message(vec![text("follow up")]),
+    ];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages.len(),
+        2,
+        "one assistant and one merged user message"
+    );
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(
+        messages[0]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "thinking aloud"},
+            {"type": "tool_use", "id": "toolu_a", "name": "search", "input": {"q": "a"}},
+            {"type": "tool_use", "id": "toolu_b", "name": "search", "input": {"q": "b"}}
+        ])
+    );
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(
+        messages[1]["content"],
+        serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": [{"type": "text", "text": "first"}], "is_error": false},
+            {"type": "tool_result", "tool_use_id": "toolu_b", "content": [{"type": "text", "text": "second"}], "is_error": true},
+            {"type": "text", "text": "follow up"}
+        ]),
+        "tool_result blocks come before text in the merged user message"
+    );
+}
+
+#[tokio::test]
+async fn renders_images_and_refusals() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let mut request = base_request();
+    request.items = vec![
+        user_message(vec![
+            Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::Base64 {
+                    data: "AAAA".to_owned(),
+                },
+            },
+            Part::Image {
+                media_type: "image/jpeg".to_owned(),
+                source: ImageSource::Url {
+                    url: "https://example.invalid/x.jpg".to_owned(),
+                },
+            },
+        ]),
+        assistant_message(vec![Part::Refusal {
+            text: "I will not".to_owned(),
+        }]),
+    ];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/x.jpg"}}
+        ])
+    );
+    assert_eq!(
+        body["messages"][1]["content"],
+        serde_json::json!([{"type": "text", "text": "I will not"}])
+    );
+}
+
+#[tokio::test]
+async fn tool_result_images_render_natively() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let mut request = base_request();
+    request.items = vec![Item::ToolResult {
+        call_id: "toolu_a".to_owned(),
+        provider_item_id: None,
+        parts: vec![
+            Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::Base64 {
+                    data: "AAAA".to_owned(),
+                },
+            },
+            text("caption"),
+        ],
+        is_error: false,
+        raw: None,
+    }];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_a",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "text", "text": "caption"}
+            ],
+            "is_error": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn unsupported_request_fields_fail_before_any_http() {
+    let server = MockServer::start(Vec::new()).await;
+
+    let mut seed = base_request();
+    seed.sampling = Some(SamplingParams {
+        seed: Some(7),
+        ..SamplingParams::default()
+    });
+    let error = one_request(&server, seed).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(!error.retryable);
+
+    let mut effort = base_request();
+    effort.reasoning = Some(ReasoningParams {
+        effort: Some(ReasoningEffort::High),
+        ..ReasoningParams::default()
+    });
+    let error = one_request(&server, effort).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+
+    let mut bad_system = base_request();
+    bad_system.system = vec![Part::Refusal {
+        text: "nope".to_owned(),
+    }];
+    let error = one_request(&server, bad_system).await;
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    let mut bad_args = base_request();
+    bad_args.items = vec![Item::ToolCall {
+        call_id: "toolu_a".to_owned(),
+        provider_item_id: None,
+        name: ToolName::new("search"),
+        raw_args: JsonString::new("not json"),
+        raw: None,
+    }];
+    let error = one_request(&server, bad_args).await;
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    assert!(
+        server.requests().is_empty(),
+        "capability/render checks run before sending HTTP"
+    );
+}
+
+#[tokio::test]
+async fn the_same_log_renders_byte_identical_requests() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse()), Reply::sse(empty_sse())]).await;
+    let provider = provider(&server);
+    let mut request = base_request();
+    request.items = vec![user_message(vec![text("hi")])];
+    request.tools = vec![descriptor("a"), descriptor("b")];
+    request.max_output_tokens = 100;
+    drain(&provider, request.clone()).await;
+    drain(&provider, request).await;
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].body, recorded[1].body);
+}
+
+#[tokio::test]
+async fn reasoning_raw_json_is_replayed_byte_for_byte() {
+    let raw = "{\"type\":\"thinking\",\n  \"thinking\":\"why\",  \"signature\":\"sig-123\"}";
+    let reasoning = Item::Reasoning {
+        summary: vec![text("why")],
+        binding: ReasoningBinding {
+            provider: model().provider,
+            model: model().model,
+            prefix_epoch: 0,
+            tools_hash: String::new(), // replaced below with the produced fingerprint
+        },
+        raw: RawProviderData {
+            provider: ProviderId::new("anthropic"),
+            model: Some(ModelId::new("claude-test")),
+            kind: "anthropic.thinking".to_owned(),
+            json: JsonString::new(raw),
+        },
+    };
+    // First produce a reasoning item from a real stream so we learn the tools hash
+    // the adapter binds; then replay the hand-crafted raw with that same binding.
+    let thinking_sse = common::sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":1}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"why"}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-123"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![
+        Reply::sse(thinking_sse),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ])
+    .await;
+    let provider = provider(&server);
+    let events = drain(&provider, base_request()).await;
+    let produced = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(asterpath_protocol::StreamEvent::ItemCompleted {
+                item: Item::Reasoning { binding, .. },
+                ..
+            }) => Some(binding.clone()),
+            _ => None,
+        })
+        .expect("produced reasoning");
+    let produced_raw = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(asterpath_protocol::StreamEvent::ItemCompleted {
+                item: Item::Reasoning { raw, .. },
+                ..
+            }) => Some(raw.json.clone()),
+            _ => None,
+        })
+        .expect("produced reasoning raw");
+    let reasoning = match reasoning {
+        Item::Reasoning { summary, raw, .. } => Item::Reasoning {
+            summary,
+            binding: produced.clone(),
+            raw,
+        },
+        other => other,
+    };
+
+    let mut replay = base_request();
+    replay.items = vec![reasoning.clone()];
+    drain(&provider, replay).await;
+    let body = server.requests()[1].body.clone();
+    assert!(
+        body.contains(raw),
+        "raw reasoning JSON is spliced unchanged:\n{body}"
+    );
+
+    // The adapter's own produced raw round-trips byte-for-byte too.
+    let mut own_replay = base_request();
+    own_replay.items = vec![Item::Reasoning {
+        summary: vec![text("why")],
+        binding: produced,
+        raw: RawProviderData {
+            provider: ProviderId::new("anthropic"),
+            model: Some(ModelId::new("claude-test")),
+            kind: "anthropic.thinking".to_owned(),
+            json: produced_raw.clone(),
+        },
+    }];
+    drain(&provider, own_replay).await;
+    assert!(
+        server.requests()[2].body.contains(produced_raw.as_str()),
+        "produced raw is replayed unchanged"
+    );
+
+    let mut wrong_epoch = base_request();
+    wrong_epoch.prefix_epoch = 1;
+    wrong_epoch.items = vec![reasoning.clone()];
+    drain(&provider, wrong_epoch).await;
+    assert!(!server.requests()[3].body.contains(raw));
+
+    let mut wrong_model = base_request();
+    wrong_model.spec.model = ModelId::new("other-model");
+    wrong_model.items = vec![reasoning.clone()];
+    drain(&provider, wrong_model).await;
+    assert!(!server.requests()[4].body.contains(raw));
+
+    // Non-empty tools change the fingerprint, so the reasoning is dropped.
+    let mut wrong_tools = base_request();
+    wrong_tools.tools = vec![descriptor("search")];
+    wrong_tools.items = vec![reasoning.clone()];
+    drain(&provider, wrong_tools).await;
+    assert!(!server.requests()[5].body.contains(raw));
+
+    // A binding from another provider is never replayed.
+    let mut other_provider = reasoning;
+    if let Item::Reasoning { binding, .. } = &mut other_provider {
+        binding.provider = ProviderId::new("other");
+    }
+    let mut wrong_provider = base_request();
+    wrong_provider.items = vec![other_provider];
+    drain(&provider, wrong_provider).await;
+    assert!(!server.requests()[6].body.contains(raw));
+}

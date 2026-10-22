@@ -189,6 +189,24 @@ impl ProviderError {
         self
     }
 
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
+        self.retry_after = Some(retry_after);
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_raw(mut self, raw: RawProviderData) -> Self {
+        self.raw = Some(raw);
+        self
+    }
+
     pub fn context_exceeded(&self) -> bool {
         matches!(self.kind, ProviderErrorKind::ContextExceeded)
     }
