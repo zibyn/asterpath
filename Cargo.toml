@@ -12,6 +12,7 @@ members = [
     "crates/asterpath-testing",
     "crates/asterpath-acceptance",
     "crates/asterpath",
+    "crates/asterpath-cli",
     "xtask",
 ]
 
