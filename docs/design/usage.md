@@ -114,7 +114,7 @@ pub enum UsageError {
 | 取消但 `AssistantMessage` 已落盘 | 进 `ModelCall`；恢复不重调模型 |
 | 回合内压缩（BetweenSteps 或强制压缩） | 进 `Compaction`；计入该 turn 的 `compaction` 桶；不计入任何 step |
 | Idle 压缩 | 进 `Compaction`；只计入 session，`turn = None` |
-| 压缩调用失败 | 不落日志、不计；崩溃于 `CompactionApplied` 前重做，只记最终 append 的那次 |
+| 压缩调用失败 / 压后仍超窗 | 写 `CompactionAborted`（不带 usage），该次调用不计；崩溃于终态前重做，只记最终 append 的 `CompactionApplied` |
 | `stop_reason = ContextWindowExceeded` 但响应完成 | 进 `ModelCall`（这是一次已答完的调用） |
 | 使用量为全零 | 仍产生记录（一次调用就是一次调用） |
 
@@ -141,7 +141,7 @@ pub enum UsageError {
 
 ### 压缩的 turn 归属
 
-- 折叠到 `CompactionApplied` 时，取最近一条未闭合的 `CompactionStarted.caused_by`（同一 session 同一时刻至多一个压缩意图）。
+- 折叠到 `CompactionApplied` 时，取与其同 dedup key 的 `CompactionStarted.caused_by`（同一 session 同一时刻至多一个压缩意图）。
 - `caused_by` 落在某个回合内 → `turn = Some(该回合)`；落在回合外 → `turn = None`。
 - `step` 恒为 `None`：即使强制压缩发生在 step 的错误路径中，按 #9 也不把用量下沉到 step。这与 tracing 把 compaction span 挂到 step 的做法有意不同（trace 表达因果，usage 表达计费归属）。
 

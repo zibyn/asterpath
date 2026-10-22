@@ -21,7 +21,7 @@
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起；signal 等待的意图记录是 `SignalAwaited`。
-- **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合。
+- **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合。
 - 幂等：`(session, 事件类型, dedup_key)` 唯一，重复 append 返回原 `LogId`。
 - 信封的 `recorded_at` 是诊断时间，只供 trace/审计读取；任何恢复、投影或分支逻辑不得读取它。`seq` 仍是唯一排序依据。
 - session 恢复写一条非模型可见的 `StreamResumed`。
@@ -77,6 +77,7 @@ pub enum SessionEvent {
                         replaces: LogIdRange,
                         model: ModelSpec, usage: Usage,
                         raw: Option<RawProviderData> },
+    CompactionAborted { reason: CompactionAbortReason },
     ChildSessionSpawned { child: SessionId, task: Vec<Part>,
                           config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
@@ -92,6 +93,7 @@ pub enum SessionEvent {
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
 pub enum CompactionTrigger { Threshold, Manual, ProviderError }
+pub enum CompactionAbortReason { SummaryFailed, Insufficient }
 pub enum ToolResultStatus { Completed, Failed, Interrupted }
 pub struct ToolErrorInfo { kind: ToolErrorKind, message: String }
 pub enum ToolErrorKind {
@@ -114,7 +116,7 @@ pub enum TurnEndReason {
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。`model` 记在三个承载 usage 的终态记录上，是发起请求的 `ModelSpec`（#13）。
 - `usage` 的桶、聚合与重放去重规则见 [usage.md](usage.md)；日志层只负责让每条终态记录唯一。
-- `CompactionStarted` 是摘要调用的意图记录，`CompactionApplied` 是它的终态；失败的摘要 attempt 不落日志。`CompactionApplied` 不是 step：可在回合内 BetweenSteps 或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
+- `CompactionStarted` 是摘要调用的意图记录，`CompactionApplied`（成功）与 `CompactionAborted`（`SummaryFailed` / `Insufficient`）是它的终态；失败的摘要 attempt 不落日志，`CompactionAborted` 因此不携带 usage / raw。`CompactionApplied` 不是 step：可在回合内 BetweenSteps / 强制压缩或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向触发该等待或压缩的日志记录（例如开启审批的 `ToolCallRequested`、声明等待的 `SignalAwaited`、触发压缩的 frontier 记录）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
@@ -148,7 +150,7 @@ pub struct LogEntry {
 | `ToolCallRequested` | 意图提交时生成的 `tool_call_id` |
 | `ToolResult` | `tool_call_id` |
 | `StepCommitted` / `TurnCommitted` | step / turn id |
-| `CompactionStarted` / `CompactionApplied` | `compaction:<意图提交前 frontier LogId>` |
+| `CompactionStarted` / `CompactionApplied` / `CompactionAborted` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
 | `SignalAwaited` / `SignalReceived` | signal id（审批用 `tool_call_id`） |
@@ -185,7 +187,7 @@ pub enum StepState {
 }
 ```
 
-「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`SignalAwaited` 无 `SignalReceived`；`CompactionStarted` 无 `CompactionApplied`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
+「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`SignalAwaited` 无 `SignalReceived`；`CompactionStarted` 无 `CompactionApplied` / `CompactionAborted`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
 - `OpenIntents`（protocol）是唯一的折叠实现：`apply(event)` 维护 `(kind, id)` 集合，`is_idle()` 排除 `compaction`。storage 在同一事务里把集合物化为 `open_intents` 表；恢复对日志折叠得到同一集合；两者不一致即违反 G7。
 - 关闭事件按键精确匹配。审批的 `SignalReceived` 没有对应 `SignalAwaited`，不关闭任何意图；`InputRecorded` 不是意图。
@@ -224,10 +226,10 @@ recover(session):
                           写 ChildSessionCompleted 或重新挂起（subagents.md §9）
         SignalAwaited -> 保持等待；到达时由投递方 append(SignalReceived)
 
-    # 2b. 未完成的压缩：CompactionStarted 无 CompactionApplied
+    # 2b. 未完成的压缩：CompactionStarted 无终态
     for started in open compactions, 按 seq:
         -> 重做摘要（同一意图键）；成功 append(CompactionApplied)，
-           失败由驱动方按 [compaction.md](compaction.md) 收尾
+           失败 append(CompactionAborted)，再由驱动方按 [compaction.md](compaction.md) 收尾
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
     #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；
@@ -242,6 +244,7 @@ recover(session):
 - **frontier**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。
 - **已完成但未 ack**：本层不存在这个状态。调度队列的 ack 属于 `Storage`（#5）。
 - 补记完成后，驱动方从 frontier 继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
+- 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 - 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`TimerCancelled`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
 
 ## 7. 验收场景
@@ -261,6 +264,7 @@ recover(session):
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 | S12 | 同一 key、不同事件类型各 append 一次（六对共享 key 见 §4） | 两条记录都落盘，互不抑制 |
 | S13 | 在 open step 中到达 `InputRecorded`（steering）、`TimerFired`、`SignalReceived`（审批或匹配等待）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；启动恢复入队；`open_intents` 与日志折叠一致 |
+| S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
 
 ## 8. 留给下游
 

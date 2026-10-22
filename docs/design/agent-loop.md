@@ -16,7 +16,7 @@
 - **回合（turn）由输入驱动**：`InputRecorded` 触发 `TurnStarted`，直到不再需要继续时 `TurnCommitted`。
 - **步骤（step）= 一次模型请求 + 由它触发的全部工具调用**；工具全部终结后才写 `StepCommitted`。回合可以零个 step。
 - `StepCommitted` 是 step 的**通用终态**：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达。
-- 模型请求的投影水位是 `StepStarted.seq`：只投影它之前的记录；重试复用同一投影；steering 在 step 边界进入下一次投影。
+- 模型请求的投影水位是 `StepStarted.seq`：只投影它之前的模型可见记录；`CompactionApplied` 作为重写算子不受水位限制。重试复用同一投影；强制压缩后按新投影重试同一 step；steering 在 step 边界进入下一次投影。
 - steering 只排队，**不打断**在途模型流；输入到达即写 `InputRecorded`。
 - 取消是回合级、协作式；宽限期后 drop 在途工具并写 `Interrupted`；取消同时闭合本 step 的等待意图。
 - 模型失败在 step 内按 attempt 重试；工具失败不重试，作为模型可见结果交回模型。
@@ -35,7 +35,7 @@
 - `StepStarted` 是意图记录；它之后的模型请求与工具执行都属于该 step。
 - `StepCommitted` 是 step 的通用终态：成功、模型失败、取消都写它。`TurnCommitted.reason` 表达回合结果。
 - 一个 step 至多一次成功的模型请求（多个 attempt 中至多一个 `AssistantMessage`），零或多个工具调用。
-- 模型请求的投影水位是 `StepStarted.seq`：只投影 `seq < StepStarted.seq` 的记录，尊重 `CompactionApplied`。重试复用同一投影；唯一例外是上下文超限触发的强制压缩，压缩后按新投影重试同一 step（[compaction.md](compaction.md)）；新输入只有落在下一个 `StepStarted` 之前才可见。
+- 模型请求的投影水位是 `StepStarted.seq`：模型可见记录只投影 `seq < StepStarted.seq`；`CompactionApplied` 不受水位限制，始终折叠到 frontier。重试复用同一投影；唯一例外是上下文超限触发的强制压缩，压缩后按新投影重试同一 step（[compaction.md](compaction.md)）；新输入只有落在下一个 `StepStarted` 之前才可见。
 
 **与检查点、追踪、token 的对齐**：
 
@@ -88,7 +88,7 @@ run_turn(session):
         if cancelled:
             append(TurnCommitted(Cancelled)); return      # 零 step 取消
         # pre-step：压缩（#9）→ 宿主 gate
-        match compact_if_needed(session):                 # 可写 CompactionApplied
+        match compact_if_needed(session):                 # 可写 CompactionApplied / CompactionAborted
             Ok(NotNeeded | NothingToDo | Applied) -> {}
             Ok(Insufficient) -> append(TurnCommitted(ContextExhausted)); return
             Err(_)           -> append(TurnCommitted(CompactionFailed)); return
@@ -102,30 +102,43 @@ run_turn(session):
 
         step = next_step_id()
         append(StepStarted{turn, step})
-        projection = project(seq < StepStarted.seq)        # 尊重 CompactionApplied
+        projection = project(frontier, visible_before = StepStarted.seq)  # CompactionApplied 不受水位限制
+        force_compacted = false
 
-        match call_model(projection, step):                # 内部按 attempt 重试
-            Ok(msg):
-                append(AssistantMessage{turn, step, items: msg.items,
-                                        raw: msg.raw, usage: msg.usage,
-                                        stop_reason: msg.stop_reason})
-            Cancelled:
-                append(ModelCallAborted{turn, step, attempt, kind: Cancelled})
-                append(StepCommitted{turn, step})
-                append(TurnCommitted(Cancelled)); return
-            Err(err):
-                append(ModelCallAborted{turn, step, attempt,
-                                        kind: err.kind,        # Rejected | Transport
-                                        partial: err.partial,
-                                        usage: err.partial_usage})
-                # 上下文超限且本 step 未强制压缩过：压缩一次，复用同一 step 重试
-                if err.context_exceeded && !force_compacted.contains((turn, step)):
-                    force_compacted.insert((turn, step))
-                    if compact_forced(session) == Ok(Applied):
-                        continue                              # 不写 StepCommitted
-                append(StepCommitted{turn, step})
-                append(TurnCommitted(if err.context_exceeded
-                                     { ContextExhausted } else { Failed })); return
+        # 同一 step 的内层循环：attempt 重试 + 至多一次强制压缩
+        loop:
+            match call_model(projection, step):            # 内部按 attempt 重试
+                Ok(msg):
+                    append(AssistantMessage{turn, step, items: msg.items,
+                                            raw: msg.raw, usage: msg.usage,
+                                            stop_reason: msg.stop_reason})
+                    break
+                Cancelled:
+                    append(ModelCallAborted{turn, step, attempt, kind: Cancelled})
+                    append(StepCommitted{turn, step})
+                    append(TurnCommitted(Cancelled)); return
+                Err(err):
+                    append(ModelCallAborted{turn, step, attempt,
+                                            kind: err.kind,        # Rejected | Transport
+                                            partial: err.partial,
+                                            usage: err.partial_usage})
+                    # 上下文超限且本 step 未强制压缩过：压缩一次，重试同一 step
+                    if err.context_exceeded && !force_compacted:
+                        force_compacted = true
+                        match compact_forced(session):    # 可写 CompactionApplied / CompactionAborted
+                            Ok(Applied):
+                                projection = project(frontier,
+                                                     visible_before = StepStarted.seq)
+                                continue              # 内层重试，不新开 step
+                            Ok(_):                    # Insufficient / NothingToDo / NotNeeded / NotConfigured
+                                append(StepCommitted{turn, step})
+                                append(TurnCommitted(ContextExhausted)); return
+                            Err(_):
+                                append(StepCommitted{turn, step})
+                                append(TurnCommitted(CompactionFailed)); return
+                    append(StepCommitted{turn, step})
+                    append(TurnCommitted(if err.context_exceeded
+                                         { ContextExhausted } else { Failed })); return
 
         calls = msg.tool_calls
         if !calls.is_empty():
@@ -165,6 +178,7 @@ run_turn(session):
 - 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。
 - 若该 step 无 `AssistantMessage` 且最后一条 `ModelCallAborted` 是 `Crash` / `Transport`，按重试策略重调模型；`Transport` 耗尽则 `StepCommitted` + `TurnCommitted(Failed)`。
 - 若最后一条 abort 是 `Cancelled` / `Rejected`，按取消/失败收尾，不重试（#3 §6）。
+- 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态，再投影并重试同一 step。
 - 工具完成后写 `StepCommitted`，再按 §4 的继续规则决定下一个 step 或 `TurnCommitted`。
 - open 的 spawn 工具按 `Safe` 重放；`spawn` / `await_completion` 吸收 R1–R3（[subagents.md](subagents.md) §9）。恢复不为 child 等待另设预收尾路径。
 
@@ -248,7 +262,7 @@ StepCommitted
 
 - `ProviderError`（#11）提供 `retryable` 与规范化分类（含上下文窗口耗尽）。
 - 只在 `retryable && attempt < max_attempts && !cancelled` 时重试；每次失败写 `ModelCallAborted{attempt, kind: Transport}`。
-- 不可重试错误：`ModelCallAborted{kind: Rejected}`，结束回合（`Failed`；上下文窗口耗尽时先强制压缩一次并重试同一 step，仍超限才 `ContextExhausted`，见 [compaction.md](compaction.md)）。
+- 不可重试错误：`ModelCallAborted{kind: Rejected}`，结束回合（`Failed`；上下文窗口耗尽时先强制压缩一次并重试同一 step，仍超限才 `ContextExhausted`；压缩调用失败则 `CompactionFailed`，见 [compaction.md](compaction.md)）。
 - 退避：指数 ×2，jitter，cap 30s；可被取消打断。
 - 每次 attempt 受 `request_timeout` 约束；超时按可重试 `Transport` 处理。
 - 部分流：不写 `AssistantMessage`；`partial` 仅作诊断，不投影（I9）。
@@ -318,8 +332,8 @@ pub struct TurnConfig {
 | L6 | 不可重试错误 | `ModelCallAborted{Rejected}` + `StepCommitted` + `TurnCommitted(Failed)`；恢复不重试 |
 | L7 | `max_steps_per_turn = 1` 且第一步有工具调用 | 工具完成后 `TurnCommitted(MaxStepsExceeded)` |
 | L8 | 空响应 / refusal | `AssistantMessage` 空或含 refusal；`TurnCommitted(Completed)`；`stop_reason` 保留 |
-| L9 | 上下文窗口耗尽 | 错误路径：同一 step 强制压缩一次并重试，成功则回合继续，仍超限则 `ContextExhausted`；`stop_reason` 路径：不压缩，直接 `ContextExhausted`；每 step 至多一次强制压缩 |
-| L10 | 压缩阶段失败 | 零 step；`TurnCommitted(CompactionFailed)` |
+| L9 | 上下文窗口耗尽 | 错误路径：同一 `StepStarted` 内强制压缩一次并重试（无第二个 `StepStarted`，重试投影含压缩结果），成功则回合继续，仍超限则 `ContextExhausted`；压缩调用失败则 `CompactionFailed`；`stop_reason` 路径：不压缩，直接 `ContextExhausted`；每 step 至多一次强制压缩 |
+| L10 | 压缩阶段失败 | 零 step；`CompactionAborted` + `TurnCommitted(CompactionFailed)` |
 | L11 | 崩溃于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`；usage 保留；补完未完成工具后提交 step |
 | L12 | 投影水位 | step 中记录的 steering 不会被同一 step 的重试看到；只被下一 step 看到 |
 | L13 | 崩溃于 `ModelCallAborted{Cancelled}` 之后、`StepCommitted` 之前 | 恢复写 `StepCommitted` + `TurnCommitted(Cancelled)`；不重调模型 |

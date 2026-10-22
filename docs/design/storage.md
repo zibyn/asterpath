@@ -228,7 +228,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 | `ChildSessionSpawned` | 插入 `(child, child_session_id)` | — |
 | `ChildSessionCompleted` | 删除 `(child, child_session_id)` | 入队父会话 `runnable` |
 | `CompactionStarted` | 插入 `(compaction, frontier LogId)` | — |
-| `CompactionApplied` | 删除 `(compaction, frontier LogId)` | — |
+| `CompactionApplied` / `CompactionAborted` | 删除 `(compaction, frontier LogId)` | — |
 | `AssistantMessage` / `ModelCallAborted` / `StreamResumed` / `ContextForked` | 不变 | — |
 
 - 删除按键**精确匹配**。审批的 `SignalReceived` 没有对应 `SignalAwaited`，因此不删除任何行；steering 的 `InputRecorded` 也不改变状态。

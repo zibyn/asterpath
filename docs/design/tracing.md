@@ -115,7 +115,7 @@ flowchart TD
 | wait（timer） | `TimerScheduled` | `TimerFired` / `TimerCancelled` | `caused_by` 所在 span | `wait timer` |
 | wait（approval） | `ToolCallRequested`，仅当存在 `SignalReceived{name=tool.approval.<id>}` | `SignalReceived` | tool_call | `wait approval` |
 | wait（signal） | `SignalAwaited` | `SignalReceived` | `caused_by` 所在 span | `wait signal` |
-| compaction | `CompactionStarted` | `CompactionApplied` | step（强制压缩）/ turn（BetweenSteps）/ session（Idle） | `compact {model}` |
+| compaction | `CompactionStarted` | `CompactionApplied` / `CompactionAborted` | step（强制压缩）/ turn（BetweenSteps）/ session（Idle） | `compact {model}` |
 
 规则：
 
@@ -148,7 +148,7 @@ flowchart TD
 | `finish_reasons` | `AssistantMessage.stop_reason` |
 | `usage` | **只取成功 `AssistantMessage.usage`** |
 | `attempt_count` | `1 + ModelCallAborted` 条数 |
-| `compacted` | 最近一条 `CompactionApplied` 位于 `StepStarted.seq` 之前 |
+| `compacted` | 最近一条 `CompactionApplied` 位于该次请求之前（含同一 step 内强制压缩的那条） |
 
 `attempt` event：
 
@@ -189,6 +189,7 @@ struct AttemptEvent {
 | wait | fire / receive / complete | Ok | — |
 | wait | 被取消收尾 | Cancelled | — |
 | compaction | `CompactionApplied` | Ok | — |
+| compaction | `CompactionAborted` | Error | `reason` |
 | 任意 | 无终态（frontier） | Unset，`ended_at = None` | — |
 
 - 工具 `Failed` 是模型可见结果，不把 step 或 turn 置为 Error。
@@ -240,7 +241,7 @@ pub enum TraceError {
 | #3 事件日志 | `recorded_at`；`SignalAwaited`；`CompactionStarted`；`StreamResumed` → `resume` event |
 | #5 存储 | `log.recorded_at` 由 append 分配；索引与 trace 无关 |
 | #8 子智能体 | 父 trace 的 `subagent` span；子 trace 根 span 的 `parent_trace` / `parent_span`；`fork_source_log` |
-| #9 压缩 | `CompactionStarted` → `CompactionApplied` 构成 compaction span；usage 单列 |
+| #9 压缩 | `CompactionStarted` → `CompactionApplied` / `CompactionAborted` 构成 compaction span；usage 单列 |
 | #11 协议 | §2 的类型进 `asterpath-protocol` |
 | #13 token | 已定。span `usage` 与 [usage.md](usage.md) 的 `model_calls` / `compaction` 必须对账（U12）；`partial` 不进总量 |
 | #17 调度 | `SignalAwaited` 的写入点；timer/signal 等待的 `caused_by` 锚点 |

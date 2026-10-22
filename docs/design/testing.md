@@ -156,7 +156,7 @@ pub fn storage_contract(factory: &impl BackendFactory);
 
 共享套件清单（对应 [storage.md §8–§9](storage.md#8-保证清单)）：
 
-- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对六对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`、`ChildSessionSpawned`/`ChildSessionCompleted`、`TimerScheduled`/`TimerFired`/`TimerCancelled`、`SignalAwaited`/`SignalReceived`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
+- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对六对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`TimerScheduled`/`TimerFired`/`TimerCancelled`、`SignalAwaited`/`SignalReceived`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
 - G3：串行与并发 append 后 `seq` 严格递增无洞；只由存储分配。
 - G4：`scan(after)` 只返回已提交、按 `seq` 升序、`limit` 有界；`frontier` 等于末条 `log_id`。
 - G5：`append` 派生入队；同 session 合并并递增 `generation`；`ack` 代次不符不删除新唤醒；租约过期可重新 `claim`；启动清租约并入队。
