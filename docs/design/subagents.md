@@ -94,31 +94,7 @@ pub enum ContextPolicy {
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
 - **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的宿主取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
-`DurableExecutor` 接缝（core，[#17](https://github.com/zibyn/asterpath/issues/17)）：
-
-```rust
-pub trait DurableExecutor: Send + Sync {
-    fn schedule_timer(&self, req: TimerRequest)
-        -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
-    fn cancel_timer(&self, session: SessionId, timer: TimerId)
-        -> BoxFuture<'_, Result<(), ExecutionError>>;
-    fn await_signal(&self, req: AwaitSignal)
-        -> BoxFuture<'_, Result<SignalPayload, ExecutionError>>;
-    fn deliver_signal(&self, delivery: SignalDelivery)
-        -> BoxFuture<'_, Result<(), ExecutionError>>;
-    fn await_wake(&self, session: SessionId, cause: WakeCause)
-        -> BoxFuture<'_, Result<(), ExecutionError>>;
-    fn wake(&self, session: SessionId, cause: WakeCause);   // 仅内存
-}
-
-pub struct AwaitSignal {
-    pub session: SessionId,
-    pub signal: SignalId,
-    pub name: SignalName,
-    pub caused_by: LogId,
-    pub intent: SignalIntent,        // Record | AlreadyRecorded（审批）
-}
-```
+`DurableExecutor` 与 `AwaitSignal` 的签名在 [module-contracts.md](module-contracts.md) §3.4（core，[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
 - timer id 由 `(session, caused_by, slot)` 确定性派生；通用 signal id 由 `(session, name)` 派生，审批 signal id 即 `tool_call_id`。重复注册返回同一 id，恢复重放不会制造第二个等待。
 - `await_signal` 只在 `SignalIntent::Record` 时写 `SignalAwaited`；审批用 `AlreadyRecorded`，由 open 的 `ToolCallRequested` 承担意图（#7）。
@@ -235,7 +211,7 @@ ContextForked {
 - **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父快照的拷贝（字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析）。`system` / `request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（宿主代码，不持久化）。
 - 之后父配置变化不影响已 spawn 的子；子配置变化也不回写父。
 - 模型可见的 spawn 参数只能收窄：
-  - `model_alias` 必须来自宿主提供的 alias 集合（pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（v1 provider 在 session 创建时快照，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
+  - `model_alias` 必须来自宿主提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（v1 provider 在 session 创建时快照，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
   - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
 - 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionCatalog` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。

@@ -9,7 +9,7 @@
 > - `AssistantMessage` 携带 `usage` 与 `stop_reason`；`StepCommitted` 只作检查点标记。
 > - 新增 `TimerCancelled`；`TimerScheduled` 增加 `caused_by`。
 > - `AbortKind` 增加 `Rejected`；`TurnEndReason` 的改名与新增见 §8。
-> - `StreamState` 增加 `TurnOpen`；恢复时若 `AssistantMessage` 已存在，不重调模型。
+> - `SessionState`（原名 `StreamState`）增加 `TurnOpen`；恢复时若 `AssistantMessage` 已存在，不重调模型。
 
 ## 1. 决策摘要
 

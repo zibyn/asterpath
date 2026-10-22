@@ -9,6 +9,8 @@
 > **2026-10-22 #13 修订**：`AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`；用量桶、聚合与去重口径见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md)。`UsageRecorded` 是事件总线上的瞬时通知，不是 session 事件，不落日志。
 >
 > **2026-10-22 #28 修订**：`ToolCallRequested` 增加 `provider_call_id`，与框架生成的 `tool_call_id` 分开；恢复不重跑已记录意图的 pre-execute。语义见 [tools.md](tools.md) §3/§6。
+>
+> **2026-10-22 #30 修订**：`StreamState` 改名为 `SessionState` 并补 `turn`，与 `SessionHandle::state()` 共用；「前缘」专指最后一条已提交记录，恢复目标是它之后的「恢复点」。
 
 ## 1. 决策摘要
 
@@ -189,14 +191,16 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 - **I8 幂等 append**：同一 `(session, 事件类型, dedup_key)` 永远只有一条记录。
 - **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。
 
-## 6. 检查点、frontier 与恢复
+## 6. 检查点、恢复点与恢复
 
 ### 状态
 
+`SessionState` 同时是 `SessionHandle::state()` 的返回类型（[packaging.md](packaging.md) §3.3）；它由 `OpenIntents` 折叠推导，与恢复共用同一分类器。
+
 ```rust
-pub enum StreamState {
+pub enum SessionState {
     Idle,                                   // 没有非 compaction 的未闭合意图
-    TurnOpen { step: Option<StepState> },   // TurnStarted 无 TurnCommitted
+    TurnOpen { turn: TurnId, step: Option<StepState> }, // TurnStarted 无 TurnCommitted
 }
 
 pub enum StepState {
@@ -261,13 +265,13 @@ recover(session):
     #    无决定且策略为 Ask 则重新挂起；否则 Safe 重跑 / Unsafe Interrupted；
     #    全部终结后写 StepCommitted。
 
-    return ResumePoint { state, history, next: frontier(entries) }
+    return ResumePoint { state, history, next: resume_point(entries) }
 ```
 
 - **检查点**：`entries.iter().rposition(|e| e 是 StepCommitted).unwrap_or(0)`。
-- **frontier**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。
+- **恢复点**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。前缘（`EventLog::frontier`，最后一条已提交记录）在它之前一条。
 - **已完成但未 ack**：本层不存在这个状态。调度队列的 ack 属于 `Storage`（#5）。
-- 补记完成后，驱动方从 frontier 继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
+- 补记完成后，驱动方从恢复点继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
 - 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 - 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`TimerCancelled`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
 

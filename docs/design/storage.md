@@ -67,10 +67,11 @@ pub trait EventLog: Send + Sync {
 pub struct Wake {
     pub session: SessionId,
     pub generation: u64,
-    pub reason: WakeReason,
+    pub reason: WakeCause,
 }
 
-pub enum WakeReason {
+// core §3.4 的同名类型；Startup 只由启动入队产生。
+pub enum WakeCause {
     Timer(TimerId),
     Signal(SignalId),
     ChildCompleted(SessionId),
@@ -262,7 +263,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 ## 7. 唤醒队列与 timer
 
 - `runnable` 每 session 一行：同一会话的多次唤醒合并，`generation` 递增。
-- `claim`：取 `not_before <= now` 且未被有效租用的一行，设置 `lease_owner`、`lease_until = now + 30s`。**不续约**；租约只覆盖一次驱动尝试，过期即可被重新认领（at-least-once）。
+- `claim`：取 `not_before <= now` 且未被有效租用的一行，设置 `lease_owner`、`lease_until = now + 30s`。**不续约**；租约是**崩溃检测窗口**，不是驱动互斥，过期即可被重新认领（at-least-once）。同一 session 的互斥由 facade 的 `SessionHandle::drive()` 单飞保证：另一个消费者在驱动进行中认领到同一 session 时拿到 `AgentError::Busy`，应 `ack` 本次唤醒后放弃；原驱动稍后的 `ack` 对已删行是 no-op，generation 已变时也不会误删新唤醒。
 - `ack(wake)`：`DELETE ... WHERE session_id=? AND generation=?`。generation 不匹配说明期间有新的唤醒，保留该行。
 - `due_timers`：只读索引查询，返回 `deadline <= now AND fired_at IS NULL`。追加 `TimerFired` 由调度方（#17）完成；append 同时标记 `fired_at` 并入队。
 - 启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（必要时前向迁移）→ `recover_at_startup`。
@@ -308,6 +309,6 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 - **#6**：turn/step 的终止条件、取消宽限期，决定哪些意图在何时闭合；`idle` 由未闭合意图推导。
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
-- **#17**：claim 循环、`TimerFired` 追加、signal 投递、租约时长。
+- **#17**：claim 循环、`TimerFired` 追加、signal 投递；租约语义见 §7（已定，不续约）。
 - **#18**：已定。只保留 `SessionRetirement` 可选能力（整会话退役、墓碑）；导出由宿主用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
 - **#19**：六个注入点的工具链与 CI 场景。

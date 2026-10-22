@@ -127,7 +127,7 @@ impl Clock for ManualClock { /* 读 AtomicI64 */ }
 
 ## 4. 后端中立契约套件
 
-`asterpath-testing` 提供共享套件，in-memory 与 SQLite 各自运行：
+`asterpath-testing` 提供共享套件；套件代码只依赖 core/protocol。in-memory 后端在 `asterpath-testing` 自己的测试里实现 `BackendFactory` 并运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入模块间零依赖（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
 
 ```rust
 pub struct BackendHandle {
@@ -164,7 +164,7 @@ pub fn storage_contract(factory: &impl BackendFactory);
 - G7：丢弃派生状态后，仅凭日志与显式唤醒查询重建 `sessions` / `timers` / `runnable`。
 - S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、S9（timer 恰一次）、claim/ack 不丢唤醒也在此层。
 
-仅 SQLite：
+仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 
 - G1：`append` 返回后 `SIGKILL`，重启能读到该条；FULL 下的掉电承诺以 `synchronous=FULL` 配置测试，不在 CI 模拟真实掉电。
 - `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version` 迁移。

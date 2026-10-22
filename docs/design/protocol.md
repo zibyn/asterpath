@@ -48,7 +48,7 @@
 | 前缀代次（prefix epoch） | 会话中已发生的压缩次数；用于判断旧 reasoning 是否仍可回放 |
 | 原始供应商数据（raw） | 随条目保存的供应商原始 JSON 文本；只能原样回放 |
 
-`ProviderId`、`ModelId`、`ToolName`、`JsonString` 是 protocol 里的 opaque newtype；`JsonString` 保存原始 JSON 文本，不保证与 `serde_json::Value` 往返一致。
+`ProviderId`、`ModelId`、`ToolName`、`ModelAlias`、`JsonString` 是 protocol 里的 opaque newtype；`JsonString` 保存原始 JSON 文本，不保证与 `serde_json::Value` 往返一致。`JsonValue` 与 `JsonSchema` 是 `serde_json::Value` 的别名（任意 JSON 值 / JSON Schema 文档）；`ToolArgs = JsonString`。
 
 日志信封的 `LogEntry` / `NewEntry` 定义在 core，payload 是不透明 `serde_json::Value`；protocol 提供 `decode_entry(&LogEntry) -> Result<SessionEvent, LogDecodeError>`，先按 `schema_version` 逐级 upcast 再解码（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）。`LogDecodeError` 分 `UnsupportedVersion` / `Upcast` / `Decode`，均为硬错误。
 
@@ -805,7 +805,7 @@ pub enum ProviderErrorKind {
 
 - **#12**：`StreamEvent`、`ResponseStarted` / `ResponseEnded`、`protocol.dropped_items` 到 trace span 的命名与属性。
 - **#13**：已定。`Usage` 的聚合、桶、partial usage 与 session 树 rollup 见 [usage.md](usage.md)；`ProviderError.partial_usage` 与三个事件上的 `model` 字段已回写本文件与 #3。
-- **#15**：`ProviderId` / `ModelId` / `ToolName` / `JsonString` 的精确类型与打包。#26 已定 `Provider::id()` + `ProviderCatalog` 与 `RequestConfig`。
+- **#15**：已定。`ProviderId` / `ModelId` / `ToolName` / `JsonString` / `ModelAlias` 是 opaque newtype；alias 集合由宿主配置（[packaging.md](packaging.md) §3.2）。#26 已定 `Provider::id()` + `ProviderCatalog` 与 `RequestConfig`。
 - **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。

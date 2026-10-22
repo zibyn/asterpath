@@ -40,7 +40,7 @@
 | `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | 是（仅工具） |
 
 - 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（合约，[#21](https://github.com/zibyn/asterpath/issues/21) 已定，见 [sandbox.md](sandbox.md)）、`asterpath-sandbox-linux` / `asterpath-sandbox-macos`（后端，v1 不建）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18) 已收敛：内核只有 `SessionRetirement` 接缝，策略与归档由宿主实现；v1 不建）、MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
-- `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。
+- `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：模块 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件（SQLite 即如此），`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。
 
@@ -69,7 +69,7 @@ pub struct ConfigSnapshot {
 
 ## 3. 公共 API
 
-类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `Compactor` / `CompactResult` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。
+类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` 在 `asterpath-protocol`；`InputId` 与其他 opaque ID、`Clock` / `Timestamp` 在 `asterpath-core`；`PluginManifest` 在 `asterpath-plugin-host`（仅 `plugin-host` feature）；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。
 
 ### 3.1 稳定层级与版本
 
@@ -95,6 +95,14 @@ pub struct AsterpathConfig {
     pub compactor: Option<Arc<dyn Compactor>>,   // None = 压缩不可用
     pub event_log: Option<Arc<dyn EventLog>>,   // 覆盖 sqlite feature
     pub storage: Option<Arc<dyn Storage>>,
+    pub clock: Arc<dyn Clock>,                  // 默认 SystemClock
+    pub approval: Arc<dyn ApprovalPolicy>,      // 默认见 tools.md §4
+    pub tool: ToolConfig,                       // 管线并发、截断与外进程超时
+    pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
+    pub session_catalog: Option<Arc<dyn SessionCatalog>>,
+    pub session_retirement: Option<Arc<dyn SessionRetirement>>,
+    #[cfg(feature = "plugin-host")]
+    pub plugins: Vec<PluginManifest>,           // 仅 plugin-host feature
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
@@ -117,6 +125,11 @@ impl Asterpath {
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 与 plugin 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
+- `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
+- 关闭 `sqlite` feature 时，`event_log` / `storage` / `session_catalog` 必须注入；`session_retirement` 仍是可选的。
+- `plugins` 字段只在 `plugin-host` feature 下存在；其他 build 不引入 `asterpath-plugin-host`（[plugins.md](plugins.md)）。
+- 没有 `executor` 注入：v1 只有一套 `DurableExecutor` 实现；需要替换它的嵌入者直接使用 `asterpath-core` 的 `ModuleHost`。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 替换超过一个模块、或需要自定义 `Module` 生命周期的嵌入者，直接使用 `asterpath-core` 的 `ModuleHost`；facade 不覆盖该场景。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider` = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
@@ -152,9 +165,10 @@ impl SessionHandle {
 ```
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
+- `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，由 `OpenIntents` 折叠推导，不依赖驱动者。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（timer / signal / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
-- `approve()` 是 `DurableExecutor::deliver_signal` 的便捷封装（signal name = `tool.approval.<tool_call_id>`，payload = `Allow | Deny { reason }`）。
+- `approve()` 是 `DurableExecutor::deliver_signal` 的便捷封装（signal name = `tool.approval.<tool_call_id>`，payload = `ApprovalDecision`）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 `AgentRunner::compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。
@@ -210,13 +224,13 @@ pub enum AsterError {
     Lifecycle(LifecycleError),
     Storage(StorageError),
     Execution(ExecutionError),
-    Protocol(ProtocolError),
     Provider(ProviderError),
     Tool(ToolError),
 }
 ```
 
 - 各层错误保持自己的枚举；`AsterError` 只做求和，不加语义。
+- 没有 `ProtocolError`：protocol 的解码失败是 `LogDecodeError`，在 agent 恢复中归为 `AgentError::Corrupt`，存储侧归为 `StorageError::Corrupt`；facade 不暴露内部信封错误。
 - 库契约不暴露 `anyhow` / `Box<dyn Error>`；`anyhow` 只允许出现在 CLI 二进制。
 
 ### 3.6 Feature flags
@@ -276,6 +290,13 @@ tool_choice = "auto"          # auto | none | required | <tool name>
 disable_parallel_tool_use = false
 # [request.sampling] temperature / top_p / top_k / seed
 # [request.reasoning] effort / budget_tokens / summary
+
+[tools]
+max_parallel_calls = 8        # ToolConfig；缺省字段用 Default
+
+[model_aliases.fast]          # 宿主提供的 alias 集合，spawn 用它收窄模型
+provider = "anthropic"
+model = "claude-fable-5-1"
 
 [compaction]
 # CompactionConfig 字段

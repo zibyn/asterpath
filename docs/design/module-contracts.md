@@ -103,21 +103,41 @@ impl ModuleCtx {
 pub trait Event: Send + Sync + 'static {}
 pub trait WaterfallEvent: Event { type Error: Error + Send + Sync + 'static; }
 
+pub trait Handler<E: Event>: Send + Sync + 'static {
+    fn handle(&self, event: &E) -> BoxFuture<'_, ()>;
+}
+
+pub trait Middleware<E: WaterfallEvent>: Send + Sync + 'static {
+    fn handle(&self, event: E, next: Next<'_, E>)
+        -> BoxFuture<'_, Result<E, E::Error>>;
+}
+
 impl ModuleCtx {
-    pub fn emit<E: Event>(&self, event: E);
+    pub fn emit<E: Event>(&self, event: E) -> BoxFuture<'_, ()>;
+    pub fn waterfall<E: WaterfallEvent>(&self, event: E)
+        -> BoxFuture<'_, Result<E, E::Error>>;
     pub fn on<E: Event>(&self, handler: impl Handler<E>) -> Effect;
     pub fn intercept<E: WaterfallEvent>(&self, middleware: impl Middleware<E>) -> Effect;
+    pub fn effect(&self, dispose: impl FnOnce() -> BoxFuture<'static, ()> + Send + 'static)
+        -> Effect;
 }
 ```
 
 - `emit`：按注册顺序依次 await 处理者；处理者错误记录后继续，不传播。确定性优先于并发。
-- `intercept`：中间件按注册顺序组成链，可改写事件、调用 `next` 或短路；错误传播给调用者。
+- `waterfall`：中间件按注册顺序组成链，可改写事件、调用 `next` 或短路；错误传播给调用者。`Next<'_, E>` 是不透明的续行句柄。
+- `on` / `intercept` 只注册；执行统一走 `emit` / `waterfall`。
+- `effect`：为任意清理动作注册 `Effect`；关停时宿主按 LIFO 顺序 await 该 disposer。
+- `Effect` 是已注册句柄：`provide` / `on` / `intercept` / `effect` 都产出它，不要求调用方再交回宿主。
 - 不单独提供 `serial`/`bail`：有序中止用 waterfall 表达。
 - 跨模块事件是 core/protocol 里的普通数据结构。
 
 ### 3.4 事件日志、存储、持久执行器
 
 ```rust
+pub type Timestamp = i64;        // Unix epoch 毫秒；唯一允许的时间表示
+pub struct DedupKey(String);
+pub struct SignalName(String);
+
 pub trait EventLog: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
@@ -130,6 +150,39 @@ pub trait SessionCatalog: Send + Sync {
         -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
     fn children(&self, session: SessionId)
         -> BoxStream<'_, Result<SessionId, StorageError>>;
+}
+
+pub struct TimerRequest {
+    pub session: SessionId,
+    pub timer: TimerId,
+    pub caused_by: LogId,
+    pub deadline: Timestamp,
+}
+
+pub type SignalPayload = serde_json::Value;
+
+pub struct SignalDelivery {
+    pub session: SessionId,
+    pub signal: SignalId,
+    pub name: SignalName,
+    pub payload: SignalPayload,
+}
+
+pub struct AwaitSignal {
+    pub session: SessionId,
+    pub signal: SignalId,
+    pub name: SignalName,
+    pub caused_by: LogId,
+    pub intent: SignalIntent,        // Record | AlreadyRecorded（审批）
+}
+
+pub enum SignalIntent { Record, AlreadyRecorded }
+
+pub enum WakeCause {
+    Timer(TimerId),
+    Signal(SignalId),
+    ChildCompleted(SessionId),
+    Startup,                          // 仅启动入队使用
 }
 
 pub trait DurableExecutor: Send + Sync {
@@ -168,6 +221,7 @@ pub struct ApprovalEndpoint;
 - `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
 - `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
+- `EventLog::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
 - `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定（[ADR-0014](../adr/0014-subagent-scheduling-api.md)）。v1 没有 activity / workflow。
 - timer id 由 `(session, caused_by, slot)` 确定性派生；审批 signal id 即 `tool_call_id`，通用 signal id 由 `(session, name)` 派生。重复注册返回同一 id，恢复重放不会制造第二个等待。
 - `await_signal` 的 `SignalIntent` 区分 `Record`（写 `SignalAwaited`）与 `AlreadyRecorded`（审批：open `ToolCallRequested` 已是意图记录）。
@@ -176,9 +230,9 @@ pub struct ApprovalEndpoint;
 
 ### 3.5 错误与 ID
 
-- 每类能力一个 `#[non_exhaustive]` 枚举：`LifecycleError`、`StorageError`、`ExecutionError` 在 core；`ProtocolError`、`ProviderError`、`ToolError` 在 protocol。
+- 每类能力一个 `#[non_exhaustive]` 枚举：`LifecycleError`、`StorageError`、`ExecutionError` 在 core；`ProviderError`、`ToolError`、`LogDecodeError` 在 protocol。`LogDecodeError` 只在 protocol 内部消费，经 `AgentError::Corrupt` / `StorageError::Corrupt` 露出。
 - `AsterError` 在门面 crate，对上述错误求和；core 不反向依赖 protocol。
-- `SessionId`、`TurnId`、`StepId`、`ToolCallId`、`LogId`、`TimerId`、`SignalId` 是 core 里的 opaque newtype。
+- `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`TimerId`、`SignalId` 是 core 里的 opaque newtype。
 - `anyhow` 只允许出现在 CLI/二进制；库契约不暴露 `Box<dyn Error>`。
 
 ### 3.6 运行时与配置
@@ -227,14 +281,16 @@ pub trait ToolRegistry: Send + Sync {
 }
 
 pub trait AgentRunner: Send + Sync {
-    fn run(&self, input: AgentInput) -> BoxStream<'_, Result<AgentEvent, AgentError>>;
+    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>>;
+    fn compact_now(&self, session: SessionId)
+        -> BoxFuture<'_, Result<CompactResult, AgentError>>;
 }
 ```
 
 - 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定，见 [protocol.md](protocol.md)。
 - `Provenance::Unknown` 只出现在 `ToolCallRequested`；`ToolDescriptor.provenance` 必须是 `InProcess` 或 `External`，它不进入审批（见 [tools.md](tools.md) §3/§4）。
 - 工具执行管线与审批见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)；`ToolDescriptor` 的最终字段以那里为准。
-- `AgentRunner` 是 loop 契约；turn/step、取消、steering 由 #6 定。
+- `AgentRunner` 的精确签名以 [packaging.md](packaging.md) §3.4 为准；`RunRequest` / `AgentEvent` / `AgentError` / `CompactResult` 都在 protocol。
 
 ### 4.1 扩展模块（非内核）
 
@@ -257,7 +313,7 @@ pub trait AgentRunner: Send + Sync {
 1. 组装根显式构造全部模块；只有它知道具体模块类型。
 2. `Module::dependencies()` 静态声明；宿主拓扑排序；成环 = `LifecycleError::Cycle`，启动失败并打印环路径。
 3. `init` 是模块向宿主注册能力/effect 的唯一时机；宿主注册表在 init 结束后关闭。能力级注册表（如 `ToolRegistry`）可在运行期自行增删，不走宿主注册表。
-4. 所有注册经 `ctx.effect()`；关停时 LIFO 回卷，异步 disposer 逐个 await。`init` 失败时，宿主回卷该模块已注册的 effect，再报告启动失败。
+4. 所有注册产生 `Effect`（`provide` / `on` / `intercept` / `effect`）；关停时 LIFO 回卷，异步 disposer 逐个 await。`init` 失败时，宿主回卷该模块已注册的 effect，再报告启动失败。
 5. 缺必需依赖 = 启动失败；缺可选依赖 = `None`。
 6. 模块不得启动不受 effect 约束的后台任务；宿主关停后不得有任务存活。
 7. v1 不做动态发现、热替换、运行期卸载；换模块 = 重启进程。
@@ -288,6 +344,7 @@ pub trait AgentRunner: Send + Sync {
 - 最终成员列表、每个 crate 的职责与 v1 交付边界见 [packaging.md](packaging.md) §2。M0 起根目录 `deps-allowlist.toml` 是白名单的机器可读来源，由 `cargo xtask check-deps` 校验；`asterpath-testing` 只依赖合约，需要真实组装的验收测试放 `asterpath-acceptance`。
 - core/protocol 不带 feature flags；feature 只出现在边缘/后端 crate，且不得改变公共契约类型。
 - 跨模块类型只有两条路：进合约 crate，或变成 trait/事件。"加一个模块依赖"不是选项。
+- `[dev-dependencies]` 不计入模块间零依赖：模块 crate 可以 dev-depend on `asterpath-testing` 跑共享契约套件（SQLite 即如此）；`cargo xtask check-deps` 只校验普通依赖边。
 
 ## 8. 对下游票的约束
 

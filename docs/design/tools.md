@@ -68,13 +68,21 @@ pub enum ToolError {
     Transport { message: String },
     Internal { message: String },
 }
+
+/// 单次调用有效的取消句柄；Clone 共享同一状态。
+pub struct CancelToken { /* ... */ }
+
+impl CancelToken {
+    pub fn is_cancelled(&self) -> bool;
+    pub fn cancelled(&self) -> BoxFuture<'_, ()>;
+}
 ```
 
 规则：
 
 - `ToolArgs = JsonString`：保持 provider 原始 JSON 字符串，工具自行解析；框架不做 re-serialize。
 - **超时由管线执行**，工具只观察 `CancelToken`（`is_cancelled` / `cancelled`），不自己管 deadline。
-- `CancelToken` 只在本次调用内有效；具体类型归 #15 打包。
+- `CancelToken` 只在本次调用内有效；`Clone` 共享状态，回合取消广播后立即变为已取消。
 - 工具不写日志、不写 `ToolResult`；返回值由管线落盘。
 - `ToolDescriptor` 在工具生命周期内不可变。
 - `ToolName` 在注册表中唯一：进程内工具用裸名，字符集 `[A-Za-z0-9_-]`、长度 1–64，`__` 保留；外部工具暴露为 `<plugin_id>__<sanitized_name>`。命名空间、重名与整插件失败规则见 [plugins.md](plugins.md) §6。
@@ -127,6 +135,13 @@ pub enum ApprovalVerdict {
     Deny { reason: Option<String> },
 }
 
+/// 宿主对一次审批请求的回答，也是 `SignalReceived.payload`。
+#[non_exhaustive]
+pub enum ApprovalDecision {
+    Allow,
+    Deny { reason: Option<String> },
+}
+
 pub struct ApprovalRequest {        // #[non_exhaustive]
     pub session: SessionId,
     pub turn: TurnId,
@@ -142,7 +157,8 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
 - `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { intent: SignalIntent::AlreadyRecorded, name: "tool.approval.<tool_call_id>", .. })`。
-- 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: {Allow | Deny, reason?} }`。
+- 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: ApprovalDecision }`。
+- `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是宿主的回答；两者不合并，`Ask` 只在策略侧存在。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
 - Deny 的 `reason` 写入 `ToolResult.error.message`；没有 reason 时用固定文本。
 - **恢复**：open `ToolCallRequested` + 无决定信号 + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有决定信号则按记录执行，**不再看当前策略**。
