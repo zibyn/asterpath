@@ -103,6 +103,15 @@ impl Testdrive {
         Self::spawn(command, name)
     }
 
+    /// Resume one known session. Scenario (c) resumes the parent: its spawn
+    /// replay drives the children, so the process must not start elsewhere.
+    pub fn resume_session(scenario: Scenario<'_>, session: SessionId) -> Self {
+        let name = scenario.fixture.to_owned();
+        let mut command = Self::command(&scenario);
+        command.arg("--session").arg(session.to_hex());
+        Self::spawn(command, name)
+    }
+
     fn command(scenario: &Scenario<'_>) -> Command {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("testdrive"));
         command

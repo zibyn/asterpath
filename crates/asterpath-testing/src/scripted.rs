@@ -26,6 +26,17 @@ pub struct FixtureStep {
     pub usage: Usage,
 }
 
+impl FixtureStep {
+    /// The provider stream events for this response. Shared by the ordered
+    /// scripted provider and content-routed providers in acceptance harnesses.
+    pub fn events(&self) -> Vec<Result<StreamEvent, ProviderError>> {
+        item_events(
+            self.items.clone(),
+            Some((self.stop_reason.clone(), self.usage)),
+        )
+    }
+}
+
 /// Acceptance fixture: the single source for a scripted session.
 ///
 /// Only the provider and clock are scripted; tool assembly stays in

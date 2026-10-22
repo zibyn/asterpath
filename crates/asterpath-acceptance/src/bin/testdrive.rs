@@ -4,24 +4,29 @@
 //! uses; only the provider and the clock are scripted. Progress is reported as
 //! JSON lines on stdout so the parent test can wait for a window and `SIGKILL`.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder};
 use asterpath_core::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
 use asterpath_protocol::{
-    AgentEvent, Item, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, SessionSpec,
-    Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
+    AgentEvent, Item, ModelId, ModelRequest, ModelSpec, Part, Provider, ProviderCapabilities,
+    ProviderError, ProviderErrorKind, ProviderId, RequestConfig, SessionSpec, StreamEvent, Tool,
+    ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
     TurnConfig, TurnEndReason, UserInput, decode_entry,
 };
 use asterpath_testing::{
-    Failpoint, FailpointEventLog, FailpointTool, Fixture, ManualClock, Point, ScriptedProvider,
+    Failpoint, FailpointEventLog, FailpointTool, Fixture, FixtureStep, ManualClock, Point,
+    ScriptedProvider,
 };
-use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use futures_util::{StreamExt, stream};
+use serde::Deserialize;
 use serde_json::json;
 
 const INPUT: InputId = InputId::from_bytes([42; 16]);
@@ -143,11 +148,169 @@ async fn execute(args: Args) -> Result<i32, String> {
     }
 }
 
-fn fixture_from(path: &Path) -> Result<Fixture, String> {
+struct LoadedFixture {
+    fixture: Fixture,
+    /// Present when the fixture scripts responses by request content instead
+    /// of in call order (parallel fan-out).
+    routing: Option<RoutingFixture>,
+}
+
+#[derive(Deserialize)]
+struct RoutingFixture {
+    provider: String,
+    routes: Vec<Route>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Route {
+    #[serde(default)]
+    name: String,
+    /// Matched against the concatenated text of message and tool-result items.
+    #[serde(default)]
+    contains: Option<String>,
+    /// Minimum number of `ToolResult` items the request must carry.
+    #[serde(default)]
+    tool_results: usize,
+    /// One of the parallel fan-out children.
+    #[serde(default)]
+    child: bool,
+    response: FixtureStep,
+}
+
+impl Route {
+    fn matches(&self, texts: &[String], tool_results: usize) -> bool {
+        tool_results >= self.tool_results
+            && self
+                .contains
+                .as_ref()
+                .is_none_or(|needle| texts.iter().any(|text| text.contains(needle)))
+    }
+}
+
+fn fixture_from(path: &Path) -> Result<LoadedFixture, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read fixture {}: {error}", path.display()))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("invalid fixture {}: {error}", path.display()))
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid fixture {}: {error}", path.display()))?;
+    let routing = if value.get("routes").is_some() {
+        Some(
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid fixture {}: {error}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let fixture = serde_json::from_value(value)
+        .map_err(|error| format!("invalid fixture {}: {error}", path.display()))?;
+    Ok(LoadedFixture { fixture, routing })
+}
+
+/// Routes each request by content: call order is not deterministic once two
+/// children are driven in parallel, and a crash replay makes it worse.
+struct RoutingProvider {
+    id: ProviderId,
+    routes: Vec<Route>,
+    served_children: Mutex<HashSet<String>>,
+    waiting_emitted: AtomicBool,
+    /// Run mode only: hold the last child's response so the parent cannot
+    /// finish before the parent test's `SIGKILL`.
+    hold: Option<Duration>,
+}
+
+impl RoutingProvider {
+    fn new(id: ProviderId, routes: Vec<Route>, hold: Option<Duration>) -> Self {
+        Self {
+            id,
+            routes,
+            served_children: Mutex::new(HashSet::new()),
+            waiting_emitted: AtomicBool::new(false),
+            hold,
+        }
+    }
+
+    fn child_count(&self) -> usize {
+        self.routes.iter().filter(|route| route.child).count()
+    }
+
+    /// Marks a child route served; true when this call completed the set.
+    fn served_last_child(&self, name: &str) -> bool {
+        let mut served = self
+            .served_children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        served.insert(name.to_owned());
+        let all = self
+            .routes
+            .iter()
+            .filter(|route| route.child)
+            .all(|route| served.contains(&route.name));
+        all && !self.waiting_emitted.swap(true, Ordering::SeqCst)
+    }
+}
+
+fn request_texts(request: &ModelRequest) -> Vec<String> {
+    let mut texts = Vec::new();
+    for item in &request.items {
+        let parts = match item {
+            Item::Message { parts, .. } | Item::ToolResult { parts, .. } => parts,
+            _ => continue,
+        };
+        for part in parts {
+            if let Part::Text { text } = part {
+                texts.push(text.clone());
+            }
+        }
+    }
+    texts
+}
+
+impl Provider for RoutingProvider {
+    fn id(&self) -> ProviderId {
+        self.id.clone()
+    }
+
+    fn capabilities(&self, _spec: &ModelSpec) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    fn stream(
+        &self,
+        request: ModelRequest,
+    ) -> stream::BoxStream<'_, Result<StreamEvent, ProviderError>> {
+        let texts = request_texts(&request);
+        let tool_results = request
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::ToolResult { .. }))
+            .count();
+        let Some(route) = self
+            .routes
+            .iter()
+            .find(|route| route.matches(&texts, tool_results))
+        else {
+            return stream::once(async {
+                Err(ProviderError::new(
+                    ProviderErrorKind::StreamProtocol,
+                    "no scripted route matches the request",
+                ))
+            })
+            .boxed();
+        };
+        emit(json!({
+            "event": "model_request",
+            "route": route.name,
+            "tool_results": tool_results,
+            "texts": texts,
+        }));
+        if let Some(hold) = self.hold
+            && route.child
+            && self.served_last_child(&route.name)
+        {
+            emit(json!({"event": "parent_waiting", "children": self.child_count()}));
+            std::thread::sleep(hold);
+        }
+        stream::iter(route.response.events()).boxed()
+    }
 }
 
 fn hold_millis(run_mode: bool) -> u64 {
@@ -246,6 +409,8 @@ async fn assemble(
         let mut tool: Arc<dyn Tool> = match name.as_str() {
             "set_marker" => Arc::new(SetMarker::new(effect_file()?, hold)),
             "append_line" => Arc::new(AppendLine::new(effect_file()?, hold)),
+            // Registered by the scheduler module in the real composition root.
+            "spawn_agent" => continue,
             other => return Err(format!("unknown fixture tool {other}")),
         };
         for failpoint in args.failpoints.iter().filter(|fp| fp.point.is_tool()) {
@@ -283,10 +448,11 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
         .fixture
         .as_ref()
         .ok_or_else(|| "--fixture is required".to_owned())?;
-    let fixture = fixture_from(path)?;
+    let loaded = fixture_from(path)?;
+    let fixture = &loaded.fixture;
 
-    let scripted = if args.provider.is_none() {
-        let mut provider = ScriptedProvider::from_fixture(&fixture);
+    let scripted = if args.provider.is_none() && loaded.routing.is_none() {
+        let mut provider = ScriptedProvider::from_fixture(fixture);
         if run_mode && fixture.stream_open_first_attempt {
             provider = provider.stream_open_on_first_attempt();
         }
@@ -294,17 +460,30 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
     } else {
         None
     };
-    let provider: Arc<dyn Provider> = match &scripted {
-        Some(scripted) => Arc::clone(scripted) as Arc<dyn Provider>,
-        None => real_provider(
+    // Run mode holds the last child's response so the parent cannot finish
+    // before the test's `SIGKILL` at `parent_waiting`.
+    let routing = match &loaded.routing {
+        Some(routing) if args.provider.is_none() => Some(Arc::new(RoutingProvider::new(
+            ProviderId::new(&routing.provider),
+            routing.routes.clone(),
+            run_mode.then(|| Duration::from_secs(30)),
+        ))),
+        _ => None,
+    };
+    let provider: Arc<dyn Provider> = if let Some(scripted) = &scripted {
+        Arc::clone(scripted) as Arc<dyn Provider>
+    } else if let Some(routing) = &routing {
+        Arc::clone(routing) as Arc<dyn Provider>
+    } else {
+        real_provider(
             args.provider.as_deref().expect("provider parsed"),
             args.base_url.as_deref().expect("base url parsed"),
-        )?,
+        )?
     };
-    let asterpath = assemble(args, &fixture, provider).await?;
+    let asterpath = assemble(args, fixture, provider).await?;
 
     let session = if run_mode {
-        let spec = session_spec(&fixture, args.provider.as_deref());
+        let spec = session_spec(fixture, args.provider.as_deref());
         let handle = asterpath
             .create_session(spec)
             .await
@@ -330,13 +509,21 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
         emit(
             json!({"event": "wakeable", "sessions": wakeable.iter().map(|session| session.to_hex()).collect::<Vec<_>>()}),
         );
-        let Some(session) = wakeable.first().copied() else {
-            marker("nothing_to_do");
-            asterpath
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-            return Ok(0);
+        // `--session` names the follow-up session to drive (scenario (c)
+        // resumes the parent, whose spawn replay recovers the children).
+        let session = match args.session.as_deref() {
+            Some(hex) => parse_session_id(hex)?,
+            None => {
+                let Some(session) = wakeable.first().copied() else {
+                    marker("nothing_to_do");
+                    asterpath
+                        .shutdown()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(0);
+                };
+                session
+            }
         };
         let entries = scan(asterpath.event_log(), session).await?;
         let committed_attempts = entries
