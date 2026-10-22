@@ -207,3 +207,25 @@ pub enum TransportKind {
     Stdio,
     Http,
 }
+
+/// Pipeline concurrency, truncation and external-tool timeout defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolConfig {
+    pub max_parallel_calls: NonZeroUsize,
+    pub max_output_bytes: usize,
+    pub max_output_bytes_per_step: usize,
+    pub external_timeout: Option<Duration>,
+    pub kill_grace: Duration,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_calls: NonZeroUsize::new(8).expect("non-zero"),
+            max_output_bytes: 64 * 1024,
+            max_output_bytes_per_step: 256 * 1024,
+            external_timeout: Some(Duration::from_secs(120)),
+            kill_grace: Duration::from_secs(5),
+        }
+    }
+}

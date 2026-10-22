@@ -15,6 +15,7 @@ pub mod intents;
 pub mod item;
 pub mod projection;
 pub mod provider;
+pub mod tool;
 pub mod usage;
 
 pub use agent::{
@@ -25,7 +26,7 @@ pub use agent::{
 pub use config::{
     CompactionConfig, ConfigSnapshot, ContextPolicy, ModelSpec, Parallelism, Provenance,
     ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig, SamplingParams, SideEffect,
-    SubagentConfig, ToolChoice, ToolDescriptor, TransportKind, TurnConfig,
+    SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
@@ -43,5 +44,10 @@ pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, 
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
     ProviderError, ProviderErrorKind, StreamEvent,
+};
+pub use tool::{
+    ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken, DefaultApprovalPolicy,
+    NO_APPROVAL_ENDPOINT, PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent,
+    TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry,
 };
 pub use usage::{InputTokens, OutputTokens, Usage};

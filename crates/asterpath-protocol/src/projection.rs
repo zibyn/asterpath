@@ -34,31 +34,44 @@ pub enum ProjectionError {
 }
 
 /// Fold a set of scanned entries into model-visible history, ordered by seq.
+///
+/// Tool results are emitted in `ToolCallRequested` order, not log-completion
+/// order, so parallel calls reconstruct identically whatever order they finish.
 pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionError> {
     let mut ordered: Vec<&LogEntry> = entries.iter().collect();
     ordered.sort_by_key(|entry| entry.seq);
 
     let mut history: Vec<ProjectedEntry> = Vec::new();
-    let mut provider_calls: HashMap<ToolCallId, String> = HashMap::new();
+    let mut intents: HashMap<ToolCallId, (String, u64)> = HashMap::new();
+    let mut pending_results: Vec<(u64, ProjectedEntry)> = Vec::new();
 
     for entry in ordered {
         match decode_entry(entry)? {
-            SessionEvent::ContextForked { items, .. } => push(&mut history, entry.log_id, items),
-            SessionEvent::InputRecorded { input } => push(
-                &mut history,
-                entry.log_id,
-                vec![Item::Message {
-                    role: crate::item::Role::User,
-                    parts: input,
-                }],
-            ),
-            SessionEvent::AssistantMessage { items, .. } => push(&mut history, entry.log_id, items),
+            SessionEvent::ContextForked { items, .. } => {
+                flush_results(&mut pending_results, &mut history);
+                push(&mut history, entry.log_id, items);
+            }
+            SessionEvent::InputRecorded { input } => {
+                flush_results(&mut pending_results, &mut history);
+                push(
+                    &mut history,
+                    entry.log_id,
+                    vec![Item::Message {
+                        role: crate::item::Role::User,
+                        parts: input,
+                    }],
+                );
+            }
+            SessionEvent::AssistantMessage { items, .. } => {
+                flush_results(&mut pending_results, &mut history);
+                push(&mut history, entry.log_id, items);
+            }
             SessionEvent::ToolCallRequested {
                 tool_call_id,
                 provider_call_id,
                 ..
             } => {
-                provider_calls.insert(tool_call_id, provider_call_id);
+                intents.insert(tool_call_id, (provider_call_id, entry.seq));
             }
             SessionEvent::ToolResult {
                 tool_call_id,
@@ -67,7 +80,7 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
                 error,
                 ..
             } => {
-                let call_id = provider_calls.get(&tool_call_id).cloned().ok_or(
+                let (call_id, intent_seq) = intents.get(&tool_call_id).cloned().ok_or(
                     ProjectionError::UnknownToolCall {
                         tool_call: tool_call_id,
                     },
@@ -88,17 +101,19 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
                         true,
                     ),
                 };
-                push(
-                    &mut history,
-                    entry.log_id,
-                    vec![Item::ToolResult {
-                        call_id,
-                        provider_item_id: None,
-                        parts,
-                        is_error,
-                        raw: None,
-                    }],
-                );
+                pending_results.push((
+                    intent_seq,
+                    ProjectedEntry {
+                        origin: ProjectedOrigin::Log(entry.log_id),
+                        items: vec![Item::ToolResult {
+                            call_id,
+                            provider_item_id: None,
+                            parts,
+                            is_error,
+                            raw: None,
+                        }],
+                    },
+                ));
             }
             SessionEvent::CompactionApplied {
                 first_kept,
@@ -106,6 +121,7 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
                 replaces,
                 ..
             } => {
+                flush_results(&mut pending_results, &mut history);
                 history.retain(|projected| !overlaps(&projected.origin, &replaces));
                 let index = history
                     .iter()
@@ -125,8 +141,14 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
             _ => {}
         }
     }
+    flush_results(&mut pending_results, &mut history);
 
     Ok(history)
+}
+
+fn flush_results(pending: &mut Vec<(u64, ProjectedEntry)>, history: &mut Vec<ProjectedEntry>) {
+    pending.sort_by_key(|(intent_seq, _)| *intent_seq);
+    history.extend(pending.drain(..).map(|(_, projected)| projected));
 }
 
 /// Flatten a projection into the ordered item list a model request carries.

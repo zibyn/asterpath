@@ -12,8 +12,10 @@ dependencies = [
  "asterpath-provider-openai",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "futures-core",
  "futures-util",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -24,8 +26,10 @@ version = "0.1.0"
 dependencies = [
  "asterpath-core",
  "asterpath-protocol",
+ "asterpath-testing",
  "futures-core",
  "futures-util",
+ "serde_json",
  "tokio",
 ]
 
@@ -92,6 +96,17 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "serde_json",
+]
+
+[[package]]
+name = "asterpath-tools"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "futures-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

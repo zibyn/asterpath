@@ -15,10 +15,12 @@ asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
+asterpath-tools = { path = "../asterpath-tools" }
 futures-core = "0.3"
 futures-util = "0.3"
 thiserror = "2"
 
 [dev-dependencies]
 asterpath-testing = { path = "../asterpath-testing" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
