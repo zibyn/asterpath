@@ -2,7 +2,7 @@
 
 > 来源：[#16](https://github.com/zibyn/asterpath/issues/16)，2026-10-22 已定。本文件定义外部插件的清单形状、加载规则、工具命名空间与冲突策略、版本协商、失败隔离，以及插件与进程内模块的边界。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 外部工具协议 adapter](https://github.com/zibyn/asterpath/issues/20)、[#15 打包](https://github.com/zibyn/asterpath/issues/15)。
+> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 MCP adapter 与 ACP 边界](./mcp.md)、[#15 打包](https://github.com/zibyn/asterpath/issues/15)。
 >
 > 相关 ADR：[0013 外部插件用清单加载，进程内模块编译期组装](../adr/0013-plugin-boundary.md)。
 
@@ -80,7 +80,10 @@ pub enum PluginTransport {                   // serde 内部标签 kind
         env: BTreeMap<String, String>,       // 追加到继承环境；同键覆盖
         cwd: Option<PathBuf>,                // 缺省为宿主进程 cwd
     },
-    Http { url: String },                    // 认证头等字段归 #20，随 manifest_version 扩展
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,   // 可选，缺省空；Debug 脱敏，不展开变量
+    },
 }
 
 pub enum PluginCapability {
@@ -111,7 +114,7 @@ pub struct PluginTimeouts {
   "version": "0.3.1",
   "required": false,
   "protocol": "mcp",
-  "protocol_versions": ["2025-06-18"],
+  "protocol_versions": ["2026-07-28"],
   "transport": {
     "kind": "stdio",
     "command": "weather-mcp",
@@ -127,7 +130,7 @@ pub struct PluginTimeouts {
 
 - `command` 直接交给操作系统执行，**不经过 shell**；`args` 原样传递，不做变量替换。
 - `env` 追加到宿主进程的环境；同键覆盖。框架不做 `${VAR}` 展开，host 在构造 manifest 前解析。
-- 秘密可以放在 `env`（以及 #20 后续加入的认证字段）里；`Debug` 必须脱敏，错误信息只报字段名，不报值。
+- 秘密可以放在 `env` 或 HTTP `headers` 里；`Debug` 必须脱敏，错误信息只报字段名，不报值。
 - 插件进程**继承宿主进程的环境变量**；需要最小权限的宿主应在自己的进程中先净化环境。manifest 不是沙箱，进程隔离与文件/网络边界由宿主或扩展模块负责（#21）。
 - manifest 本身不进入事件日志、trace 或 usage；它只是启动期配置。
 
@@ -141,7 +144,7 @@ pub struct PluginTimeouts {
 
 - **清单校验**在启动任何进程之前完成：`manifest_version`、`id` 字符集、`protocol_versions` 非空、能力受支持、超时为正。
 - **重复 `id`**：加载集合里共享同一 `id` 的所有 manifest 都失败；其中任一 `required` 则宿主启动失败。绝不"先到先得"。
-- **握手与版本协商**由协议 adapter 执行（#20）；`protocol_versions` 是宿主接受的精确白名单，adapter 的协商结果必须命中，否则该插件失败。
+- **握手与版本协商**由协议 adapter 执行（[mcp.md](mcp.md)）；`protocol_versions` 是宿主接受的精确白名单，adapter 的协商结果必须命中，否则该插件失败。
 - **能力发现**（例如 MCP `tools/list`）由 adapter 完成；发现到的工具必须都能被命名空间规则合法暴露，否则整插件失败。
 - **原子注册**：先校验该插件的全部合成名称，再一次性注册；任何一个名称非法、超长或碰撞，都不注册该插件的任何工具。
 - 插件之间无依赖；宿主可以串行或并行加载，结果不依赖顺序。
@@ -180,11 +183,11 @@ pub struct PluginTimeouts {
 ### 7.2 外部插件协议
 
 - `protocol_versions` 是**精确字符串白名单**，不是 semver 范围；空列表是清单错误。
-- adapter 握手（例如 MCP `initialize`）返回的协议版本必须命中白名单；否则该插件加载失败。
+- adapter 协商（MCP `server/discover`）返回的协议版本必须命中白名单；否则该插件加载失败。
 - 插件自身 `version` 只用于诊断展示，不参与兼容判断。
 - 不降级、不禁用部分能力、不尝试旧协议回退。
-- MCP 版本字符串与常量归 [#20](https://github.com/zibyn/asterpath/issues/20)；自定义 stdio 协议版本是 adapter 定义的 opaque 字符串，同样精确匹配。
-- `PluginProtocol::Acp` 是清单能识别的值；v1 是否实现 ACP 由 [#20](https://github.com/zibyn/asterpath/issues/20) 决定。识别值不等于实现，未实现的协议值使插件加载失败。
+- MCP v1 只支持 `2026-07-28`（无状态修订）；版本常量与 `server/discover` 协商见 [mcp.md](mcp.md)。自定义 stdio 协议版本是 adapter 定义的 opaque 字符串，同样精确匹配。
+- `PluginProtocol::Acp` 是清单能识别的值；v1 不实现 ACP（宿主/会话接口，不是工具传输，见 [mcp.md](mcp.md) §9）。识别值不等于实现，未实现的协议值使插件加载失败。
 
 ### 7.3 Provider、model alias 与 raw
 
@@ -203,7 +206,7 @@ pub struct PluginTimeouts {
   - 模型新请求该工具：pre-execute 照常运行；若未被拒绝，写 `ToolCallRequested`（`provenance = Unknown`，`replay = Unsafe`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。若 pre-execute 拒绝，写 `Denied`。
   - 崩溃恢复遇到 open intent：`provenance = Unknown` 直接写 `Failed{NotFound}`；否则按记录里的 `replay` 处理——`Safe` 且工具不存在写 `Failed{NotFound}`，`Unsafe` 写 `Interrupted`（#3）。
 - **同名工具实现变更**：v1 不在 `ToolCallRequested` 里记录实现指纹；宿主/插件契约要求升级时保持同名工具的 replay 语义，否则插件应把该工具声明为 `Unsafe`。这是有意的 v1 边界。
-- **插件 server 在宿主运行中崩溃**：连接与重连策略归 #20；在途调用按 #7 记 `Failed{Transport}`，取消宽限到期记 `Interrupted`。manifest 在 v1 不定义重启策略。
+- **插件 server 在宿主运行中崩溃**：v1 不自动重连/重启（[mcp.md](mcp.md) §7.3）。stdio 在途调用记 `Failed{Transport}`，该插件在本进程内不可用；HTTP 每次调用独立。取消宽限到期记 `Interrupted`。manifest 在 v1 不定义重启策略。
 
 ## 9. 失败隔离与状态报告
 
@@ -236,7 +239,7 @@ pub enum PluginLoadStage {
 | 主题 | 归属 |
 | --- | --- |
 | manifest 形状、加载选择、`id`/命名空间/冲突、版本策略、安装边界 | **本票（#16）** |
-| 传输实现、`initialize`、`tools/list`、`tools/call`、取消、断连/重连、协议版本常量、协议错误映射 | [#20](https://github.com/zibyn/asterpath/issues/20) |
+| 传输实现、MCP 版本常量、`server/discover`、`tools/list`、`tools/call`、取消、断连、协议错误映射 | [#20](./mcp.md)（已定） |
 | crate 打包、feature 布局、CLI `plugin list`、公共稳定面、`ToolName` 精确类型 | [#15](https://github.com/zibyn/asterpath/issues/15) |
 | 安装、更新、市场/registry、凭据/OAuth、环境变量展开、策略与脱敏 | host 或生态工具 |
 | provider / storage / executor / agent loop 等核心能力 | 进程内模块，不是插件（#2） |
@@ -270,7 +273,7 @@ pub enum PluginLoadStage {
 ## 13. 留给下游
 
 - **#7**：`ToolErrorKind::NotFound`、未知工具管线路径、`Provenance::Unknown`、命名空间规则已回写 [tools.md](./tools.md)。
-- **#20**：传输变体与认证字段（HTTP headers 等）随 `manifest_version` 扩展；MCP 版本常量；MCP "未知工具"错误映射到 `NotFound` 而不是 `Transport`；重连/重启语义。
+- **#20**：已定。HTTP 静态 `headers` 随 `manifest_version: 1`；MCP 只支持 `2026-07-28`；unknown tool → `NotFound`；不自动重连。见 [mcp.md](./mcp.md)。
 - **#15**：`PluginManifest` / `PluginId` 的最终打包位置；CLI `plugin list`；feature 布局；`ToolName` 的精确类型与校验。
 - **#4**：`Provenance` 新增 `Unknown` 值；日志 schema 在 v1 发布前完成该字段。
 - **#18**：manifest 不持久化，保留/归档无需处理插件清单。

@@ -32,14 +32,14 @@
 | `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol` | 是 |
 | `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | 是 |
 | `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | 是 |
-| `asterpath-plugin-host` | 外部插件清单与子进程/MCP adapter；实现依赖 [#20](https://github.com/zibyn/asterpath/issues/20) | `core`, `protocol` | 图内留位，不进 v1 验收 |
+| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol` | 图内留位，不进 v1 验收 |
 | `asterpath-testing` | in-memory fakes、`ScriptedProvider`、五个故障注入装饰器 + `ManualClock`（六点，见 [testing.md](testing.md)） | `core`, `protocol` | 是 |
 | `asterpath` | facade / 默认组装根；暴露稳定 API | 任意 | 是 |
 | `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | 是 |
 | `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | 是（仅测试） |
 | `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | 是（仅工具） |
 
-- 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（[#21](https://github.com/zibyn/asterpath/issues/21)）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18) 已收敛：内核只有 `SessionRetirement` 接缝，策略与归档由宿主实现；v1 不建）、MCP/ACP adapter（#20）。
+- 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（[#21](https://github.com/zibyn/asterpath/issues/21)）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18) 已收敛：内核只有 `SessionRetirement` 接缝，策略与归档由宿主实现；v1 不建）、MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。
 - 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。
@@ -295,7 +295,7 @@ default = "ask"               # ask | allow | deny
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage | 场景 (c) 通过 |
 | M4 CLI | `asterpath-cli` 七命令、配置、审批端 | CLI 场景测试通过 |
 
-- `asterpath-plugin-host` 与扩展 crate 不参与 M0–M4 的通过条件；它们在 [#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21) 定稿后各自加闸门。
+- `asterpath-plugin-host` 与扩展 crate 不参与 M0–M4 的通过条件；[#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) 已定，[#21](https://github.com/zibyn/asterpath/issues/21) 待定，各自实现时再加闸门。
 - CI 顺序：`cargo xtask check-deps` → `cargo fmt --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --workspace` → `cargo test -p asterpath-acceptance --test acceptance` → `cargo doc --workspace --no-deps`。
 - 另跑 feature 矩阵：`cargo check -p asterpath --no-default-features` 与 `--features anthropic` / `openai` / `sqlite` 各自组合。
 - CI 分层与超时（[testing.md](testing.md) §6）：`cargo test --workspace` 预算 5 分钟；进程级验收预算 5 分钟、单 marker 等待上限 15 秒；feature 矩阵 5 分钟。

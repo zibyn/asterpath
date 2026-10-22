@@ -68,6 +68,22 @@ _Avoid_: 信任级别、信任边界
 外部工具对模型暴露时的 `<PluginId>__<名称>` 前缀约定；`__` 保留，进程内工具不得使用。
 _Avoid_: 前缀、别名
 
+**MCP 服务端（MCP Server）**：
+通过 MCP 协议暴露工具的外部进程或 HTTP 端点；在框架内始终以 `Provenance::External` 出现。
+_Avoid_: MCP 插件、插件服务器
+
+**传输类别（Transport Kind）**：
+外部能力来源的传输分类 `Stdio | Http`；只说明来源类别，不含端点、命令或凭据。
+_Avoid_: 传输配置、连接信息
+
+**服务端发现（Server Discovery）**：
+MCP 的无会话协商：用 `server/discover` 取得协议版本与能力，不建立会话。
+_Avoid_: 握手、initialize
+
+**工具快照（Tool Snapshot）**：
+插件加载时发现并原子注册的工具集合；进程内不随服务端变化。
+_Avoid_: 工具缓存、动态注册表
+
 ## 交互与生命周期
 
 **类型化事件（Typed Event）**：

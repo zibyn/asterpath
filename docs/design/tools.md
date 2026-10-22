@@ -58,6 +58,7 @@ pub struct ToolOutput {
 #[non_exhaustive]
 pub enum ToolError {
     InvalidArgs { message: String },
+    NotFound { message: String },      // 运行期目标消失，例如 MCP unknown tool
     Transport { message: String },
     Internal { message: String },
 }
@@ -178,7 +179,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - 回合取消向所有在途调用广播 `CancelToken`（#6）。
 - 在 `cancel_grace`（默认 10s）内返回的工具按真实结果记 `Completed` / `Failed`；到期未返回的写 `Interrupted`。
 - 子进程：先 SIGTERM，`kill_grace` 后 SIGKILL；在平台支持时杀进程组/树，不留孤儿。
-- MCP：若 server 支持 `notifications/cancelled` 就发送；宽限内无响应则关闭连接并杀死 server 进程。
+- MCP（`2026-07-28`）：stdio 发送 `notifications/cancelled`，HTTP 关闭 SSE 流；宽限内无响应则关闭连接并杀死 server 进程。见 [mcp.md](mcp.md) §8。
 
 **panic**
 
@@ -225,10 +226,10 @@ pub enum ToolErrorKind {
 - `Interrupted`：`output` / `error` 为 `None`；投影合成固定的中断提示。
 - `Cancelled` 用于工具或外部 server 在宽限内自行报告取消；管线到期 drop 的调用写 `Interrupted`。
 - 默认上限：64 KiB/调用、256 KiB/step（按模型可见 content 的序列化字节计）；工具可用 `max_output_bytes` 覆盖单次值，但不能突破 step 累计上限。
-- 截断在 UTF-8 边界进行，并在 content 末尾附 `"[output truncated: N bytes omitted]"`；`truncated = true`。
+- 截断以 `Part` 为单位：文本 Part 可在 UTF-8 边界截断；非文本 Part 不拆分，整块放不下时丢弃。最后在 content 末尾附 `"[output truncated: N bytes omitted]"`；`truncated = true`。
 - **完整输出不落日志**；日志是模型可见内容的有界记录，不是工具的原始输出存储。
 
-状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。`NotFound` 由管线产生，不由工具返回：工具不存在时没有 `invoke`，因此 `ToolError` 不需要对应变体；`ToolErrorKind` 是事件级分类。
+状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。`NotFound` 既可由管线在注册表缺失时产生，也可由工具在运行期发现目标消失时返回（例如 MCP server 报 unknown tool），因此 `ToolError` 有 `NotFound` 变体；`ToolErrorKind` 仍是事件级分类。
 
 ## 8. 结果去向
 
@@ -302,3 +303,4 @@ pub struct ToolConfig {
 - **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
 - **#17**：已定。`DurableExecutor::await_signal` 以 `SignalIntent::AlreadyRecorded` 支持审批等待，不写 `SignalAwaited`；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。
+- **#20**：已定。MCP 外部工具的发现、结果/错误映射、失败矩阵与 ACP 出界见 [mcp.md](mcp.md)；`Provenance` 只带 `TransportKind::{Stdio, Http}`。
