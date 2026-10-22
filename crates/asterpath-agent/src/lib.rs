@@ -25,13 +25,15 @@ use asterpath_core::{
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CancelRegistration, CancelToken, CancellationRegistry,
-    CompactResult, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents,
-    Parallelism, PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent,
-    PreStepGateDecision, PreStepGateEvent, Provenance, ProviderCatalog, ProviderError,
-    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState,
-    StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
-    TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
+    CompactPlan, CompactResult, CompactSummary, CompactionAbortReason, CompactionError,
+    CompactionInput, CompactionOutcome, CompactionTrigger, Compactor, ConfigSnapshot, Item,
+    ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism, PostExecuteError,
+    PostExecuteEvent, PreExecuteError, PreExecuteEvent, PreStepGateDecision, PreStepGateEvent,
+    ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorKind, ReplaySafety,
+    ResumeReason, RunRequest, SessionEvent, SessionState, StopReason, StreamEvent, Tool, ToolArgs,
+    ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind, ToolName,
+    ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor,
+    approval_signal_id, approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -52,6 +54,7 @@ pub struct Agent {
     executor: Arc<dyn DurableExecutor>,
     clock: Arc<dyn Clock>,
     hooks: Option<ModuleCtx>,
+    compactor: Option<Arc<dyn Compactor>>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
     cancellations: Arc<CancellationRegistry>,
 }
@@ -81,9 +84,18 @@ impl Agent {
             executor,
             clock,
             hooks,
+            compactor: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             cancellations: Arc::new(CancellationRegistry::new()),
         }
+    }
+
+    /// Inject the optional compaction capability. `None` means compaction is
+    /// unavailable everywhere (`NotConfigured`).
+    #[must_use]
+    pub fn with_compactor(mut self, compactor: Option<Arc<dyn Compactor>>) -> Self {
+        self.compactor = compactor;
+        self
     }
 
     /// Share the facade's per-session cancellation registry. Without this the
@@ -141,7 +153,7 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let decoded = decode_entries(self.scan(session).await?, session)?;
+        let mut decoded = decode_entries(self.scan(session).await?, session)?;
         let config = decoded
             .iter()
             .find_map(|(_, event)| match event {
@@ -156,6 +168,29 @@ impl Agent {
         let mut intents = OpenIntents::default();
         for (entry, event) in &decoded {
             intents.apply(event, entry.dedup_key.as_ref());
+        }
+
+        // A dangling compaction intent is redone only when a compactor is
+        // assembled; otherwise it stays open and never blocks Idle.
+        if self.compactor.is_some()
+            && intents.compactions_are_open()
+            && let Some(reason) = self
+                .resolve_open_compaction(session, &decoded, &config)
+                .await?
+        {
+            decoded = decode_entries(self.scan(session).await?, session)?;
+            intents = OpenIntents::default();
+            for (entry, event) in &decoded {
+                intents.apply(event, entry.dedup_key.as_ref());
+            }
+            if let SessionState::TurnOpen { turn, step } = intents.state() {
+                if step.is_some()
+                    && let Some((step_id, _)) = open_step(&decoded, turn)
+                {
+                    self.commit_step(session, turn, step_id).await?;
+                }
+                return self.commit_turn(session, turn, reason, events).await;
+            }
         }
 
         match intents.state() {
@@ -339,6 +374,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let mut pending = existing_step;
         let mut steps_started = 0u32;
+        let mut auto_compactions = 0u32;
 
         loop {
             let (step, watermark, start_attempt) = match pending.take() {
@@ -350,7 +386,48 @@ impl Agent {
                             .commit_turn(session, turn, TurnEndReason::Cancelled, events)
                             .await;
                     }
-                    // Compaction (#46) runs here, before the host gate.
+                    // Automatic threshold compaction (#46), before the host gate.
+                    if self.compactor.is_some()
+                        && auto_compactions < config.compaction.max_auto_compactions_per_turn
+                    {
+                        let (input, frontier) = self
+                            .compaction_input(
+                                session,
+                                config,
+                                CompactionTrigger::Threshold,
+                                u64::MAX,
+                            )
+                            .await?;
+                        match self
+                            .perform_compaction(session, input, frontier, None)
+                            .await?
+                        {
+                            CompactionRun::Done(CompactResult::Applied(_)) => {
+                                auto_compactions += 1;
+                            }
+                            CompactionRun::Done(CompactResult::Insufficient) => {
+                                return self
+                                    .commit_turn(
+                                        session,
+                                        turn,
+                                        TurnEndReason::ContextExhausted,
+                                        events,
+                                    )
+                                    .await;
+                            }
+                            CompactionRun::Done(_) => {}
+                            CompactionRun::Failed(_) => {
+                                return self
+                                    .commit_turn(
+                                        session,
+                                        turn,
+                                        TurnEndReason::CompactionFailed,
+                                        events,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
                     match self.pre_step_gate(session, turn).await {
                         GateOutcome::Continue => {}
                         GateOutcome::Stop(reason) => {
@@ -448,9 +525,11 @@ impl Agent {
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
         // The projection is computed once per step; retries reuse it (L12).
-        let request = self.build_request(session, config, watermark).await?;
+        // A forced compaction re-projects the same step.
+        let mut request = self.build_request(session, config, watermark).await?;
         let max_attempts = config.turn.max_attempts.get();
         let mut attempt = start_attempt;
+        let mut force_compacted = false;
 
         loop {
             // A step still open when cancellation arrives never calls the model.
@@ -613,6 +692,33 @@ impl Agent {
                 None,
             )
             .await?;
+
+            // Context exhaustion before any `AssistantMessage`: try one forced
+            // compaction inside this same step, then retry the same step.
+            if error.context_exceeded() && !force_compacted {
+                force_compacted = true;
+                let (input, frontier) = self
+                    .compaction_input(session, config, CompactionTrigger::ProviderError, watermark)
+                    .await?;
+                match self
+                    .perform_compaction(session, input, frontier, None)
+                    .await?
+                {
+                    CompactionRun::Done(CompactResult::Applied(_)) => {
+                        request = self.build_request(session, config, watermark).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    CompactionRun::Done(_) => {
+                        self.commit_step(session, turn, step).await?;
+                        return Ok(StepOutcome::Turn(TurnEndReason::ContextExhausted));
+                    }
+                    CompactionRun::Failed(_) => {
+                        self.commit_step(session, turn, step).await?;
+                        return Ok(StepOutcome::Turn(TurnEndReason::CompactionFailed));
+                    }
+                }
+            }
 
             if will_retry {
                 if !backoff.is_zero() {
@@ -1619,17 +1725,261 @@ impl AgentRunner for Agent {
             for (entry, event) in &entries {
                 intents.apply(event, entry.dedup_key.as_ref());
             }
-            if !intents.is_idle()
-                || self
-                    .busy
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .contains(&session)
-            {
+            if !intents.is_idle() {
                 return Err(AgentError::Busy { session });
             }
-            Ok(CompactResult::NotConfigured)
+            // Share the drive single-flight; compact_now is turn-free.
+            if !self.acquire(session) {
+                return Err(AgentError::Busy { session });
+            }
+            let _busy = SessionBusy {
+                busy: Arc::clone(&self.busy),
+                session,
+            };
+            let config = entries
+                .iter()
+                .find_map(|(_, event)| match event {
+                    SessionEvent::SessionCreated { config, .. } => Some(config.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| AgentError::Corrupt {
+                    session,
+                    detail: "session log has no SessionCreated".to_owned(),
+                })?;
+            let (input, frontier) = self
+                .compaction_input(session, &config, CompactionTrigger::Manual, u64::MAX)
+                .await?;
+            match self
+                .perform_compaction(session, input, frontier, None)
+                .await?
+            {
+                CompactionRun::Done(result) => Ok(result),
+                CompactionRun::Failed(error) => Err(AgentError::Compaction(error)),
+            }
         })
+    }
+}
+
+/// Compaction machinery shared by all three triggers.
+impl Agent {
+    /// Build the compactor's planning input from the projection at `watermark`.
+    /// `CompactionApplied` is folded regardless of the watermark.
+    async fn compaction_input(
+        &self,
+        session: SessionId,
+        config: &ConfigSnapshot,
+        trigger: CompactionTrigger,
+        watermark: u64,
+    ) -> Result<(CompactionInput, LogId), AgentError> {
+        let entries = self.scan(session).await?;
+        let frontier = entries
+            .last()
+            .map(|entry| entry.log_id)
+            .unwrap_or_else(|| LogId::from_i64(0));
+        let mut visible = Vec::new();
+        let mut started: Vec<(StepId, LogId)> = Vec::new();
+        let mut committed: HashSet<StepId> = HashSet::new();
+        for entry in &entries {
+            let event = decode_entry(entry).map_err(|error| AgentError::Corrupt {
+                session,
+                detail: error.to_string(),
+            })?;
+            match &event {
+                SessionEvent::StepStarted { step_id, .. } => {
+                    started.push((*step_id, entry.log_id));
+                }
+                SessionEvent::StepCommitted { step_id, .. } => {
+                    committed.insert(*step_id);
+                }
+                _ => {}
+            }
+            if matches!(event, SessionEvent::CompactionApplied { .. }) || entry.seq < watermark {
+                visible.push(entry.clone());
+            }
+        }
+        let history =
+            asterpath_protocol::project(&visible).map_err(|error| AgentError::Corrupt {
+                session,
+                detail: error.to_string(),
+            })?;
+        let live: HashSet<LogId> = history
+            .iter()
+            .filter_map(|entry| match entry.origin {
+                ProjectedOrigin::Log(id) => Some(id),
+                ProjectedOrigin::Summary(_) => None,
+            })
+            .collect();
+        let last_usage = entries
+            .iter()
+            .filter_map(|entry| match decode_entry(entry).ok()? {
+                SessionEvent::AssistantMessage { usage, .. }
+                    if entry.seq < watermark && live.contains(&entry.log_id) =>
+                {
+                    Some(UsageAnchor {
+                        origin: entry.log_id,
+                        usage,
+                    })
+                }
+                _ => None,
+            })
+            .next_back();
+        let step_starts = started
+            .into_iter()
+            .filter(|(step, _)| committed.contains(step))
+            .map(|(_, log_id)| log_id)
+            .collect();
+        Ok((
+            CompactionInput {
+                trigger,
+                model: config.model.clone(),
+                config: config.compaction.clone(),
+                turn: config.turn.clone(),
+                history,
+                step_starts,
+                last_usage,
+            },
+            frontier,
+        ))
+    }
+
+    /// Plan, record the intent, run the summary and write its terminal.
+    ///
+    /// `existing_key` replays an open `CompactionStarted` from recovery: the
+    /// intent is already recorded, so only the terminal is appended.
+    async fn perform_compaction(
+        &self,
+        session: SessionId,
+        input: CompactionInput,
+        frontier: LogId,
+        existing_key: Option<DedupKey>,
+    ) -> Result<CompactionRun, AgentError> {
+        let Some(compactor) = &self.compactor else {
+            return Ok(CompactionRun::Done(CompactResult::NotConfigured));
+        };
+        let job = match compactor.plan(&input) {
+            CompactPlan::Summarize(job) => job,
+            CompactPlan::NotNeeded => return Ok(CompactionRun::Done(CompactResult::NotNeeded)),
+            CompactPlan::NothingToDo => {
+                return Ok(CompactionRun::Done(CompactResult::NothingToDo));
+            }
+            _ => return Ok(CompactionRun::Done(CompactResult::NotConfigured)),
+        };
+        let recording_intent = existing_key.is_none();
+        let key = existing_key.unwrap_or_else(|| dedup::compaction(frontier));
+        if recording_intent {
+            self.append(
+                session,
+                SessionEvent::CompactionStarted {
+                    trigger: input.trigger,
+                    replaces_from: job.replaces.first,
+                    caused_by: frontier,
+                },
+                Some(key.clone()),
+            )
+            .await?;
+        }
+        match compactor.compact(job).await {
+            Ok(CompactSummary::Applied(outcome)) => {
+                self.append_applied(session, &outcome, key.clone()).await?;
+                Ok(CompactionRun::Done(CompactResult::Applied(outcome)))
+            }
+            Ok(CompactSummary::Insufficient) => {
+                self.append_aborted(session, CompactionAbortReason::Insufficient, key)
+                    .await?;
+                Ok(CompactionRun::Done(CompactResult::Insufficient))
+            }
+            Err(error) => {
+                self.append_aborted(session, CompactionAbortReason::SummaryFailed, key)
+                    .await?;
+                Ok(CompactionRun::Failed(error))
+            }
+            Ok(_) => {
+                // Forward-compatible summary results are treated as Insufficient.
+                self.append_aborted(session, CompactionAbortReason::Insufficient, key)
+                    .await?;
+                Ok(CompactionRun::Done(CompactResult::Insufficient))
+            }
+        }
+    }
+
+    async fn append_applied(
+        &self,
+        session: SessionId,
+        outcome: &CompactionOutcome,
+        key: DedupKey,
+    ) -> Result<(), AgentError> {
+        self.append(
+            session,
+            SessionEvent::CompactionApplied {
+                first_kept: outcome.first_kept,
+                summary: outcome.summary.clone(),
+                replaces: outcome.replaces,
+                model: outcome.model.clone(),
+                usage: outcome.usage,
+                raw: outcome.raw.clone(),
+            },
+            Some(key),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn append_aborted(
+        &self,
+        session: SessionId,
+        reason: CompactionAbortReason,
+        key: DedupKey,
+    ) -> Result<(), AgentError> {
+        self.append(
+            session,
+            SessionEvent::CompactionAborted { reason },
+            Some(key),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Redo an open `CompactionStarted`. Returns the turn end reason when the
+    /// redo produced a terminal that must close the current turn.
+    async fn resolve_open_compaction(
+        &self,
+        session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
+        config: &ConfigSnapshot,
+    ) -> Result<Option<TurnEndReason>, AgentError> {
+        let mut terminal: HashSet<DedupKey> = HashSet::new();
+        for (entry, event) in decoded {
+            if matches!(
+                event,
+                SessionEvent::CompactionApplied { .. } | SessionEvent::CompactionAborted { .. }
+            ) && let Some(key) = &entry.dedup_key
+            {
+                terminal.insert(key.clone());
+            }
+        }
+        let open = decoded.iter().rev().find_map(|(entry, event)| {
+            let SessionEvent::CompactionStarted { trigger, .. } = event else {
+                return None;
+            };
+            let key = entry.dedup_key.clone()?;
+            (!terminal.contains(&key)).then_some((key, *trigger))
+        });
+        let Some((key, trigger)) = open else {
+            return Ok(None);
+        };
+        let (input, frontier) = self
+            .compaction_input(session, config, trigger, u64::MAX)
+            .await?;
+        match self
+            .perform_compaction(session, input, frontier, Some(key))
+            .await?
+        {
+            CompactionRun::Done(CompactResult::Insufficient) => {
+                Ok(Some(TurnEndReason::ContextExhausted))
+            }
+            CompactionRun::Failed(_) => Ok(Some(TurnEndReason::CompactionFailed)),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -1733,6 +2083,26 @@ struct BusyGuard {
     session: SessionId,
     /// Removes the session's active cancel token when the drive ends.
     _cancel: CancelRegistration,
+}
+
+/// Single-flight guard for the turn-free `compact_now` path.
+struct SessionBusy {
+    busy: Arc<Mutex<HashSet<SessionId>>>,
+    session: SessionId,
+}
+
+impl Drop for SessionBusy {
+    fn drop(&mut self) {
+        self.busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.session);
+    }
+}
+
+enum CompactionRun {
+    Done(CompactResult),
+    Failed(CompactionError),
 }
 
 impl Drop for BusyGuard {

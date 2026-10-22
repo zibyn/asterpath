@@ -72,6 +72,7 @@ name = "asterpath"
 version = "0.1.0"
 dependencies = [
  "asterpath-agent",
+ "asterpath-compaction",
  "asterpath-core",
  "asterpath-protocol",
  "asterpath-provider-anthropic",
@@ -132,6 +133,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "asterpath-compaction"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-testing",
+ "futures-core",
+ "futures-util",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

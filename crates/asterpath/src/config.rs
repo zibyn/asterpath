@@ -8,8 +8,8 @@ use asterpath_core::{
     ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
 };
 use asterpath_protocol::{
-    AgentRunner, ApprovalPolicy, CompactionConfig, DefaultApprovalPolicy, ModelAlias, ModelSpec,
-    Provider, SubagentConfig, Tool, ToolConfig, TurnConfig,
+    AgentRunner, ApprovalPolicy, CompactionConfig, Compactor, DefaultApprovalPolicy, ModelAlias,
+    ModelSpec, Provider, SubagentConfig, Tool, ToolConfig, TurnConfig,
 };
 
 use crate::error::AsterError;
@@ -21,6 +21,9 @@ pub struct AsterpathConfig {
     pub tools: Vec<Arc<dyn Tool>>,
     pub tool: ToolConfig,
     pub agent: Option<Arc<dyn AgentRunner>>,
+    /// Optional compaction capability. `None` (the M0 default) makes every
+    /// compaction path report `NotConfigured`.
+    pub compactor: Option<Arc<dyn Compactor>>,
     /// Overrides the `sqlite` feature; must be paired with `storage`.
     pub event_log: Option<Arc<dyn EventLog>>,
     pub storage: Option<Arc<dyn Storage>>,
@@ -47,6 +50,7 @@ impl Default for AsterpathConfig {
             tools: Vec::new(),
             tool: ToolConfig::default(),
             agent: None,
+            compactor: None,
             event_log: None,
             storage: None,
             session_catalog: None,
@@ -111,6 +115,12 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn agent(mut self, agent: Arc<dyn AgentRunner>) -> Self {
         self.config.agent = Some(agent);
+        self
+    }
+
+    #[must_use]
+    pub fn compactor(mut self, compactor: Arc<dyn Compactor>) -> Self {
+        self.config.compactor = Some(compactor);
         self
     }
 

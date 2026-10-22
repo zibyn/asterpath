@@ -173,6 +173,7 @@ impl Asterpath {
                     Arc::clone(&config.clock),
                     hooks,
                 )
+                .with_compactor(config.compactor.clone())
                 .with_cancellations(Arc::clone(&cancellations)),
             )
         });
@@ -393,7 +394,7 @@ impl SessionHandle {
         Ok(intents.state())
     }
 
-    /// Compaction is not wired in this ticket; idle sessions report NotConfigured.
+    /// Run one manual compaction. Only allowed while idle and undriven.
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError> {
         Ok(self.agent.compact_now(self.session).await?)
     }
