@@ -12,6 +12,7 @@
 > - 新增 `CompactionStarted` 意图记录（#9）。
 > - 新增 `SignalAwaited` 意图记录（#3；API 见 ADR-0014）。
 > - `asterpath-storage-sqlite` 的 `log` 表增加 `recorded_at` 列（#5）。
+> - `Span` 增加 `parent_trace` / `child_trace`，原 `parent` 改名 `parent_span`；补全 `SpanAttributes` 子结构；`ErrorType` 增加 `ToolCancelled` / `ToolNotFound`；`backoff_before_ms` 来自 `ModelCallAborted.backoff_ms`；`TraceTap` 只在终态发 `Ended`（#31）。
 
 ## 1. 决策摘要
 
@@ -42,7 +43,8 @@ pub enum SpanStatus { Unset, Ok, Error, Cancelled, Interrupted }
 #[non_exhaustive]
 pub enum ErrorType {
     ProviderRejected, Transport, ToolInvalidArgs, ToolDenied, ToolTimeout,
-    ToolPanic, ContextExhausted, CompactionFailed, MaxSteps, Internal, Other,
+    ToolPanic, ToolCancelled, ToolNotFound, ContextExhausted,
+    CompactionFailed, MaxSteps, Internal, Other,
 }
 
 pub struct LogIdRange { pub first: LogId, pub last: LogId }
@@ -50,7 +52,9 @@ pub struct LogIdRange { pub first: LogId, pub last: LogId }
 pub struct Span {
     pub trace: TraceId,
     pub span: SpanId,
-    pub parent: Option<SpanId>,
+    pub parent_span: Option<SpanId>,      // 同 trace 内的父 span
+    pub parent_trace: Option<TraceId>,    // 子会话根 span：父 trace（TraceId = SessionId）
+    pub child_trace: Option<TraceId>,     // 父 trace 的 subagent span：子 trace
     pub kind: SpanKind,
     pub name: String,                     // 稳定命名，见表 3
     pub session: SessionId,
@@ -71,12 +75,50 @@ pub struct Span {
 pub enum SpanAttributes {
     Session(SessionAttrs),
     Turn(TurnAttrs),
-    Step,
+    Step,                                 // step 无额外属性
     ModelCall(ModelCallAttrs),
     ToolCall(ToolCallAttrs),
     Subagent(SubagentAttrs),
     Wait(WaitAttrs),
     Compaction(CompactionAttrs),
+}
+
+pub struct SessionAttrs {
+    pub parent_session: Option<SessionId>,
+    pub fork_source_log: Option<LogId>,
+}
+pub struct TurnAttrs { pub index: u32 }
+pub struct ModelCallAttrs {
+    pub provider: String,
+    pub request_model: ModelSpec,
+    pub response_model: Option<String>,
+    pub response_id: Option<String>,
+    pub finish_reasons: Vec<StopReason>,
+    pub usage: Option<Usage>,
+    pub attempt_count: u32,
+    pub compacted: bool,
+}
+pub struct ToolCallAttrs {
+    pub name: ToolName,
+    pub side_effect: SideEffect,
+    pub replay: ReplaySafety,
+    pub provenance: Provenance,
+    pub truncated: bool,
+}
+pub struct SubagentAttrs {
+    pub child: SessionId,
+    pub outcome: Option<ChildOutcome>,
+}
+pub struct WaitAttrs {
+    pub wait: WaitKind,
+    pub deadline: Option<Timestamp>,
+    pub caused_by: Option<LogId>,
+}
+pub struct CompactionAttrs {
+    pub trigger: CompactionTrigger,
+    pub replaces: Option<LogIdRange>,
+    pub model: Option<ModelSpec>,
+    pub usage: Option<Usage>,
 }
 
 pub enum SpanUpdate { Started(Span), Ended(Span) }
@@ -124,7 +166,7 @@ flowchart TD
 - **审批等待**只在日志里存在 `SignalReceived{name=tool.approval.<id>}` 时建立；自动允许（无 signal）不产生 wait span。重建无法区分“未询问”和“瞬间允许”，接受。
 - **排队中的子会话**（尚无 `ChildSessionSpawned`）是内存状态，不建 span（#8 §3.4）。
 - **compaction 的父**由 `CompactionStarted.caused_by` 定位：落在 open step 内 → step；回合 open → turn；回合已提交 → session。
-- **子会话是独立 trace**（`TraceId = child SessionId`），其根 span 带 `parent_trace` / `parent_span` / `parent_session`；父 trace 中的 `subagent` span 带 `child_trace`。exporter 用 OTel span link 连接两棵树，不合并成一条超长 trace。
+- **子会话是独立 trace**（`TraceId = child SessionId`），其根 span 带 `parent_trace` / `parent_span`（`parent_trace` 即父会话）；父 trace 中的 `subagent` span 带 `child_trace`。exporter 用 OTel span link 连接两棵树，不合并成一条超长 trace。
 - **session span 永远 open**（没有 session 关闭事件），只作容器；exporter 按 turn 切分导出。
 
 ## 4. 身份、因果与重放
@@ -163,6 +205,7 @@ struct AttemptEvent {
 }
 ```
 
+- `backoff_before_ms` 取同一 span 前一条 `ModelCallAborted.backoff_ms`；首次 attempt 为 0。jitter 已由 loop 写入日志，重建不再现算。
 - 失败 attempt 的 `partial_usage` 只作诊断；token 总量只取 span 的 `usage`（[usage.md](usage.md)）。
 - 最终成功的 `model_call` 即使中间有可重试错误，`status = Ok`；被重试处理的错误不置 `Error`（与 OTel Recording Errors 一致）。
 - 重试耗尽 / `Rejected` → `status = Error`，`error_type` 取最后一次 attempt。
@@ -195,6 +238,7 @@ struct AttemptEvent {
 - 工具 `Failed` 是模型可见结果，不把 step 或 turn 置为 Error。
 - `subagent` 的 `status`：`Completed` → Ok；`Failed` / `Lost` → Error；`Cancelled` → Cancelled。具体 `outcome` 留在属性里。
 - `wait` 的取消不是错误；`status = Cancelled`，不设 `error_type`。
+- 工具错误的 `ToolErrorKind → ErrorType` 映射：`InvalidArgs → ToolInvalidArgs`、`Denied → ToolDenied`、`Timeout → ToolTimeout`、`Cancelled → ToolCancelled`、`Panic → ToolPanic`、`Transport → Transport`、`NotFound → ToolNotFound`、`Internal → Internal`。
 
 ## 7. 查询与导出 seam
 
@@ -229,7 +273,7 @@ pub enum TraceError {
 - `TraceQuery` 从注入的 `EventLog` 流式折叠，内存有界；没有 trace 表，也不需要额外索引。
 - 日志被退役后，该会话的 span 一并消失：`TraceQuery` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
-- `TraceTap` 由 `asterpath-tracing` 在事件总线之上运行，向 exporter 发 `Started` / `Ended`；它不改变日志，也不参与恢复。
+- `TraceTap` 由 `asterpath-tracing` 在事件总线之上运行，向 exporter 发 `Started` / `Ended`：每条开启记录发 `Started`，只有终态记录发 `Ended`。session span 永不发 `Ended`；frontier 上的 span 在其后续 append 关闭时才发 `Ended`。它不改变日志，也不参与恢复。
 - **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `EventLog` 读取权限，并自行脱敏。默认导出不含内容。
 - **采样、过滤、格式、批量、重试**：全归 exporter。内核与 tracing 模块不做 head sampling。
 - 导出格式（OTLP/JSON/其他）与 `gen_ai.*` 映射只在 exporter 中出现；核心类型不使用字符串属性名。
@@ -265,7 +309,7 @@ pub enum TraceError {
 | T11 | `kill -9` 于模型流中 | 恢复后同一 `model_call` span；新增带 `replayed=true` 的 attempt event；最终恰一条 `AssistantMessage` |
 | T12 | compaction（BetweenSteps 与 Idle） | 各一个 `compact {model}` span，父分别为 turn / session；`trigger`、`replaces`、usage 正确 |
 | T13 | 内容边界 | 任何 span 都不含 prompt/completion/工具参数全文；内容只能通过 `log_range` 从 `EventLog` 取 |
-| T14 | exporter 实时订阅 | 收到成对的 `Started` / `Ended`；顺序与日志一致；tracing 模块不改变任何日志记录 |
+| T14 | exporter 实时订阅 | 除 session span 与 frontier 外，每个 span 收到成对的 `Started` / `Ended`；session 只有 `Started`；顺序与日志一致；tracing 模块不改变任何日志记录 |
 
 ## 10. 非目标
 

@@ -11,6 +11,8 @@
 > **2026-10-22 #28 修订**：`ToolCallRequested` 增加 `provider_call_id`，与框架生成的 `tool_call_id` 分开；恢复不重跑已记录意图的 pre-execute。语义见 [tools.md](tools.md) §3/§6。
 >
 > **2026-10-22 #30 修订**：`StreamState` 改名为 `SessionState` 并补 `turn`，与 `SessionHandle::state()` 共用；「前缘」专指最后一条已提交记录，恢复目标是它之后的「恢复点」。
+>
+> **2026-10-22 #31 修订**：未知工具恢复统一写 `Failed{NotFound}`；`ModelCallAborted` 增加 `backoff_ms`；`SessionEvent` 加 `#[non_exhaustive]`。
 
 ## 1. 决策摘要
 
@@ -52,6 +54,7 @@ pub struct ParentRef {
 ## 3. 事件枚举
 
 ```rust
+#[non_exhaustive]
 pub enum SessionEvent {
     SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef> },
     ContextForked { source: ParentRef, source_log: LogId,
@@ -66,6 +69,7 @@ pub enum SessionEvent {
     ModelCallAborted { turn_id: TurnId, step_id: StepId, attempt: u32,
                        kind: AbortKind, partial: Option<Vec<Item>>,
                        model: ModelSpec,
+                       backoff_ms: u64,         // 下一 attempt 前的实际退避；不重试为 0
                        usage: Option<Usage> },  // 非模型可见；usage 为 best-effort
     ToolCallRequested { turn_id: TurnId, step_id: StepId,
                         tool_call_id: ToolCallId,        // 框架生成的不透明身份
@@ -261,7 +265,8 @@ recover(session):
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
     #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；
-    #    未终结工具先查审批信号：有 Allow 则执行，有 Deny 则写 Failed{Denied}，
+    #    未终结工具若 provenance = Unknown 直接写 Failed{NotFound}（不查审批、不重跑）；
+    #    否则先查审批信号：有 Allow 则执行，有 Deny 则写 Failed{Denied}，
     #    无决定且策略为 Ask 则重新挂起；否则 Safe 重跑 / Unsafe Interrupted；
     #    全部终结后写 StepCommitted。
 
@@ -295,6 +300,8 @@ recover(session):
 | S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
+| S17 | 恢复遇到 `ToolCallRequested{provenance: Unknown}` | 恰写一条 `ToolResult{Failed, NotFound}`；不查审批、不重跑；模型可见 |
+| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 可经 `runnable` 被认领并开始回合；输入恰被投影一次 |
 
 ## 8. 留给下游
 

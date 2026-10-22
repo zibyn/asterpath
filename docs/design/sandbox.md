@@ -14,7 +14,7 @@
 
 - **沙箱是 spawn 点的纯变换**：`SandboxProvider::confine(SpawnRequest) -> ConfinedSpawn`，把「想启动的命令」变成「实际执行的命令」。它不是 `Tool` 装饰器。
 - **只有要起进程的调用点能被约束**：纯进程内 Rust 工具没有进程边界，OS 层面无法沙箱；包装器只能整次拒绝或审计。
-- **合约与后端分离**：合约 crate `asterpath-sandbox` 只含类型与 trait、零依赖；后端 crate 独立。v1 只定接缝，不实现、不进 workspace。
+- **合约与后端分离**：合约 crate `asterpath-sandbox` 只含类型与 trait、零依赖；后端 crate 独立。v1 只在本文件定义合约形状，不建 crate、不实现、不进 workspace。
 - **策略只建模文件系统三档**：`ReadOnly` / `WorkspaceWrite` / `FullAccess`。网络与进程可见性不在 v1 schema 里。
 - **策略由宿主解析**：调用点静态配置 > session > 部署默认；模型参数不能放宽；不落日志、不进 `ConfigSnapshot`。
 - **默认 fail closed**：后端不能完整强制请求的策略就拒绝启动进程；`Partial` 必须宿主显式 opt-in。

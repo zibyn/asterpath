@@ -9,6 +9,7 @@
 > - `ToolResult` 增加 `error` 与 `truncated`。
 > - `ToolCallRequested.raw_args` 明确为 pre-execute 之后的 **effective args**。
 > - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。
+> - `ToolError` 增加 `Cancelled`（#31）。
 >
 > 2026-10-22 #28 修订：`ToolCallRequested` 增加 `provider_call_id`；已有意图的调用恢复时不重跑 pre-execute；每个调用由单一 supervisor 写终态（真实结果 > 取消 > 超时）。
 >
@@ -65,6 +66,7 @@ pub enum ToolError {
     InvalidArgs { message: String },
     NotFound { message: String },      // 运行期目标消失，例如 MCP unknown tool
     Denied { message: String },        // 沙箱在进程启动前按策略拒绝 spawn（#21）
+    Cancelled { message: String },     // 工具或外部 server 在宽限内自行报告取消
     Transport { message: String },
     Internal { message: String },
 }

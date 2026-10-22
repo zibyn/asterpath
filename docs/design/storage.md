@@ -4,6 +4,7 @@
 > 相关 ADR：[0005 存储契约与 SQLite 首实现](../adr/0005-storage-contract-and-sqlite.md)。
 > 前置：[#3 事件日志与检查点恢复](event-log-recovery.md)、[#4 schema 版本](../adr/0004-log-schema-version-and-upcasting.md)。
 > 范围：v1 单进程、单写者、崩溃安全。Postgres 只在 seam 层面被考虑，不实现。
+> **2026-10-22 #31 修订**：`InputRecorded` 也入队 `runnable`，使 `submit_input` 后崩溃仍可唤醒。
 
 ## 1. 决策摘要
 
@@ -214,7 +215,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 | 事件 | `open_intents` 动作 | 其他派生动作 |
 | --- | --- | --- |
 | `SessionCreated` | — | 插入 sessions 行 |
-| `InputRecorded` | 不变 | — |
+| `InputRecorded` | 不变 | 入队 `runnable` |
 | `TurnStarted` | 插入 `(turn, turn_id)` | — |
 | `TurnCommitted` | 删除 `(turn, turn_id)` | — |
 | `StepStarted` | 插入 `(step, step_id)` | — |
@@ -232,7 +233,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 | `CompactionApplied` / `CompactionAborted` | 删除 `(compaction, frontier LogId)` | — |
 | `AssistantMessage` / `ModelCallAborted` / `StreamResumed` / `ContextForked` | 不变 | — |
 
-- 删除按键**精确匹配**。审批的 `SignalReceived` 没有对应 `SignalAwaited`，因此不删除任何行；steering 的 `InputRecorded` 也不改变状态。
+- 删除按键**精确匹配**。审批的 `SignalReceived` 没有对应 `SignalAwaited`，因此不删除任何行；steering 的 `InputRecorded` 也不改变 `open_intents`，但仍入队 `runnable`：`submit_input` 后崩溃时，该行在重启后仍可被认领（S18）。驱动中的重复唤醒由 `claim → Busy → ack` 吸收。
 - **`idle` = `open_intents` 中没有 `kind != 'compaction'` 的行。** compaction 行只供恢复重做（#24/#27），不影响退役与启动入队。
 - `TimerCancelled` 删除 timers 行：日志是真相，`due_timers` 只查 `fired_at IS NULL`。
 

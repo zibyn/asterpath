@@ -14,7 +14,7 @@
 
 - **17 个库/应用成员 + `xtask`，一模块一 crate**。crate 列表、职责与依赖边见 [packaging.md](../design/packaging.md) §2；`runtime` 与 `scheduler` 不合并，`asterpath-testing` 只依赖合约 crate，验收用独立的 `asterpath-acceptance` 组装真实模块。
 - **依赖边由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 校验**：模块之间零边、`core` / `protocol` 无 feature。白名单是机器可读文件，不是脚本文本解析。
-- **lockstep `0.1.0`，稳定面收窄到 facade + core + protocol + 日志 schema**。模块 crate 是 0.x 实验面；v1 不发布 crates.io；公开错误/事件枚举 `#[non_exhaustive]`。
+- **lockstep `0.1.0`，稳定面收窄到 facade + core + protocol + 日志 schema**。模块 crate 是 0.x 实验面；v1 不发布 crates.io；顶层公开事件/错误枚举（如 `SessionEvent`、`ToolError`、`AsterError`）`#[non_exhaustive]`，内嵌值枚举（`AbortKind` 等）保持可穷举。
 - **feature 只在 facade、CLI 与后端 crate**：默认 `anthropic` + `openai` + `sqlite`；`plugin-host` 默认关闭；关闭 sqlite 时由宿主注入 `EventLog` / `Storage`。
 - **没有后台 driver**。宿主显式调用 `SessionHandle::drive()`；同一 session 单飞；`submit_input` 只 append 并通知在途回合；丢弃流不等于取消，取消必须显式调用。
 - **`AgentRunner::run` 的流只表达实时事件**。回合失败是 `TurnCommitted { reason }`，不是流错误；`AgentError` 只表示无法运行。恢复位置完全由日志推导。
