@@ -1,12 +1,19 @@
-//! Scenario (a): a real `SIGKILL` mid-turn, then recovery from the same SQLite.
+//! v1 acceptance scenarios: a real `SIGKILL`, then recovery from the same SQLite.
 #![cfg(unix)]
 
 mod common;
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use asterpath_protocol::{Item, Part, Role, SessionEvent, ToolResultStatus, TurnEndReason};
+use asterpath::AsterpathBuilder;
+use asterpath_core::{SessionId, ToolCallId};
+use asterpath_protocol::{
+    ChildOutcome, InputTokens, Item, OutputTokens, Part, Role, SessionEvent, Span, SpanAttributes,
+    SpanFilter, SpanKind, ToolResultStatus, TraceId, TurnEndReason, Usage, UsageFilter, UsageScope,
+};
 use common::{Scenario, Testdrive, markers, scan, session_id};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 async fn session_entries(
@@ -515,6 +522,510 @@ async fn b1_both_providers_produce_the_same_normalized_history() {
         anthropic_raw, openai_raw,
         "provider raw payloads are intentionally different"
     );
+}
+
+// --- Scenario (c): fan-out, crash while the parent waits, recovery -----------
+
+const TASK_A: &str = "task A: report alpha";
+const TASK_B: &str = "task B: report beta";
+const SUMMARY_A: &str = "summary A: alpha done";
+const SUMMARY_B: &str = "summary B: beta done";
+const SECRET_A: &str = "transcript-A-secret";
+const SECRET_B: &str = "transcript-B-secret";
+
+/// The loop's lifecycle records for one child turn. Crash bookkeeping
+/// (`StreamResumed`, `ModelCallAborted`) is not part of the sequence.
+const CHILD_LIFECYCLE: &[&str] = &[
+    "SessionCreated",
+    "InputRecorded",
+    "TurnStarted",
+    "StepStarted",
+    "AssistantMessage",
+    "StepCommitted",
+    "TurnCommitted",
+];
+
+fn usage(uncached: u64, output: u64) -> Usage {
+    Usage {
+        input: InputTokens {
+            uncached,
+            cache_read: 0,
+            cache_write: 0,
+        },
+        output: OutputTokens {
+            total: output,
+            reasoning: 0,
+        },
+    }
+}
+
+fn usage_filter(scope: UsageScope) -> UsageFilter {
+    UsageFilter {
+        scope,
+        bucket: None,
+        model: None,
+        since: None,
+        until: None,
+        limit: None,
+    }
+}
+
+/// The child log minus the crash bookkeeping the loop itself writes on
+/// recovery; anything else unexpected remains visible to the assertion.
+fn lifecycle(events: &[SessionEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                SessionEvent::StreamResumed { .. }
+                    | SessionEvent::ModelCallAborted {
+                        kind: asterpath_protocol::AbortKind::Crash,
+                        ..
+                    }
+            )
+        })
+        .map(|event| event.kind())
+        .collect()
+}
+
+fn task_text(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The facade holds the writer lock, so scenario (c) reads through its log
+/// instead of opening a second connection.
+async fn committed(
+    log: &dyn asterpath_core::EventLog,
+    session: SessionId,
+) -> Vec<asterpath_core::LogEntry> {
+    let mut stream = log.scan(asterpath_core::LogQuery {
+        session,
+        after: None,
+        limit: None,
+    });
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        entries.push(entry.expect("log entry"));
+    }
+    entries
+}
+
+async fn trace_spans(trace: &dyn asterpath_protocol::TraceQuery, session: SessionId) -> Vec<Span> {
+    let mut stream = trace.spans(SpanFilter {
+        session: Some(session),
+        ..SpanFilter::default()
+    });
+    let mut spans = Vec::new();
+    while let Some(span) = stream.next().await {
+        spans.push(span.expect("trace span"));
+    }
+    spans
+}
+
+#[tokio::test]
+async fn c1_parallel_children_survive_a_waiting_crash() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("c1.sqlite");
+    let effect = dir.path().join("unused");
+
+    let mut run = Testdrive::start(Scenario {
+        run: true,
+        db: &db,
+        fixture: "c1_fanout.json",
+        effect: &effect,
+        hold_ms: 0,
+        failpoints: Vec::new(),
+    });
+    let waiting = run.wait_marker("\"event\":\"parent_waiting\"");
+    assert_eq!(
+        serde_json::from_str::<Value>(&waiting).expect("marker json")["children"],
+        2,
+        "both children have started before the parent crash"
+    );
+    let run_lines = run.kill();
+    let parent = session_id(&run_lines);
+    assert!(
+        markers(&run_lines, "model_request")
+            .iter()
+            .all(|request| request["route"] != "parent_final"),
+        "the parent is still waiting when it is killed"
+    );
+
+    let resume_lines = Testdrive::resume_session(
+        Scenario {
+            run: false,
+            db: &db,
+            fixture: "c1_fanout.json",
+            effect: &effect,
+            hold_ms: 0,
+            failpoints: Vec::new(),
+        },
+        parent,
+    )
+    .wait_success();
+    assert_eq!(session_id(&resume_lines), parent);
+
+    // Everything below reads the same SQLite file; no process memory is reused.
+    let asterpath = AsterpathBuilder::new()
+        .database(&db)
+        .build()
+        .await
+        .expect("reopen the acceptance database");
+
+    let log = asterpath.event_log();
+    let entries = committed(log.as_ref(), parent).await;
+    let events: Vec<SessionEvent> = entries
+        .iter()
+        .map(|entry| asterpath_protocol::decode_entry(entry).expect("decode"))
+        .collect();
+
+    // --- child identity: one spawn and one completion per parent tool call ---
+
+    let spawns: Vec<(ToolCallId, SessionId, String)> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionSpawned {
+                child,
+                task,
+                parent_tool_call_id,
+                ..
+            } => Some((*parent_tool_call_id, *child, task_text(task))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        spawns.len(),
+        2,
+        "parent {parent:?} spawned exactly two children: {spawns:?}"
+    );
+    assert_eq!(
+        spawns
+            .iter()
+            .map(|(call, _, _)| *call)
+            .collect::<HashSet<_>>()
+            .len(),
+        2,
+        "the two spawns are distinct tool calls"
+    );
+    let spawned_children: HashSet<SessionId> = spawns.iter().map(|(_, child, _)| *child).collect();
+    assert_eq!(spawned_children.len(), 2, "no duplicate child session");
+    let child_for = |needle: &str| {
+        spawns
+            .iter()
+            .find(|(_, _, task)| task.contains(needle))
+            .map(|(_, child, _)| *child)
+            .expect("routed spawn task")
+    };
+    let child_a = child_for(TASK_A);
+    let child_b = child_for(TASK_B);
+
+    for (call, child, _) in &spawns {
+        assert_eq!(
+            spawns.iter().filter(|(other, _, _)| other == call).count(),
+            1,
+            "one ChildSessionSpawned per parent_tool_call_id"
+        );
+        let completions: Vec<&ChildOutcome> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ChildSessionCompleted {
+                    child: done,
+                    outcome,
+                } if done == child => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "one ChildSessionCompleted for child {child:?}"
+        );
+        assert!(matches!(completions[0], ChildOutcome::Completed { .. }));
+    }
+    let completed_children: HashSet<SessionId> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionCompleted { child, .. } => Some(*child),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completed_children, spawned_children,
+        "resume completed the same two children; it created no third"
+    );
+
+    // --- parent terminal shape ---------------------------------------------
+
+    let spawn_calls: HashSet<ToolCallId> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolCallRequested {
+                tool_call_id, name, ..
+            } if name.as_str() == "spawn_agent" => Some(*tool_call_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spawn_calls.len(), 2);
+    let results: Vec<(ToolCallId, ToolResultStatus)> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } => Some((*tool_call_id, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "exactly two spawn tool results");
+    assert!(
+        results
+            .iter()
+            .all(|(_, status)| *status == ToolResultStatus::Completed)
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|(call, _)| *call)
+            .collect::<HashSet<_>>(),
+        spawn_calls,
+        "both spawn results are Completed"
+    );
+    assert_eq!(turn_reasons(&events), vec![TurnEndReason::Completed]);
+    assert_eq!(
+        common::kind_count(&entries, "AssistantMessage"),
+        2,
+        "one model call per step; the waiting step is not re-requested"
+    );
+    assert_eq!(common::kind_count(&entries, "StepStarted"), 2);
+    assert_eq!(common::kind_count(&entries, "StepCommitted"), 2);
+    assert_eq!(common::kind_count(&entries, "StreamResumed"), 1);
+
+    // --- child logs: one clean turn each ----------------------------------
+
+    let catalog = asterpath.session_catalog();
+    let mut child_stream = catalog.children(parent);
+    let mut catalog_children = Vec::new();
+    while let Some(child) = child_stream.next().await {
+        catalog_children.push(child.expect("child session"));
+    }
+    assert_eq!(
+        catalog_children.len(),
+        2,
+        "the session tree has exactly two children"
+    );
+    assert_eq!(
+        catalog_children.into_iter().collect::<HashSet<_>>(),
+        spawned_children
+    );
+    for child in &spawned_children {
+        let child_entries = committed(log.as_ref(), *child).await;
+        let child_events: Vec<SessionEvent> = child_entries
+            .iter()
+            .map(|entry| asterpath_protocol::decode_entry(entry).expect("decode"))
+            .collect();
+        assert_eq!(
+            lifecycle(&child_events),
+            CHILD_LIFECYCLE.to_vec(),
+            "child {child:?} log: {child_events:?}"
+        );
+        assert_eq!(
+            turn_reasons(&child_events),
+            vec![TurnEndReason::Completed],
+            "child {child:?} completed exactly once"
+        );
+    }
+
+    // --- the parent's second request sees summaries, not transcripts ------
+
+    let requests = markers(&resume_lines, "model_request");
+    let final_request = requests
+        .iter()
+        .find(|request| request["route"] == "parent_final")
+        .expect("the parent's second request happens after recovery");
+    assert_eq!(final_request["tool_results"], 2);
+    let texts: Vec<&str> = final_request["texts"]
+        .as_array()
+        .expect("request texts")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let joined = texts.join("\n");
+    for summary in [SUMMARY_A, SUMMARY_B] {
+        assert!(
+            joined.contains(summary),
+            "the second request carries {summary:?}: {joined}"
+        );
+    }
+    for secret in [SECRET_A, SECRET_B] {
+        assert!(
+            !joined.contains(secret),
+            "a child transcript leaked into the parent request: {joined}"
+        );
+    }
+
+    // --- usage attribution -------------------------------------------------
+
+    let usage_query = asterpath.usage();
+    let own = usage_query
+        .totals(usage_filter(UsageScope::Session(parent)))
+        .await
+        .expect("parent usage");
+    assert_eq!(
+        own.own.model_calls,
+        usage(40, 12),
+        "parent Session own is only the parent's own calls"
+    );
+    assert_eq!(own.descendants.model_calls, Usage::default());
+    let child_a_usage = usage_query
+        .totals(usage_filter(UsageScope::Session(child_a)))
+        .await
+        .expect("child A usage")
+        .own;
+    let child_b_usage = usage_query
+        .totals(usage_filter(UsageScope::Session(child_b)))
+        .await
+        .expect("child B usage")
+        .own;
+    assert_eq!(child_a_usage.model_calls, usage(11, 3));
+    assert_eq!(child_b_usage.model_calls, usage(12, 4));
+    let subtree = usage_query
+        .totals(usage_filter(UsageScope::SessionSubtree(parent)))
+        .await
+        .expect("subtree usage");
+    assert_eq!(subtree.own.model_calls, usage(40, 12));
+    assert_eq!(
+        subtree.descendants.model_calls,
+        usage(23, 7),
+        "descendants are exactly the two children's sum"
+    );
+    assert_eq!(
+        subtree.own.total() + subtree.descendants.total(),
+        usage(40, 12).total() + usage(23, 7).total(),
+        "own + descendants does not double count"
+    );
+
+    // --- trace attribution -------------------------------------------------
+
+    let trace = asterpath.trace();
+    let parent_spans = trace_spans(trace.as_ref(), parent).await;
+    let subagents: Vec<&Span> = parent_spans
+        .iter()
+        .filter(|span| span.kind == SpanKind::Subagent)
+        .collect();
+    assert_eq!(subagents.len(), 2, "two subagent spans on the parent trace");
+    for subagent in &subagents {
+        let SpanAttributes::Subagent(attrs) = &subagent.attributes else {
+            panic!("subagent span without subagent attributes");
+        };
+        let call = subagent.tool_call.expect("subagent anchor");
+        let tool = parent_spans
+            .iter()
+            .find(|span| span.kind == SpanKind::ToolCall && span.tool_call == Some(call))
+            .expect("the spawn tool span");
+        assert_eq!(
+            subagent.parent_span,
+            Some(tool.span),
+            "subagent span hangs off its spawn tool span"
+        );
+        assert_eq!(
+            subagent.child_trace,
+            Some(TraceId::from_session(attrs.child))
+        );
+        assert!(matches!(
+            attrs.outcome,
+            Some(ChildOutcome::Completed { .. })
+        ));
+    }
+    assert_eq!(
+        subagents
+            .iter()
+            .filter_map(|span| match &span.attributes {
+                SpanAttributes::Subagent(attrs) => Some(attrs.child),
+                _ => None,
+            })
+            .collect::<HashSet<_>>(),
+        spawned_children
+    );
+    let spawn_tool_spans = parent_spans
+        .iter()
+        .filter(|span| {
+            matches!(
+                (&span.attributes, span.kind),
+                (SpanAttributes::ToolCall(attrs), SpanKind::ToolCall)
+                    if attrs.name.as_str() == "spawn_agent"
+            )
+        })
+        .count();
+    assert_eq!(spawn_tool_spans, 2);
+    let unique: HashSet<_> = parent_spans.iter().map(|span| span.span).collect();
+    assert_eq!(
+        unique.len(),
+        parent_spans.len(),
+        "recovery produced no duplicate parent spans"
+    );
+    assert_eq!(
+        parent_spans
+            .iter()
+            .filter(|span| span.kind == SpanKind::Session)
+            .count(),
+        1
+    );
+    assert_eq!(
+        parent_spans
+            .iter()
+            .filter(|span| span.kind == SpanKind::Step)
+            .count(),
+        2
+    );
+    assert!(
+        parent_spans
+            .iter()
+            .any(|span| span.kind == SpanKind::Step && span.replay),
+        "the waiting step closes after resume and carries the replay marker"
+    );
+    assert!(
+        subagents.iter().any(|span| span.replay),
+        "the resumed child wait carries a replay marker"
+    );
+
+    for child in &spawned_children {
+        let spans = trace_spans(trace.as_ref(), *child).await;
+        let roots: Vec<&Span> = spans
+            .iter()
+            .filter(|span| span.kind == SpanKind::Session)
+            .collect();
+        assert_eq!(roots.len(), 1, "child {child:?} has one session root span");
+        let subagent = subagents
+            .iter()
+            .find(|span| {
+                matches!(&span.attributes, SpanAttributes::Subagent(attrs) if attrs.child == *child)
+            })
+            .expect("the child's subagent span");
+        assert_eq!(
+            roots[0].parent_trace,
+            Some(TraceId::from_session(parent)),
+            "child root points back at the parent trace"
+        );
+        assert_eq!(
+            roots[0].parent_span,
+            Some(subagent.span),
+            "child root points at the spawn subagent span"
+        );
+        let unique: HashSet<_> = spans.iter().map(|span| span.span).collect();
+        assert_eq!(
+            unique.len(),
+            spans.len(),
+            "child {child:?} has no duplicate spans after recovery"
+        );
+    }
 }
 
 /// The loop is one implementation for every provider (ADR 0010): it branches on

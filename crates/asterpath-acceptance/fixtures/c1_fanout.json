@@ -1,0 +1,133 @@
+{
+  "provider": "p",
+  "model": "model-1",
+  "system": [{"Text": {"text": "be helpful"}}],
+  "tools": ["spawn_agent"],
+  "steps": [],
+  "routes": [
+    {
+      "name": "parent_final",
+      "tool_results": 2,
+      "response": {
+        "items": [
+          {
+            "Message": {
+              "role": "Assistant",
+              "parts": [{"Text": {"text": "all done"}}]
+            }
+          }
+        ],
+        "stop_reason": "EndTurn",
+        "usage": {
+          "input": {"uncached": 30, "cache_read": 0, "cache_write": 0},
+          "output": {"total": 7, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "name": "child_a",
+      "contains": "task A",
+      "child": true,
+      "response": {
+        "items": [
+          {
+            "Reasoning": {
+              "summary": [{"Text": {"text": "transcript-A-secret"}}],
+              "binding": {
+                "provider": "p",
+                "model": "model-1",
+                "prefix_epoch": 0,
+                "tools_hash": ""
+              },
+              "raw": {
+                "provider": "p",
+                "model": "model-1",
+                "kind": "fixture.thinking",
+                "json": "{}"
+              }
+            }
+          },
+          {
+            "Message": {
+              "role": "Assistant",
+              "parts": [{"Text": {"text": "summary A: alpha done"}}]
+            }
+          }
+        ],
+        "stop_reason": "EndTurn",
+        "usage": {
+          "input": {"uncached": 11, "cache_read": 0, "cache_write": 0},
+          "output": {"total": 3, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "name": "child_b",
+      "contains": "task B",
+      "child": true,
+      "response": {
+        "items": [
+          {
+            "Reasoning": {
+              "summary": [{"Text": {"text": "transcript-B-secret"}}],
+              "binding": {
+                "provider": "p",
+                "model": "model-1",
+                "prefix_epoch": 0,
+                "tools_hash": ""
+              },
+              "raw": {
+                "provider": "p",
+                "model": "model-1",
+                "kind": "fixture.thinking",
+                "json": "{}"
+              }
+            }
+          },
+          {
+            "Message": {
+              "role": "Assistant",
+              "parts": [{"Text": {"text": "summary B: beta done"}}]
+            }
+          }
+        ],
+        "stop_reason": "EndTurn",
+        "usage": {
+          "input": {"uncached": 12, "cache_read": 0, "cache_write": 0},
+          "output": {"total": 4, "reasoning": 0}
+        }
+      }
+    },
+    {
+      "name": "parent_first",
+      "contains": "go",
+      "response": {
+        "items": [
+          {
+            "ToolCall": {
+              "call_id": "spawn-a",
+              "provider_item_id": null,
+              "name": "spawn_agent",
+              "raw_args": "{\"task\":\"task A: report alpha\"}",
+              "raw": null
+            }
+          },
+          {
+            "ToolCall": {
+              "call_id": "spawn-b",
+              "provider_item_id": null,
+              "name": "spawn_agent",
+              "raw_args": "{\"task\":\"task B: report beta\"}",
+              "raw": null
+            }
+          }
+        ],
+        "stop_reason": "ToolUse",
+        "usage": {
+          "input": {"uncached": 10, "cache_read": 0, "cache_write": 0},
+          "output": {"total": 5, "reasoning": 0}
+        }
+      }
+    }
+  ]
+}

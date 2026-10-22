@@ -15,6 +15,7 @@ asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }
 asterpath-testing = { path = "../asterpath-testing" }
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
