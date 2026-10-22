@@ -127,19 +127,31 @@ pub enum TurnEndReason {
 ## 4. 信封与幂等键
 
 ```rust
+// core：唯一的日志信封；字段定义以 storage.md §3 为准
+pub struct NewEntry {
+    pub session: SessionId,
+    pub schema_version: u16,
+    pub dedup_key: Option<DedupKey>,
+    pub payload: serde_json::Value, // 调用方已序列化；core 不解释内容
+}
+
 pub struct LogEntry {
+    pub log_id: LogId,
     pub session: SessionId,
     pub seq: u64,                 // 存储层按 session 单调分配
-    pub log_id: LogId,
     pub recorded_at: Timestamp,   // 存储层写入；仅 trace/审计可读
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
-    pub payload: SessionEvent,
+    pub payload: serde_json::Value,
 }
+
+// protocol：类型化视图
+pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 ```
 
+- `decode_entry` 先按 `schema_version` 逐级 upcast（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)），再反序列化为 `SessionEvent`；未知变体、缺失必填字段或无法 upcast 都是 `LogDecodeError` 硬错误。本文件后续说“事件”时均指解码后的 `SessionEvent`；core 与存储层只处理信封，不依赖 protocol（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）。
 - `recorded_at` 只由 trace/审计读取，**任何恢复、投影或分支逻辑都不得读取它**。`TimerScheduled.deadline` 是调度逻辑使用的截止时间，不属于诊断时间。
-- `dedup_key` 在 `(session, 事件类型, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。事件类型取自 `payload` 的顶层变体名，是键判别式的一部分；物理存储见 [storage.md](storage.md) §4。
+- `dedup_key` 在 `(session, 事件类型, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。事件类型取自 `payload` 的顶层键（解码前），是键判别式的一部分；物理存储见 [storage.md](storage.md) §4。
 
 | 事件 | dedup key |
 | --- | --- |

@@ -108,7 +108,7 @@ pub enum StorageError {
 }
 ```
 
-与 [#2](../design/module-contracts.md) 的差异：`append` 收 `NewEntry` 而不是 `LogEntry`，因为 `seq`、`log_id` 由存储分配（#3 §4）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
+这套信封是 core 的唯一形状（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
 `Storage` 不提供公开 `enqueue`：所有唤醒都源自事件（`TimerFired`、`SignalReceived`、`ChildSessionCompleted`），`append` 派生入队。
 

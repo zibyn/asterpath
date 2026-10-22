@@ -119,7 +119,7 @@ impl ModuleCtx {
 
 ```rust
 pub trait EventLog: Send + Sync {
-    fn append(&self, entry: LogEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
+    fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 }
@@ -161,7 +161,7 @@ pub struct SystemClock;
 - timer id 由 `(session, caused_by, slot)` 确定性派生；审批 signal id 即 `tool_call_id`，通用 signal id 由 `(session, name)` 派生。重复注册返回同一 id，恢复重放不会制造第二个等待。
 - `await_signal` 的 `SignalIntent` 区分 `Record`（写 `SignalAwaited`）与 `AlreadyRecorded`（审批：open `ToolCallRequested` 已是意图记录）。
 - `wake` 只在内存；终态记录的写者先 append 再 wake。注册表不持久化，恢复靠扫描日志重建。
-- `LogEntry` 是 `{ kind, schema_version, payload }`；带类型的会话事件在 protocol，core 不依赖 protocol。
+- 日志信封只有两个形状，定义在 core：`NewEntry`（调用方提交）与 `LogEntry`（存储返回）；payload 是 core 不解释的 `serde_json::Value`，信封不设 `kind` 字段（事件类型由存储从 payload 顶层键派生，用于幂等判别）。字段与语义见 [storage.md](storage.md) §3，决定见 [ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)。带类型的 `SessionEvent` 与 upcast 归 protocol 的 `decode_entry(&LogEntry)`，core 不依赖 protocol。
 
 ### 3.5 错误与 ID
 

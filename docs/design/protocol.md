@@ -39,6 +39,8 @@
 
 `ProviderId`、`ModelId`、`ToolName`、`JsonString` 是 protocol 里的 opaque newtype；`JsonString` 保存原始 JSON 文本，不保证与 `serde_json::Value` 往返一致。
 
+日志信封的 `LogEntry` / `NewEntry` 定义在 core，payload 是不透明 `serde_json::Value`；protocol 提供 `decode_entry(&LogEntry) -> Result<SessionEvent, LogDecodeError>`，先按 `schema_version` 逐级 upcast 再解码（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）。`LogDecodeError` 分 `UnsupportedVersion` / `Upcast` / `Decode`，均为硬错误。
+
 ## 3. 规范条目模型
 
 ```rust

@@ -20,6 +20,7 @@ Asterpath 的核心目标是模块解耦：agent loop、工具注册表、会话
 - 组装根是唯一知道具体模块类型的地方，嵌入者获得清晰的替换点。
 - crate 数量与间接层增加；换来的是可检查的边界和可替换性。
 - 把实现放回内核、或让模块互相依赖，都会被 CI 挡住。
+- 日志信封是这条方向的直接结果：core 只定义不透明 payload 的 `NewEntry`/`LogEntry`，类型化解码在 protocol（[ADR-0020](0020-log-envelope-core-typed-decoding-protocol.md)）。
 
 ## Considered alternatives
 

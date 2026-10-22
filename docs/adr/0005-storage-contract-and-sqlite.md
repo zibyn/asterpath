@@ -14,6 +14,7 @@
 
 - **一个 SQLite 文件装全部 session。** `EventLog` 与 `Storage` 是两个 trait，由同一模块实现。跨 session 的调度队列与 timer 索引使按文件分片没有收益。
 - **信封强类型列 + `payload` JSON。** 事件体不拆 typed columns，upcast 继续在读取时对 `Value` 做（ADR-0004），DDL 不随 `LOG_SCHEMA_VERSION` 变化。
+- **日志信封归 core。** `NewEntry` / `LogEntry` 是 core 的唯一信封形状，payload 是 core 不解释的 `serde_json::Value`；类型化解码与 upcast 归 protocol 的 `decode_entry(&LogEntry)`（[ADR-0020](0020-log-envelope-core-typed-decoding-protocol.md)）。
 - **`journal_mode=WAL` + `synchronous=FULL` 默认。** append 返回即 fsync；`NORMAL` 是显式选项，只用于测试/开发。
 - **进程独占写者。** `<db>.lock` 上非阻塞 `flock`，生命周期持有，不续约；第二个进程 `WriterBusy`。租约表只做诊断，不判权。
 - **一条记录一个事务**；`seq` 用 `MAX(seq)+1` 在事务内分配。timer 火化 / signal 到达与入队同事务；父子会话跨流不原子。
