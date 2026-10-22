@@ -325,6 +325,7 @@ fn agent(
         Arc::new(DefaultApprovalPolicy::new(gate.clone())),
         gate,
         Arc::new(NoopExecutor),
+        Arc::new(asterpath_testing::ManualClock::new()),
         hooks,
     )
 }

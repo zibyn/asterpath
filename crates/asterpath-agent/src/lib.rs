@@ -1,8 +1,10 @@
-//! Agent loop: multi-step turns, the fixed tool pipeline and log-derived state.
+//! Agent loop: multi-step turns, the fixed tool pipeline, log-derived state and
+//! crash recovery.
 //!
 //! One driver per session; model-attempt retries inside one step; the
 //! `StepStarted.seq` projection waterline; parallel/exclusive tool scheduling
-//! scoped to a step. Steering, cancellation and recovery are later tickets.
+//! scoped to a step. Recovery reads only the committed prefix and handles open
+//! intents; completed history is never replayed from the session head.
 
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
@@ -16,8 +18,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asterpath_core::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, LogEntry, LogId, LogQuery,
-    ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, ToolCallId, TurnId,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
+    LogQuery, ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, TimerId, ToolCallId,
+    TurnId,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
@@ -25,10 +28,10 @@ use asterpath_protocol::{
     CompactResult, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents,
     Parallelism, PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent,
     PreStepGateDecision, PreStepGateEvent, Provenance, ProviderCatalog, ProviderError,
-    ProviderErrorKind, ReplaySafety, RunRequest, SessionEvent, SessionState, StopReason,
-    StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
-    ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason,
-    Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
+    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState,
+    StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
+    ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
+    TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -47,6 +50,7 @@ pub struct Agent {
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
     executor: Arc<dyn DurableExecutor>,
+    clock: Arc<dyn Clock>,
     hooks: Option<ModuleCtx>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
     cancellations: Arc<CancellationRegistry>,
@@ -64,6 +68,7 @@ impl Agent {
         approval: Arc<dyn ApprovalPolicy>,
         gate: Arc<ApprovalGate>,
         executor: Arc<dyn DurableExecutor>,
+        clock: Arc<dyn Clock>,
         hooks: Option<ModuleCtx>,
     ) -> Self {
         Self {
@@ -74,6 +79,7 @@ impl Agent {
             approval,
             gate,
             executor,
+            clock,
             hooks,
             busy: Arc::new(Mutex::new(HashSet::new())),
             cancellations: Arc::new(CancellationRegistry::new()),
@@ -166,31 +172,159 @@ impl Agent {
                     .await
             }
             SessionState::TurnOpen { turn, .. } => {
-                // Resume from the log: never repeat TurnStarted.
-                let open_step = open_step(&decoded, turn);
-                if let Some((step, _)) = open_step
-                    && has_assistant_message(&decoded, turn, step)
-                {
-                    // The model call already committed; finish its tools, commit,
-                    // then continue the turn exactly like a normal step.
-                    match self
-                        .resume_step(session, &config, turn, step, cancel, events)
-                        .await?
-                    {
-                        StepOutcome::Continue => {}
-                        StepOutcome::Turn(reason) => {
-                            return self.commit_turn(session, turn, reason, events).await;
-                        }
-                    }
-                    return self
-                        .run_steps(session, &config, turn, None, cancel, events)
-                        .await;
-                }
-
-                self.run_steps(session, &config, turn, open_step, cancel, events)
+                self.recover(session, &decoded, &config, turn, cancel, events)
                     .await
             }
         }
+    }
+
+    /// Resume from the committed prefix. Only open intents are handled; a
+    /// completed turn is never replayed from the session head.
+    async fn recover(
+        &self,
+        session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
+        config: &ConfigSnapshot,
+        turn: TurnId,
+        cancel: &CancelToken,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let from = decoded
+            .last()
+            .map(|(entry, _)| entry.log_id)
+            .unwrap_or_else(|| LogId::from_i64(0));
+        self.append(
+            session,
+            SessionEvent::StreamResumed {
+                from,
+                reason: ResumeReason::Crash,
+            },
+            None,
+        )
+        .await?;
+
+        self.recover_waits(session, decoded).await?;
+
+        let current = decode_entries(self.scan(session).await?, session)?;
+        let Some((step, watermark)) = open_step(&current, turn) else {
+            // Between steps: continue with the turn's normal continue rules.
+            return self
+                .run_steps(session, config, turn, None, cancel, events)
+                .await;
+        };
+
+        if has_assistant_message(&current, turn, step) {
+            // The model call is committed: never call it again.
+            match self
+                .resume_step(session, config, turn, step, cancel, events)
+                .await?
+            {
+                StepOutcome::Continue => {}
+                StepOutcome::Turn(reason) => {
+                    return self.commit_turn(session, turn, reason, events).await;
+                }
+            }
+            return self
+                .run_steps(session, config, turn, None, cancel, events)
+                .await;
+        }
+
+        let last = last_abort(&current, turn, step);
+        match last.map(|(_, kind)| kind) {
+            Some(AbortKind::Cancelled) => {
+                self.commit_step(session, turn, step).await?;
+                return self
+                    .commit_turn(session, turn, TurnEndReason::Cancelled, events)
+                    .await;
+            }
+            Some(AbortKind::Rejected) => {
+                self.commit_step(session, turn, step).await?;
+                return self
+                    .commit_turn(session, turn, TurnEndReason::Failed, events)
+                    .await;
+            }
+            _ => {}
+        }
+
+        let start_attempt = match last {
+            Some((attempt, _)) => attempt.saturating_add(1),
+            None => {
+                // No attempt was ever decided: record the crash, then retry.
+                self.append(
+                    session,
+                    SessionEvent::ModelCallAborted {
+                        turn_id: turn,
+                        step_id: step,
+                        attempt: 1,
+                        kind: AbortKind::Crash,
+                        partial: None,
+                        model: config.model.clone(),
+                        backoff_ms: 0,
+                        usage: None,
+                    },
+                    None,
+                )
+                .await?;
+                2
+            }
+        };
+        self.run_steps(
+            session,
+            config,
+            turn,
+            Some((step, watermark, start_attempt)),
+            cancel,
+            events,
+        )
+        .await
+    }
+
+    /// Close or refresh wait intents. Timers are recovered here; signal waits
+    /// stay waiting, and child waits belong to spawn replay (#47).
+    async fn recover_waits(
+        &self,
+        session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
+    ) -> Result<(), AgentError> {
+        let mut timers: BTreeMap<TimerId, (asterpath_core::Timestamp, LogId)> = BTreeMap::new();
+        for (_, event) in decoded {
+            match event {
+                SessionEvent::TimerScheduled {
+                    timer_id,
+                    deadline,
+                    caused_by,
+                } => {
+                    timers.insert(*timer_id, (*deadline, *caused_by));
+                }
+                SessionEvent::TimerFired { timer_id }
+                | SessionEvent::TimerCancelled { timer_id } => {
+                    timers.remove(timer_id);
+                }
+                _ => {}
+            }
+        }
+        for (timer_id, (deadline, caused_by)) in timers {
+            // A child-deadline timer is closed by spawn replay (subagents.md §9).
+            if caused_by_is_child_spawn(decoded, caused_by) {
+                continue;
+            }
+            if caused_by_is_terminal(decoded, caused_by) {
+                self.append(
+                    session,
+                    SessionEvent::TimerCancelled { timer_id },
+                    Some(dedup::timer(timer_id)),
+                )
+                .await?;
+            } else if deadline <= self.clock.now() {
+                self.append(
+                    session,
+                    SessionEvent::TimerFired { timer_id },
+                    Some(dedup::timer(timer_id)),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -199,7 +333,7 @@ impl Agent {
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
-        existing_step: Option<(StepId, u64)>,
+        existing_step: Option<(StepId, u64, u32)>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
@@ -207,8 +341,8 @@ impl Agent {
         let mut steps_started = 0u32;
 
         loop {
-            let (step, watermark) = match pending.take() {
-                Some(step) => step,
+            let (step, watermark, start_attempt) = match pending.take() {
+                Some((step, watermark, attempt)) => (step, watermark, attempt),
                 None => {
                     // Between steps: cancellation closes the turn with no step.
                     if cancel.is_cancelled() {
@@ -260,12 +394,21 @@ impl Agent {
                         .await?;
                     let seq = self.seq_of(session, log_id).await?;
                     steps_started += 1;
-                    (step, seq)
+                    (step, seq, 1)
                 }
             };
 
             match self
-                .run_step(session, config, turn, step, watermark, cancel, events)
+                .run_step(
+                    session,
+                    config,
+                    turn,
+                    step,
+                    watermark,
+                    start_attempt,
+                    cancel,
+                    events,
+                )
                 .await?
             {
                 StepOutcome::Continue => {}
@@ -300,13 +443,14 @@ impl Agent {
         turn: TurnId,
         step: StepId,
         watermark: u64,
+        start_attempt: u32,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
         // The projection is computed once per step; retries reuse it (L12).
         let request = self.build_request(session, config, watermark).await?;
         let max_attempts = config.turn.max_attempts.get();
-        let mut attempt = 1u32;
+        let mut attempt = start_attempt;
 
         loop {
             // A step still open when cancellation arrives never calls the model.
@@ -413,6 +557,7 @@ impl Agent {
                             calls,
                             cancel,
                             config.turn.cancel_grace,
+                            false,
                             events,
                         )
                         .await?;
@@ -596,6 +741,7 @@ impl Agent {
                     calls,
                     cancel,
                     config.turn.cancel_grace,
+                    true,
                     events,
                 )
                 .await?;
@@ -626,6 +772,7 @@ impl Agent {
         calls: Vec<CallItem>,
         cancel: &CancelToken,
         cancel_grace: Duration,
+        recovering: bool,
         events: &EventSink,
     ) -> Result<ToolOutcome, AgentError> {
         let lock = Arc::new(tokio::sync::RwLock::new(()));
@@ -641,6 +788,13 @@ impl Agent {
                 if existing.results.contains(&intent.tool_call_id) {
                     continue;
                 }
+                // A tool that was absent when its intent was recorded never
+                // enters approval and is never rerun.
+                if intent.provenance == Provenance::Unknown {
+                    self.not_found(session, intent.tool_call_id, &intent.name)
+                        .await?;
+                    continue;
+                }
                 if cancelled {
                     self.interrupt(session, turn, step, intent.tool_call_id, events)
                         .await?;
@@ -648,18 +802,8 @@ impl Agent {
                 }
                 match self.tools.get(&intent.name) {
                     None => {
-                        self.append_tool_result(
-                            session,
-                            intent.tool_call_id,
-                            ToolResultStatus::Failed,
-                            None,
-                            Some(ToolErrorInfo {
-                                kind: ToolErrorKind::NotFound,
-                                message: format!("tool {} is not registered", intent.name),
-                            }),
-                            false,
-                        )
-                        .await?;
+                        self.not_found(session, intent.tool_call_id, &intent.name)
+                            .await?;
                     }
                     Some(tool) => {
                         let descriptor = tool.descriptor().clone();
@@ -673,6 +817,8 @@ impl Agent {
                                 &intent.args,
                                 &descriptor,
                                 intent.log_id,
+                                intent.replay,
+                                recovering,
                                 cancel,
                                 events,
                             )
@@ -698,6 +844,10 @@ impl Agent {
                                         args: intent.args.clone(),
                                     });
                                 }
+                            }
+                            ToolDecision::Interrupt => {
+                                self.interrupt(session, turn, step, intent.tool_call_id, events)
+                                    .await?;
                             }
                             ToolDecision::Deny(reason) => {
                                 self.deny(session, intent.tool_call_id, reason).await?
@@ -800,6 +950,8 @@ impl Agent {
                             &args,
                             &descriptor,
                             caused_by,
+                            descriptor.replay,
+                            false,
                             cancel,
                             events,
                         )
@@ -819,6 +971,11 @@ impl Agent {
                                     args,
                                 });
                             }
+                        }
+                        ToolDecision::Interrupt => {
+                            // Only recovery returns this; a fresh call has no
+                            // recorded effect to protect.
+                            unreachable!("fresh intents always execute or deny")
                         }
                         ToolDecision::Deny(reason) => {
                             self.deny(session, tool_call_id, reason).await?
@@ -1183,6 +1340,8 @@ impl Agent {
         args: &ToolArgs,
         descriptor: &ToolDescriptor,
         caused_by: LogId,
+        replay: ReplaySafety,
+        recovering: bool,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolDecision, AgentError> {
@@ -1202,6 +1361,11 @@ impl Agent {
             descriptor.provenance,
         );
         match self.approval.classify(&request) {
+            // A recorded decision above always wins. Without one, recovery
+            // never reruns an unsafe tool.
+            ApprovalVerdict::Allow if recovering && replay == ReplaySafety::Unsafe => {
+                Ok(ToolDecision::Interrupt)
+            }
             ApprovalVerdict::Allow => Ok(ToolDecision::Allow),
             ApprovalVerdict::Deny { reason } => Ok(ToolDecision::Deny(
                 reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
@@ -1275,6 +1439,27 @@ impl Agent {
             Some(ToolErrorInfo {
                 kind: ToolErrorKind::Denied,
                 message,
+            }),
+            false,
+        )
+        .await
+    }
+
+    /// The model-visible terminal for a tool that is not in the registry.
+    async fn not_found(
+        &self,
+        session: SessionId,
+        tool_call_id: ToolCallId,
+        name: &ToolName,
+    ) -> Result<(), AgentError> {
+        self.append_tool_result(
+            session,
+            tool_call_id,
+            ToolResultStatus::Failed,
+            None,
+            Some(ToolErrorInfo {
+                kind: ToolErrorKind::NotFound,
+                message: format!("tool {name} is not registered"),
             }),
             false,
         )
@@ -1459,6 +1644,8 @@ struct RecordedIntent {
     log_id: LogId,
     name: ToolName,
     args: ToolArgs,
+    replay: ReplaySafety,
+    provenance: Provenance,
 }
 
 #[derive(Default)]
@@ -1483,6 +1670,8 @@ enum PreFailure {
 enum ToolDecision {
     Allow,
     Deny(String),
+    /// Recovery: the intent is recorded but the tool is unsafe to rerun.
+    Interrupt,
     Cancelled,
 }
 
@@ -1763,7 +1952,8 @@ fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepI
                 provider_call_id,
                 name,
                 raw_args,
-                ..
+                replay,
+                provenance,
             } if *turn_id == turn && *step_id == step => {
                 existing.intents.insert(
                     provider_call_id.clone(),
@@ -1772,6 +1962,8 @@ fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepI
                         log_id: entry.log_id,
                         name: name.clone(),
                         args: raw_args.clone(),
+                        replay: *replay,
+                        provenance: *provenance,
                     },
                 );
             }
@@ -1810,6 +2002,88 @@ fn has_assistant_message(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, ste
                 if *turn_id == turn && *step_id == step
         )
     })
+}
+
+/// The last decided model attempt for a step, in `seq` order.
+fn last_abort(
+    decoded: &[(LogEntry, SessionEvent)],
+    turn: TurnId,
+    step: StepId,
+) -> Option<(u32, AbortKind)> {
+    decoded.iter().rev().find_map(|(_, event)| match event {
+        SessionEvent::ModelCallAborted {
+            turn_id,
+            step_id,
+            attempt,
+            kind,
+            ..
+        } if *turn_id == turn && *step_id == step => Some((*attempt, *kind)),
+        _ => None,
+    })
+}
+
+/// A timer declared by a child spawn is closed by spawn replay (#47).
+fn caused_by_is_child_spawn(decoded: &[(LogEntry, SessionEvent)], caused_by: LogId) -> bool {
+    decoded.iter().any(|(entry, event)| {
+        entry.log_id == caused_by && matches!(event, SessionEvent::ChildSessionSpawned { .. })
+    })
+}
+
+/// Whether the record a wait points at already reached its own terminal.
+fn caused_by_is_terminal(decoded: &[(LogEntry, SessionEvent)], caused_by: LogId) -> bool {
+    let Some((entry, event)) = decoded.iter().find(|(entry, _)| entry.log_id == caused_by) else {
+        return false;
+    };
+    match event {
+        SessionEvent::ToolCallRequested { tool_call_id, .. } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::ToolResult { tool_call_id: done, .. } if done == tool_call_id
+            )
+        }),
+        SessionEvent::ChildSessionSpawned { child, .. } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::ChildSessionCompleted { child: done, .. } if done == child
+            )
+        }),
+        SessionEvent::SignalAwaited { signal_id, .. } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::SignalReceived { signal_id: done, .. } if done == signal_id
+            )
+        }),
+        SessionEvent::TimerScheduled { timer_id, .. } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::TimerFired { timer_id: done }
+                    | SessionEvent::TimerCancelled { timer_id: done }
+                    if done == timer_id
+            )
+        }),
+        SessionEvent::StepStarted { step_id, .. } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::StepCommitted { step_id: done, .. } if done == step_id
+            )
+        }),
+        SessionEvent::TurnStarted { turn_id } => decoded.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::TurnCommitted { turn_id: done, .. } if done == turn_id
+            )
+        }),
+        SessionEvent::CompactionStarted { .. } => {
+            let key = entry.dedup_key.as_ref();
+            decoded.iter().any(|(entry, event)| {
+                matches!(
+                    event,
+                    SessionEvent::CompactionApplied { .. } | SessionEvent::CompactionAborted { .. }
+                ) && entry.dedup_key.as_ref() == key
+            })
+        }
+        _ => false,
+    }
 }
 
 fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {

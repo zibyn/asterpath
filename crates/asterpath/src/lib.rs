@@ -166,6 +166,7 @@ impl Asterpath {
                     approval,
                     Arc::clone(&gate),
                     Arc::clone(&executor),
+                    Arc::clone(&config.clock),
                     hooks,
                 )
                 .with_cancellations(Arc::clone(&cancellations)),
