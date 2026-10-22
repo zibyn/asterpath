@@ -10,6 +10,7 @@
 - **终态条目**是提交单位；流式 delta 不落盘。
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
+- **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起。
@@ -45,17 +46,18 @@ pub enum SessionEvent {
     TurnStarted { turn_id: TurnId },
     StepStarted { turn_id: TurnId, step_id: StepId },
     AssistantMessage { turn_id: TurnId, step_id: StepId,
-                       items: Vec<Item>, raw: Option<RawProviderData> },
+                       items: Vec<Item>, raw: Option<RawProviderData>,
+                       usage: Usage, stop_reason: StopReason },
     ModelCallAborted { turn_id: TurnId, step_id: StepId, attempt: u32,
-                       kind: AbortKind, partial: Option<Vec<Item>> },  // 非模型可见
+                       kind: AbortKind, partial: Option<Vec<Item>>,
+                       usage: Option<Usage> },  // 非模型可见；usage 为 best-effort
     ToolCallRequested { turn_id: TurnId, step_id: StepId,
                         tool_call_id: ToolCallId, name: ToolName,
                         raw_args: JsonString, replay: ReplaySafety,
                         provenance: Provenance },
     ToolResult { tool_call_id: ToolCallId, status: ToolResultStatus,
                  output: Option<Vec<Item>> },
-    StepCommitted { turn_id: TurnId, step_id: StepId,
-                    usage: Usage, stop_reason: StopReason },
+    StepCommitted { turn_id: TurnId, step_id: StepId },  // 检查点标记
     TurnCommitted { turn_id: TurnId, reason: TurnEndReason },
     CompactionApplied { first_kept: LogId, summary: Vec<Item>,
                         replaces: LogIdRange },
@@ -63,20 +65,29 @@ pub enum SessionEvent {
                           parent_tool_call_id: ToolCallId,
                           caused_by: LogId },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
-    TimerScheduled { timer_id: TimerId, deadline: Timestamp },
+    TimerScheduled { timer_id: TimerId, deadline: Timestamp,
+                     caused_by: LogId },
     TimerFired { timer_id: TimerId },
+    TimerCancelled { timer_id: TimerId },
     SignalReceived { signal_id: SignalId, name: SignalName, payload: JsonValue },
 }
 
-pub enum AbortKind { Transport, Cancelled, Crash }
+pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
 pub enum ToolResultStatus { Completed, Failed, Interrupted }
-pub enum TurnEndReason { Completed, Cancelled, Failed, BudgetExhausted, MaxTurns }
+pub enum TurnEndReason {
+    Completed, Cancelled, Failed, BudgetExhausted,
+    MaxStepsExceeded, ContextExhausted, CompactionFailed,
+}
 // ChildOutcome 的形状归 #8。
 ```
 
 规则：
 
 - **没有通用 `Error` 事件**。错误是它所附着事件的终态（`ModelCallAborted`、`ToolResult::Failed`、`ChildOutcome`）。
+- `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
+- `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。
+- `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
+- 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向开启等待的意图记录（通常是 `ToolCallRequested`）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item`、`JsonString`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)。
 - `SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
@@ -107,8 +118,10 @@ pub struct LogEntry {
 | `ToolResult` | `tool_call_id` |
 | `StepCommitted` / `TurnCommitted` | step / turn id |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
-| `TimerScheduled` / `TimerFired` | timer id |
+| `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
 | `SignalReceived` | 生产者提供的 signal id |
+
+表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
@@ -130,14 +143,17 @@ pub struct LogEntry {
 
 ```rust
 pub enum StreamState {
-    Idle,          // 最后一条是 TurnCommitted，或 stream 刚创建
-    StepOpen,      // StepStarted 无对应 StepCommitted
-    ToolPending,   // ToolCallRequested 无对应 ToolResult
-    Waiting,       // TimerScheduled 未 fire / ChildSessionSpawned 未完成 / 等待 signal
+    Idle,                                   // 最后一条是 TurnCommitted，或 stream 刚创建
+    TurnOpen { step: Option<StepState> },   // TurnStarted 无 TurnCommitted
+}
+
+pub enum StepState {
+    InProgress,   // StepStarted 无 StepCommitted
+    Waiting,      // InProgress 且本 step 有未终结的 timer / child / signal 等待
 }
 ```
 
-「未闭合意图」的精确定义：`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；已声明等待的 signal 尚未到达。
+「未闭合意图」的精确定义：`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；已声明等待的 signal 尚未到达。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
 ### 算法
 
@@ -146,25 +162,37 @@ recover(session):
     entries   = event_log.scan(session)                    # 后端保证只返回已提交前缀（#5）
     history   = project(entries)                          # 折叠，尊重 CompactionApplied
     open      = entries.unclosed_intents()
+    open_steps = open.of_step()                           # StepStarted 无 StepCommitted
+    open_waits = open.waits()                             # timer / child / signal
     state     = classify(entries)
 
     append(StreamResumed { from: entries.last().log_id,
                            reason: Crash })               # 非模型可见
 
-    for intent in open, 按 seq 顺序:
-        match intent:
-            ModelCall    -> append(ModelCallAborted { kind: Crash, partial: 丢弃 })
-                            retry_step(intent.step_id)
-            ToolCall     -> if intent.replay == Safe:
-                               re_execute(intent.tool_call_id)      # 结果按 dedup_key 写一次
-                           else:
-                               append(ToolResult { status: Interrupted, output: None })
-            Timer        -> deadline 已过则立即入队 fire；否则重新入队到 deadline
-            ChildSession -> 查询子会话最终状态：
+    # 1. 已决定、但未提交终态的模型调用
+    for step in open_steps, 按 seq:
+        if AssistantMessage(turn, step) 不存在:
+            match last ModelCallAborted(turn, step):
+                Cancelled -> append(StepCommitted); append(TurnCommitted(Cancelled))
+                Rejected  -> append(StepCommitted); append(TurnCommitted(Failed))
+                             # abort 不携带上下文耗尽标志；崩溃窗口内按 Failed 收尾
+                _         -> {}                          # 交给驱动方重放
+
+    # 2. 等待意图
+    for wait in open_waits, 按 seq:
+        Timer        -> if caused_by 已终结: append(TimerCancelled{timer_id})
+                        else if deadline 已过: 立即入队 fire
+                        else: 重新挂起
+        ChildSession -> if caused_by 已终结: append(ChildSessionCompleted{Cancelled})
+                        else 查询子会话最终状态：
                               已完成 -> append(ChildSessionCompleted)
                               运行中 -> 重新挂起等待
                               丢失/失败 -> 按 #8 的孤儿策略处理
-            Signal       -> 保持等待；到达时由投递方 append(SignalReceived)
+        Signal       -> 保持等待；到达时由投递方 append(SignalReceived)
+
+    # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
+    #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；
+    #    执行未终结工具（Safe 重跑 / Unsafe Interrupted）；全部终结后写 StepCommitted。
 
     return ResumePoint { state, history, next: frontier(entries) }
 ```
@@ -172,7 +200,8 @@ recover(session):
 - **检查点**：`entries.iter().rposition(|e| e 是 StepCommitted).unwrap_or(0)`。
 - **frontier**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。
 - **已完成但未 ack**：本层不存在这个状态。调度队列的 ack 属于 `Storage`（#5）。
-- 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
+- 补记完成后，驱动方从 frontier 继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
+- 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`TimerCancelled`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
 
 ## 7. 验收场景
 
@@ -187,12 +216,14 @@ recover(session):
 | S7 | 含 `CompactionApplied` 的历史投影 | 模型只看到 summary + `first_kept` 之后的内容；原始记录仍可扫描 |
 | S8 | 任意恢复路径 | `seq` 严格单调；`ts` 不改变任何输出 |
 | S9 | timer 在进程停机期间到期 | 重启后恰好触发一次 `TimerFired` |
+| S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
+| S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 
 ## 8. 留给下游
 
 - **#4**：`schema_version`、upcasting 时机、未知事件与未知字段、兼容性测试（ADR-0004）。
 - **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0005](../adr/0005-storage-contract-and-sqlite.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
-- **#6**：turn/step 的终止条件、steering 注入点、取消宽限期、signal 如何变成模型输入。
+- **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
 - **#7**：审批/沙箱管线；tool 的 `ReplaySafety` 声明与执行语义。
 - **#8**：子会话完成结果、父子关闭顺序、孤儿恢复、fork session、并发与深度上限。
 - **#9**：压缩触发条件、保留策略、摘要模型。

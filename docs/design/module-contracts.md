@@ -236,7 +236,7 @@ pub trait AgentRunner: Send + Sync {
 | #3 事件日志与恢复 | `EventLog` / `Storage` / `DurableExecutor` 在 core |
 | #4 日志版本与迁移 | `LogEntry.schema_version`、upcasting、重放兼容 |
 | #5 存储与 SQLite | `Storage` 方法集与 schema；实现是模块 |
-| #6 agent loop | `AgentRunner` 在 protocol |
+| #6 agent loop | `AgentRunner` 在 protocol；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
 | #7 工具与审批 | `Tool` / `ToolRegistry` / `Provenance` 在 protocol；adapter 是模块 |
 | #8 子智能体 | 基于 `AgentRunner` + `DurableExecutor`（timer/signal） |
 | #9 上下文压缩 | 消费 `EventLog` 与 `Provider` |
