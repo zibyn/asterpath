@@ -3,24 +3,28 @@
 #![cfg(feature = "sqlite")]
 
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, SessionHandle};
 use asterpath_core::{ApprovalGate, EventLog, InputId, LogEntry, LogQuery, SessionId, ToolCallId};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, ChildFailure,
-    ChildOutcome, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId, ModelSpec,
-    Parallelism, Part, Provenance, Provider, ProviderId, ReplaySafety, RequestConfig, Role,
-    SessionEvent, SessionSpec, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig,
-    TurnEndReason, Usage, UserInput, decode_entry,
+    ChildOutcome, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId, ModelRequest,
+    ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCapabilities, ProviderError,
+    ProviderErrorKind, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec,
+    SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
+    ToolDescriptor, ToolError, ToolErrorKind, ToolName, ToolOutput, ToolResultStatus,
+    ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
-use futures_util::StreamExt;
+use futures_core::stream::BoxStream;
+use futures_util::{StreamExt, stream};
+use tokio::sync::Notify;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
@@ -631,5 +635,637 @@ async fn child_approval_wait_survives_a_restart() {
     assert_eq!(output, vec![text("child done")]);
 
     reopened.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+// --- #48: fan-out, admission, cancellation and timeout ---------------------
+
+/// A provider that routes by request shape: tool results mean the parent's
+/// follow-up step, `task-*` user text is a child, anything else is the
+/// parent's first step.
+struct RoutingProvider {
+    first: Vec<Item>,
+    child: ChildReply,
+    /// When set, every child waits for a permit before answering.
+    quota: Option<Arc<Quota>>,
+}
+
+type ChildReply = Arc<dyn Fn(&str) -> Vec<Result<StreamEvent, ProviderError>> + Send + Sync>;
+
+impl Provider for RoutingProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("p")
+    }
+
+    fn capabilities(&self, _spec: &ModelSpec) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
+        if request
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::ToolResult { .. }))
+        {
+            return stream::iter(response_events(
+                assistant("parent done"),
+                StopReason::EndTurn,
+            ))
+            .boxed();
+        }
+        let task = request.items.iter().find_map(|item| match item {
+            Item::Message {
+                role: Role::User,
+                parts,
+            } => parts.iter().find_map(|part| match part {
+                Part::Text { text } if text.starts_with("task-") => Some(text.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let Some(task) = task else {
+            return stream::iter(response_events(self.first.clone(), StopReason::ToolUse)).boxed();
+        };
+        let events = (self.child)(&task);
+        let Some(quota) = &self.quota else {
+            return stream::iter(events).boxed();
+        };
+        let quota = Arc::clone(quota);
+        stream::once(async move {
+            quota.take().await;
+            events
+        })
+        .flat_map(stream::iter)
+        .boxed()
+    }
+}
+
+/// Permits handed out to gated children; enables deterministic fan-out.
+#[derive(Default)]
+struct Quota {
+    permits: AtomicUsize,
+    notify: Notify,
+}
+
+impl Quota {
+    fn release(&self, count: usize) {
+        self.permits.fetch_add(count, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn take(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.permits.load(Ordering::SeqCst) > 0 {
+                self.permits.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn response_events(items: Vec<Item>, stop: StopReason) -> Vec<Result<StreamEvent, ProviderError>> {
+    let mut sequence = 0;
+    let mut events = vec![Ok(StreamEvent::ResponseStarted {
+        sequence,
+        request_id: None,
+    })];
+    for (index, item) in items.into_iter().enumerate() {
+        sequence += 1;
+        events.push(Ok(StreamEvent::ItemStarted {
+            sequence,
+            output_index: index as u32,
+        }));
+        sequence += 1;
+        events.push(Ok(StreamEvent::ItemCompleted {
+            sequence,
+            output_index: index as u32,
+            item,
+        }));
+    }
+    sequence += 1;
+    events.push(Ok(StreamEvent::ResponseEnded {
+        sequence,
+        stop_reason: stop,
+        usage: Usage::default(),
+    }));
+    events
+}
+
+fn spawn_call(call_id: &str, args: &str) -> Item {
+    Item::ToolCall {
+        call_id: call_id.to_owned(),
+        provider_item_id: None,
+        name: ToolName::new("spawn_agent"),
+        raw_args: JsonString::new(args),
+        raw: None,
+    }
+}
+
+fn spec_with(subagents: SubagentConfig, turn: TurnConfig) -> SessionSpec {
+    SessionSpec {
+        subagents,
+        turn,
+        ..spec(None)
+    }
+}
+
+fn completions(entries: &[LogEntry]) -> Vec<ChildOutcome> {
+    decoded(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionCompleted { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+fn all_tool_results(
+    entries: &[LogEntry],
+) -> Vec<(ToolResultStatus, Vec<Part>, Option<ToolErrorKind>)> {
+    decoded(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult {
+                status,
+                output,
+                error,
+                ..
+            } => Some((
+                status,
+                output.unwrap_or_default(),
+                error.map(|error| error.kind),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn spawned(entries: &[LogEntry]) -> Vec<ToolCallId> {
+    decoded(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionSpawned {
+                parent_tool_call_id,
+                ..
+            } => Some(parent_tool_call_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn spawned_children(entries: &[LogEntry]) -> Vec<SessionId> {
+    decoded(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { child, .. } => Some(child),
+            _ => None,
+        })
+        .collect()
+}
+
+fn requested(entries: &[LogEntry]) -> Vec<ToolCallId> {
+    decoded(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolCallRequested { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_for(
+    asterpath: &Asterpath,
+    session: SessionId,
+    what: &str,
+    predicate: impl Fn(&[SessionEvent]) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = decoded(&scan(asterpath.event_log(), session).await);
+            if predicate(&events) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+#[tokio::test]
+async fn fan_out_partial_failure_keeps_siblings_independent() {
+    let db = temp_db("fan-out");
+    let child: ChildReply = Arc::new(|task| match task {
+        "task-boom" => vec![Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "boom",
+        ))],
+        "task-a" => response_events(assistant("a done"), StopReason::EndTurn),
+        _ => response_events(assistant("b done"), StopReason::EndTurn),
+    });
+    let provider = Arc::new(RoutingProvider {
+        first: vec![
+            spawn_call("call-a", r#"{"task":"task-a"}"#),
+            spawn_call("call-boom", r#"{"task":"task-boom"}"#),
+            spawn_call("call-b", r#"{"task":"task-b"}"#),
+        ],
+        child,
+        quota: None,
+    });
+    let asterpath = open(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .await;
+    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    handle.submit_input(input("go")).await.unwrap();
+    drive_all(&handle).await;
+
+    let entries = scan(asterpath.event_log(), handle.id()).await;
+    assert_eq!(spawned(&entries).len(), 3);
+    let outcomes = completions(&entries);
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ChildOutcome::Completed { .. }))
+            .count(),
+        2
+    );
+    assert!(outcomes.iter().any(|outcome| matches!(
+        outcome,
+        ChildOutcome::Failed {
+            reason: ChildFailure::TurnFailed,
+            ..
+        }
+    )));
+
+    // One independent tool result per call; the failed task is still a
+    // successful spawn result, and the siblings keep their own summaries.
+    let results = all_tool_results(&entries);
+    assert_eq!(results.len(), 3);
+    assert!(
+        results
+            .iter()
+            .all(|(status, _, _)| *status == ToolResultStatus::Completed)
+    );
+    let outputs: Vec<String> = results
+        .iter()
+        .flat_map(|(_, parts, _)| parts.clone())
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(outputs.contains(&"a done".to_owned()));
+    assert!(outputs.contains(&"b done".to_owned()));
+    assert!(
+        outputs.iter().any(|text| text.contains("TurnFailed")),
+        "the failed sibling is marked: {outputs:?}"
+    );
+    assert!(matches!(
+        decoded(&entries).last(),
+        Some(SessionEvent::TurnCommitted {
+            reason: TurnEndReason::Completed,
+            ..
+        })
+    ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn the_ninth_spawn_queues_until_a_slot_is_released() {
+    let db = temp_db("admission");
+    let quota = Arc::new(Quota::default());
+    let child: ChildReply =
+        Arc::new(|task| response_events(assistant(&format!("done {task}")), StopReason::EndTurn));
+    let first: Vec<Item> = (0..9)
+        .map(|index| {
+            spawn_call(
+                &format!("call-{index}"),
+                &format!(r#"{{"task":"task-{index}"}}"#),
+            )
+        })
+        .collect();
+    let provider = Arc::new(RoutingProvider {
+        first,
+        child,
+        quota: Some(Arc::clone(&quota)),
+    });
+    let config = AsterpathConfig {
+        tool: ToolConfig {
+            max_parallel_calls: NonZeroUsize::new(16).expect("non-zero"),
+            ..ToolConfig::default()
+        },
+        ..simple_config(&db, vec![provider as Arc<dyn Provider>], Vec::new())
+    };
+    let asterpath = open(config).await;
+    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    let driver = tokio::spawn({
+        let handle = handle.clone();
+        async move { drive_all(&handle).await }
+    });
+
+    wait_for(&asterpath, parent, "eight admitted children", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+            .count()
+            == 8
+            && events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ToolCallRequested { .. }))
+                .count()
+                == 9
+    })
+    .await;
+    let entries = scan(asterpath.event_log(), parent).await;
+    let calls = requested(&entries);
+    let admitted = spawned(&entries);
+    assert_eq!(admitted.len(), 8, "the ninth call is queued");
+    assert_eq!(
+        calls.iter().find(|call| !admitted.contains(call)),
+        calls.get(8),
+        "the highest-seq call waits"
+    );
+
+    // Releasing one child frees its slot; the queued call is admitted.
+    quota.release(1);
+    wait_for(&asterpath, parent, "ninth admission", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+            .count()
+            == 9
+    })
+    .await;
+    let entries = scan(asterpath.event_log(), parent).await;
+    let admitted = spawned(&entries);
+    assert_eq!(admitted.len(), 9);
+    assert_eq!(admitted[8], calls[8], "admission is FIFO by seq");
+
+    quota.release(8);
+    let events = tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("drive finishes")
+        .expect("driver task");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCommitted {
+            reason: TurnEndReason::Completed,
+            ..
+        })
+    ));
+    let entries = scan(asterpath.event_log(), parent).await;
+    assert_eq!(completions(&entries).len(), 9);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
+    let db = temp_db("parent-cancel");
+    let quota = Arc::new(Quota::default());
+    let child: ChildReply =
+        Arc::new(|_task| response_events(assistant("never"), StopReason::EndTurn));
+    let provider = Arc::new(RoutingProvider {
+        first: vec![
+            spawn_call("call-slow", r#"{"task":"task-slow"}"#),
+            spawn_call("call-queued", r#"{"task":"task-queued"}"#),
+        ],
+        child,
+        quota: Some(Arc::clone(&quota)),
+    });
+    let subagents = SubagentConfig {
+        max_concurrent_children: NonZeroUsize::new(1).expect("non-zero"),
+        cancel_grace: Duration::from_millis(100),
+        ..SubagentConfig::default()
+    };
+    let asterpath = open(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .await;
+    let handle = asterpath
+        .create_session(spec_with(
+            subagents,
+            TurnConfig {
+                cancel_grace: Duration::from_millis(300),
+                ..TurnConfig::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    let driver = tokio::spawn({
+        let handle = handle.clone();
+        async move { drive_all(&handle).await }
+    });
+
+    wait_for(&asterpath, parent, "one admitted child", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+            .count()
+            == 1
+            && events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ToolCallRequested { .. }))
+                .count()
+                == 2
+    })
+    .await;
+    handle.cancel().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("delivers cancellation")
+        .expect("driver task");
+
+    let entries = scan(asterpath.event_log(), parent).await;
+    let events = decoded(&entries);
+    let admitted = spawned(&entries);
+    assert_eq!(admitted.len(), 1, "the queued spawn creates no child");
+    assert_eq!(
+        completions(&entries),
+        vec![ChildOutcome::Cancelled {
+            reason: asterpath_protocol::CancelReason::Parent
+        }]
+    );
+    let results = all_tool_results(&entries);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .all(|(status, _, _)| *status == ToolResultStatus::Interrupted)
+    );
+
+    let position = |kind: &str| {
+        events
+            .iter()
+            .position(|event| event.kind() == kind)
+            .expect(kind)
+    };
+    assert!(position("ChildSessionCompleted") < position("ToolResult"));
+    assert!(position("ToolResult") < position("StepCommitted"));
+    assert!(position("StepCommitted") < position("TurnCommitted"));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnCommitted {
+            reason: TurnEndReason::Cancelled,
+            ..
+        })
+    ));
+
+    // The child got the cancellation and closed its own turn.
+    let child = spawned_children(&entries)[0];
+    let child_events = decoded(&scan(asterpath.event_log(), child).await);
+    assert!(matches!(
+        child_events.last(),
+        Some(SessionEvent::TurnCommitted {
+            reason: TurnEndReason::Cancelled,
+            ..
+        })
+    ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn spawn_timeout_fires_and_reports_failed_timeout() {
+    let db = temp_db("timeout");
+    let quota = Arc::new(Quota::default());
+    let child: ChildReply =
+        Arc::new(|_task| response_events(assistant("never"), StopReason::EndTurn));
+    let provider = Arc::new(RoutingProvider {
+        first: vec![spawn_call(
+            "call-hang",
+            r#"{"task":"task-hang","timeout_ms":50}"#,
+        )],
+        child,
+        quota: Some(Arc::clone(&quota)),
+    });
+    let subagents = SubagentConfig {
+        cancel_grace: Duration::from_millis(100),
+        ..SubagentConfig::default()
+    };
+    let asterpath = open(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .await;
+    let handle = asterpath
+        .create_session(spec_with(subagents, TurnConfig::default()))
+        .await
+        .unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), drive_all(&handle))
+        .await
+        .expect("timeout closes the wait");
+
+    let entries = scan(asterpath.event_log(), parent).await;
+    let events = decoded(&entries);
+    let position = |kind: &str| {
+        events
+            .iter()
+            .position(|event| event.kind() == kind)
+            .expect(kind)
+    };
+    assert!(position("TimerScheduled") < position("TimerFired"));
+    assert!(position("TimerFired") < position("ChildSessionCompleted"));
+    assert!(position("ChildSessionCompleted") < position("ToolResult"));
+    assert_eq!(
+        completions(&entries),
+        vec![ChildOutcome::Cancelled {
+            reason: asterpath_protocol::CancelReason::Timeout
+        }]
+    );
+    let (status, _, error) = all_tool_results(&entries)
+        .into_iter()
+        .next()
+        .expect("spawn result");
+    assert_eq!(status, ToolResultStatus::Failed);
+    assert_eq!(error, Some(ToolErrorKind::Timeout));
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnCommitted {
+            reason: TurnEndReason::Completed,
+            ..
+        })
+    ));
+
+    let children = spawned_children(&entries);
+    let child_events = decoded(&scan(asterpath.event_log(), children[0]).await);
+    assert!(matches!(
+        child_events.last(),
+        Some(SessionEvent::TurnCommitted {
+            reason: TurnEndReason::Cancelled,
+            ..
+        })
+    ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn child_completion_cancels_the_timeout_timer() {
+    let db = temp_db("timeout-cancelled");
+    let child: ChildReply =
+        Arc::new(|_task| response_events(assistant("child done"), StopReason::EndTurn));
+    let provider = Arc::new(RoutingProvider {
+        first: vec![spawn_call(
+            "call-fast",
+            r#"{"task":"task-fast","timeout_ms":1000}"#,
+        )],
+        child,
+        quota: None,
+    });
+    let asterpath = open(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .await;
+    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    drive_all(&handle).await;
+
+    let entries = scan(asterpath.event_log(), parent).await;
+    let kinds = kinds(&entries);
+    assert!(kinds.contains(&"TimerScheduled"));
+    assert!(kinds.contains(&"TimerCancelled"));
+    assert!(!kinds.contains(&"TimerFired"), "the child won the race");
+    assert_eq!(
+        completions(&entries),
+        vec![ChildOutcome::Completed {
+            summary: asterpath_protocol::Summary {
+                items: vec![text("child done")]
+            }
+        }]
+    );
+    let (status, output, _) = all_tool_results(&entries)
+        .into_iter()
+        .next()
+        .expect("spawn result");
+    assert_eq!(status, ToolResultStatus::Completed);
+    assert_eq!(output, vec![text("child done")]);
+
+    asterpath.shutdown().await.unwrap();
     cleanup(&db);
 }
