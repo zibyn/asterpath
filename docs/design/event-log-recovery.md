@@ -133,6 +133,7 @@ pub enum TurnEndReason {
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向触发该等待或压缩的日志记录（例如开启审批的 `ToolCallRequested`、声明等待的 `SignalAwaited`、触发压缩的 frontier 记录）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
+- `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-core` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
 - `SignalAwaited` 是 signal 等待的意图记录；审批不走它，因为 open 的 `ToolCallRequested` 已经承担意图（[tools.md](tools.md)）。`SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
 - timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0014](../adr/0014-subagent-scheduling-api.md)）；存储投递归 #5。
 

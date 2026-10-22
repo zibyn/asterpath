@@ -90,7 +90,6 @@ pub struct AsterpathConfig {
     pub database: PathBuf,
     pub providers: Vec<Arc<dyn Provider>>,
     pub tools: Vec<Arc<dyn Tool>>,
-    pub default_model: Option<ModelSpec>,
     pub agent: Option<Arc<dyn AgentRunner>>,
     pub compactor: Option<Arc<dyn Compactor>>,   // None = 压缩不可用
     pub event_log: Option<Arc<dyn EventLog>>,   // 覆盖 sqlite feature
@@ -123,9 +122,11 @@ impl Asterpath {
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
+- `event_log` / `storage` 要么同时注入，要么都留空；只注入其一是 `AsterError::Config`。同时注入时 `database` 被忽略；都留空时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
-- 关闭 `sqlite` feature 时，`event_log` / `storage` / `session_catalog` 必须注入；`session_retirement` 仍是可选的。
+- 关闭 `sqlite` feature 时，`event_log` / `storage` 必须注入，`session_catalog` 也必须注入；`session_retirement` 仍是可选的。
 - v1 的 `AsterpathConfig` 没有插件字段；插件清单属于 M5 的 `asterpath-plugin-host`（[plugins.md](plugins.md)）。
 - 没有 `executor` 注入：v1 只有一套 `DurableExecutor` 实现；需要替换它的嵌入者直接使用 `asterpath-core` 的 `ModuleHost`。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
@@ -261,7 +262,7 @@ pub enum AsterError {
 
 - `run` 不接受 `--session`；要续跑已有 session 用 `resume`。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
-- 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。TTY 上默认 `ask`，提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 默认 `deny`，显式传 `ask` 是用法错误。`allow` / `deny` 只由显式 flag 启用。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
+- 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。策略取 `--approval` > `[approval] default` > `ask`。TTY 上 `ask` 提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 上来自配置或缺省的 `ask` 一律降级为 `deny`（无法提示），而显式 `--approval ask` 是用法错误（退出码 2）。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
 ### 4.1 配置
@@ -279,7 +280,7 @@ base_url = "https://api.anthropic.com"
 base_url = "https://api.openai.com/v1"
 
 [turn]
-max_steps_per_turn = 0        # 0 = 不设上限；其余字段用默认值
+# max_steps_per_turn = 100    # 省略 = 不设上限（None）；0 是配置错误；其余字段用默认值
 
 [request]
 max_output_tokens = 8192      # RequestConfig；缺省字段用 Default
@@ -302,9 +303,10 @@ model = "claude-fable-5-1"
 # SubagentConfig 字段
 
 [approval]
-default = "ask"               # ask | allow | deny
+default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级为 deny
 ```
 
+- `max_steps_per_turn = 0` 是配置错误（退出码 2）；不设上限靠省略该字段。
 - API key **只从环境变量读**：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`。配置文件出现 `api_key` / `secret` / `token` 字段直接报错（退出码 2）。
 - 环境变量覆盖：`ASTERPATH_CONFIG`、`ASTERPATH_DB`、`ASTERPATH_PROVIDER`、`ASTERPATH_MODEL`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。

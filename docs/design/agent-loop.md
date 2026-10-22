@@ -97,7 +97,7 @@ run_turn(session):
             Err(_)          -> append(TurnCommitted(Failed)); return
             Continue        -> {}
 
-        if steps_started == max_steps_per_turn:
+        if max_steps_per_turn == Some(steps_started):
             append(TurnCommitted(MaxStepsExceeded)); return
 
         step = next_step_id()
@@ -312,13 +312,13 @@ pub struct TurnConfig {
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `max_steps_per_turn` | `None` | 宿主可设；超限 `MaxStepsExceeded` |
+| `max_steps_per_turn` | `None` | 宿主可设；`Some(0)` 在构建期被拒绝（`AsterError::Config`）；超限 `MaxStepsExceeded` |
 | `max_attempts` | `3` | 含首次 |
 | `retry_backoff` | 1s 指数 ×2，cap 30s，jitter | 仅 retryable |
 | `request_timeout` | `600s` | 每次 attempt；`None` 关闭 |
 | `cancel_grace` | `10s` | 0 = 立即 drop |
 | `tool_timeout` | `None` | 由 `ToolDescriptor` 决定；external 缺省 120s |
-| `tool_kill_grace` | `5s` | 超时/取消后强杀外部工具的宽限（#7） |
+| `kill_grace` | `5s` | 超时/取消后强杀外部工具的宽限；属 `ToolConfig`（[tools.md](tools.md) §9，#7） |
 | pre-step gate | 无 | 宿主注册 waterfall |
 | host stop | 无 | 宿主经 gate 返回 `Stopped { reason }` |
 | cost/budget 扩展 | 无 | 模块订阅 `UsageRecorded`，经 gate 返回 `Stopped { reason }`；最多超支一个 step；价格表/币种不在内核（#13） |
