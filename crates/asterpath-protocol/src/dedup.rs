@@ -45,6 +45,15 @@ pub fn compaction(frontier: LogId) -> DedupKey {
     DedupKey::new(format!("compaction:{}", frontier.as_i64()))
 }
 
+/// Frontier encoded in a canonical compaction dedup key.
+pub fn compaction_frontier(key: &DedupKey) -> Option<LogId> {
+    key.as_str()
+        .strip_prefix("compaction:")?
+        .parse::<i64>()
+        .ok()
+        .map(LogId::from_i64)
+}
+
 pub fn child_session(child: SessionId) -> DedupKey {
     DedupKey::new(child.to_hex())
 }
