@@ -1,35 +1,64 @@
 //! Spawn, materialization, outcome mapping and the durable wait.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, OnceLock, Weak};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::Duration;
 
 use asterpath_core::{
-    DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
-    SessionId, ToolCallId, WakeCause,
+    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
+    SessionId, SystemClock, TimerId, TimerRequest, ToolCallId, WakeCause,
 };
 use asterpath_protocol::{
-    AgentError, AgentRunner, CancelReason, ChildFailure, ChildOutcome, ConfigSnapshot,
-    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
+    AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
+    RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
+    encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
+use crate::tool::SPAWN_TOOL_NAME;
 use crate::{ChildRef, SpawnError, SpawnRequest, SubagentSpawner, WaitError};
 
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
+
+/// The one timer slot a spawn owns; the executor derives the durable id.
+const SPAWN_TIMEOUT_SLOT: TimerId = TimerId::from_bytes([0; 16]);
 
 pub struct Scheduler {
     log: Arc<dyn EventLog>,
     catalog: Arc<dyn SessionCatalog>,
     executor: Arc<dyn DurableExecutor>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
+    clock: Arc<dyn Clock>,
+    config: SubagentConfig,
+    /// Shared with the agent runner so child drives see cancellation.
+    cancellations: Arc<CancellationRegistry>,
     /// Set by the composition root after the agent is built. Weak: the agent
     /// reaches the module bus and this scheduler, so an Arc here would leak the
     /// whole composition root.
     runner: OnceLock<Weak<dyn AgentRunner>>,
+    /// Admission state is memory only; `recovered` marks parents whose open
+    /// spawns have been rebuilt from the log.
+    admission: Mutex<Admission>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Admission {
+    live: usize,
+    parents: HashMap<SessionId, ParentAdmission>,
+    recovered: HashSet<SessionId>,
+}
+
+#[derive(Default)]
+struct ParentAdmission {
+    running: usize,
+    admitted: HashSet<ToolCallId>,
+    /// Open spawn `ToolCallRequested`s by `seq`; the lowest seq is next.
+    queue: BTreeMap<u64, ToolCallId>,
 }
 
 impl Scheduler {
@@ -39,12 +68,39 @@ impl Scheduler {
         executor: Arc<dyn DurableExecutor>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
     ) -> Self {
+        Self::with_runtime(
+            log,
+            catalog,
+            executor,
+            aliases,
+            Arc::new(SystemClock),
+            SubagentConfig::default(),
+            Arc::new(CancellationRegistry::new()),
+        )
+    }
+
+    /// Full wiring: the facade passes the injected clock, scheduler-wide
+    /// defaults and the registry the agent shares.
+    pub fn with_runtime(
+        log: Arc<dyn EventLog>,
+        catalog: Arc<dyn SessionCatalog>,
+        executor: Arc<dyn DurableExecutor>,
+        aliases: BTreeMap<ModelAlias, ModelSpec>,
+        clock: Arc<dyn Clock>,
+        config: SubagentConfig,
+        cancellations: Arc<CancellationRegistry>,
+    ) -> Self {
         Self {
             log,
             catalog,
             executor,
             aliases,
+            clock,
+            config,
+            cancellations,
             runner: OnceLock::new(),
+            admission: Mutex::new(Admission::default()),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -97,9 +153,21 @@ impl SubagentSpawner for Scheduler {
                     session: req.parent.session,
                 }))?
                 .clone();
+            let subagents = parent_config.subagents.clone();
+            // Per-call wins; otherwise the inherited default (None by default).
+            let timeout = req.timeout.or(subagents.spawn_timeout);
+
+            // Rebuild this parent's queue and Running count from the log first.
+            self.recover_parent(req.parent.session, &parent_events)
+                .await
+                .map_err(SpawnError::Execution)?;
 
             // R1: one child per parent tool call, ever.
             if let Some(record) = find_spawn(&parent_events, req.parent.tool_call) {
+                let completed = find_completion(&parent_events, record.child).is_some();
+                self.ensure_timeout(req.parent.session, record.log_id, timeout, completed)
+                    .await
+                    .map_err(SpawnError::Execution)?;
                 self.materialize(
                     req.parent.clone(),
                     record.child,
@@ -114,6 +182,23 @@ impl SubagentSpawner for Scheduler {
                     child: record.child,
                 });
             }
+
+            // Admission is FIFO by ToolCallRequested.seq, per-parent and
+            // global. The guard also clears this call's recovered queue entry
+            // if validation rejects it.
+            let seq = parent_events
+                .iter()
+                .find_map(|(entry, _)| (entry.log_id == req.caused_by).then_some(entry.seq))
+                .ok_or_else(|| {
+                    SpawnError::Execution(backend("spawn request has no ToolCallRequested record"))
+                })?;
+            let mut queue_guard = QueueGuard {
+                scheduler: self,
+                parent: req.parent.session,
+                seq,
+                tool_call: req.parent.tool_call,
+                armed: true,
+            };
 
             let child_depth = self
                 .parent_depth(req.parent.session)
@@ -162,8 +247,16 @@ impl SubagentSpawner for Scheduler {
                 ..parent_config
             };
 
+            self.admit(
+                &mut queue_guard,
+                subagents.max_concurrent_children.get(),
+                self.config.max_live_children.get(),
+            )
+            .await;
+            drop(queue_guard);
+
             let child = fresh_session_id();
-            append(
+            let spawn_log = append(
                 &*self.log,
                 req.parent.session,
                 SessionEvent::ChildSessionSpawned {
@@ -179,6 +272,10 @@ impl SubagentSpawner for Scheduler {
             .await
             .map_err(SpawnError::Execution)?;
 
+            self.ensure_timeout(req.parent.session, spawn_log, timeout, false)
+                .await
+                .map_err(SpawnError::Execution)?;
+
             self.materialize(req.parent.clone(), child, &req.task, &config, &req.context)
                 .await
                 .map_err(SpawnError::Execution)?;
@@ -193,12 +290,13 @@ impl SubagentSpawner for Scheduler {
     fn await_completion(&self, child: &ChildRef) -> BoxFuture<'_, Result<ChildOutcome, WaitError>> {
         let child = child.clone();
         Box::pin(async move {
-            let parent_events = scan(&*self.log, child.parent.session)
+            let mut parent_events = scan(&*self.log, child.parent.session)
                 .await
                 .map_err(WaitError::Execution)?;
 
             // R3: a recorded outcome wins; the child is never queried again.
             if let Some(outcome) = find_completion(&parent_events, child.child) {
+                self.stop_timeout(&child, &parent_events).await;
                 return wait_outcome(&outcome);
             }
 
@@ -212,11 +310,12 @@ impl SubagentSpawner for Scheduler {
                     "child wait does not own the recorded child session",
                 )));
             }
+            let spawn_log = record.log_id;
 
-            let mut child_events = match scan(&*self.log, child.child).await {
-                Ok(events) => events,
-                Err(error) => return self.lost(&child, error.to_string()).await,
-            };
+            // An unreadable child becomes a recorded `Lost`, never a hang.
+            if let Err(error) = scan(&*self.log, child.child).await {
+                return self.lost(&child, error.to_string()).await;
+            }
 
             // R2: fill records missing after a crash before waiting or driving.
             self.materialize(
@@ -228,9 +327,13 @@ impl SubagentSpawner for Scheduler {
             )
             .await
             .map_err(WaitError::Execution)?;
+            let mut child_events = scan(&*self.log, child.child)
+                .await
+                .map_err(WaitError::Execution)?;
 
             if let Some(outcome) = child_outcome(&child_events) {
                 self.record_completion(&child, outcome.clone()).await?;
+                self.stop_timeout(&child, &parent_events).await;
                 return wait_outcome(&outcome);
             }
 
@@ -241,10 +344,11 @@ impl SubagentSpawner for Scheduler {
             };
 
             loop {
-                let parent_events = scan(&*self.log, child.parent.session)
+                parent_events = scan(&*self.log, child.parent.session)
                     .await
                     .map_err(WaitError::Execution)?;
                 if let Some(outcome) = find_completion(&parent_events, child.child) {
+                    self.stop_timeout(&child, &parent_events).await;
                     return wait_outcome(&outcome);
                 }
 
@@ -252,10 +356,46 @@ impl SubagentSpawner for Scheduler {
                     Ok(events) => events,
                     Err(error) => return self.lost(&child, error.to_string()).await,
                 };
+                // R3 applies to the child's own terminal too: it wins over a
+                // due timer and turns `TimerFired` into `TimerCancelled`.
                 if let Some(outcome) = child_outcome(&child_events) {
                     self.record_completion(&child, outcome.clone()).await?;
+                    self.stop_timeout(&child, &parent_events).await;
                     return wait_outcome(&outcome);
                 }
+
+                let timer_sleep = match find_timer(&parent_events, spawn_log) {
+                    Some(TimeoutTimer::Pending { timer_id, deadline }) => {
+                        if deadline <= self.clock.now() {
+                            // The child terminal was checked just above, before
+                            // any `TimerFired` is written.
+                            match self
+                                .executor
+                                .await_wake(child.parent.session, WakeCause::Timer(timer_id))
+                                .await
+                            {
+                                Ok(()) => {
+                                    self.time_out(&child, record.config.subagents.cancel_grace)
+                                        .await?;
+                                    return Err(WaitError::Timeout);
+                                }
+                                // Another writer cancelled the timer.
+                                Err(ExecutionError::Cancelled) => None,
+                                Err(error) => return Err(WaitError::Execution(error)),
+                            }
+                        } else {
+                            Some(Duration::from_millis(
+                                (deadline - self.clock.now()).max(0) as u64
+                            ))
+                        }
+                    }
+                    Some(TimeoutTimer::Fired) => {
+                        self.time_out(&child, record.config.subagents.cancel_grace)
+                            .await?;
+                        return Err(WaitError::Timeout);
+                    }
+                    _ => None,
+                };
 
                 let drive = drive_child(Arc::clone(&runner), child.child);
                 tokio::pin!(drive);
@@ -263,10 +403,18 @@ impl SubagentSpawner for Scheduler {
                     .executor
                     .await_wake(child.parent.session, WakeCause::ChildCompleted(child.child));
                 tokio::pin!(wake);
+                let timer_wait = async {
+                    match timer_sleep {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(timer_wait);
 
                 let driven = tokio::select! {
                     result = &mut drive => Some(result),
                     _ = &mut wake => None,
+                    _ = &mut timer_wait => None,
                 };
                 match driven {
                     // Another writer closed the wait; re-read the records.
@@ -304,27 +452,279 @@ impl SubagentSpawner for Scheduler {
 
     fn cancel(&self, child: &ChildRef) -> BoxFuture<'_, Result<(), WaitError>> {
         let child = child.clone();
-        Box::pin(async move {
-            let parent_events = scan(&*self.log, child.parent.session)
-                .await
-                .map_err(WaitError::Execution)?;
-            if find_completion(&parent_events, child.child).is_some() {
-                return Ok(());
-            }
-            // #48 adds child-session cancel propagation; this ticket only owns
-            // the parent-side closure.
-            self.record_completion(
-                &child,
-                ChildOutcome::Cancelled {
-                    reason: CancelReason::Parent,
-                },
-            )
-            .await
-        })
+        Box::pin(self.cancel_wait(child))
     }
 }
 
 impl Scheduler {
+    /// Rebuild this parent's queue and Running count from the log. A child
+    /// with `ChildSessionSpawned` and no completion is Running and is never
+    /// re-queued; open spawns wait in `seq` order.
+    async fn recover_parent(
+        &self,
+        parent: SessionId,
+        events: &[(LogEntry, SessionEvent)],
+    ) -> Result<(), ExecutionError> {
+        if self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recovered
+            .contains(&parent)
+        {
+            return Ok(());
+        }
+
+        let mut spawned: HashMap<ToolCallId, SessionId> = HashMap::new();
+        let mut completed: HashSet<SessionId> = HashSet::new();
+        for (_, event) in events {
+            match event {
+                SessionEvent::ChildSessionSpawned {
+                    parent_tool_call_id,
+                    child,
+                    ..
+                } => {
+                    spawned.insert(*parent_tool_call_id, *child);
+                }
+                SessionEvent::ChildSessionCompleted { child, .. } => {
+                    completed.insert(*child);
+                }
+                _ => {}
+            }
+        }
+        let mut queue = BTreeMap::new();
+        for (entry, event) in events {
+            if let SessionEvent::ToolCallRequested {
+                tool_call_id, name, ..
+            } = event
+                && name.as_str() == SPAWN_TOOL_NAME
+                && !spawned.contains_key(tool_call_id)
+            {
+                queue.insert(entry.seq, *tool_call_id);
+            }
+        }
+        let running: Vec<ToolCallId> = spawned
+            .iter()
+            .filter(|(_, child)| !completed.contains(child))
+            .map(|(call, _)| *call)
+            .collect();
+
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state.recovered.insert(parent) {
+            return Ok(());
+        }
+        let mut started = 0usize;
+        {
+            let entry = state.parents.entry(parent).or_default();
+            for (seq, call) in queue {
+                entry.queue.entry(seq).or_insert(call);
+            }
+            for call in running {
+                if entry.admitted.insert(call) {
+                    entry.running += 1;
+                    started += 1;
+                }
+            }
+        }
+        state.live += started;
+        Ok(())
+    }
+
+    /// Block until this spawn is the lowest-seq queued call and a slot is free.
+    /// The guard removes a still-queued entry if the future is dropped.
+    async fn admit(&self, guard: &mut QueueGuard<'_>, per_parent: usize, live_max: usize) {
+        let parent = guard.parent;
+        let seq = guard.seq;
+        let tool_call = guard.tool_call;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let admitted = {
+                let mut state = self
+                    .admission
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let live = state.live;
+                let entry = state.parents.entry(parent).or_default();
+                entry.queue.entry(seq).or_insert(tool_call);
+                let front = entry.queue.keys().next().copied() == Some(seq);
+                let admitted = front && entry.running < per_parent && live < live_max;
+                if admitted {
+                    entry.queue.remove(&seq);
+                    entry.running += 1;
+                    entry.admitted.insert(tool_call);
+                    state.live += 1;
+                }
+                admitted
+            };
+            if admitted {
+                guard.armed = false;
+                self.notify.notify_waiters();
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Free the slot a completed child occupied; re-admission is FIFO.
+    fn release_slot(&self, parent: SessionId, tool_call: ToolCallId) {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let released = match state.parents.get_mut(&parent) {
+            Some(entry) => {
+                if entry.admitted.remove(&tool_call) {
+                    entry.running = entry.running.saturating_sub(1);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if released {
+            state.live = state.live.saturating_sub(1);
+        }
+        drop(state);
+        if released {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Schedule the durable spawn timeout exactly once.
+    async fn ensure_timeout(
+        &self,
+        session: SessionId,
+        spawn_log: LogId,
+        timeout: Option<Duration>,
+        completed: bool,
+    ) -> Result<(), ExecutionError> {
+        let Some(timeout) = timeout else {
+            return Ok(());
+        };
+        // A completed spawn never opens a wait.
+        if completed {
+            return Ok(());
+        }
+        let millis = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
+        self.executor
+            .schedule_timer(TimerRequest {
+                session,
+                timer: SPAWN_TIMEOUT_SLOT,
+                caused_by: spawn_log,
+                deadline: self.clock.now().saturating_add(millis),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Child completed first: `TimerCancelled` replaces `TimerFired`.
+    async fn stop_timeout(&self, child: &ChildRef, parent_events: &[(LogEntry, SessionEvent)]) {
+        let Some(record) = find_spawn(parent_events, child.parent.tool_call) else {
+            return;
+        };
+        if let Some(TimeoutTimer::Pending { timer_id, .. }) =
+            find_timer(parent_events, record.log_id)
+        {
+            let _ = self
+                .executor
+                .cancel_timer(child.parent.session, timer_id)
+                .await;
+        }
+    }
+
+    /// Timeout wins: cancel the child and record `Cancelled{Timeout}`. The
+    /// parent's tool then maps this wait to `Failed{Timeout}`.
+    async fn time_out(&self, child: &ChildRef, grace: Duration) -> Result<(), WaitError> {
+        self.drain_child(child.child, grace).await;
+        self.record_completion(
+            child,
+            ChildOutcome::Cancelled {
+                reason: CancelReason::Timeout,
+            },
+        )
+        .await
+    }
+
+    /// Parent cancellation: signal the child through the shared registry, give
+    /// it `cancel_grace` to close its stream, then record `Cancelled{Parent}`
+    /// unless an outcome is already committed (R3/SA8).
+    pub(crate) async fn cancel_wait(&self, child: ChildRef) -> Result<(), WaitError> {
+        let parent_events = scan(&*self.log, child.parent.session)
+            .await
+            .map_err(WaitError::Execution)?;
+        if find_completion(&parent_events, child.child).is_some() {
+            return Ok(());
+        }
+        let grace = find_spawn(&parent_events, child.parent.tool_call)
+            .map(|record| record.config.subagents.cancel_grace)
+            .unwrap_or(self.config.cancel_grace);
+
+        self.drain_child(child.child, grace).await;
+
+        let parent_events = scan(&*self.log, child.parent.session)
+            .await
+            .map_err(WaitError::Execution)?;
+        // A committed outcome (possibly Completed) is authoritative.
+        if find_completion(&parent_events, child.child).is_some() {
+            return Ok(());
+        }
+        self.record_completion(
+            &child,
+            ChildOutcome::Cancelled {
+                reason: CancelReason::Parent,
+            },
+        )
+        .await?;
+        self.stop_timeout(&child, &parent_events).await;
+        Ok(())
+    }
+
+    /// The spawn record for this parent tool call, if it was admitted.
+    pub(crate) async fn spawned_child(
+        &self,
+        parent: ParentRef,
+    ) -> Result<Option<ChildRef>, ExecutionError> {
+        let events = scan(&*self.log, parent.session).await?;
+        Ok(
+            find_spawn(&events, parent.tool_call).map(|record| ChildRef {
+                parent,
+                child: record.child,
+            }),
+        )
+    }
+
+    /// Drive a child after cancellation. `run` registers a fresh token, so the
+    /// registry is signalled after the stream is built.
+    async fn drain_child(&self, session: SessionId, grace: Duration) {
+        let Some(runner) = self.runner.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let mut stream = runner.run(RunRequest {
+            session,
+            trigger: RunTrigger::Resume,
+        });
+        self.cancellations.cancel(session);
+        let deadline = tokio::time::sleep(grace);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => break,
+                event = stream.next() => match event {
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+            }
+        }
+    }
+
     /// R2: create the child log's records from the parent record. Every write
     /// is deduplicated by the child id, so replay fills gaps without doubling.
     async fn materialize(
@@ -399,6 +799,7 @@ impl Scheduler {
         )
         .await
         .map_err(WaitError::Execution)?;
+        self.release_slot(child.parent.session, child.parent.tool_call);
         self.executor
             .wake(child.parent.session, WakeCause::ChildCompleted(child.child));
         Ok(())
@@ -418,7 +819,35 @@ impl Scheduler {
     }
 }
 
+/// Removes a still-queued admission when the spawn future is dropped.
+struct QueueGuard<'a> {
+    scheduler: &'a Scheduler,
+    parent: SessionId,
+    seq: u64,
+    tool_call: ToolCallId,
+    armed: bool,
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .scheduler
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = state.parents.get_mut(&self.parent)
+            && entry.queue.get(&self.seq) == Some(&self.tool_call)
+        {
+            entry.queue.remove(&self.seq);
+        }
+    }
+}
+
 struct SpawnRecord {
+    log_id: LogId,
     child: SessionId,
     task: Vec<Part>,
     config: ConfigSnapshot,
@@ -426,7 +855,7 @@ struct SpawnRecord {
 }
 
 fn find_spawn(events: &[(LogEntry, SessionEvent)], tool_call: ToolCallId) -> Option<SpawnRecord> {
-    events.iter().find_map(|(_, event)| match event {
+    events.iter().find_map(|(entry, event)| match event {
         SessionEvent::ChildSessionSpawned {
             child,
             task,
@@ -435,12 +864,43 @@ fn find_spawn(events: &[(LogEntry, SessionEvent)], tool_call: ToolCallId) -> Opt
             parent_tool_call_id,
             ..
         } if *parent_tool_call_id == tool_call => Some(SpawnRecord {
+            log_id: entry.log_id,
             child: *child,
             task: task.clone(),
             config: config.clone(),
             context: context.clone(),
         }),
         _ => None,
+    })
+}
+
+enum TimeoutTimer {
+    Pending { timer_id: TimerId, deadline: i64 },
+    Fired,
+    Cancelled,
+}
+
+/// The spawn's timeout timer: scheduled under `caused_by = ChildSessionSpawned`.
+fn find_timer(events: &[(LogEntry, SessionEvent)], spawn_log: LogId) -> Option<TimeoutTimer> {
+    let (timer_id, deadline) = events.iter().find_map(|(_, event)| match event {
+        SessionEvent::TimerScheduled {
+            timer_id,
+            deadline,
+            caused_by,
+        } if *caused_by == spawn_log => Some((*timer_id, *deadline)),
+        _ => None,
+    })?;
+    let terminal = events.iter().rev().find_map(|(_, event)| match event {
+        SessionEvent::TimerFired { timer_id: fired } if *fired == timer_id => Some(true),
+        SessionEvent::TimerCancelled {
+            timer_id: cancelled,
+        } if *cancelled == timer_id => Some(false),
+        _ => None,
+    });
+    Some(match terminal {
+        Some(true) => TimeoutTimer::Fired,
+        Some(false) => TimeoutTimer::Cancelled,
+        None => TimeoutTimer::Pending { timer_id, deadline },
     })
 }
 
