@@ -102,6 +102,33 @@ pub struct ApprovalRequest {
     pub provenance: Provenance,
 }
 
+impl ApprovalRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: SessionId,
+        turn: TurnId,
+        step: StepId,
+        tool_call_id: ToolCallId,
+        tool: ToolName,
+        args: JsonString,
+        replay: ReplaySafety,
+        side_effect: SideEffect,
+        provenance: Provenance,
+    ) -> Self {
+        Self {
+            session,
+            turn,
+            step,
+            tool_call_id,
+            tool,
+            args,
+            replay,
+            side_effect,
+            provenance,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
