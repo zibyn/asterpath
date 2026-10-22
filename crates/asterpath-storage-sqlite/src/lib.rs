@@ -579,6 +579,12 @@ fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageE
     Ok(())
 }
 
+/// How long to keep retrying a contended writer lock (1 ms per attempt).
+/// A second *process* holds the lock indefinitely and still gets
+/// `WriterBusy`; this only absorbs the fork/exec window in which a child
+/// transiently inherits the lock descriptor before `CLOEXEC` closes it.
+const WRITER_LOCK_RETRIES: usize = 50;
+
 fn acquire_writer_lock(path: &Path) -> Result<WriterLock, StorageError> {
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
@@ -589,18 +595,21 @@ fn acquire_writer_lock(path: &Path) -> Result<WriterLock, StorageError> {
         .mode(0o600)
         .open(PathBuf::from(lock_path))
         .map_err(backend)?;
-    // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    for _ in 0..WRITER_LOCK_RETRIES {
+        // SAFETY: `file` owns a valid descriptor for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(WriterLock { _file: file });
+        }
         let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
+        match error.raw_os_error() {
             Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                Err(StorageError::WriterBusy)
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            _ => Err(backend(error)),
-        };
+            _ => return Err(backend(error)),
+        }
     }
-    Ok(WriterLock { _file: file })
+    Err(StorageError::WriterBusy)
 }
 
 fn migrate(conn: &Connection) -> Result<(), StorageError> {
