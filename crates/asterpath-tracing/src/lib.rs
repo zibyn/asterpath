@@ -465,16 +465,11 @@ impl Folder {
                     AbortKind::Cancelled => {
                         self.close(index, entry, SpanStatus::Cancelled, None);
                     }
-                    // `backoff_ms == 0` means the loop did not retry, so this
-                    // abort is the terminal record (a crash is always retried).
-                    AbortKind::Transport if *backoff_ms == 0 => {
-                        self.model_last_abort
-                            .insert(index, (entry.log_id, entry.recorded_at, error));
-                        self.close(index, entry, SpanStatus::Error, Some(error));
-                    }
                     _ => {
-                        // A retryable attempt; the span stays open until the
-                        // success or, once retries are exhausted, the commit.
+                        // A retryable attempt. `backoff_ms == 0` cannot prove a
+                        // retry is over: forced compaction retries too. The span
+                        // closes on success or when the step commit shows that
+                        // no further attempt will come.
                         self.model_last_abort
                             .insert(index, (entry.log_id, entry.recorded_at, error));
                         if self.latest_resume_seq > self.openings[index].seq {

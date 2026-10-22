@@ -1865,6 +1865,111 @@ async fn a_log_without_session_created_is_corrupt() {
 }
 
 #[tokio::test]
+async fn forced_compaction_retry_keeps_the_model_call_ok() {
+    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let session = sid(18);
+    let t = turn();
+    let s = step(0x13);
+
+    append(
+        &*log,
+        session,
+        &created(session),
+        Some(dedup::session_created(session)),
+    )
+    .await;
+    append(
+        &*log,
+        session,
+        &SessionEvent::TurnStarted { turn_id: t },
+        None,
+    )
+    .await;
+    let step_id = append(
+        &*log,
+        session,
+        &SessionEvent::StepStarted {
+            turn_id: t,
+            step_id: s,
+        },
+        None,
+    )
+    .await;
+    // Context exhaustion is not retried, but the loop forces a compaction and
+    // then retries the same step, so `backoff_ms == 0` is not a terminal.
+    append(
+        &*log,
+        session,
+        &aborted(t, s, 1, AbortKind::Transport, 0),
+        None,
+    )
+    .await;
+    let key = dedup::compaction(step_id);
+    append(
+        &*log,
+        session,
+        &SessionEvent::CompactionStarted {
+            trigger: CompactionTrigger::ProviderError,
+            replaces_from: step_id,
+            caused_by: step_id,
+        },
+        Some(key.clone()),
+    )
+    .await;
+    append(
+        &*log,
+        session,
+        &compaction_applied(step_id, step_id),
+        Some(key),
+    )
+    .await;
+    append(
+        &*log,
+        session,
+        &assistant(t, s, vec![text("done")]),
+        Some(dedup::assistant_message(t, s)),
+    )
+    .await;
+    append(
+        &*log,
+        session,
+        &SessionEvent::StepCommitted {
+            turn_id: t,
+            step_id: s,
+        },
+        Some(dedup::step_committed(s)),
+    )
+    .await;
+    append(
+        &*log,
+        session,
+        &SessionEvent::TurnCommitted {
+            turn_id: t,
+            reason: TurnEndReason::Completed,
+        },
+        Some(dedup::turn_committed(t)),
+    )
+    .await;
+
+    let spans = fold(&log, session).await;
+    let model_span = span_of(&spans, SpanKind::ModelCall);
+    assert_eq!(model_span.status, SpanStatus::Ok);
+    let SpanAttributes::ModelCall(attrs) = &model_span.attributes else {
+        panic!("model attrs");
+    };
+    assert_eq!(attrs.attempts.len(), 1);
+    assert_eq!(attrs.attempt_count, 2);
+    assert!(
+        attrs.compacted,
+        "the forced compaction precedes the final request"
+    );
+    assert_eq!(
+        span_of(&spans, SpanKind::Compaction).parent_span,
+        Some(span_of(&spans, SpanKind::Step).span)
+    );
+}
+
+#[tokio::test]
 async fn tap_pairs_a_wait_span_that_only_becomes_visible_with_its_decision() {
     let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
     let session = sid(17);
