@@ -760,6 +760,8 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
         completed_children, spawned_children,
         "resume completed the same two children; it created no third"
     );
+    assert_eq!(common::kind_count(&entries, "ChildSessionSpawned"), 2);
+    assert_eq!(common::kind_count(&entries, "ChildSessionCompleted"), 2);
 
     // --- parent terminal shape ---------------------------------------------
 
