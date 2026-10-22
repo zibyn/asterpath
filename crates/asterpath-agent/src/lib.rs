@@ -30,10 +30,10 @@ use asterpath_protocol::{
     Compactor, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism,
     PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent, PreStepGateDecision,
     PreStepGateEvent, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
-    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState,
-    StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
-    TurnEndReason, Usage, UsageAnchor, UsageBucket, UsageRecorded, approval_signal_id,
+    ProviderErrorKind, RecordAppended, ReplaySafety, ResumeReason, RunRequest, SessionEvent,
+    SessionState, StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor,
+    ToolError, ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus,
+    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageBucket, UsageRecorded, approval_signal_id,
     approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
@@ -189,6 +189,10 @@ impl Agent {
             if let Some(recorded) = recorded {
                 hooks.emit(recorded).await;
             }
+        }
+        // Observers see the record once it is visible; never part of recovery.
+        if let Some(bus) = &self.hooks {
+            bus.emit(RecordAppended { session }).await;
         }
         Ok(log_id)
     }

@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use asterpath_core::{
-    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
-    SessionId, SystemClock, TimerId, TimerRequest, ToolCallId, WakeCause,
+    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, ModuleCtx,
+    SessionCatalog, SessionId, SystemClock, TimerId, TimerRequest, ToolCallId, WakeCause,
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, ProviderId, Role,
-    RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry,
-    dedup, encode_entry,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, ProviderId,
+    RecordAppended, Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary,
+    TurnEndReason, decode_entry, dedup, encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -40,6 +40,7 @@ pub struct Scheduler {
     /// reaches the module bus and this scheduler, so an Arc here would leak the
     /// whole composition root.
     runner: OnceLock<Weak<dyn AgentRunner>>,
+    bus: Mutex<Option<ModuleCtx>>,
     /// Admission state is memory only; `recovered` marks parents whose open
     /// spawns have been rebuilt from the log.
     admission: Mutex<Admission>,
@@ -99,9 +100,33 @@ impl Scheduler {
             config,
             cancellations,
             runner: OnceLock::new(),
+            bus: Mutex::new(None),
             admission: Mutex::new(Admission::default()),
             notify: tokio::sync::Notify::new(),
         }
+    }
+
+    pub(crate) fn set_event_bus(&self, ctx: ModuleCtx) {
+        *self.bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
+    }
+
+    async fn append(
+        &self,
+        session: SessionId,
+        event: SessionEvent,
+        key: Option<asterpath_core::DedupKey>,
+    ) -> Result<LogId, ExecutionError> {
+        let entry = encode_entry(session, key, &event).map_err(backend)?;
+        let log_id = self.log.append(entry).await.map_err(backend)?;
+        let bus = self
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(bus) = bus {
+            bus.emit(RecordAppended { session }).await;
+        }
+        Ok(log_id)
     }
 
     /// Late-bind the runner so the scheduler and the agent never own each other.
@@ -249,21 +274,21 @@ impl SubagentSpawner for Scheduler {
             drop(queue_guard);
 
             let child = fresh_session_id();
-            let spawn_log = append(
-                &*self.log,
-                req.parent.session,
-                SessionEvent::ChildSessionSpawned {
-                    child,
-                    task: req.task.clone(),
-                    config: config.clone(),
-                    context: req.context.clone(),
-                    parent_tool_call_id: req.parent.tool_call,
-                    caused_by: req.caused_by,
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await
-            .map_err(SpawnError::Execution)?;
+            let spawn_log = self
+                .append(
+                    req.parent.session,
+                    SessionEvent::ChildSessionSpawned {
+                        child,
+                        task: req.task.clone(),
+                        config: config.clone(),
+                        context: req.context.clone(),
+                        parent_tool_call_id: req.parent.tool_call,
+                        caused_by: req.caused_by,
+                    },
+                    Some(dedup::child_session(child)),
+                )
+                .await
+                .map_err(SpawnError::Execution)?;
 
             self.ensure_timeout(req.parent.session, spawn_log, timeout, false)
                 .await
@@ -769,8 +794,7 @@ impl Scheduler {
             }
             Some(_) => {}
             None => {
-                append(
-                    &*self.log,
+                self.append(
                     child,
                     SessionEvent::SessionCreated {
                         config: config.clone(),
@@ -792,8 +816,7 @@ impl Scheduler {
             let items = self
                 .fork_snapshot(parent.clone(), *at, &config.model.provider)
                 .await?;
-            append(
-                &*self.log,
+            self.append(
                 child,
                 SessionEvent::ContextForked {
                     source: parent,
@@ -809,8 +832,7 @@ impl Scheduler {
             .iter()
             .any(|(_, event)| matches!(event, SessionEvent::InputRecorded { .. }))
         {
-            append(
-                &*self.log,
+            self.append(
                 child,
                 SessionEvent::InputRecorded {
                     input: task.to_vec(),
@@ -831,8 +853,7 @@ impl Scheduler {
         child: &ChildRef,
         outcome: ChildOutcome,
     ) -> Result<(), WaitError> {
-        append(
-            &*self.log,
+        self.append(
             child.parent.session,
             SessionEvent::ChildSessionCompleted {
                 child: child.child,
@@ -1143,16 +1164,6 @@ async fn scan(
         events.push((entry, event));
     }
     Ok(events)
-}
-
-async fn append(
-    log: &dyn EventLog,
-    session: SessionId,
-    event: SessionEvent,
-    key: Option<asterpath_core::DedupKey>,
-) -> Result<LogId, ExecutionError> {
-    let entry = encode_entry(session, key, &event).map_err(backend)?;
-    log.append(entry).await.map_err(backend)
 }
 
 fn backend(error: impl std::fmt::Display) -> ExecutionError {

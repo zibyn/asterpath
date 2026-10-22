@@ -17,6 +17,7 @@ pub mod item;
 pub mod projection;
 pub mod provider;
 pub mod tool;
+pub mod tracing;
 pub mod usage;
 
 pub use agent::{
@@ -38,8 +39,8 @@ pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payloa
 pub use encode::encode_entry;
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,
-    ParentRef, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo, ToolErrorKind,
-    ToolResultStatus, TurnEndReason,
+    ParentRef, RecordAppended, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo,
+    ToolErrorKind, ToolResultStatus, TurnEndReason,
 };
 pub use ids::{
     JsonSchema, JsonString, JsonValue, ModelAlias, ModelId, ProviderId, ToolArgs, ToolName,
@@ -56,6 +57,11 @@ pub use tool::{
     DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, PostExecuteError, PostExecuteEvent,
     PreExecuteError, PreExecuteEvent, TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError,
     ToolOutput, ToolRegistry, approval_signal_id, approval_signal_name,
+};
+pub use tracing::{
+    AttemptEvent, CompactionAttrs, ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, Span,
+    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
+    ToolCallAttrs, TraceError, TraceId, TraceQuery, TraceTap, TurnAttrs, WaitAttrs, WaitKind,
 };
 pub use usage::{
     InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageError, UsageFilter,

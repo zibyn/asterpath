@@ -1,0 +1,18 @@
+[package]
+name = "asterpath-tracing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterpath-core = { path = "../asterpath-core" }
+asterpath-protocol = { path = "../asterpath-protocol" }
+futures-core = "0.3"
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+asterpath-testing = { path = "../asterpath-testing" }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

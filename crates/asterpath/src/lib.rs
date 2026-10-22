@@ -19,18 +19,19 @@ use std::sync::Arc;
 
 use asterpath_agent::Agent;
 use asterpath_core::{
-    ApprovalGate, DurableExecutor, EventLog, InputId, LogQuery, ModuleHost, SessionCatalog,
-    SessionId, SessionRetirement, SignalDelivery, Storage, ToolCallId,
+    ApprovalGate, DurableExecutor, EventLog, InputId, LogQuery, ModuleCtx, ModuleHost,
+    SessionCatalog, SessionId, SessionRetirement, SignalDelivery, Storage, ToolCallId,
 };
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
-    OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
-    ToolRegistry, ToolSelection, UsageQuery, UserInput, approval_signal_id, approval_signal_name,
-    dedup,
+    OpenIntents, ProviderCatalog, RecordAppended, RunRequest, RunTrigger, SessionEvent,
+    SessionSpec, SessionState, ToolRegistry, ToolSelection, TraceQuery, TraceTap, UsageQuery,
+    UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
 use asterpath_scheduler::SchedulerModule;
 use asterpath_tools::ToolsModule;
+use asterpath_tracing::TracingModule;
 use asterpath_usage::UsageModule;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -57,6 +58,9 @@ pub struct Asterpath {
     executor: Arc<dyn DurableExecutor>,
     gate: Arc<ApprovalGate>,
     cancellations: Arc<CancellationRegistry>,
+    trace: Arc<dyn TraceQuery>,
+    trace_tap: Arc<dyn TraceTap>,
+    bus: Option<ModuleCtx>,
     host: ModuleHost,
 }
 
@@ -154,6 +158,8 @@ impl Asterpath {
         let executor: Arc<dyn DurableExecutor> = runtime;
 
         let cancellations = Arc::new(CancellationRegistry::new());
+        let tracing_module = Arc::new(TracingModule::new(Arc::clone(&event_log)));
+        module_host.register(tracing_module.clone());
 
         // The scheduler is assembled before the agent; the runner is bound
         // afterwards so the two never form an ownership cycle.
@@ -181,6 +187,7 @@ impl Asterpath {
             tools.register(tool);
         }
         let hooks = tools_module.context();
+        let bus = hooks.clone();
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
@@ -216,6 +223,9 @@ impl Asterpath {
             executor,
             gate,
             cancellations,
+            trace: tracing_module.query(),
+            trace_tap: tracing_module.tap(),
+            bus,
             host: module_host,
         })
     }
@@ -273,6 +283,7 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.event_log.append(entry).await?;
+        self.notify(session).await;
 
         Ok(SessionHandle {
             session,
@@ -280,6 +291,7 @@ impl Asterpath {
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
+            bus: self.bus.clone(),
         })
     }
 
@@ -295,6 +307,7 @@ impl Asterpath {
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
+            bus: self.bus.clone(),
         })
     }
 
@@ -329,6 +342,22 @@ impl Asterpath {
     pub fn approval_gate(&self) -> Arc<ApprovalGate> {
         Arc::clone(&self.gate)
     }
+
+    /// Deterministic trace projection over the event log.
+    pub fn trace(&self) -> Arc<dyn TraceQuery> {
+        Arc::clone(&self.trace)
+    }
+
+    /// Real-time span lifecycle driven by the typed event bus.
+    pub fn trace_tap(&self) -> Arc<dyn TraceTap> {
+        Arc::clone(&self.trace_tap)
+    }
+
+    async fn notify(&self, session: SessionId) {
+        if let Some(bus) = &self.bus {
+            bus.emit(RecordAppended { session }).await;
+        }
+    }
 }
 
 /// One session: submit inputs, then drive explicitly.
@@ -339,6 +368,7 @@ pub struct SessionHandle {
     agent: Arc<dyn AgentRunner>,
     executor: Arc<dyn DurableExecutor>,
     cancellations: Arc<CancellationRegistry>,
+    bus: Option<ModuleCtx>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -366,6 +396,12 @@ impl SessionHandle {
             message: error.to_string(),
         })?;
         self.event_log.append(entry).await?;
+        if let Some(bus) = &self.bus {
+            bus.emit(RecordAppended {
+                session: self.session,
+            })
+            .await;
+        }
         Ok(input.id)
     }
 
