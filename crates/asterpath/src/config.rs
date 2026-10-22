@@ -140,6 +140,24 @@ impl AsterpathBuilder {
     }
 
     #[must_use]
+    pub fn compaction(mut self, compaction: CompactionConfig) -> Self {
+        self.config.compaction = compaction;
+        self
+    }
+
+    #[must_use]
+    pub fn subagents(mut self, subagents: SubagentConfig) -> Self {
+        self.config.subagents = subagents;
+        self
+    }
+
+    #[must_use]
+    pub fn model_aliases(mut self, model_aliases: BTreeMap<ModelAlias, ModelSpec>) -> Self {
+        self.config.model_aliases = model_aliases;
+        self
+    }
+
+    #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.config.clock = clock;
         self
