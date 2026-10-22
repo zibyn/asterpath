@@ -20,6 +20,7 @@ asterpath-runtime = { path = "../asterpath-runtime" }
 asterpath-scheduler = { path = "../asterpath-scheduler" }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
 asterpath-tools = { path = "../asterpath-tools" }
+asterpath-usage = { path = "../asterpath-usage" }
 futures-core = "0.3"
 futures-util = "0.3"
 serde_json = "1"

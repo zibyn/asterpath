@@ -57,4 +57,7 @@ pub use tool::{
     PreExecuteError, PreExecuteEvent, TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError,
     ToolOutput, ToolRegistry, approval_signal_id, approval_signal_name,
 };
-pub use usage::{InputTokens, OutputTokens, Usage};
+pub use usage::{
+    InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageError, UsageFilter,
+    UsageQuery, UsageRecord, UsageRecorded, UsageReport, UsageScope, UsageTotals,
+};
