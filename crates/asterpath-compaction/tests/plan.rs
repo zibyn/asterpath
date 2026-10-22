@@ -242,6 +242,16 @@ fn summary_input_is_text_only() {
                                 url: "https://example.invalid/x.png".to_owned(),
                             },
                         },
+                        Part::ProviderOpaque {
+                            provider: ProviderId::new("p"),
+                            kind: "wire-opaque".to_owned(),
+                            raw: asterpath_protocol::RawProviderData {
+                                provider: ProviderId::new("p"),
+                                model: None,
+                                kind: "raw".to_owned(),
+                                json: asterpath_protocol::JsonString::new("{}"),
+                            },
+                        },
                     ],
                 },
                 Item::ToolCall {
@@ -268,6 +278,7 @@ fn summary_input_is_text_only() {
     assert!(!rendered.contains("secret reasoning"));
     assert!(!rendered.contains("image/png"));
     assert!(!rendered.contains("https://example.invalid"));
+    assert!(!rendered.contains("wire-opaque"));
     assert!(rendered.contains("answer"));
     assert!(rendered.contains("non-text content omitted"));
     assert!(rendered.contains("tool call shell"));

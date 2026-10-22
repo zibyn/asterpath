@@ -363,7 +363,9 @@ fn text_part(part: &Part) -> Option<Part> {
     match part {
         Part::Text { .. } => Some(part.clone()),
         Part::Refusal { text } => Some(Part::Text { text: text.clone() }),
-        Part::Image { .. } | Part::ProviderOpaque { .. } => Some(Part::Text {
+        // Provider opaque data is dropped, not rendered.
+        Part::ProviderOpaque { .. } => None,
+        Part::Image { .. } => Some(Part::Text {
             text: NON_TEXT_PLACEHOLDER.to_owned(),
         }),
     }
