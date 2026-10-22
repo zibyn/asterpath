@@ -1,6 +1,6 @@
 # 子智能体：子会话、上下文、等待与恢复
 
-> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复。具体 API 签名归 [#17](https://github.com/zibyn/asterpath/issues/17)，`Item` / `ConfigSnapshot` / `Usage` 类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，token 聚合口径归 [#13](https://github.com/zibyn/asterpath/issues/13)。
+> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复。具体 API 签名归 [#17](https://github.com/zibyn/asterpath/issues/17)，`Item` / `Part` / `ConfigSnapshot` / `Usage` 类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，token 聚合口径归 [#13](https://github.com/zibyn/asterpath/issues/13)。
 >
 > 对齐：[#3 事件日志与检查点恢复](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)、[#7 工具契约](./tools.md)。
 >
@@ -59,7 +59,7 @@ pub trait SubagentSpawner: Send + Sync {
 
 pub struct SpawnRequest {        // #[non_exhaustive]
     pub parent: ParentRef,       // parent session / turn / tool_call
-    pub task: Vec<Item>,
+    pub task: Vec<Part>,
     pub context: ContextPolicy,  // Fresh | Fork { at: LogId }
     pub model_alias: Option<ModelAlias>,
     pub tool_allowlist: Option<Vec<ToolName>>,
@@ -84,7 +84,7 @@ pub enum ContextPolicy {
 | approval | 默认策略 `InProcess → Allow`；宿主可用自定义策略收紧 |
 
 - spawn 的 `ReplaySafety::Safe` 是框架声明：恢复会先按 `parent_tool_call_id` 查找已有子会话（R1），不会产生第二个子。
-- 工具参数 schema 与 `task` 的编码（字符串 → 一个 user text `Item`）归 #15/#17。
+- 工具参数 schema 与 `task` 的编码（字符串 → 一个 user text `Part`）归 #15/#17。
 - **host 不经 turn / tool call 直接 spawn 在 v1 不做**：等待需要一个 `caused_by` 锚点（#3）。宿主可以注册自己的工具包装 `SubagentSpawner`，或通过输入让模型决定。
 
 ### 3.2 创建顺序
@@ -207,7 +207,7 @@ pub enum ChildFailure {
 }
 
 pub struct Summary {
-    pub items: Vec<Item>,   // 最后一条已提交 AssistantMessage 的 text / refusal；可空
+    pub items: Vec<Part>,   // 最后一条已提交 AssistantMessage 的 text / refusal；可空
 }
 ```
 
@@ -393,7 +393,7 @@ pub struct SubagentConfig {
 ## 14. 留给下游
 
 - **#9**：子会话内的压缩策略；fork 快照尊重父的 `CompactionApplied`，但物化后与父压缩解耦。
-- **#11**：`Item`、`ConfigSnapshot`、`ContextPolicy`、`ChildOutcome` 的最终类型；summary 的渲染。
+- **#11**：已定。`Item` / `Part`、`ConfigSnapshot`、`ContextPolicy`、`ChildOutcome` 的最终类型与 summary 的渲染见 [protocol.md](protocol.md)。
 - **#12**：子 session span 与父 spawn tool span 的命名/属性；`caused_by` / `source_log` 映射。
 - **#13**：session 树 rollup、去重口径、子 usage 是否单独查询。
 - **#15**：spawn 工具的最终命名/参数 schema；`SubagentSpawner` 的打包位置。

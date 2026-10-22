@@ -83,7 +83,7 @@ pub enum CompactResult {
 - 摘要模型：默认 = 当前会话的 provider + 模型；可配 `compaction.summary_model` 单独指定；**不做跨 provider 自动回退**。
 - 调用不挂工具，`max_output_tokens = max_summary_tokens`（默认 2048）；输出达到上限按截断文本接受，不重试。
 - 提示词是 compactor 内的固定模板，v1 不开放给宿主；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
-- 产出是单条 `Item::Compaction { text }`（类型归 #11）；供应商渲染规则归 #11（Anthropic 渲染为用户文本块，OpenAI 可映射为原生 compaction item）。
+- 产出是单条 `Item::Compaction { parts: Vec<Part> }`（类型归 #11）；v1 两边都渲染为文本——Anthropic 为用户文本块，OpenAI 为普通 input 文本消息；原生 compaction item 出界。
 
 ## 5. 事件、投影与恢复
 
@@ -92,7 +92,7 @@ pub enum CompactResult {
 ```rust
 CompactionApplied {
     first_kept: LogId,
-    summary: Vec<Item>,
+    summary: Vec<Part>,
     replaces: LogIdRange,
     usage: Usage,
     raw: Option<RawProviderData>,
@@ -194,7 +194,7 @@ pub struct CompactionConfig {
 
 ## 10. 留给下游
 
-- **#11**：`Item::Compaction` 的形状与双协议渲染；`ModelSpec.context_window`；`Usage`；`Compactor` trait。
+- **#11**：已定。`Item::Compaction` 的形状与双协议渲染、`ModelSpec.context_window`、`Usage`、`Compactor` trait 见 [protocol.md](protocol.md)。
 - **#12**：`compaction` span 的命名与属性；失败 attempt 的 trace。
 - **#13**：`compaction` 桶与 turn / session / 子会话 rollup 的最终口径；估算与 usage 归一化的关系。
 - **#15**：`Compactor`、`SessionHandle::compact_now()` 的精确签名与错误类型。

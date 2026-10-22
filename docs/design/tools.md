@@ -52,7 +52,7 @@ pub struct ToolContext {           // #[non_exhaustive]
 }
 
 pub struct ToolOutput {
-    pub content: Vec<Item>,
+    pub content: Vec<Part>,
 }
 
 #[non_exhaustive]
@@ -196,7 +196,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ToolResult {
     tool_call_id: ToolCallId,
     status: ToolResultStatus,        // Completed | Failed | Interrupted
-    output: Option<Vec<Item>>,       // 模型可见，已截断
+    output: Option<Vec<Part>>,       // 模型可见，已截断
     error: Option<ToolErrorInfo>,    // Failed 必带
     truncated: bool,
 }
@@ -287,7 +287,7 @@ pub struct ToolConfig {
 
 ## 12. 留给下游
 
-- **#11**：`Item`、`JsonString`、`JsonValue`、`Usage`；工具参数保持原始 JSON 字符串；session `ToolResult` 映射为规范 `ToolResult` item（`is_error = status != Completed`）。
+- **#11**：已定。`Part`、`Item`、`JsonString`、`JsonValue`、`Usage`；工具参数保持原始 JSON 字符串；session `ToolResult` 映射为规范 `ToolResult` item（`is_error = status != Completed`）。类型与映射见 [protocol.md](protocol.md)。
 - **#12**：tool span 命名与属性；默认只记元数据。
 - **#13**：工具输出计入下一次模型请求的 input tokens，不单独统计。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。

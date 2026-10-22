@@ -155,7 +155,7 @@ pub trait DurableExecutor: Send + Sync {
 
 ```rust
 pub trait Provider: Send + Sync {
-    fn capabilities(&self) -> ProviderCapabilities;
+    fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities;
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>>;
 }
 
@@ -193,7 +193,7 @@ pub trait AgentRunner: Send + Sync {
 }
 ```
 
-- 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定。
+- 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定，见 [protocol.md](protocol.md)。
 - 工具执行管线与审批见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)；`ToolDescriptor` 的最终字段以那里为准。
 - `AgentRunner` 是 loop 契约；turn/step、取消、steering 由 #6 定。
 
@@ -261,7 +261,7 @@ pub trait AgentRunner: Send + Sync {
 | #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) |
 | #9 上下文压缩 | 已定。`Compactor` 在 protocol，默认实现 `asterpath-compaction`；见 [compaction.md](compaction.md) |
 | #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
-| #11 协议模型 | 规范模型与 `Provider` 在 protocol |
+| #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 订阅 usage 事件；usage 类型在 protocol |
 | #15 打包 | 最终 crate 列表、门面、CLI 打包 |

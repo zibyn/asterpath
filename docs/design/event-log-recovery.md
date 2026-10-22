@@ -46,7 +46,7 @@ pub enum SessionEvent {
     ContextForked { source: ParentRef, source_log: LogId,
                     items: Vec<Item> },                           // fork 子会话的首个模型可见记录
     StreamResumed { from: LogId, reason: ResumeReason },          // 非模型可见
-    InputRecorded { input: Vec<Item> },                           // 模型可见
+    InputRecorded { input: Vec<Part> },                           // 模型可见
     TurnStarted { turn_id: TurnId },
     StepStarted { turn_id: TurnId, step_id: StepId },
     AssistantMessage { turn_id: TurnId, step_id: StepId,
@@ -60,14 +60,14 @@ pub enum SessionEvent {
                         raw_args: JsonString,   // pre-execute 之后的 effective args
                         replay: ReplaySafety, provenance: Provenance },
     ToolResult { tool_call_id: ToolCallId, status: ToolResultStatus,
-                 output: Option<Vec<Item>>,
+                 output: Option<Vec<Part>>,
                  error: Option<ToolErrorInfo>, truncated: bool },
     StepCommitted { turn_id: TurnId, step_id: StepId },  // 检查点标记
     TurnCommitted { turn_id: TurnId, reason: TurnEndReason },
-    CompactionApplied { first_kept: LogId, summary: Vec<Item>,
+    CompactionApplied { first_kept: LogId, summary: Vec<Part>,
                         replaces: LogIdRange,
                         usage: Usage, raw: Option<RawProviderData> },
-    ChildSessionSpawned { child: SessionId, task: Vec<Item>,
+    ChildSessionSpawned { child: SessionId, task: Vec<Part>,
                           config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
                           caused_by: LogId },
@@ -103,7 +103,7 @@ pub enum TurnEndReason {
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向开启等待的意图记录（通常是 `ToolCallRequested`）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
-- `Usage`、`Item`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
+- `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `SignalReceived` 本身不一定模型可见；若要进入上下文，由消费方写一条 `InputRecorded`（归 #6）。
 - timer / signal 的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)；存储投递归 #5。
 

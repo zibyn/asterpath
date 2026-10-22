@@ -74,6 +74,72 @@ _Avoid_: 事件
 **热替换（Hot Swap）**：
 运行中替换模块实现；v1 明确不支持，换模块即重启进程。
 
+## 协议与模型
+
+**协议适配器（Protocol Adapter）**：
+实现 `Provider` 契约、在规范模型与某供应商传输格式之间双向映射的模块。
+_Avoid_: provider 客户端、SDK 包装
+
+**模型规格（Model Spec）**：
+供应商、模型与上下文窗口的组合；能力标志按它查询。
+_Avoid_: 模型配置、模型引用
+
+**能力标志（Capability Flag）**：
+适配器声明的、某项协议能力是否可用；上层只按标志分支，不按供应商身份分支。
+_Avoid_: 特性开关、能力矩阵
+
+**条目（Item）**：
+模型历史中的一个有序顶层单元：消息、推理、工具调用/结果、服务端工具调用/结果、压缩摘要或供应商不透明条目。
+_Avoid_: 消息（作为同义词）、记录
+
+**片段（Part）**：
+条目内部的内容单元：文本、图像、拒绝或不透明内容块。
+_Avoid_: 块、content
+
+**模型请求（Model Request）**：
+发给供应商的一次完整请求：模型规格、system、历史、工具与采样/推理参数。
+_Avoid_: prompt、payload
+
+**模型响应（Response）**：
+一次供应商调用产出的规范流式结果，包含有序条目、用量与终止原因。
+_Avoid_: 回复、completion
+
+**模型尝试（Attempt）**：
+一次 HTTP 请求；重试产生多个尝试，只有成功的尝试产出模型响应。
+_Avoid_: 调用、retry
+
+**终止原因（Stop Reason）**：
+模型响应结束的规范原因；与回合的结束原因 `TurnEndReason` 不同。
+_Avoid_: 停止条件、结束状态
+
+**用量（Usage）**：
+一次响应消耗的 token，按未缓存输入、缓存读、缓存写、输出与推理拆分；统一为 exclusive 口径。
+_Avoid_: token 数、消耗
+
+**原始供应商数据（Raw Provider Data）**：
+随条目保存的供应商原始 JSON 文本；只能原样回放，不得重新序列化。
+_Avoid_: 原始响应、provider payload
+
+**推理绑定（Reasoning Binding）**：
+推理条目与其产出供应商、模型及前缀代次的关联；任一不匹配即不可回放。
+_Avoid_: 签名、reasoning key
+
+**前缀代次（Prefix Epoch）**：
+会话中已发生压缩的次数；用于判断旧推理是否仍可回放。
+_Avoid_: 版本号、generation
+
+**供应商不透明条目（Provider Opaque）**：
+无法规范化、但必须在同一供应商回放的供应商原始条目或内容块。
+_Avoid_: 未知块、passthrough
+
+**归一化（Normalization）**：
+把供应商格式转成规范模型；不改变语义，不静默丢弃。
+_Avoid_: 转换、适配
+
+**原始回放（Raw Replay）**：
+把原始供应商数据原样送回同一供应商，用于不透明 reasoning 与服务端工具。
+_Avoid_: 重放（与日志重放混淆）、re-send
+
 ## Agent 循环
 
 **回合（Turn）**：
