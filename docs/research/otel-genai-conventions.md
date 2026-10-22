@@ -235,7 +235,7 @@ OpenAI 的 `input_tokens` 已包含 cached tokens，不能再次相加。OTel �
 
 ### 6.4 没有 total / cost
 
-现行 GenAI 约定没有 `gen_ai.usage.total_tokens`，也没有成本、价格、币种或缓存折扣属性。total 必须由 `input_tokens + output_tokens` 自己算；成本属于 Asterpath 的本地计价层。（在 `model/gen-ai/registry.yaml` 的 `gen_ai.usage.*` 列表中未出现 total；docs 中也没有 cost 属性。）
+现行 GenAI 约定没有 `gen_ai.usage.total_tokens`，也没有成本、价格、币种或缓存折扣属性。total 必须由 `input_tokens + output_tokens` 自己算；成本与计价不属于 Asterpath 框架。（在 `model/gen-ai/registry.yaml` 的 `gen_ai.usage.*` 列表中未出现 total；docs 中也没有 cost 属性。）
 
 ## 7. 内容、reasoning、缓存、错误
 
@@ -313,7 +313,7 @@ part 的 `type` well-known 值：`text`、`reasoning`、`tool_call`、`tool_call
 
 ### 9.1 Span hierarchy
 
-建议保留原生 `session → turn → step → model call / tool call / subagent / workflow`，并按下面的方式映射到 OTel 形状：
+建议保留原生 `session → turn → step → model call / tool call / subagent`，并按下面的方式映射到 OTel 形状：
 
 | Asterpath 层级 | 是否保留为原生 span | OTel 导出映射 |
 | --- | --- | --- |
@@ -323,14 +323,12 @@ part 的 `type` well-known 值：`text`、`reasoning`、`tool_call`、`tool_call
 | model call | 是 | 按 `gen_ai.client.inference` 语义：`{operation} {model}`、`CLIENT`、模型/usage/status 属性 |
 | tool call | 是 | `execute_tool {tool.name}`、`INTERNAL` |
 | subagent | 是 | 嵌套 `invoke_agent {agent.name}`、`INTERNAL` |
-| workflow | 是 | `invoke_workflow {workflow.name}`、`INTERNAL` |
-| plan | 可选 | 只有能可靠区分规划时才导出 `plan {agent.name}` |
 
 具体规则：
 
 - **不要把 `invoke_agent` 当成“每个 turn 一个 span”。** OTel 的 `invoke_agent` 是 agent invocation，不是 turn；按 turn 生成会混淆语义。建议把 subagent 的一次运行映射为嵌套 `invoke_agent`；顶层 session 是否也映射为 `invoke_agent` 属于待定项（§11）。
 - **保留 turn/step 作为原生 INTERNAL span。** 不要为了 OTel 兼容把它们压平成 model call 的兄弟节点；否则 Asterpath 的重放、token 聚合和取消边界会丢失。
-- **父关系**：model call 和 tool call 的父是 step；subagent 的父是发起它的 step；subagent 内部的 model/tool call 的父是 subagent 的 `invoke_agent`；workflow 的 activities 的父是 workflow。OTel 唯一明确的层级规则是 plan：产生计划的 LLM call 是 plan 的子，计划产生的 tool/task 与 plan 同级挂在 `invoke_agent` 下；这条可以借用。
+- **父关系**：model call 和 tool call 的父是 step；subagent 的父是发起它的 step；subagent 内部的 model/tool call 的父是 subagent 的 `invoke_agent`。OTel 唯一明确的层级规则是 plan：产生计划的 LLM call 是 plan 的子，计划产生的 tool/task 与 plan 同级挂在 `invoke_agent` 下；Asterpath 没有 plan 概念，不借用。
 - **completion 内容不要默认进 trace**：session/turn/step span 默认只带结构字段和事件引用；prompt/completion 留在事件日志，按需导出。
 - **create_agent 不适用**：Asterpath 的 agent 是本地配置/类型，不是 hosted agent 资源；不要为构造 agent 生成本地 span 去凑 `create_agent`。
 
@@ -359,7 +357,7 @@ struct TokenUsage {
 - **聚合层级**：model call → step → turn → session。subagent 的 usage 归到 subagent 自己的子树；父级 rollup 用显式的 `include_descendants` 标志，默认不重复计数。OTel 的 `gen_ai.invoke_agent.inference_calls` / `tool_calls` 也明确把 subagent 的调用记在 subagent 自己的 invocation 上，每个 call 在整棵树里只计一次；这条聚合不变量可以借用。（[METRICS]）
 - **失败/取消**：只要有可用的 provider usage 就记录；usage counter 只记录严格为正的贡献；不要因为失败就不记，也不要伪造用量。（[TOKM]）
 - **重试**：一个逻辑 model call 的 usage 只记一次，不按 transport attempt 重复累计；attempt 作为事件/原生字段记录。
-- **不要引入** `total_tokens` 作为必填字段或成本字段；成本在 Asterpath 的计价层计算，输入是归一化后的 token 字段 + 价格表。（[TOKM]）
+- **不要引入** `total_tokens` 作为必填字段或成本字段；成本、计价与币种不属于框架。（[TOKM]）
 
 ### 9.3 Replay traces
 
@@ -377,10 +375,10 @@ OTel GenAI 完全没有 replay 语义：没有 replay 标记、attempt 字段、
 - **核心不依赖 OTel SDK/OTLP。** 原生 Rust 类型（`Span`, `Trace`, `TokenUsage`, `ModelCall`, `ToolCall` 等）是唯一内部模型；不引入 `opentelemetry` crate。
 - **唯一知道 `gen_ai.*` 字符串的地方是可选 exporter**：一个 feature/crate 把原生 span/事件映射成 OTel 形状的 struct/JSON。核心域类型不 stringly-typed，属性名只在序列化边界出现。
 - **固定版本**：exporter 固定 `semantic-conventions-genai@9ffc7e0` + `gen-ai-dev/1.42.0-dev`，并写 mapping tests。因为整体是 Development，升级时按 commit diff 审查，不要用 semver 假设。
-- **内容边界**：默认导出不含 prompt/completion；内容留在事件日志。启用时用显式 `capture_content` 开关，并在序列化前跑脱敏 hook；优先导出事件 id/内容哈希引用，而不是全文。OTel 的内容属性本身是 opt-in，且明确警告 sensitive/PII；借用这个默认值。（[CI], [SPANS]）
+- **内容边界**：默认导出不含 prompt/completion；内容留在事件日志。启用时用显式 `capture_content` 开关；内容安全与脱敏由 host/导出层负责。优先导出事件 id/内容哈希引用，而不是全文。OTel 的内容属性本身是 opt-in，且明确警告 sensitive/PII；借用这个默认值。（[CI], [SPANS]）
 - **provider 特定属性**：`openai.api.type`、`openai.request.service_tier`、`openai.response.system_fingerprint` 等只放在 OpenAI adapter/exporter 中，不进入核心模型。（[OPENAI]）
 - **不要导出** `gen_ai.prompt.variable.*`：动态 key 既增加基数又容易泄露变量内容；Asterpath 用显式的 prompt template id/version 即可。（[CI]）
-- **sampling**：GenAI 文档不定义采样策略，只建议 sampling-relevant 属性。Asterpath 保留原生策略（错误、慢请求强制保留）；不要因为引入 exporter 就换成 OTel sampler。（[CI], [AGENT]）
+- **sampling**：GenAI 文档不定义采样策略，只建议 sampling-relevant 属性。采样是 host/导出层策略，框架只定义相关属性，不内置 sampler。（[CI], [AGENT]）
 
 ## 10. 来源
 
@@ -418,7 +416,7 @@ OTel GenAI 完全没有 replay 语义：没有 replay 标记、attempt 字段、
 | **内容默认关闭 + 结构化 part**：`gen_ai.input.messages`/`output.messages`/`system_instructions`/`tool.definitions` 全部 opt-in；part 类型 `text`/`reasoning`/`tool_call`/`tool_call_response`/`server_tool_call`/`compaction` 等可作为导出映射。证据：与 Asterpath 事件日志的 item 模型高度相似。([CI], [INPUT], [OUTPUT]) | **默认把 prompt/completion 写进 span**：OTel 默认不记录，且警告 PII；Asterpath 的 trace 默认只带事件引用。([SPANS]) | **是否采用 OTel 的完整 JSON schema**：Asterpath 内部有自己的 item 日志；导出时再做 schema 映射，还是直接复用 schema，待 #12 决定。([INPUT], [OUTPUT]) |
 | **Reasoning 表示**：请求用 `gen_ai.request.reasoning.level`；用量用 `gen_ai.usage.reasoning.output_tokens`；内容作为 `reasoning` part；redacted thinking 用 generic part。证据：不引入单独的 reasoning 内容属性，避免把不透明思考块当普通文本。([ANTH], [OPENAI], [OUTPUT]) | **缓存断点/TTL 属性**：OTel 只定义 cache token 计数，没有 `cache_control`/TTL；不要把这些字段命名成 `gen_ai.*`。([CI]) | **跨 provider reasoning 翻译**：OTel 不定义；Anthropic signature/redacted 与 OpenAI encrypted reasoning 不可互译。Asterpath 应保留原始 provider 字段并禁止自动翻译。([OUTPUT], [OUTPUT-TEST]) |
 | **错误/状态语义**：`error.type` 低基数、成功 Unset、失败 Error、自动重试折叠、`finish_reasons` 缺失位置用 `error`、不记录已处理错误。证据：这是 Stable 属性 + 明确的 Recording Errors 规则。([REC-ERR], [CI], [EXC]) | **把 HTTP status 当 `error.type`**：OTel 要求 provider/client error code 或 canonical exception name；HTTP 404 不一定算错误。([REC-ERR]) | **异常表示**：用 OTel 的 `gen_ai.client.operation.exception` 事件，还是原生 error 事件 + 导出映射；建议原生事件为真相源。([EXC]) |
-| **导出边界**：可选 exporter 才认识 `gen_ai.*`；固定 commit/`1.42.0-dev`；默认不导内容；provider 特定属性留在 adapter。证据：满足“不引入 OTel SDK”的约束，同时保留互操作路径。([README], [MANIFEST]) | **OTel SDK/OTLP 作为核心依赖**：超出本票约束；核心不得依赖 `opentelemetry` crate 或第三方 agent 框架。([README]) | **导出格式与采样**：OTLP JSON、其他格式、以及是否导出 turn/step span，均待 #12 决定；GenAI 约定本身不定义采样。([CI], [AGENT]) |
+| **导出边界**：可选 exporter 才认识 `gen_ai.*`；固定 commit/`1.42.0-dev`；默认不导内容；provider 特定属性留在 adapter。证据：满足“不引入 OTel SDK”的约束，同时保留互操作路径。([README], [MANIFEST]) | **OTel SDK/OTLP 作为核心依赖**：超出本票约束；核心不得依赖 `opentelemetry` crate 或第三方 agent 框架。([README]) | **导出格式与采样**：OTLP JSON、其他格式、以及是否导出 turn/step span，都是 host/导出层责任；GenAI 约定本身不定义采样。([CI], [AGENT]) |
 | **重放所需的对齐点**：`gen_ai.response.id`、`gen_ai.tool.call.id`、`gen_ai.conversation.id`、`gen_ai.conversation.compacted` 可作为关联键或压缩标记。证据：语义明确，但均为 Development，导出时仍需固定 commit。([CI], [SPANS]) | **依赖 OTel 表达 replay/attempt/dedupe**：OTel 没有这些语义；Asterpath 必须原生定义 `replay`/`replay_of`/`attempt`/`log_seq`。([CI]) | **replay 的 trace identity**：重放重建同一 trace 还是新建 trace 并链接，取决于 #3 的恢复模型；OTel 不提供答案。([AGENT]) |
 
 [CI]: https://github.com/open-telemetry/semantic-conventions-genai/blob/9ffc7e00c639be7712e544e3e54331e885dccf84/docs/gen-ai/client-inference.md

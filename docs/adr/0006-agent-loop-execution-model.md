@@ -16,7 +16,7 @@
 - **取消是回合级、协作式**：模型流立即 abort；工具给 `cancel_grace`（默认 10s），到期 drop 并写 `Interrupted`；等待意图由 loop 收尾（`TimerCancelled` / `ChildSessionCompleted{Cancelled}`）。
 - **模型失败在 step 内按 attempt 重试**；工具失败不重试，作为模型可见结果。默认 `max_attempts = 3`，指数退避 + jitter。
 - **usage 与 stop_reason 记在 `AssistantMessage`**，`StepCommitted` 只作检查点标记；恢复时若 `AssistantMessage` 已存在则不重调模型。
-- **默认不设 step 上限**；宿主通过 pre-step waterfall gate 实施预算/停止策略；`MaxTurns` 改名 `MaxStepsExceeded`，并新增 `ContextExhausted`、`CompactionFailed`。
+- **默认不设 step 上限**；宿主通过 pre-step waterfall gate 实施停止策略；`MaxTurns` 改名 `MaxStepsExceeded`，并新增 `ContextExhausted`、`CompactionFailed`。
 
 ## Consequences
 
@@ -24,7 +24,7 @@
 - 失败/取消的 step 也是检查点，恢复不会重试；日志里不会出现永远 open 的 step。
 - steering 的代价是最多晚一个 step 生效；想立即停止用取消。
 - 审批/子会话等待会让一个 step 跨天 open；这是 #3 的 `Waiting` 设计，不是缺陷。
-- 宿主必须自己实现预算与步数策略；框架只提供 gate。
+- 宿主必须自己实现停止与步数策略；框架只提供 gate。
 - 不自动续写被截断的输出；宿主可以再发输入。
 
 ## Considered alternatives
@@ -33,4 +33,4 @@
 - **新增 `StepCancelled` / `StepFailed` 终态**：语义更直白，但每加一种结束方式都要加一个事件，恢复和投影也要多分支；`StepCommitted` 作为通用终态更小。
 - **立即打断模型流来注入 steering**：响应更快，但会吞掉在途请求的成本，并让 step 边界不再可预测；Codex / Claude Code 都选择排队。
 - **usage 留在 `StepCommitted`**：schema 改动最小，但工具中崩溃会永久丢该 step 的 usage，且恢复可能重调模型。
-- **框架内建 `max_turns` / 预算**：宿主策略被固化进库；回合由输入驱动，也没有可数的「回合上限」。
+- **框架内建 `max_turns` / 停止策略**：宿主策略被固化进库；回合由输入驱动，也没有可数的「回合上限」。

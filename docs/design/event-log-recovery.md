@@ -11,6 +11,7 @@
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
 - **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
+- **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件。工具语义见 [tools.md](tools.md)。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起。
@@ -53,10 +54,11 @@ pub enum SessionEvent {
                        usage: Option<Usage> },  // 非模型可见；usage 为 best-effort
     ToolCallRequested { turn_id: TurnId, step_id: StepId,
                         tool_call_id: ToolCallId, name: ToolName,
-                        raw_args: JsonString, replay: ReplaySafety,
-                        provenance: Provenance },
+                        raw_args: JsonString,   // pre-execute 之后的 effective args
+                        replay: ReplaySafety, provenance: Provenance },
     ToolResult { tool_call_id: ToolCallId, status: ToolResultStatus,
-                 output: Option<Vec<Item>> },
+                 output: Option<Vec<Item>>,
+                 error: Option<ToolErrorInfo>, truncated: bool },
     StepCommitted { turn_id: TurnId, step_id: StepId },  // 检查点标记
     TurnCommitted { turn_id: TurnId, reason: TurnEndReason },
     CompactionApplied { first_kept: LogId, summary: Vec<Item>,
@@ -74,8 +76,12 @@ pub enum SessionEvent {
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
 pub enum ToolResultStatus { Completed, Failed, Interrupted }
+pub struct ToolErrorInfo { kind: ToolErrorKind, message: String }
+pub enum ToolErrorKind {
+    InvalidArgs, Denied, Timeout, Cancelled, Panic, Transport, Internal,
+}
 pub enum TurnEndReason {
-    Completed, Cancelled, Failed, BudgetExhausted,
+    Completed, Cancelled, Failed, Stopped { reason: String },
     MaxStepsExceeded, ContextExhausted, CompactionFailed,
 }
 // ChildOutcome 的形状归 #8。
@@ -84,6 +90,8 @@ pub enum TurnEndReason {
 规则：
 
 - **没有通用 `Error` 事件**。错误是它所附着事件的终态（`ModelCallAborted`、`ToolResult::Failed`、`ChildOutcome`）。
+- `ToolResult` 是工具调用的唯一终态：`Failed` 必带 `error`；`Interrupted` 的 `output` / `error` 为 `None`。
+- 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
@@ -119,7 +127,7 @@ pub struct LogEntry {
 | `StepCommitted` / `TurnCommitted` | step / turn id |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
-| `SignalReceived` | 生产者提供的 signal id |
+| `SignalReceived` | 生产者提供的 signal id（审批用 `tool_call_id`） |
 
 表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。
 
@@ -192,7 +200,9 @@ recover(session):
 
     # 3. 其余 open step 由驱动方按 agent-loop.md 的恢复入口重放：
     #    有 AssistantMessage 跳过模型；无 abort 补 Crash abort 后重试；
-    #    执行未终结工具（Safe 重跑 / Unsafe Interrupted）；全部终结后写 StepCommitted。
+    #    未终结工具先查审批信号：有 Allow 则执行，有 Deny 则写 Failed{Denied}，
+    #    无决定且策略为 Ask 则重新挂起；否则 Safe 重跑 / Unsafe Interrupted；
+    #    全部终结后写 StepCommitted。
 
     return ResumePoint { state, history, next: frontier(entries) }
 ```
@@ -224,7 +234,7 @@ recover(session):
 - **#4**：`schema_version`、upcasting 时机、未知事件与未知字段、兼容性测试（ADR-0004）。
 - **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0005](../adr/0005-storage-contract-and-sqlite.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
 - **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
-- **#7**：审批/沙箱管线；tool 的 `ReplaySafety` 声明与执行语义。
+- **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：子会话完成结果、父子关闭顺序、孤儿恢复、fork session、并发与深度上限。
 - **#9**：压缩触发条件、保留策略、摘要模型。
 - **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
