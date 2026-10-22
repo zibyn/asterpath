@@ -180,7 +180,7 @@ async fn two_step_turn_with_a_tool_call_matches_l1_and_projects_the_result() {
         .await
         .expect("facade builds");
     let handle = asterpath
-        .create_session(spec(ToolSelection::All))
+        .create_session(spec(ToolSelection::Names(vec![ToolName::new("echo")])))
         .await
         .unwrap();
     handle.submit_input(input("go")).await.unwrap();
@@ -319,9 +319,16 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
             _ => None,
         })
         .expect("snapshot");
+    // `All` also picks up the scheduler's built-in spawn tool.
+    let names: Vec<_> = snapshot
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, ["alpha", "beta", "spawn_agent"]);
     assert_eq!(
-        snapshot.tools,
-        vec![descriptor("alpha"), descriptor("beta")]
+        &snapshot.tools[..2],
+        &[descriptor("alpha"), descriptor("beta")]
     );
 
     let error = asterpath
