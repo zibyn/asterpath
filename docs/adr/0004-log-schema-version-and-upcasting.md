@@ -18,6 +18,7 @@
 - **未知事件变体 → 硬错误**，整个 session 拒绝恢复。**未知字段 → 忽略**。**缺失必填字段 → 硬错误**，绝不默认填充；默认值只允许出现在显式 upcaster 里。
 - **无降级**：发现 `max(schema_version)` 高于自身支持版本时拒绝打开，不做只读 `inspect` 例外。
 - **session 不记录代码版本，也没有版本栅栏**：恢复与框架/tool 代码版本无关。
+- **带 dedup key 的事件变体名是持久判别式，发布后不得改名。** 幂等键按 `(session, event_kind, dedup_key)` 唯一（[ADR-0005](0005-storage-contract-and-sqlite.md)），判别式由存储写入；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示。否则升级窗口内重放旧写的终态会按新判别式查重落空，写出重复记录。
 - upcaster 放在拥有 `EventPayload` 的合约 crate（当前判断是 `protocol`；最终 crate 归属由 #15 确认）。
 - v1 不做 upcast 缓存：每次扫描逐条 upcast。代码里留 `shortcut:` 注明升级条件。
 

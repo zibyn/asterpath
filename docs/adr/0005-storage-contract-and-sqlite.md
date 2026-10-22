@@ -18,6 +18,7 @@
 - **进程独占写者。** `<db>.lock` 上非阻塞 `flock`，生命周期持有，不续约；第二个进程 `WriterBusy`。租约表只做诊断，不判权。
 - **一条记录一个事务**；`seq` 用 `MAX(seq)+1` 在事务内分配。timer 火化 / signal 到达与入队同事务；父子会话跨流不原子。
 - **派生索引在 `append` 内维护**：`sessions`、`timers`、`runnable` 可由日志重建，撤销了单独 enqueue API 的必要。
+- **幂等键按事件类型隔离。** `log` 表存 `event_kind`（payload 顶层变体名），唯一约束与查重 SQL 都用 `(session_id, event_kind, dedup_key)`。意图与终态刻意共用原始 key（如 `tool_call_id`）作为关联，不能互相抑制；因此解码提前到查重之前，以便同时得到 `event_kind`。
 - **没有 torn-tail 修复**：SQLite 提交原子，解码失败是硬错误而不是可截断的尾巴。
 - **v1 不做投影快照**；恢复从检查点折叠。
 
@@ -26,6 +27,7 @@
 - **2026-10-22 #18 修订**：日志仍不支持原地删除、裁剪或改写；整会话退役（日志 + 墓碑）是可选管理能力，见 [ADR-0016](0016-retention-and-archive-seam.md)。
 - 掉电也不丢已返回的 append，代价是每 step 约 4~6 次 fsync；在 LLM 延迟尺度下可接受。
 - 写入路径只有一条：日志行与派生行同事务，不存在索引与日志分叉。
+- `event_kind` 是持久判别式：带 dedup key 的事件变体改名时，映射必须保持旧值（[ADR-0004](0004-log-schema-version-and-upcasting.md)）。
 - 单写者让恢复与调度不需要分布式租约；多进程/多 worker 只能作为未来的新后端或新执行模型重新设计。
 - 日志不支持原地删除、裁剪或改写；整会话退役是可选管理能力（#18，见 [ADR-0016](0016-retention-and-archive-seam.md)），内核不内置保留策略。
 - 事件体是 JSON，按字段查询要走 SQLite JSON 函数或全扫；v1 的查询模式（按 session + seq）不需要。

@@ -21,7 +21,7 @@
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起；signal 等待的意图记录是 `SignalAwaited`。
 - **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合。
-- 幂等：`LogEntry.dedup_key` 在 session 内唯一，重复 append 返回原 `LogId`。
+- 幂等：`(session, 事件类型, dedup_key)` 唯一，重复 append 返回原 `LogId`。
 - 信封的 `recorded_at` 是诊断时间，只供 trace/审计读取；任何恢复、投影或分支逻辑不得读取它。`seq` 仍是唯一排序依据。
 - session 恢复写一条非模型可见的 `StreamResumed`。
 - compaction 的事件形状由本文件定，策略、算法与参数归 [#9](https://github.com/zibyn/asterpath/issues/9)，见 [compaction.md](compaction.md)。
@@ -136,7 +136,7 @@ pub struct LogEntry {
 ```
 
 - `recorded_at` 只由 trace/审计读取，**任何恢复、投影或分支逻辑都不得读取它**。`TimerScheduled.deadline` 是调度逻辑使用的截止时间，不属于诊断时间。
-- `dedup_key` 在 `(session, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。
+- `dedup_key` 在 `(session, 事件类型, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。事件类型取自 `payload` 的顶层变体名，是键判别式的一部分；物理存储见 [storage.md](storage.md) §4。
 
 | 事件 | dedup key |
 | --- | --- |
@@ -152,7 +152,7 @@ pub struct LogEntry {
 | `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
 | `SignalAwaited` / `SignalReceived` | signal id（审批用 `tool_call_id`） |
 
-表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。
+表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
@@ -165,7 +165,7 @@ pub struct LogEntry {
 - **I5 恢复只处理未闭合意图**：已闭合的历史不重做。
 - **I6 等待是已记录的**：每个等待都有意图记录与最终终态（fire / receive / complete / cancel）；恢复不依赖内存中的等待者。
 - **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 丢弃 `replaces` 区间（含旧 summary）并在 `first_kept` 之前插入新 summary；原始记录保留。
-- **I8 幂等 append**：同一 `(session, dedup_key)` 永远只有一条记录。
+- **I8 幂等 append**：同一 `(session, 事件类型, dedup_key)` 永远只有一条记录。
 - **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。
 
 ## 6. 检查点、frontier 与恢复
@@ -254,6 +254,7 @@ recover(session):
 | S9 | timer 在进程停机期间到期 | 重启后恰好触发一次 `TimerFired` |
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
+| S12 | 同一 key、不同事件类型各 append 一次（六对共享 key 见 §4） | 两条记录都落盘，互不抑制 |
 
 ## 8. 留给下游
 

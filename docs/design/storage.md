@@ -129,10 +129,11 @@ CREATE TABLE log (
     seq             INTEGER NOT NULL,
     recorded_at     INTEGER NOT NULL,           -- 诊断时间，仅 trace/审计可读
     schema_version  INTEGER NOT NULL,
+    event_kind      TEXT    NOT NULL,           -- payload 顶层变体名，幂等键判别式
     dedup_key       TEXT,                       -- NULL = 无幂等键
     payload         TEXT    NOT NULL,           -- JSON
     UNIQUE (session_id, seq),
-    UNIQUE (session_id, dedup_key)              -- SQLite 中多个 NULL 互不冲突
+    UNIQUE (session_id, event_kind, dedup_key)  -- 不同事件类型互不抑制；NULL 互不冲突
 );
 
 CREATE TABLE timers (
@@ -172,6 +173,7 @@ CREATE TABLE retired_sessions (
 - `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `timers` / `runnable`。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
+- `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
 - `recorded_at` 由 `append` 分配，不接受调用方传入；只供 trace/审计读取，不参与派生索引或任何逻辑。
 - 无外键：单写者 + 派生索引，外键只会增加写放大。
@@ -183,18 +185,19 @@ CREATE TABLE retired_sessions (
 
 ```
 BEGIN IMMEDIATE
+  event = decode(payload)                        -- 失败 -> InvalidEntry；顶层键给出 event_kind
+  kind = event_kind(event)
   if dedup_key 非空:
-      SELECT log_id FROM log WHERE session_id=? AND dedup_key=?
+      SELECT log_id FROM log WHERE session_id=? AND event_kind=? AND dedup_key=?
       if 命中: ROLLBACK; return 原 log_id        -- 不写、不派生
   seq = COALESCE((SELECT MAX(seq) FROM log WHERE session_id=?), 0) + 1
   recorded_at = now_ms()                        -- 存储层本地时钟
-  INSERT INTO log (..., recorded_at, ...)
-  event = decode(payload)                        -- 失败 -> InvalidEntry
+  INSERT INTO log (..., event_kind, recorded_at, ...)
   apply_derived(event)                           -- sessions/timers/runnable，同一事务
 COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
-- 解码只用于派生索引；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
+- 解码在查重之前，同时给出 `event_kind` 与派生输入；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
 - 派生规则（与恢复的分类器共享同一个函数，不各写一套）：
 
 | 事件 | `sessions.state` | 派生动作 |
@@ -251,7 +254,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 后端必须满足（Postgres 也照此实现）：
 
 - **G1 前缀持久**：`append` 返回后，该条记录排在崩溃可见的前缀里；FULL 下扛掉电。
-- **G2 幂等**：`(session, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写派生行。
+- **G2 幂等**：`(session, event_kind, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写派生行；同 key 不同事件类型互不抑制。
 - **G3 全序**：`seq` 在 session 内严格单调、无洞，只由存储分配。
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
 - **G5 至少一次唤醒**：入队的唤醒最终会被 `claim`；同 session 合并；`ack` 不会吃掉新一代唤醒。
