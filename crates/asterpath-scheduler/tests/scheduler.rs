@@ -17,7 +17,7 @@ use asterpath_protocol::{
     CompactionConfig, ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelId, ModelSpec,
     Parallelism, Part, Provenance, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest,
     SessionEvent, SideEffect, StopReason, SubagentConfig, Summary, ToolDescriptor, ToolName,
-    TurnConfig, TurnEndReason, Usage, dedup, encode_entry,
+    ToolResultStatus, TurnConfig, TurnEndReason, Usage, dedup, encode_entry,
 };
 use asterpath_protocol::{
     CancelToken, CancellationRegistry, Tool, ToolArgs, ToolContext, ToolError,
@@ -1156,12 +1156,12 @@ async fn append_keyed(
 
 /// Parent history before the spawn step, then the spawn step itself
 /// (assistant message and sibling tool result) that the fork must not see.
-async fn seed_fork_parent(log: &dyn EventLog) -> (LogId, LogId) {
+async fn seed_fork_parent(log: &dyn EventLog, subagents: &SubagentConfig) -> (LogId, LogId) {
     append(
         log,
         PARENT,
         SessionEvent::SessionCreated {
-            config: config(3),
+            config: config_with(3, subagents.clone()),
             parent: None,
         },
     )
@@ -1345,7 +1345,7 @@ fn fork_event(events: &[SessionEvent]) -> &SessionEvent {
 #[tokio::test]
 async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
     let log = Arc::new(InMemoryEventLog::new());
-    let (caused_by, at) = seed_fork_parent(&*log).await;
+    let (caused_by, at) = seed_fork_parent(&*log, &SubagentConfig::default()).await;
     let scheduler = new_scheduler(
         log.clone(),
         Arc::new(FakeCatalog::default()),
@@ -1753,7 +1753,7 @@ async fn fork_drops_foreign_provider_opaque_items_without_translation() {
 #[tokio::test]
 async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
     let log = Arc::new(InMemoryEventLog::new());
-    let (caused_by, at) = seed_fork_parent(&*log).await;
+    let (caused_by, at) = seed_fork_parent(&*log, &SubagentConfig::default()).await;
     let child = SessionId::from_bytes([0x77; 16]);
     append_keyed(
         &*log,
@@ -1985,6 +1985,52 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
     assert_eq!(
         spawned_calls(&*log, reference.session).await,
         vec![calls[0], calls[1], calls[2]]
+    );
+}
+
+#[tokio::test]
+async fn a_spawn_cancelled_before_admission_does_not_block_a_later_spawn() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let calls = [
+        ToolCallId::from_bytes([0x61; 16]),
+        ToolCallId::from_bytes([0x62; 16]),
+    ];
+    let subagents = limit(1);
+    let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
+    // The first spawn was cancelled while queued: an intent and an
+    // `Interrupted` result, but no child and no `ChildSessionSpawned`.
+    append(
+        &*log,
+        reference.session,
+        SessionEvent::ToolResult {
+            tool_call_id: calls[0],
+            status: ToolResultStatus::Interrupted,
+            output: None,
+            error: None,
+            truncated: false,
+        },
+    )
+    .await;
+
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        Arc::new(SystemClock),
+        subagents.clone(),
+    );
+    let child = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.spawn(request_for(&reference, calls[1], caused_by[1])),
+    )
+    .await
+    .expect("a closed queue entry must not block the next spawn")
+    .expect("spawn admitted");
+    assert_eq!(child.parent.tool_call, calls[1]);
+    assert_eq!(
+        spawned_calls(&*log, reference.session).await,
+        vec![calls[1]],
+        "the cancelled call creates no child"
     );
 }
 
@@ -2230,6 +2276,195 @@ impl DurableExecutor for TestExecutor {
     }
 
     fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+}
+
+#[tokio::test]
+async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let subagents = SubagentConfig {
+        default_context: ContextPolicy::Fresh,
+        ..SubagentConfig::default()
+    };
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    // The spawn tool leaves the request at its `Fresh` default.
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        Arc::new(SystemClock),
+        subagents,
+    );
+    let child = scheduler
+        .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
+        .await
+        .expect("spawn");
+    let context = events(&*log, parent)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { context, .. } => Some(context),
+            _ => None,
+        })
+        .expect("spawn record");
+    assert_eq!(context, ContextPolicy::Fresh);
+    assert!(
+        !events(&*log, child.child)
+            .await
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ContextForked { .. })),
+        "a fresh child never forks the parent"
+    );
+}
+
+#[tokio::test]
+async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let subagents = SubagentConfig {
+        // The watermark in the default is a placeholder; the spawn step's
+        // `StepStarted` is authoritative.
+        default_context: ContextPolicy::Fork {
+            at: LogId::from_i64(0),
+        },
+        ..SubagentConfig::default()
+    };
+    let (caused_by, at) = seed_fork_parent(&*log, &subagents).await;
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        Arc::new(SystemClock),
+        subagents,
+    );
+    // Same request the spawn tool builds: `Fresh` unless the snapshot says otherwise.
+    let child = scheduler
+        .spawn(SpawnRequest::new(
+            fork_parent_ref(),
+            caused_by,
+            vec![text("fork task")],
+        ))
+        .await
+        .expect("fork spawn");
+
+    let context = events(&*log, PARENT)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { context, .. } => Some(context),
+            _ => None,
+        })
+        .expect("spawn record");
+    assert_eq!(context, ContextPolicy::Fork { at });
+
+    let child_events = events(&*log, child.child).await;
+    let SessionEvent::ContextForked { source_log, .. } = fork_event(&child_events) else {
+        unreachable!()
+    };
+    assert_eq!(*source_log, at, "the snapshot is taken at the spawn step");
+}
+
+/// Appends the child's terminal when driven, as a real agent would when it
+/// finishes inside the cancellation grace window.
+struct CompletingRunner {
+    log: Arc<InMemoryEventLog>,
+}
+
+impl AgentRunner for CompletingRunner {
+    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
+        let log = Arc::clone(&self.log);
+        let session = req.session;
+        let turn = TurnId::from_bytes([5; 16]);
+        stream::once(async move {
+            append(
+                &*log,
+                session,
+                SessionEvent::TurnCommitted {
+                    turn_id: turn,
+                    reason: TurnEndReason::Completed,
+                },
+            )
+            .await;
+            Ok(AgentEvent::TurnCommitted {
+                turn,
+                reason: TurnEndReason::Completed,
+            })
+        })
+        .boxed()
+    }
+
+    fn compact_now(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::CompactResult, AgentError>> {
+        Box::pin(async move { Err(AgentError::NotFound { session }) })
+    }
+}
+
+#[tokio::test]
+async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let subagents = SubagentConfig {
+        cancel_grace: Duration::from_millis(50),
+        ..SubagentConfig::default()
+    };
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let child = SessionId::from_bytes([9; 16]);
+    let spawn_log = append(
+        &*log,
+        parent,
+        SessionEvent::ChildSessionSpawned {
+            child,
+            task: vec![text("task")],
+            config: config_with(3, subagents.clone()),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: reference.tool_call,
+            caused_by,
+        },
+    )
+    .await;
+    let executor = TestExecutor::new(log.clone(), Arc::clone(&clock));
+    executor
+        .schedule_timer(TimerRequest {
+            session: parent,
+            timer: TimerId::from_bytes([0x62; 16]),
+            caused_by: spawn_log,
+            deadline: clock.now() - 1,
+        })
+        .await
+        .expect("timer");
+
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        executor,
+        clock,
+        subagents,
+    );
+    let runner: Arc<dyn AgentRunner> = Arc::new(CompletingRunner {
+        log: Arc::clone(&log),
+    });
+    scheduler.set_runner(Arc::clone(&runner));
+    let outcome = scheduler
+        .await_completion(&ChildRef {
+            parent: reference,
+            child,
+        })
+        .await
+        .expect("the terminal written during grace wins over the timeout");
+    assert!(matches!(outcome, ChildOutcome::Completed { .. }));
+    assert_eq!(
+        events(&*log, parent)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::ChildSessionCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![ChildOutcome::Completed {
+            summary: Summary { items: Vec::new() }
+        }]
+    );
 }
 
 #[tokio::test]
