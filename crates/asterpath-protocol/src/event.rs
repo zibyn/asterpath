@@ -12,6 +12,15 @@ use crate::ids::ToolName;
 use crate::item::{Item, Part, RawProviderData};
 use crate::usage::Usage;
 
+/// Typed bus notification emitted after a record becomes visible at a session
+/// frontier. Observers such as the tracing tap use it; it is never logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordAppended {
+    pub session: SessionId,
+}
+
+impl asterpath_core::Event for RecordAppended {}
+
 /// One committed record in a session log. Only terminal records are logged.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
