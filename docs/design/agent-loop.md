@@ -27,7 +27,7 @@
 **回合**：
 
 - 由输入驱动。`InputRecorded` 到达即落盘；驱动方调用 `AgentRunner::run` 时，session 空闲则写 `TurnStarted` 开始新回合，已有回合则把输入作为 steering 并入当前回合。
-- 包含零或多个 step。零 step 的回合只可能由 pre-step gate 或压缩失败结束。
+- 包含零或多个 step。零 step 的回合只可能由 pre-step gate 或压缩路径（失败 / 仍超窗）结束。
 - 由 `TurnCommitted { reason }` 结束；之后 session 回到 Idle。
 
 **步骤**：
@@ -35,7 +35,7 @@
 - `StepStarted` 是意图记录；它之后的模型请求与工具执行都属于该 step。
 - `StepCommitted` 是 step 的通用终态：成功、模型失败、取消都写它。`TurnCommitted.reason` 表达回合结果。
 - 一个 step 至多一次成功的模型请求（多个 attempt 中至多一个 `AssistantMessage`），零或多个工具调用。
-- 模型请求的投影水位是 `StepStarted.seq`：只投影 `seq < StepStarted.seq` 的记录，尊重 `CompactionApplied`。重试复用同一投影；新输入只有落在下一个 `StepStarted` 之前才可见。
+- 模型请求的投影水位是 `StepStarted.seq`：只投影 `seq < StepStarted.seq` 的记录，尊重 `CompactionApplied`。重试复用同一投影；唯一例外是上下文超限触发的强制压缩，压缩后按新投影重试同一 step（[compaction.md](compaction.md)）；新输入只有落在下一个 `StepStarted` 之前才可见。
 
 **与检查点、追踪、token 的对齐**：
 
@@ -63,7 +63,7 @@ stateDiagram-v2
     [*] --> Idle
     Idle --> BetweenSteps: InputRecorded / TurnStarted
     BetweenSteps --> BetweenSteps: compaction + gate Continue
-    BetweenSteps --> TurnCommitted: gate EndTurn / CompactionFailed
+    BetweenSteps --> TurnCommitted: gate EndTurn / CompactionFailed / ContextExhausted
     BetweenSteps --> ModelCalling: StepStarted
     ModelCalling --> ModelCalling: ModelCallAborted (retryable, attempt++)
     ModelCalling --> ToolsPending: AssistantMessage + tool calls
@@ -88,8 +88,10 @@ run_turn(session):
         if cancelled:
             append(TurnCommitted(Cancelled)); return      # 零 step 取消
         # pre-step：压缩（#9）→ 宿主 gate
-        if compact_if_needed(session) 失败:              # 可写 CompactionApplied
-            append(TurnCommitted(CompactionFailed)); return
+        match compact_if_needed(session):                 # 可写 CompactionApplied
+            Ok(NotNeeded | NothingToDo | Applied) -> {}
+            Ok(Insufficient) -> append(TurnCommitted(ContextExhausted)); return
+            Err(_)           -> append(TurnCommitted(CompactionFailed)); return
         match pre_step_gate(session):                     # waterfall
             EndTurn(reason) -> append(TurnCommitted(reason)); return
             Err(_)          -> append(TurnCommitted(Failed)); return
@@ -116,6 +118,11 @@ run_turn(session):
                                         kind: err.kind,        # Rejected | Transport
                                         partial: err.partial,
                                         usage: err.partial_usage})
+                # 上下文超限且本 step 未强制压缩过：压缩一次，复用同一 step 重试
+                if err.context_exceeded && !force_compacted.contains((turn, step)):
+                    force_compacted.insert((turn, step))
+                    if compact_forced(session) == Ok(Applied):
+                        continue                              # 不写 StepCommitted
                 append(StepCommitted{turn, step})
                 append(TurnCommitted(if err.context_exceeded
                                      { ContextExhausted } else { Failed })); return
@@ -240,7 +247,7 @@ StepCommitted
 
 - `ProviderError`（#11）提供 `retryable` 与规范化分类（含上下文窗口耗尽）。
 - 只在 `retryable && attempt < max_attempts && !cancelled` 时重试；每次失败写 `ModelCallAborted{attempt, kind: Transport}`。
-- 不可重试错误：`ModelCallAborted{kind: Rejected}`，结束回合（`Failed`；上下文窗口耗尽时 `ContextExhausted`）。
+- 不可重试错误：`ModelCallAborted{kind: Rejected}`，结束回合（`Failed`；上下文窗口耗尽时先强制压缩一次并重试同一 step，仍超限才 `ContextExhausted`，见 [compaction.md](compaction.md)）。
 - 退避：指数 ×2，jitter，cap 30s；可被取消打断。
 - 每次 attempt 受 `request_timeout` 约束；超时按可重试 `Transport` 处理。
 - 部分流：不写 `AssistantMessage`；`partial` 仅作诊断，不投影（I9）。
@@ -257,7 +264,7 @@ StepCommitted
 | 模型错误不可重试 / 重试耗尽 | `Failed` |
 | `max_steps_per_turn` 达到 | `MaxStepsExceeded` |
 | 宿主 gate 返回停止 | `Stopped { reason }` |
-| 上下文窗口耗尽（provider 错误或 stop reason） | `ContextExhausted` |
+| 上下文窗口耗尽：`stop_reason` 超限，或强制压缩后仍超限 | `ContextExhausted` |
 | 压缩阶段失败 | `CompactionFailed` |
 | gate 自身出错 | `Failed` |
 
@@ -309,7 +316,7 @@ pub struct TurnConfig {
 | L6 | 不可重试错误 | `ModelCallAborted{Rejected}` + `StepCommitted` + `TurnCommitted(Failed)`；恢复不重试 |
 | L7 | `max_steps_per_turn = 1` 且第一步有工具调用 | 工具完成后 `TurnCommitted(MaxStepsExceeded)` |
 | L8 | 空响应 / refusal | `AssistantMessage` 空或含 refusal；`TurnCommitted(Completed)`；`stop_reason` 保留 |
-| L9 | 上下文窗口耗尽 | provider 错误路径或 stop reason 路径都得到 `TurnCommitted(ContextExhausted)` |
+| L9 | 上下文窗口耗尽 | 错误路径：同一 step 强制压缩一次并重试，成功则回合继续，仍超限则 `ContextExhausted`；`stop_reason` 路径：不压缩，直接 `ContextExhausted`；每 step 至多一次强制压缩 |
 | L10 | 压缩阶段失败 | 零 step；`TurnCommitted(CompactionFailed)` |
 | L11 | 崩溃于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`；usage 保留；补完未完成工具后提交 step |
 | L12 | 投影水位 | step 中记录的 steering 不会被同一 step 的重试看到；只被下一 step 看到 |
@@ -319,7 +326,7 @@ pub struct TurnConfig {
 
 - **#7**：已定。工具契约、审批、并行/独占调度、超时与结果形状见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；取消、`ChildSessionCompleted{Cancelled}` 与孤儿策略见 [subagents.md](subagents.md)。
-- **#9**：压缩触发条件与算法；loop 只定义 pre-step 调用与 `CompactionFailed`。
+- **#9**：已定。触发、保留、摘要调用、事件与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#11**：`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）。
 - **#12**：span 命名与属性映射。
 - **#13**：token 聚合与中断 attempt 的 partial usage 口径。

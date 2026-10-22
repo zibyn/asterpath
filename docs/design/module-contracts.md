@@ -26,6 +26,7 @@ modules (each crate; no module→module edges)
   asterpath-runtime          DurableExecutor impl
   asterpath-storage-sqlite   EventLog + Storage impl
   asterpath-agent            AgentRunner impl (turn/step loop)
+  asterpath-compaction       Compactor impl (#9)
   asterpath-tools            ToolRegistry impl (+ optional built-in tools)
   asterpath-provider-anthropic
   asterpath-provider-openai
@@ -38,7 +39,7 @@ modules (each crate; no module→module edges)
         ▼
 contract crates
   asterpath-protocol   canonical model, Provider/Tool/ToolRegistry/AgentRunner,
-                       session events, Provenance
+                       Compactor, session events, Provenance
         │
         ▼
   asterpath-core       Module host, ServiceId/ServiceKey, EventBus,
@@ -258,7 +259,7 @@ pub trait AgentRunner: Send + Sync {
 | #6 agent loop | `AgentRunner` 在 protocol；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
 | #7 工具与审批 | 已定。`Tool` / `ToolRegistry` / `Provenance` 在 protocol；管线与审批见 [tools.md](tools.md)、[ADR-0007](../adr/0007-approval-and-sandbox-layers.md) |
 | #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；scheduler 提供 `SubagentSpawner`，见 [subagents.md](subagents.md) |
-| #9 上下文压缩 | 消费 `EventLog` 与 `Provider` |
+| #9 上下文压缩 | 已定。`Compactor` 在 protocol，默认实现 `asterpath-compaction`；见 [compaction.md](compaction.md) |
 | #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
 | #11 协议模型 | 规范模型与 `Provider` 在 protocol |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |

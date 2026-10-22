@@ -19,7 +19,7 @@
 - 幂等：`LogEntry.dedup_key` 在 session 内唯一，重复 append 返回原 `LogId`。
 - 信封不含墙钟时间；`seq` 是唯一排序依据。
 - session 恢复写一条非模型可见的 `StreamResumed`。
-- compaction 的事件形状由本文件定，算法与参数归 [#9](https://github.com/zibyn/asterpath/issues/9)。
+- compaction 的事件形状由本文件定，策略、算法与参数归 [#9](https://github.com/zibyn/asterpath/issues/9)，见 [compaction.md](compaction.md)。
 
 ## 2. 日志流模型
 
@@ -65,7 +65,8 @@ pub enum SessionEvent {
     StepCommitted { turn_id: TurnId, step_id: StepId },  // 检查点标记
     TurnCommitted { turn_id: TurnId, reason: TurnEndReason },
     CompactionApplied { first_kept: LogId, summary: Vec<Item>,
-                        replaces: LogIdRange },
+                        replaces: LogIdRange,
+                        usage: Usage, raw: Option<RawProviderData> },
     ChildSessionSpawned { child: SessionId, task: Vec<Item>,
                           config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
@@ -98,6 +99,7 @@ pub enum TurnEndReason {
 - 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。
+- `CompactionApplied` 不是 step：可在回合内 BetweenSteps 或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上，失败的摘要 attempt 不落日志。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向开启等待的意图记录（通常是 `ToolCallRequested`）。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
@@ -130,6 +132,7 @@ pub struct LogEntry {
 | `ToolCallRequested` | 意图提交时生成的 `tool_call_id` |
 | `ToolResult` | `tool_call_id` |
 | `StepCommitted` / `TurnCommitted` | step / turn id |
+| `CompactionApplied` | `compaction:<append 前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `TimerScheduled` / `TimerFired` / `TimerCancelled` | timer id（`TimerFired` 与 `TimerCancelled` 由执行器保证互斥） |
 | `SignalReceived` | 生产者提供的 signal id（审批用 `tool_call_id`） |
@@ -146,7 +149,7 @@ pub struct LogEntry {
 - **I4 时间无关**：`ts` 不参与任何分支、比较或投影。
 - **I5 恢复只处理未闭合意图**：已闭合的历史不重做。
 - **I6 等待是已记录的**：每个等待都有意图记录与最终终态（fire / receive / complete / cancel）；恢复不依赖内存中的等待者。
-- **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 跳过被替换区间，原始记录保留。
+- **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 丢弃 `replaces` 区间（含旧 summary）并在 `first_kept` 之前插入新 summary；原始记录保留。
 - **I8 幂等 append**：同一 `(session, dedup_key)` 永远只有一条记录。
 - **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。
 
@@ -229,7 +232,7 @@ recover(session):
 | S4 | 后端只暴露已提交前缀；payload 损坏 | SQLite 上不存在半条记录，坏 payload 报 `Corrupt`；非原子后端自行截断 |
 | S5 | 同 `dedup_key` append 两次 | 只有一条记录；两次返回同一 `LogId` |
 | S6 | 父会话等待子会话时崩溃 | 重启后重新挂起；子完成后恰有一条 `ChildSessionCompleted`，父 history 正确 |
-| S7 | 含 `CompactionApplied` 的历史投影 | 模型只看到 summary + `first_kept` 之后的内容；原始记录仍可扫描 |
+| S7 | 含 `CompactionApplied` 的历史投影 | 模型只看到最新 summary + `first_kept` 之后的内容；旧 summary 被覆盖；原始记录仍可扫描 |
 | S8 | 任意恢复路径 | `seq` 严格单调；`ts` 不改变任何输出 |
 | S9 | timer 在进程停机期间到期 | 重启后恰好触发一次 `TimerFired` |
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
@@ -242,7 +245,7 @@ recover(session):
 - **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
-- **#9**：压缩触发条件、保留策略、摘要模型。
+- **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#17**：子智能体调度 API、spawn/等待/取消/恢复的接缝、timer/signal API。
 - **#12**：`StreamResumed` 与 `caused_by` 如何映射到 trace。
 - **#16**：插件发现与外部能力边界。
