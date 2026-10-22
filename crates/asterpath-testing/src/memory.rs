@@ -1,0 +1,268 @@
+//! In-memory `EventLog` and `Storage` backend.
+//!
+//! **This backend does not satisfy G1.** There is no persistence, no fsync and
+//! no crash prefix guarantee; everything is lost with the process. It exists to
+//! run the backend-neutral contract suites. It also does not implement
+//! `SessionRetirement`.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use asterpath_core::{
+    Clock, DueTimer, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, Storage,
+    StorageError, SystemClock, Timestamp,
+};
+use asterpath_protocol::{OpenIntents, SessionEvent, decode_entry, decode_payload};
+use futures_core::future::BoxFuture;
+use futures_core::stream::BoxStream;
+use futures_util::StreamExt;
+use futures_util::stream;
+
+use crate::contract::{BackendFactory, BackendHandle};
+
+#[derive(Default)]
+struct State {
+    entries: Vec<LogEntry>,
+    next_log_id: i64,
+    session_seq: HashMap<SessionId, u64>,
+    dedup: HashMap<(SessionId, String, Option<String>), LogId>,
+}
+
+/// Append-only, per-session in-memory event log with idempotent appends,
+/// per-session monotonic `seq` and exclusive-cursor scans.
+pub struct InMemoryEventLog {
+    state: Mutex<State>,
+    clock: SystemClock,
+}
+
+impl Default for InMemoryEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryEventLog {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            clock: SystemClock,
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn snapshot(&self) -> Vec<LogEntry> {
+        self.state().entries.clone()
+    }
+
+    fn append_sync(&self, entry: NewEntry) -> Result<LogId, StorageError> {
+        // Decode before dedup so an unknown variant / bad payload is rejected
+        // at append time, exactly like the SQLite write path.
+        let event = decode_payload(&entry.payload, entry.schema_version)
+            .map_err(|error| StorageError::InvalidEntry(error.to_string()))?;
+        let kind = event.kind().to_owned();
+
+        let mut state = self.state();
+        let dedup = entry
+            .dedup_key
+            .as_ref()
+            .map(|key| (entry.session, kind, Some(key.as_str().to_owned())));
+        if let Some(dedup) = &dedup
+            && let Some(log_id) = state.dedup.get(dedup)
+        {
+            return Ok(*log_id);
+        }
+
+        let log_id = LogId::from_i64(state.next_log_id + 1);
+        state.next_log_id += 1;
+        let seq = state.session_seq.entry(entry.session).or_insert(0);
+        *seq += 1;
+        let seq = *seq;
+
+        let log_entry = LogEntry {
+            log_id,
+            session: entry.session,
+            seq,
+            recorded_at: self.clock.now(),
+            schema_version: entry.schema_version,
+            dedup_key: entry.dedup_key,
+            payload: entry.payload,
+        };
+        if let Some(dedup) = dedup {
+            state.dedup.insert(dedup, log_id);
+        }
+        state.entries.push(log_entry);
+        Ok(log_id)
+    }
+}
+
+impl EventLog for InMemoryEventLog {
+    fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
+        let result = self.append_sync(entry);
+        Box::pin(async move { result })
+    }
+
+    fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
+        let mut entries: Vec<LogEntry> = self
+            .snapshot()
+            .into_iter()
+            .filter(|entry| entry.session == query.session)
+            .filter(|entry| query.after.is_none_or(|after| entry.log_id > after))
+            .collect();
+        entries.sort_by_key(|entry| entry.seq);
+        if let Some(limit) = query.limit {
+            entries.truncate(limit);
+        }
+        stream::iter(entries.into_iter().map(Ok)).boxed()
+    }
+
+    fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
+        let frontier = self
+            .snapshot()
+            .into_iter()
+            .filter(|entry| entry.session == session)
+            .max_by_key(|entry| entry.seq)
+            .map(|entry| entry.log_id);
+        Box::pin(async move { Ok(frontier) })
+    }
+}
+
+/// Read-only wake discovery derived on demand from the log.
+pub struct InMemoryStorage {
+    log: Arc<InMemoryEventLog>,
+}
+
+impl InMemoryStorage {
+    pub fn new(log: Arc<InMemoryEventLog>) -> Self {
+        Self { log }
+    }
+}
+
+struct SessionFacts {
+    intents: OpenIntents,
+    pending_input: bool,
+    due: Vec<DueTimer>,
+}
+
+fn session_facts(
+    session: SessionId,
+    entries: &[LogEntry],
+    now: Timestamp,
+) -> Result<SessionFacts, StorageError> {
+    let mut intents = OpenIntents::default();
+    let mut pending_input = false;
+    let mut timers: HashMap<_, Timestamp> = HashMap::new();
+
+    for entry in entries {
+        let event = decode_entry(entry).map_err(|error| StorageError::Corrupt {
+            session: Some(session),
+            detail: error.to_string(),
+        })?;
+        intents.apply(&event, entry.dedup_key.as_ref());
+        match event {
+            SessionEvent::InputRecorded { .. } => pending_input = true,
+            SessionEvent::StepStarted { .. } => pending_input = false,
+            SessionEvent::TimerScheduled {
+                timer_id, deadline, ..
+            } => {
+                timers.insert(timer_id, deadline);
+            }
+            SessionEvent::TimerFired { timer_id } | SessionEvent::TimerCancelled { timer_id } => {
+                timers.remove(&timer_id);
+            }
+            _ => {}
+        }
+    }
+
+    let due = timers
+        .into_iter()
+        .filter(|(_, deadline)| *deadline <= now)
+        .map(|(timer_id, deadline)| DueTimer {
+            timer_id,
+            session,
+            deadline,
+        })
+        .collect();
+
+    Ok(SessionFacts {
+        intents,
+        pending_input,
+        due,
+    })
+}
+
+impl Storage for InMemoryStorage {
+    fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        let result = self.wakeable_sync(now);
+        Box::pin(async move { result })
+    }
+
+    fn due_timers(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>> {
+        let result = self.due_timers_sync(now, limit);
+        Box::pin(async move { result })
+    }
+}
+
+impl InMemoryStorage {
+    fn wakeable_sync(&self, now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
+        let mut by_session: HashMap<SessionId, Vec<LogEntry>> = HashMap::new();
+        for entry in self.log.snapshot() {
+            by_session.entry(entry.session).or_default().push(entry);
+        }
+
+        let mut wakeable = Vec::new();
+        for (session, mut entries) in by_session {
+            entries.sort_by_key(|entry| entry.seq);
+            let facts = session_facts(session, &entries, now)?;
+            if !facts.intents.is_idle() || facts.pending_input || !facts.due.is_empty() {
+                wakeable.push(session);
+            }
+        }
+        wakeable.sort();
+        Ok(wakeable)
+    }
+
+    fn due_timers_sync(&self, now: Timestamp, limit: usize) -> Result<Vec<DueTimer>, StorageError> {
+        let mut by_session: HashMap<SessionId, Vec<LogEntry>> = HashMap::new();
+        for entry in self.log.snapshot() {
+            by_session.entry(entry.session).or_default().push(entry);
+        }
+
+        let mut due = Vec::new();
+        for (session, mut entries) in by_session {
+            entries.sort_by_key(|entry| entry.seq);
+            due.extend(session_facts(session, &entries, now)?.due);
+        }
+        due.sort_by_key(|timer| (timer.deadline, timer.timer_id));
+        due.truncate(limit);
+        Ok(due)
+    }
+}
+
+/// A factory over one shared in-memory log. `open` returns fresh handles to the
+/// same backend, mirroring "reopen the same database" in the contract suites.
+#[derive(Default)]
+pub struct MemoryBackend {
+    log: Arc<InMemoryEventLog>,
+}
+
+impl MemoryBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl BackendFactory for MemoryBackend {
+    fn open(&self) -> BackendHandle {
+        BackendHandle {
+            log: self.log.clone(),
+            storage: Arc::new(InMemoryStorage::new(self.log.clone())),
+        }
+    }
+}
