@@ -12,15 +12,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use asterpath_core::{
     ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
-    LogQuery, ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, TimerId, ToolCallId,
-    TurnId,
+    LogQuery, ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, TimerId, Timestamp,
+    ToolCallId, TurnId, unique_bytes,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
@@ -105,6 +104,12 @@ impl Agent {
     pub fn with_cancellations(mut self, cancellations: Arc<CancellationRegistry>) -> Self {
         self.cancellations = cancellations;
         self
+    }
+
+    /// Ids come from the injected clock plus a process counter, so a fixed
+    /// `ManualClock` yields a deterministic prefix and unique ids.
+    fn fresh_id(&self) -> [u8; 16] {
+        unique_bytes(self.clock.now())
     }
 
     fn acquire(&self, session: SessionId) -> bool {
@@ -295,7 +300,7 @@ impl Agent {
                     events.push(Ok(AgentEvent::Idle { session }));
                     return Ok(());
                 }
-                let turn = TurnId::from_bytes(fresh_id());
+                let turn = TurnId::from_bytes(self.fresh_id());
                 self.append(session, SessionEvent::TurnStarted { turn_id: turn }, None)
                     .await?;
                 events.push(Ok(AgentEvent::TurnStarted { turn }));
@@ -361,6 +366,10 @@ impl Agent {
         }
 
         let last = last_abort(&current, turn, step);
+        // C5: a forced compaction committed after the rejected attempt redoes
+        // the same step with the new projection, never the failure terminal.
+        let force_compacted = matches!(last, Some((_, AbortKind::Rejected)))
+            && compaction_after_last_abort(&current, turn, step);
         match last.map(|(_, kind)| kind) {
             Some(AbortKind::Cancelled) => {
                 self.commit_step(session, turn, step).await?;
@@ -368,7 +377,7 @@ impl Agent {
                     .commit_turn(session, turn, TurnEndReason::Cancelled, events)
                     .await;
             }
-            Some(AbortKind::Rejected) => {
+            Some(AbortKind::Rejected) if !force_compacted => {
                 self.commit_step(session, turn, step).await?;
                 return self
                     .commit_turn(session, turn, TurnEndReason::Failed, events)
@@ -399,11 +408,19 @@ impl Agent {
                 2
             }
         };
+        // §4.1: an exhausted retry budget is a failure terminal, never an
+        // unbudgeted model call.
+        if start_attempt > config.turn.max_attempts.get() {
+            self.commit_step(session, turn, step).await?;
+            return self
+                .commit_turn(session, turn, TurnEndReason::Failed, events)
+                .await;
+        }
         self.run_steps(
             session,
             config,
             turn,
-            Some((step, watermark, start_attempt)),
+            Some((step, watermark, start_attempt, force_compacted)),
             cancel,
             events,
         )
@@ -580,7 +597,7 @@ impl Agent {
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
-        existing_step: Option<(StepId, u64, u32)>,
+        existing_step: Option<(StepId, u64, u32, bool)>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
@@ -589,8 +606,10 @@ impl Agent {
         let mut auto_compactions = 0u32;
 
         loop {
-            let (step, watermark, start_attempt) = match pending.take() {
-                Some((step, watermark, attempt)) => (step, watermark, attempt),
+            let (step, watermark, start_attempt, force_compacted) = match pending.take() {
+                Some((step, watermark, attempt, force_compacted)) => {
+                    (step, watermark, attempt, force_compacted)
+                }
                 None => {
                     // Between steps: cancellation closes the turn with no step.
                     if cancel.is_cancelled() {
@@ -670,7 +689,7 @@ impl Agent {
                             .commit_turn(session, turn, TurnEndReason::MaxStepsExceeded, events)
                             .await;
                     }
-                    let step = StepId::from_bytes(fresh_id());
+                    let step = StepId::from_bytes(self.fresh_id());
                     let log_id = self
                         .append(
                             session,
@@ -683,7 +702,7 @@ impl Agent {
                         .await?;
                     let seq = self.seq_of(session, log_id).await?;
                     steps_started += 1;
-                    (step, seq, 1)
+                    (step, seq, 1, false)
                 }
             };
 
@@ -695,6 +714,7 @@ impl Agent {
                     step,
                     watermark,
                     start_attempt,
+                    force_compacted,
                     cancel,
                     events,
                 )
@@ -733,6 +753,7 @@ impl Agent {
         step: StepId,
         watermark: u64,
         start_attempt: u32,
+        force_compacted: bool,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
@@ -741,7 +762,7 @@ impl Agent {
         let mut request = self.build_request(session, config, watermark).await?;
         let max_attempts = config.turn.max_attempts.get();
         let mut attempt = start_attempt;
-        let mut force_compacted = false;
+        let mut force_compacted = force_compacted;
 
         loop {
             // A step still open when cancellation arrives never calls the model.
@@ -875,7 +896,7 @@ impl Agent {
             });
             let will_retry = error.retryable && !error.context_exceeded() && attempt < max_attempts;
             let backoff = if will_retry {
-                backoff(&config.turn, attempt)
+                backoff(&config.turn, attempt, self.clock.now())
             } else {
                 Duration::ZERO
             };
@@ -1182,7 +1203,7 @@ impl Agent {
             }
 
             // No recorded intent: pre-execute runs for this call only.
-            let tool_call_id = ToolCallId::from_bytes(fresh_id());
+            let tool_call_id = ToolCallId::from_bytes(self.fresh_id());
             let mut args = call.raw_args;
             let failure = self
                 .pre_execute(
@@ -1397,10 +1418,37 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
         let mut recorded = HashSet::new();
+        let mut step_calls = HashSet::new();
+        let mut spawned_children = BTreeSet::new();
+        let mut completed_children = BTreeSet::new();
         let mut open_timers: BTreeMap<asterpath_core::TimerId, u64> = BTreeMap::new();
         for (entry, event) in &decoded {
             if let SessionEvent::ToolResult { tool_call_id, .. } = event {
                 recorded.insert(*tool_call_id);
+            }
+            match event {
+                SessionEvent::ToolCallRequested {
+                    turn_id,
+                    step_id,
+                    tool_call_id,
+                    ..
+                } if *turn_id == turn && *step_id == step => {
+                    step_calls.insert(*tool_call_id);
+                }
+                // #41/#48: a spawn owned by this step is a wait to close even
+                // when its tool future was dropped before the scheduler wrote
+                // the terminal. Dedup by child id makes a racing write a no-op.
+                SessionEvent::ChildSessionSpawned {
+                    child,
+                    parent_tool_call_id,
+                    ..
+                } if step_calls.contains(parent_tool_call_id) => {
+                    spawned_children.insert(*child);
+                }
+                SessionEvent::ChildSessionCompleted { child, .. } => {
+                    completed_children.insert(*child);
+                }
+                _ => {}
             }
             if entry.seq <= step_started_seq {
                 continue;
@@ -1413,9 +1461,21 @@ impl Agent {
                 | SessionEvent::TimerCancelled { timer_id } => {
                     open_timers.remove(timer_id);
                 }
-                // #48: child waits are closed by the scheduler's own terminal.
                 _ => {}
             }
+        }
+        for child in spawned_children.difference(&completed_children) {
+            self.append(
+                session,
+                SessionEvent::ChildSessionCompleted {
+                    child: *child,
+                    outcome: ChildOutcome::Cancelled {
+                        reason: CancelReason::Parent,
+                    },
+                },
+                Some(dedup::child_session(*child)),
+            )
+            .await?;
         }
         for tool_call_id in pending {
             if !recorded.contains(tool_call_id) {
@@ -2604,6 +2664,27 @@ fn last_abort(
     })
 }
 
+/// C5: the step's last abort was followed by a forced `CompactionApplied`, so
+/// recovery redoes the same step once with the new projection.
+fn compaction_after_last_abort(
+    decoded: &[(LogEntry, SessionEvent)],
+    turn: TurnId,
+    step: StepId,
+) -> bool {
+    let abort_seq = decoded.iter().rev().find_map(|(entry, event)| match event {
+        SessionEvent::ModelCallAborted {
+            turn_id, step_id, ..
+        } if *turn_id == turn && *step_id == step => Some(entry.seq),
+        _ => None,
+    });
+    let Some(abort_seq) = abort_seq else {
+        return false;
+    };
+    decoded.iter().any(|(entry, event)| {
+        entry.seq > abort_seq && matches!(event, SessionEvent::CompactionApplied { .. })
+    })
+}
+
 /// A timer declared by a child spawn is closed by spawn replay (#47).
 fn caused_by_is_child_spawn(decoded: &[(LogEntry, SessionEvent)], caused_by: LogId) -> bool {
     decoded.iter().any(|(entry, event)| {
@@ -2707,8 +2788,9 @@ fn has_pending_input(decoded: &[(LogEntry, SessionEvent)]) -> bool {
     pending
 }
 
-/// Exponential backoff with jitter, capped at `max_backoff`.
-fn backoff(config: &TurnConfig, attempt: u32) -> Duration {
+/// Exponential backoff with jitter, capped at `max_backoff`. The jitter is
+/// derived from the injected clock and the attempt, never wall time.
+fn backoff(config: &TurnConfig, attempt: u32, now: Timestamp) -> Duration {
     let exponent = attempt.saturating_sub(1).min(10);
     let capped = config
         .initial_backoff
@@ -2718,28 +2800,7 @@ fn backoff(config: &TurnConfig, attempt: u32) -> Duration {
     if jitter_max.is_zero() {
         return capped;
     }
-    let jitter = Duration::from_nanos(random_u64() % (jitter_max.as_nanos() as u64 + 1));
+    let seed = now as u64 ^ u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let jitter = Duration::from_nanos(seed % (jitter_max.as_nanos() as u64 + 1));
     (capped + jitter).min(config.max_backoff)
-}
-
-fn random_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos() as u64 ^ elapsed.as_secs())
-        .unwrap_or_default()
-}
-
-/// Process-local unique id source; session scoping makes collisions moot.
-fn fresh_id() -> [u8; 16] {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut bytes = [0u8; 16];
-    bytes[..8]
-        .copy_from_slice(&(nanos ^ (std::process::id() as u64).rotate_left(17)).to_le_bytes());
-    bytes[8..].copy_from_slice(&counter.to_le_bytes());
-    bytes
 }
