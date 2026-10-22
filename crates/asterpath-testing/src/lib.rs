@@ -6,5 +6,5 @@
 pub mod contract;
 pub mod memory;
 
-pub use contract::{BackendFactory, BackendHandle, event_log_contract};
+pub use contract::{BackendFactory, BackendHandle, event_log_contract, storage_contract};
 pub use memory::{InMemoryEventLog, InMemoryStorage, MemoryBackend};

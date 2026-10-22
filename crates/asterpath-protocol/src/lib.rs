@@ -28,7 +28,7 @@ pub use event::{
 pub use ids::{
     JsonSchema, JsonString, JsonValue, ModelAlias, ModelId, ProviderId, ToolArgs, ToolName,
 };
-pub use intents::{OpenIntents, SessionState, StepState};
+pub use intents::{IntentDelta, OpenIntent, OpenIntents, SessionState, StepState};
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role};
 pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, project};
 pub use usage::{InputTokens, OutputTokens, Usage};

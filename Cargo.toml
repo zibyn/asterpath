@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/asterpath-core",
     "crates/asterpath-protocol",
+    "crates/asterpath-storage-sqlite",
     "crates/asterpath-testing",
     "xtask",
 ]

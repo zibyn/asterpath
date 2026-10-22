@@ -4,16 +4,17 @@
 //! same assertions. G1, `Corrupt`, retirement and backend-specific behaviour
 //! are deliberately not here.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId, SignalId,
-    SignalName, StepId, Storage, StorageError, TimerId, ToolCallId, TurnId,
+    DedupKey, DueTimer, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId,
+    SignalId, SignalName, StepId, Storage, StorageError, TimerId, Timestamp, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
-    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, Part, Provenance, ProviderId, ReplaySafety,
-    SessionEvent, ToolName, ToolResultStatus, Usage, dedup,
+    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, OpenIntents, Part, Provenance, ProviderId,
+    ReplaySafety, SessionEvent, ToolName, ToolResultStatus, Usage, decode_entry, dedup,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -456,6 +457,464 @@ fn cursor_scan(log: &dyn EventLog) {
         "G4: frontier is the last LogId"
     );
     assert_eq!(frontier(log, session(99)), None);
+}
+
+fn turn_with(byte: u8) -> TurnId {
+    TurnId::from_bytes([byte; 16])
+}
+
+fn step_with(byte: u8) -> StepId {
+    StepId::from_bytes([byte; 16])
+}
+
+fn signal_with(byte: u8) -> SignalId {
+    SignalId::from_bytes([byte; 16])
+}
+
+fn timer_with(byte: u8) -> TimerId {
+    TimerId::from_bytes([byte; 16])
+}
+
+fn turn_started_with(turn_id: TurnId) -> SessionEvent {
+    SessionEvent::TurnStarted { turn_id }
+}
+
+fn turn_committed_with(turn_id: TurnId) -> SessionEvent {
+    SessionEvent::TurnCommitted {
+        turn_id,
+        reason: asterpath_protocol::TurnEndReason::Completed,
+    }
+}
+
+fn step_started_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
+    SessionEvent::StepStarted { turn_id, step_id }
+}
+
+fn step_committed_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
+    SessionEvent::StepCommitted { turn_id, step_id }
+}
+
+fn timer_scheduled_with(timer_id: TimerId, deadline: Timestamp) -> SessionEvent {
+    SessionEvent::TimerScheduled {
+        timer_id,
+        deadline,
+        caused_by: LogId::from_i64(1),
+    }
+}
+
+fn timer_fired_with(timer_id: TimerId) -> SessionEvent {
+    SessionEvent::TimerFired { timer_id }
+}
+
+fn timer_cancelled_with(timer_id: TimerId) -> SessionEvent {
+    SessionEvent::TimerCancelled { timer_id }
+}
+
+fn signal_awaited_with(signal_id: SignalId) -> SessionEvent {
+    SessionEvent::SignalAwaited {
+        signal_id,
+        name: SignalName::new("wait"),
+        caused_by: LogId::from_i64(1),
+    }
+}
+
+fn signal_received_with(signal_id: SignalId, name: &str) -> SessionEvent {
+    SessionEvent::SignalReceived {
+        signal_id,
+        name: SignalName::new(name),
+        payload: json!({}),
+    }
+}
+
+/// Append an event and remember the session as part of this contract run.
+fn append_in(
+    log: &dyn EventLog,
+    sessions: &mut BTreeSet<SessionId>,
+    session: SessionId,
+    event: &SessionEvent,
+    dedup_key: Option<DedupKey>,
+) -> LogId {
+    sessions.insert(session);
+    append(log, session, event, dedup_key)
+}
+
+/// Backend-neutral storage suite (G5, G6, G7 plus pending-input and timer
+/// semantics). The expected wake set is derived by folding the visible log, so
+/// a materialized index that disagrees with the log fails here.
+pub fn storage_contract(factory: &impl BackendFactory) {
+    let backend = factory.open();
+    let log = backend.log.as_ref();
+    let storage = backend.storage.as_ref();
+    let now: Timestamp = 1_000;
+    let mut sessions = BTreeSet::new();
+
+    // An open turn makes the session wakeable; committing it clears that.
+    let s_turn = session(0x60);
+    let turn = turn_with(1);
+    append_in(log, &mut sessions, s_turn, &turn_started_with(turn), None);
+    assert!(
+        block_on(storage.wakeable(now))
+            .expect("wakeable")
+            .contains(&s_turn),
+        "G5: an open turn is wakeable"
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_turn,
+        &turn_committed_with(turn),
+        Some(dedup::turn_committed(turn)),
+    );
+
+    // Pending input is retained until StepStarted, and reported once.
+    let s_input = session(0x61);
+    append_in(
+        log,
+        &mut sessions,
+        s_input,
+        &input_recorded(),
+        Some(DedupKey::new("input-61")),
+    );
+    for _ in 0..2 {
+        let wakeable = block_on(storage.wakeable(now)).expect("wakeable");
+        assert!(
+            wakeable.contains(&s_input),
+            "G5: pending input wakes until a step starts"
+        );
+        assert_eq!(
+            wakeable.iter().filter(|s| **s == s_input).count(),
+            1,
+            "G5: a session appears at most once per call"
+        );
+    }
+    let input_turn = turn_with(2);
+    let input_step = step_with(2);
+    append_in(
+        log,
+        &mut sessions,
+        s_input,
+        &step_started_with(input_turn, input_step),
+        None,
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_input,
+        &step_committed_with(input_turn, input_step),
+        Some(dedup::step_committed(input_step)),
+    );
+
+    // Timers: due and unfired wake; fired, cancelled and future timers do not.
+    let s_due = session(0x62);
+    let due_timer = timer_with(1);
+    let due_id = append_in(
+        log,
+        &mut sessions,
+        s_due,
+        &timer_scheduled_with(due_timer, 900),
+        Some(dedup::timer(due_timer)),
+    );
+    let repeated = append_in(
+        log,
+        &mut sessions,
+        s_due,
+        &timer_scheduled_with(due_timer, 900),
+        Some(dedup::timer(due_timer)),
+    );
+    assert_eq!(
+        repeated, due_id,
+        "G5: repeating drive returns the original LogId"
+    );
+    assert_eq!(
+        scan(log, s_due).len(),
+        1,
+        "G5: repeating drive does not write duplicate records"
+    );
+
+    let s_fired = session(0x63);
+    let fired_timer = timer_with(2);
+    append_in(
+        log,
+        &mut sessions,
+        s_fired,
+        &timer_scheduled_with(fired_timer, 500),
+        Some(dedup::timer(fired_timer)),
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_fired,
+        &timer_fired_with(fired_timer),
+        Some(dedup::timer(fired_timer)),
+    );
+
+    let s_future = session(0x64);
+    let future_timer = timer_with(3);
+    append_in(
+        log,
+        &mut sessions,
+        s_future,
+        &timer_scheduled_with(future_timer, 2_000),
+        Some(dedup::timer(future_timer)),
+    );
+
+    let s_multi = session(0x6b);
+    let kept_timer = timer_with(4);
+    let cancelled_timer = timer_with(5);
+    append_in(
+        log,
+        &mut sessions,
+        s_multi,
+        &timer_scheduled_with(kept_timer, 400),
+        Some(dedup::timer(kept_timer)),
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_multi,
+        &timer_scheduled_with(cancelled_timer, 300),
+        Some(dedup::timer(cancelled_timer)),
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_multi,
+        &timer_cancelled_with(cancelled_timer),
+        Some(dedup::timer(cancelled_timer)),
+    );
+
+    // Awaited signals wake; matching receives close them.
+    let s_signal = session(0x65);
+    let signal_id = signal_with(1);
+    append_in(
+        log,
+        &mut sessions,
+        s_signal,
+        &signal_awaited_with(signal_id),
+        Some(dedup::signal(signal_id)),
+    );
+    assert!(
+        block_on(storage.wakeable(now))
+            .expect("wakeable")
+            .contains(&s_signal),
+        "G5: an awaited signal is wakeable"
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_signal,
+        &signal_received_with(signal_id, "wait"),
+        Some(dedup::signal(signal_id)),
+    );
+
+    // Children: an open spawn wakes; completion closes it.
+    let s_child = session(0x66);
+    let child = session(0x67);
+    append_in(
+        log,
+        &mut sessions,
+        s_child,
+        &child_spawned(child),
+        Some(dedup::child_session(child)),
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_child,
+        &child_completed(child),
+        Some(dedup::child_session(child)),
+    );
+
+    // Only a dangling compaction intent leaves the session idle.
+    let s_compaction = session(0x68);
+    let compaction_key = dedup::compaction(LogId::from_i64(1));
+    append_in(
+        log,
+        &mut sessions,
+        s_compaction,
+        &compaction_started(),
+        Some(compaction_key.clone()),
+    );
+    assert!(
+        !block_on(storage.wakeable(now))
+            .expect("wakeable")
+            .contains(&s_compaction),
+        "G5: compaction alone does not make a session wakeable"
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_compaction,
+        &compaction_applied(),
+        Some(compaction_key),
+    );
+
+    // Approval closes nothing: SignalReceived without SignalAwaited.
+    let s_approval = session(0x69);
+    let approval_call = call(9);
+    append_in(
+        log,
+        &mut sessions,
+        s_approval,
+        &tool_call_requested(approval_call),
+        Some(dedup::tool_call(approval_call)),
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_approval,
+        &signal_received_with(
+            SignalId::from_bytes(*approval_call.as_bytes()),
+            "tool.approval",
+        ),
+        Some(dedup::tool_call(approval_call)),
+    );
+    assert!(
+        block_on(storage.wakeable(now))
+            .expect("wakeable")
+            .contains(&s_approval),
+        "G5: an approval decision does not close the open tool intent"
+    );
+    append_in(
+        log,
+        &mut sessions,
+        s_approval,
+        &tool_result(approval_call),
+        Some(dedup::tool_result(approval_call)),
+    );
+
+    // G6: each session stream is independent.
+    let stream_a = session(0x70);
+    let stream_b = session(0x71);
+    let turn_a = turn_with(7);
+    let turn_b = turn_with(8);
+    append_in(
+        log,
+        &mut sessions,
+        stream_a,
+        &turn_started_with(turn_a),
+        None,
+    );
+    append_in(
+        log,
+        &mut sessions,
+        stream_b,
+        &turn_started_with(turn_b),
+        None,
+    );
+    append_in(
+        log,
+        &mut sessions,
+        stream_a,
+        &turn_committed_with(turn_a),
+        Some(dedup::turn_committed(turn_a)),
+    );
+    assert_eq!(
+        scan(log, stream_a)
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "G6: another stream does not create holes or delay visibility"
+    );
+    assert_eq!(
+        scan(log, stream_b)
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "G6: each stream allocates its own seq"
+    );
+    assert_eq!(
+        frontier(log, stream_a),
+        scan(log, stream_a).last().map(|entry| entry.log_id),
+        "G6: frontier is per stream"
+    );
+
+    // G5/G7: the materialized wake index must equal the log fold.
+    let expected_wakeable = expected_wakeable(log, &sessions, now);
+    let wakeable = block_on(storage.wakeable(now)).expect("wakeable");
+    assert_eq!(
+        wakeable, expected_wakeable,
+        "G5/G7: wakeable must match the open-intent, pending-input and timer fold"
+    );
+
+    let expected_due = expected_due_timers(log, &sessions, now);
+    let due = block_on(storage.due_timers(now, 100)).expect("due_timers");
+    assert_eq!(
+        due, expected_due,
+        "G5: due_timers must match unfired timers at or before now"
+    );
+    assert_eq!(
+        block_on(storage.due_timers(now, 1)).expect("due_timers"),
+        expected_due[..1],
+        "G5: due_timers honours its limit"
+    );
+}
+
+fn expected_wakeable(
+    log: &dyn EventLog,
+    sessions: &BTreeSet<SessionId>,
+    now: Timestamp,
+) -> Vec<SessionId> {
+    let mut wakeable = Vec::new();
+    for &session in sessions {
+        let entries = scan(log, session);
+        let intents = OpenIntents::fold(&entries).expect("fold open intents");
+        let (pending, timers) = pending_and_timers(&entries);
+        if !intents.is_idle() || pending || timers.values().any(|deadline| *deadline <= now) {
+            wakeable.push(session);
+        }
+    }
+    wakeable
+}
+
+fn expected_due_timers(
+    log: &dyn EventLog,
+    sessions: &BTreeSet<SessionId>,
+    now: Timestamp,
+) -> Vec<DueTimer> {
+    let mut due = Vec::new();
+    for &session in sessions {
+        let entries = scan(log, session);
+        let (_, timers) = pending_and_timers(&entries);
+        for (timer_id, deadline) in timers {
+            if deadline <= now {
+                due.push(DueTimer {
+                    timer_id,
+                    session,
+                    deadline,
+                });
+            }
+        }
+    }
+    due.sort_by_key(|timer| (timer.deadline, timer.timer_id));
+    due
+}
+
+fn pending_and_timers(entries: &[LogEntry]) -> (bool, BTreeMap<TimerId, Timestamp>) {
+    let mut pending = false;
+    let mut timers = BTreeMap::new();
+    for entry in entries {
+        match decode_entry(entry).expect("decode log entry") {
+            SessionEvent::InputRecorded { .. } => pending = true,
+            SessionEvent::StepStarted { .. } => pending = false,
+            SessionEvent::TimerScheduled {
+                timer_id, deadline, ..
+            } => {
+                timers.insert(timer_id, deadline);
+            }
+            SessionEvent::TimerFired { timer_id } | SessionEvent::TimerCancelled { timer_id } => {
+                timers.remove(&timer_id);
+            }
+            _ => {}
+        }
+    }
+    (pending, timers)
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    futures_executor::block_on(future)
 }
 
 fn hard_errors(log: &dyn EventLog) {

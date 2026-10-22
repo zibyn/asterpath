@@ -12,9 +12,10 @@ pub mod service;
 pub mod time;
 
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, DueTimer, DurableExecutor, EventLog,
-    LogEntry, LogQuery, NewEntry, SessionCatalog, SessionRetirement, SignalDelivery, SignalIntent,
-    SignalName, SignalPayload, Storage, TimerRequest, WakeCause,
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, DueTimer, DurableExecutor,
+    EVENT_LOG_SERVICE, EventLog, LogEntry, LogQuery, NewEntry, SESSION_CATALOG_SERVICE,
+    STORAGE_SERVICE, SessionCatalog, SessionRetirement, SignalDelivery, SignalIntent, SignalName,
+    SignalPayload, Storage, TimerRequest, WakeCause,
 };
 pub use error::{ExecutionError, LifecycleError, RetirementError, StorageError};
 pub use event::{Event, Handler, Middleware, Next, WaterfallEvent};
