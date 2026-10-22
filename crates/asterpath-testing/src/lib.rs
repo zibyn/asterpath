@@ -3,10 +3,12 @@
 //! This crate is for test targets only. The in-memory backend is **not**
 //! durable: it does not satisfy G1 (committed-prefix persistence).
 
+pub mod clock;
 pub mod contract;
 pub mod memory;
 pub mod scripted;
 
+pub use clock::ManualClock;
 pub use contract::{BackendFactory, BackendHandle, event_log_contract, storage_contract};
 pub use memory::{InMemoryEventLog, InMemoryStorage, MemoryBackend};
 pub use scripted::{ScriptedProvider, ScriptedStep};

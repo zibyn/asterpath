@@ -45,6 +45,8 @@ pub enum ExecutionError {
     NotFound { session: SessionId },
     #[error("execution backend error: {0}")]
     Backend(String),
+    #[error("wait was cancelled")]
+    Cancelled,
 }
 
 /// Failures of the optional session retirement capability.

@@ -133,7 +133,10 @@ pub trait SessionRetirement: Send + Sync {
 pub const EVENT_LOG_SERVICE: ServiceKey<dyn EventLog> = service_key("EventLog");
 pub const STORAGE_SERVICE: ServiceKey<dyn Storage> = service_key("Storage");
 pub const SESSION_CATALOG_SERVICE: ServiceKey<dyn SessionCatalog> = service_key("SessionCatalog");
+pub const DURABLE_EXECUTOR_SERVICE: ServiceKey<dyn DurableExecutor> =
+    service_key("DurableExecutor");
 
+#[derive(Clone, Debug)]
 pub struct TimerRequest {
     pub session: SessionId,
     pub timer: TimerId,
@@ -143,6 +146,7 @@ pub struct TimerRequest {
 
 pub type SignalPayload = serde_json::Value;
 
+#[derive(Clone, Debug)]
 pub struct SignalDelivery {
     pub session: SessionId,
     pub signal: SignalId,
@@ -150,6 +154,7 @@ pub struct SignalDelivery {
     pub payload: SignalPayload,
 }
 
+#[derive(Clone, Debug)]
 pub struct AwaitSignal {
     pub session: SessionId,
     pub signal: SignalId,
