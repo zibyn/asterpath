@@ -23,9 +23,9 @@ use asterpath_core::{
     SessionId, SignalDelivery, Storage, ToolCallId,
 };
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, ApprovalDecision, CompactResult, OpenIntents, ProviderCatalog,
-    RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, ToolRegistry, ToolSelection,
-    UserInput, approval_signal_id, approval_signal_name, dedup,
+    AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult, OpenIntents,
+    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, ToolRegistry,
+    ToolSelection, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
 use asterpath_tools::ToolsModule;
@@ -51,6 +51,7 @@ pub struct Asterpath {
     agent: Arc<dyn AgentRunner>,
     executor: Arc<dyn DurableExecutor>,
     gate: Arc<ApprovalGate>,
+    cancellations: Arc<CancellationRegistry>,
     host: ModuleHost,
 }
 
@@ -153,18 +154,22 @@ impl Asterpath {
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
+        let cancellations = Arc::new(CancellationRegistry::new());
 
         let agent = config.agent.unwrap_or_else(|| {
-            Arc::new(Agent::new(
-                Arc::clone(&event_log),
-                Arc::clone(&providers),
-                Arc::clone(&tools),
-                config.tool.clone(),
-                approval,
-                Arc::clone(&gate),
-                Arc::clone(&executor),
-                hooks,
-            ))
+            Arc::new(
+                Agent::new(
+                    Arc::clone(&event_log),
+                    Arc::clone(&providers),
+                    Arc::clone(&tools),
+                    config.tool.clone(),
+                    approval,
+                    Arc::clone(&gate),
+                    Arc::clone(&executor),
+                    hooks,
+                )
+                .with_cancellations(Arc::clone(&cancellations)),
+            )
         });
 
         Ok(Self {
@@ -176,6 +181,7 @@ impl Asterpath {
             agent,
             executor,
             gate,
+            cancellations,
             host: module_host,
         })
     }
@@ -239,6 +245,7 @@ impl Asterpath {
             event_log: Arc::clone(&self.event_log),
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
+            cancellations: Arc::clone(&self.cancellations),
         })
     }
 
@@ -248,6 +255,7 @@ impl Asterpath {
             event_log: Arc::clone(&self.event_log),
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
+            cancellations: Arc::clone(&self.cancellations),
         })
     }
 
@@ -281,6 +289,7 @@ pub struct SessionHandle {
     event_log: Arc<dyn EventLog>,
     agent: Arc<dyn AgentRunner>,
     executor: Arc<dyn DurableExecutor>,
+    cancellations: Arc<CancellationRegistry>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -320,8 +329,10 @@ impl SessionHandle {
         run.map(|event| event.map_err(AsterError::from)).boxed()
     }
 
-    /// Placeholder until cancellation is implemented; the session is not left open.
+    /// Cancel the active turn. Idempotent; a no-op while idle. With a custom
+    /// runner that does not share the registry this degrades to a no-op.
     pub async fn cancel(&self) -> Result<(), AsterError> {
+        self.cancellations.cancel(self.session);
         Ok(())
     }
 
