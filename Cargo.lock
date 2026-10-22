@@ -11,6 +11,7 @@ dependencies = [
  "asterpath-protocol",
  "asterpath-provider-anthropic",
  "asterpath-provider-openai",
+ "asterpath-runtime",
  "asterpath-storage-sqlite",
  "asterpath-testing",
  "asterpath-tools",
@@ -84,6 +85,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-runtime"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-testing",
+ "futures-core",
+ "futures-util",
+ "serde_json",
  "tokio",
 ]
 

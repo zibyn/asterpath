@@ -18,11 +18,16 @@ pub use asterpath_provider_anthropic as anthropic;
 use std::sync::Arc;
 
 use asterpath_agent::Agent;
-use asterpath_core::{EventLog, InputId, LogQuery, ModuleHost, SessionCatalog, SessionId, Storage};
-use asterpath_protocol::{
-    AgentEvent, AgentRunner, CompactResult, OpenIntents, ProviderCatalog, RunRequest, RunTrigger,
-    SessionEvent, SessionSpec, SessionState, ToolRegistry, ToolSelection, UserInput, dedup,
+use asterpath_core::{
+    ApprovalGate, DurableExecutor, EventLog, InputId, LogQuery, ModuleHost, SessionCatalog,
+    SessionId, SignalDelivery, Storage, ToolCallId,
 };
+use asterpath_protocol::{
+    AgentEvent, AgentRunner, ApprovalDecision, CompactResult, OpenIntents, ProviderCatalog,
+    RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, ToolRegistry, ToolSelection,
+    UserInput, approval_signal_id, approval_signal_name, dedup,
+};
+use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
 use asterpath_tools::ToolsModule;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -44,6 +49,8 @@ pub struct Asterpath {
     providers: Arc<ProviderCatalog>,
     tools: Arc<dyn ToolRegistry>,
     agent: Arc<dyn AgentRunner>,
+    executor: Arc<dyn DurableExecutor>,
+    gate: Arc<ApprovalGate>,
     host: ModuleHost,
 }
 
@@ -129,12 +136,23 @@ impl Asterpath {
             }
         }
 
+        let runtime = Arc::new(RuntimeExecutor::new(
+            Arc::clone(&event_log),
+            Arc::clone(&storage),
+            Arc::clone(&config.clock),
+        ));
+        module_host.register(Arc::new(RuntimeModule::new(Arc::clone(&runtime))));
+
         module_host.init().await?;
         let tools = tools_module.registry();
         for tool in config.tools {
             tools.register(tool);
         }
         let hooks = tools_module.context();
+        let executor: Arc<dyn DurableExecutor> = runtime;
+
+        let gate = Arc::clone(&config.gate);
+        let approval = Arc::clone(&config.approval);
 
         let agent = config.agent.unwrap_or_else(|| {
             Arc::new(Agent::new(
@@ -142,6 +160,9 @@ impl Asterpath {
                 Arc::clone(&providers),
                 Arc::clone(&tools),
                 config.tool.clone(),
+                approval,
+                Arc::clone(&gate),
+                Arc::clone(&executor),
                 hooks,
             ))
         });
@@ -153,6 +174,8 @@ impl Asterpath {
             providers,
             tools,
             agent,
+            executor,
+            gate,
             host: module_host,
         })
     }
@@ -215,6 +238,7 @@ impl Asterpath {
             session,
             event_log: Arc::clone(&self.event_log),
             agent: Arc::clone(&self.agent),
+            executor: Arc::clone(&self.executor),
         })
     }
 
@@ -223,6 +247,7 @@ impl Asterpath {
             session: id,
             event_log: Arc::clone(&self.event_log),
             agent: Arc::clone(&self.agent),
+            executor: Arc::clone(&self.executor),
         })
     }
 
@@ -242,6 +267,11 @@ impl Asterpath {
     pub fn session_catalog(&self) -> Arc<dyn SessionCatalog> {
         Arc::clone(&self.session_catalog)
     }
+
+    /// Register an RAII endpoint here while the host can answer approvals.
+    pub fn approval_gate(&self) -> Arc<ApprovalGate> {
+        Arc::clone(&self.gate)
+    }
 }
 
 /// One session: submit inputs, then drive explicitly.
@@ -250,6 +280,7 @@ pub struct SessionHandle {
     session: SessionId,
     event_log: Arc<dyn EventLog>,
     agent: Arc<dyn AgentRunner>,
+    executor: Arc<dyn DurableExecutor>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -291,6 +322,27 @@ impl SessionHandle {
 
     /// Placeholder until cancellation is implemented; the session is not left open.
     pub async fn cancel(&self) -> Result<(), AsterError> {
+        Ok(())
+    }
+
+    /// Answer a pending `Ask` as the approval endpoint. The decision is a
+    /// recorded `SignalReceived`, so it survives a crash and is reused.
+    pub async fn approve(
+        &self,
+        call: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<(), AsterError> {
+        let payload = serde_json::to_value(decision).map_err(|error| AsterError::Config {
+            message: error.to_string(),
+        })?;
+        self.executor
+            .deliver_signal(SignalDelivery {
+                session: self.session,
+                signal: approval_signal_id(call),
+                name: approval_signal_name(call),
+                payload,
+            })
+            .await?;
         Ok(())
     }
 

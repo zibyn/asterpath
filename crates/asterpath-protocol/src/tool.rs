@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use asterpath_core::{
-    ApprovalGate, Effect, Event, ServiceKey, SessionId, StepId, ToolCallId, TurnId, WaterfallEvent,
-    service_key,
+    ApprovalGate, Effect, Event, ServiceKey, SessionId, SignalId, SignalName, StepId, ToolCallId,
+    TurnId, WaterfallEvent, service_key,
 };
 use futures_core::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -335,6 +335,19 @@ pub enum ApprovalDecision {
 
 /// Fixed reason used when `Ask` has no endpoint to answer it.
 pub const NO_APPROVAL_ENDPOINT: &str = "no approval endpoint is registered";
+
+/// Signal name prefix shared by the pipeline and approval responders.
+pub const APPROVAL_SIGNAL_PREFIX: &str = "tool.approval.";
+
+/// One call's approval signal name: `tool.approval.<tool_call_id>`.
+pub fn approval_signal_name(call: ToolCallId) -> SignalName {
+    SignalName::new(format!("{APPROVAL_SIGNAL_PREFIX}{}", call.to_hex()))
+}
+
+/// The approval signal id is the framework `tool_call_id` itself.
+pub fn approval_signal_id(call: ToolCallId) -> SignalId {
+    SignalId::from_bytes(*call.as_bytes())
+}
 
 /// Framework default: in-process tools are allowed; external tools ask while an
 /// endpoint is registered and are denied otherwise. `Unknown` is never asked.

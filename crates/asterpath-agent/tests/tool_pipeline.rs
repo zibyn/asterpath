@@ -6,17 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath_core::{
-    Effect, EventLog, LifecycleError, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId,
-    ToolCallId, TurnId,
+    ApprovalGate, AwaitSignal, DurableExecutor, Effect, EventLog, ExecutionError, LifecycleError,
+    LogQuery, Middleware, Module, ModuleCtx, Next, SessionId, SignalDelivery, SignalPayload,
+    TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId,
-    ModelSpec, Parallelism, Part, PostExecuteError, PostExecuteEvent, PreExecuteError,
-    PreExecuteEvent, Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety,
-    RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason,
-    SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage, decode_entry,
-    encode_entry,
+    AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item,
+    JsonString, ModelId, ModelSpec, Parallelism, Part, PostExecuteError, PostExecuteEvent,
+    PreExecuteError, PreExecuteEvent, Provenance, Provider, ProviderCatalog, ProviderId,
+    ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect,
+    StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
+    ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
+    decode_entry, encode_entry,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -315,13 +316,58 @@ fn agent(
     hooks: Option<ModuleCtx>,
 ) -> impl AgentRunner {
     let provider: Arc<dyn Provider> = provider;
+    let gate = Arc::new(ApprovalGate::new());
     asterpath_agent::Agent::new(
         log,
         Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
         registry,
         tool_config,
+        Arc::new(DefaultApprovalPolicy::new(gate.clone())),
+        gate,
+        Arc::new(NoopExecutor),
         hooks,
     )
+}
+
+/// Pipeline tests never wait: approval is `Allow` for their in-process tools.
+struct NoopExecutor;
+
+impl DurableExecutor for NoopExecutor {
+    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn cancel_timer(
+        &self,
+        _session: SessionId,
+        _timer: TimerId,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn await_signal(
+        &self,
+        _req: AwaitSignal,
+    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn deliver_signal(
+        &self,
+        _delivery: SignalDelivery,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn await_wake(
+        &self,
+        _session: SessionId,
+        _cause: WakeCause,
+    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
+        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
+    }
+
+    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
 }
 
 async fn drive(agent: &impl AgentRunner) -> Vec<AgentEvent> {

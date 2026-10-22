@@ -16,18 +16,18 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asterpath_core::{
-    ApprovalGate, DedupKey, EventLog, LogEntry, LogId, LogQuery, ModuleCtx, SessionId, StepId,
-    ToolCallId, TurnId,
+    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, LogEntry, LogId, LogQuery,
+    ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, CancelToken, CompactResult, ConfigSnapshot, DefaultApprovalPolicy, Item,
+    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
+    ApprovalRequest, ApprovalVerdict, CancelToken, CompactResult, ConfigSnapshot, Item,
     ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism, PostExecuteError,
     PostExecuteEvent, PreExecuteError, PreExecuteEvent, Provenance, ProviderCatalog, ProviderError,
     ProviderErrorKind, ReplaySafety, RunRequest, SessionEvent, SessionState, StopReason,
     StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
     ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason,
-    Usage, decode_entry, dedup,
+    Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -45,26 +45,33 @@ pub struct Agent {
     tool_config: ToolConfig,
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
+    executor: Arc<dyn DurableExecutor>,
     hooks: Option<ModuleCtx>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
 }
 
 impl Agent {
+    /// The composition root supplies policy, gate and durable executor; this
+    /// module never constructs them, so approval waits are real.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         log: Arc<dyn EventLog>,
         providers: Arc<ProviderCatalog>,
         tools: Arc<dyn ToolRegistry>,
         tool_config: ToolConfig,
+        approval: Arc<dyn ApprovalPolicy>,
+        gate: Arc<ApprovalGate>,
+        executor: Arc<dyn DurableExecutor>,
         hooks: Option<ModuleCtx>,
     ) -> Self {
-        let gate = Arc::new(ApprovalGate::new());
         Self {
             log,
             providers,
             tools,
             tool_config,
-            approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+            approval,
             gate,
+            executor,
             hooks,
             busy: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -441,24 +448,30 @@ impl Agent {
                     }
                     Some(tool) => {
                         let descriptor = tool.descriptor().clone();
-                        if let Some(reason) = self.approval_failure(
-                            session,
-                            turn,
-                            step,
-                            intent.tool_call_id,
-                            &intent.name,
-                            &intent.args,
-                            &descriptor,
-                        ) {
-                            self.deny(session, intent.tool_call_id, reason).await?;
-                        } else {
-                            runnable.push(Runnable {
+                        match self
+                            .decide_approval(
+                                session,
+                                turn,
+                                step,
+                                intent.tool_call_id,
+                                &intent.name,
+                                &intent.args,
+                                &descriptor,
+                                intent.log_id,
+                                events,
+                            )
+                            .await?
+                        {
+                            ToolDecision::Allow => runnable.push(Runnable {
                                 tool,
                                 descriptor,
                                 tool_call_id: intent.tool_call_id,
                                 name: intent.name.clone(),
                                 args: intent.args.clone(),
-                            });
+                            }),
+                            ToolDecision::Deny(reason) => {
+                                self.deny(session, intent.tool_call_id, reason).await?
+                            }
                         }
                     }
                 }
@@ -486,21 +499,22 @@ impl Agent {
                 Some(descriptor) => (descriptor.replay, descriptor.provenance),
                 None => (ReplaySafety::Unsafe, Provenance::Unknown),
             };
-            self.append(
-                session,
-                SessionEvent::ToolCallRequested {
-                    turn_id: turn,
-                    step_id: step,
-                    tool_call_id,
-                    provider_call_id: call.provider_call_id,
-                    name: call.name.clone(),
-                    raw_args: args.clone(),
-                    replay,
-                    provenance,
-                },
-                Some(dedup::tool_call(tool_call_id)),
-            )
-            .await?;
+            let caused_by = self
+                .append(
+                    session,
+                    SessionEvent::ToolCallRequested {
+                        turn_id: turn,
+                        step_id: step,
+                        tool_call_id,
+                        provider_call_id: call.provider_call_id,
+                        name: call.name.clone(),
+                        raw_args: args.clone(),
+                        replay,
+                        provenance,
+                    },
+                    Some(dedup::tool_call(tool_call_id)),
+                )
+                .await?;
 
             match (failure, descriptor, tool) {
                 (Some(PreFailure::Denied(reason)), _, _) => {
@@ -535,24 +549,30 @@ impl Agent {
                     .await?;
                 }
                 (None, Some(descriptor), Some(tool)) => {
-                    if let Some(reason) = self.approval_failure(
-                        session,
-                        turn,
-                        step,
-                        tool_call_id,
-                        &call.name,
-                        &args,
-                        &descriptor,
-                    ) {
-                        self.deny(session, tool_call_id, reason).await?;
-                    } else {
-                        runnable.push(Runnable {
+                    match self
+                        .decide_approval(
+                            session,
+                            turn,
+                            step,
+                            tool_call_id,
+                            &call.name,
+                            &args,
+                            &descriptor,
+                            caused_by,
+                            events,
+                        )
+                        .await?
+                    {
+                        ToolDecision::Allow => runnable.push(Runnable {
                             tool,
                             descriptor,
                             tool_call_id,
                             name: call.name,
                             args,
-                        });
+                        }),
+                        ToolDecision::Deny(reason) => {
+                            self.deny(session, tool_call_id, reason).await?
+                        }
                     }
                 }
                 (None, Some(_), None) => unreachable!("descriptor comes from the registry entry"),
@@ -663,6 +683,7 @@ impl Agent {
                     }),
                     false,
                 ),
+                Invocation::Cancelled => (ToolResultStatus::Interrupted, None, None, false),
                 Invocation::Timeout => (
                     ToolResultStatus::Failed,
                     None,
@@ -703,9 +724,11 @@ impl Agent {
                         // the model-visible error message are rewritable.
                         if status == ToolResultStatus::Completed {
                             output = Some(event.output);
+                            truncated = event.truncated;
                         }
-                        error = event.error;
-                        truncated = event.truncated;
+                        if status == ToolResultStatus::Failed {
+                            error = event.error;
+                        }
                     }
                     Err(PostExecuteError::Internal { message }) => {
                         status = ToolResultStatus::Failed;
@@ -770,8 +793,10 @@ impl Agent {
         }
     }
 
+    /// A recorded approval signal wins over the current policy and is never
+    /// re-prompted. `Ask` without a live endpoint fails closed.
     #[allow(clippy::too_many_arguments)]
-    fn approval_failure(
+    async fn decide_approval(
         &self,
         session: SessionId,
         turn: TurnId,
@@ -780,7 +805,13 @@ impl Agent {
         name: &ToolName,
         args: &ToolArgs,
         descriptor: &ToolDescriptor,
-    ) -> Option<String> {
+        caused_by: LogId,
+        events: &EventSink,
+    ) -> Result<ToolDecision, AgentError> {
+        if let Some(payload) = self.recorded_approval(session, tool_call_id).await? {
+            return approval_decision(session, payload);
+        }
+
         let request = ApprovalRequest::new(
             session,
             turn,
@@ -793,17 +824,56 @@ impl Agent {
             descriptor.provenance,
         );
         match self.approval.classify(&request) {
-            ApprovalVerdict::Allow => None,
-            ApprovalVerdict::Deny { reason } => {
-                Some(reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()))
+            ApprovalVerdict::Allow => Ok(ToolDecision::Allow),
+            ApprovalVerdict::Deny { reason } => Ok(ToolDecision::Deny(
+                reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
+            )),
+            ApprovalVerdict::Ask => {
+                if !self.gate.is_open() {
+                    return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
+                }
+                events.push(Ok(AgentEvent::ApprovalRequested(request)));
+                let payload = self
+                    .executor
+                    .await_signal(AwaitSignal {
+                        session,
+                        signal: approval_signal_id(tool_call_id),
+                        name: approval_signal_name(tool_call_id),
+                        caused_by,
+                        intent: SignalIntent::AlreadyRecorded,
+                    })
+                    .await?;
+                approval_decision(session, payload)
             }
-            ApprovalVerdict::Ask => Some(if self.gate.is_open() {
-                "approval waiting is not supported yet".to_owned()
-            } else {
-                NO_APPROVAL_ENDPOINT.to_owned()
-            }),
-            _ => Some(DENIED_WITHOUT_REASON.to_owned()),
+            _ => Ok(ToolDecision::Deny(DENIED_WITHOUT_REASON.to_owned())),
         }
+    }
+
+    async fn recorded_approval(
+        &self,
+        session: SessionId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<SignalPayload>, AgentError> {
+        let signal = approval_signal_id(tool_call_id);
+        let mut stream = self.log.scan(LogQuery {
+            session,
+            after: None,
+            limit: None,
+        });
+        while let Some(entry) = stream.next().await {
+            let event = decode_entry(&entry?).map_err(|error| AgentError::Corrupt {
+                session,
+                detail: error.to_string(),
+            })?;
+            if let SessionEvent::SignalReceived {
+                signal_id, payload, ..
+            } = event
+                && signal_id == signal
+            {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
     }
 
     async fn deny(
@@ -999,6 +1069,7 @@ struct CallItem {
 
 struct RecordedIntent {
     tool_call_id: ToolCallId,
+    log_id: LogId,
     name: ToolName,
     args: ToolArgs,
 }
@@ -1022,9 +1093,36 @@ enum PreFailure {
     Internal(String),
 }
 
+enum ToolDecision {
+    Allow,
+    Deny(String),
+}
+
+fn approval_decision(
+    session: SessionId,
+    payload: SignalPayload,
+) -> Result<ToolDecision, AgentError> {
+    match serde_json::from_value::<ApprovalDecision>(payload) {
+        Ok(ApprovalDecision::Allow) => Ok(ToolDecision::Allow),
+        Ok(ApprovalDecision::Deny { reason }) => Ok(ToolDecision::Deny(
+            reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
+        )),
+        Ok(_) => Err(AgentError::Corrupt {
+            session,
+            detail: "unknown approval decision".to_owned(),
+        }),
+        Err(error) => Err(AgentError::Corrupt {
+            session,
+            detail: format!("invalid approval decision: {error}"),
+        }),
+    }
+}
+
 enum Invocation {
     Returned(Result<ToolOutput, ToolError>),
     Panic,
+    /// The turn's cancel token was already set when the deadline expired.
+    Cancelled,
     Timeout,
 }
 
@@ -1099,7 +1197,14 @@ impl Stream for DriveStream<'_> {
             }
             match this.future.as_mut().poll(cx) {
                 Poll::Ready(()) => this.done = true,
-                Poll::Pending => return Poll::Pending,
+                // The loop already ran and queued events before parking; they
+                // must be yielded now, not on some later wake.
+                Poll::Pending => {
+                    if let Some(event) = this.sink.pop() {
+                        return Poll::Ready(Some(event));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1126,12 +1231,14 @@ async fn invoke_tool(
             Ok(Ok(result)) => Invocation::Returned(result),
             Ok(Err(_)) => Invocation::Panic,
             Err(_) => {
-                // Signal cancellation, then let the tool report a real result
-                // within the grace window; dropping it yields `Timeout`.
+                // Cancellation took the deadline first: the cancel path owns
+                // the terminal, so no `Timeout` may be written.
+                let already_cancelled = cancel.is_cancelled();
                 cancel.cancel();
                 match tokio::time::timeout(kill_grace, future.as_mut()).await {
                     Ok(Ok(result)) => Invocation::Returned(result),
                     Ok(Err(_)) => Invocation::Panic,
+                    Err(_) if already_cancelled => Invocation::Cancelled,
                     Err(_) => Invocation::Timeout,
                 }
             }
@@ -1229,7 +1336,7 @@ fn tool_calls(items: &[Item]) -> Vec<CallItem> {
 
 fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> ExistingStep {
     let mut existing = ExistingStep::default();
-    for (_, event) in decoded {
+    for (entry, event) in decoded {
         match event {
             SessionEvent::ToolCallRequested {
                 turn_id,
@@ -1244,6 +1351,7 @@ fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepI
                     provider_call_id.clone(),
                     RecordedIntent {
                         tool_call_id: *tool_call_id,
+                        log_id: entry.log_id,
                         name: name.clone(),
                         args: raw_args.clone(),
                     },

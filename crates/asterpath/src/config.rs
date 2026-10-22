@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath_core::{Clock, EventLog, SessionCatalog, Storage, SystemClock};
+use asterpath_core::{ApprovalGate, Clock, EventLog, SessionCatalog, Storage, SystemClock};
 use asterpath_protocol::{
-    AgentRunner, CompactionConfig, ModelAlias, ModelSpec, Provider, SubagentConfig, Tool,
-    ToolConfig, TurnConfig,
+    AgentRunner, ApprovalPolicy, CompactionConfig, DefaultApprovalPolicy, ModelAlias, ModelSpec,
+    Provider, SubagentConfig, Tool, ToolConfig, TurnConfig,
 };
 
 use crate::error::AsterError;
@@ -24,6 +24,10 @@ pub struct AsterpathConfig {
     pub storage: Option<Arc<dyn Storage>>,
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
     pub clock: Arc<dyn Clock>,
+    /// Defaults to the built-in policy over [`Self::gate`].
+    pub approval: Arc<dyn ApprovalPolicy>,
+    /// The framework approval endpoint gate, shared with the default policy.
+    pub gate: Arc<ApprovalGate>,
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
@@ -32,6 +36,7 @@ pub struct AsterpathConfig {
 
 impl Default for AsterpathConfig {
     fn default() -> Self {
+        let gate = Arc::new(ApprovalGate::new());
         Self {
             database: PathBuf::new(),
             providers: Vec::new(),
@@ -42,6 +47,8 @@ impl Default for AsterpathConfig {
             storage: None,
             session_catalog: None,
             clock: Arc::new(SystemClock),
+            approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+            gate,
             turn: TurnConfig::default(),
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
@@ -99,6 +106,12 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn agent(mut self, agent: Arc<dyn AgentRunner>) -> Self {
         self.config.agent = Some(agent);
+        self
+    }
+
+    #[must_use]
+    pub fn approval(mut self, approval: Arc<dyn ApprovalPolicy>) -> Self {
+        self.config.approval = approval;
         self
     }
 

@@ -46,8 +46,9 @@ pub use provider::{
     ProviderError, ProviderErrorKind, StreamEvent,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken, DefaultApprovalPolicy,
-    NO_APPROVAL_ENDPOINT, PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent,
-    TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry,
+    APPROVAL_SIGNAL_PREFIX, ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken,
+    DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, PostExecuteError, PostExecuteEvent,
+    PreExecuteError, PreExecuteEvent, TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError,
+    ToolOutput, ToolRegistry, approval_signal_id, approval_signal_name,
 };
 pub use usage::{InputTokens, OutputTokens, Usage};
