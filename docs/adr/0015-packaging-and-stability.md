@@ -12,18 +12,19 @@
 
 ## Decision
 
-- **17 个库/应用成员 + `xtask`，一模块一 crate**。crate 列表、职责与依赖边见 [packaging.md](../design/packaging.md) §2；`runtime` 与 `scheduler` 不合并，`asterpath-testing` 只依赖合约 crate，验收用独立的 `asterpath-acceptance` 组装真实模块。
+- **v1 共 16 个库/应用成员 + `xtask`，按里程碑增量创建**。crate 列表、职责、依赖边与引入里程碑见 [packaging.md](../design/packaging.md) §2；`runtime` 与 `scheduler` 不合并，`asterpath-testing` 只依赖合约 crate，验收用独立的 `asterpath-acceptance` 组装真实模块；`asterpath-plugin-host` 等扩展归 M5（post-v1）；M0 只建 7 个 crate + `xtask`。
 - **依赖边由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 校验**：模块之间零边、`core` / `protocol` 无 feature。白名单是机器可读文件，不是脚本文本解析。
 - **lockstep `0.1.0`，稳定面收窄到 facade + core + protocol + 日志 schema**。模块 crate 是 0.x 实验面；v1 不发布 crates.io；顶层公开事件/错误枚举（如 `SessionEvent`、`ToolError`、`AsterError`）`#[non_exhaustive]`，内嵌值枚举（`AbortKind` 等）保持可穷举。
-- **feature 只在 facade、CLI 与后端 crate**：默认 `anthropic` + `openai` + `sqlite`；`plugin-host` 默认关闭；关闭 sqlite 时由宿主注入 `EventLog` / `Storage`。
+- **feature 只在 facade、CLI 与后端 crate**：默认 `anthropic` + `openai` + `sqlite`；关闭 sqlite 时由宿主注入 `EventLog` / `Storage`。
 - **没有后台 driver**。宿主显式调用 `SessionHandle::drive()`；同一 session 单飞；`submit_input` 只 append 并通知在途回合；丢弃流不等于取消，取消必须显式调用。
 - **`AgentRunner::run` 的流只表达实时事件**。回合失败是 `TurnCommitted { reason }`，不是流错误；`AgentError` 只表示无法运行。恢复位置完全由日志推导。
-- **参考 CLI 七命令，退出码 `0/1/2`**；审批由 CLI 处理 `ApprovalRequested`，TTY 默认 `ask`、非 TTY 默认 `deny`，密钥只从环境变量读。
+- **参考 CLI 六命令，退出码 `0/1/2`**；审批由 CLI 处理 `ApprovalRequested`，TTY 默认 `ask`、非 TTY 默认 `deny`，密钥只从环境变量读。
 - **验收用 `testdrive` + 真 `SIGKILL`**。三段场景的断言在 [acceptance.md](../spec/acceptance.md)；#19 只负责注入点工具链，不改变断言。
 - **v1 的 provider/model 在 session 创建时快照**，不支持 turn 内切换。验收 (b) 验证的是两个 adapter 在同一脚本上的规范化等价与业务代码零分支。
 
 ## Consequences
 
+- **2026-10-22 #32 修订**：crate 按里程碑增量创建，M0 只建 7 个 crate + `xtask`；`asterpath-plugin-host` 与 MCP adapter 移出 v1 workspace，归 M5（post-v1）；`plugin-host` feature、`AsterpathConfig.plugins` 与 CLI `plugin list` 从 v1 删除（CLI 由七命令改为六命令）。
 - crate 数量多、间接层多；换来可检查的边界与可替换性，符合项目的核心目标。
 - 稳定承诺只覆盖少数 crate，模块 crate 可以在 0.x 内演进；嵌入者要替换模块时依赖的是 core/protocol 的 trait，而不是模块的公开结构。
 - 显式驱动把调度责任交给宿主，框架不藏后台任务；崩溃与宿主放弃走同一条恢复路径，测试因此能用真 `SIGKILL`。

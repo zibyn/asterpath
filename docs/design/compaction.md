@@ -182,7 +182,9 @@ project(entries):
 - **追踪**：`CompactionStarted` 到 `CompactionApplied` / `CompactionAborted` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
 - **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取 `CompactionStarted.caused_by` 所在回合；最终口径见 [usage.md](usage.md)（#13）。
 
-## 8. 默认配置
+## 8. 可配置默认
+
+数值是 `CompactionConfig` 的默认值（`bytes/3` 除外，它是实现常量），不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
 pub struct CompactionConfig {

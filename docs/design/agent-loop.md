@@ -295,7 +295,9 @@ StepCommitted
 - token 总量 = 该范围内 `AssistantMessage.usage` 求和；中断 attempt 的 partial usage 单独标注（[usage.md](usage.md)）。
 - 每次 append 承载 usage 的终态记录后，loop 发一条 `UsageRecorded`（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）；它是唯一发射点（#13）。
 
-## 10. 默认配置
+## 10. 可配置默认
+
+数值是 `TurnConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
 pub struct TurnConfig {

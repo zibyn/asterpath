@@ -5,6 +5,8 @@
 > 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 MCP adapter 与 ACP 边界](./mcp.md)、[#15 打包](https://github.com/zibyn/asterpath/issues/15)。
 >
 > 相关 ADR：[0013 外部插件用清单加载，进程内模块编译期组装](../adr/0013-plugin-boundary.md)。
+>
+> **2026-10-22 #32 范围调整**：本文件的设计保留，实现归 **M5（post-v1）**；不属于 v1 交付，也不进 M0–M4 验收。
 
 ## 1. 决策摘要
 
@@ -240,7 +242,7 @@ pub enum PluginLoadStage {
 | --- | --- |
 | manifest 形状、加载选择、`id`/命名空间/冲突、版本策略、安装边界 | **本票（#16）** |
 | 传输实现、MCP 版本常量、`server/discover`、`tools/list`、`tools/call`、取消、断连、协议错误映射 | [#20](./mcp.md)（已定） |
-| crate 打包、feature 布局、CLI `plugin list`、公共稳定面、`ToolName` 精确类型 | [#15](https://github.com/zibyn/asterpath/issues/15) |
+| crate 打包、feature 布局、公共稳定面、`ToolName` 精确类型（v1 不提供 `plugin list`） | [#15](https://github.com/zibyn/asterpath/issues/15) / [#32](https://github.com/zibyn/asterpath/issues/32) |
 | 安装、更新、市场/registry、凭据/OAuth、环境变量展开、策略与脱敏 | host 或生态工具 |
 | provider / storage / executor / agent loop 等核心能力 | 进程内模块，不是插件（#2） |
 
@@ -274,6 +276,6 @@ pub enum PluginLoadStage {
 
 - **#7**：`ToolErrorKind::NotFound`、未知工具管线路径、`Provenance::Unknown`、命名空间规则已回写 [tools.md](./tools.md)。
 - **#20**：已定。HTTP 静态 `headers` 随 `manifest_version: 1`；MCP 只支持 `2026-07-28`；unknown tool → `NotFound`；不自动重连。见 [mcp.md](./mcp.md)。
-- **#15**：`PluginManifest` / `PluginId` 的最终打包位置；CLI `plugin list`；feature 布局；`ToolName` 的精确类型与校验。
+- **#15 / #32**：`PluginManifest` / `PluginId` 的最终打包位置；feature 布局；`ToolName` 的精确类型与校验。v1 不提供 CLI `plugin list`，插件宿主归 M5。
 - **#4**：`Provenance` 新增 `Unknown` 值；日志 schema 在 v1 发布前完成该字段。
 - **#18**：manifest 不持久化，保留/归档无需处理插件清单。

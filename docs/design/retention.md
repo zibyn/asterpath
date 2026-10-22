@@ -4,6 +4,7 @@
 > 相关 ADR：[0016 只保留安全退役接缝](../adr/0016-retention-and-archive-seam.md)。
 > 前置：[#3 事件日志与恢复](event-log-recovery.md)、[#5 存储契约](storage.md)、[#4 schema 版本](../adr/0004-log-schema-version-and-upcasting.md)、[#9 压缩](compaction.md)、[#13 用量](usage.md)。
 > 范围：**只定义安全退役的 seam**。导出是宿主用现有 `EventLog` 读取的配方；导入/恢复、归档文件管理、保留策略都不在 v1。
+> **2026-10-22 #32 范围调整**：`SessionRetirement` 接缝属 v1（`asterpath-storage-sqlite` 交付）；策略、归档与导出配方归宿主，不属于 v1 验收。
 
 ## 1. 决策摘要
 
@@ -84,7 +85,7 @@ pub enum RetirementError {
 | 存在 `parent_id = session` 的活会话 | `HasChildren` |
 | 父会话存在且有非 compaction 的 open intent | `ParentNotIdle` |
 
-通过后，在**一个事务**里：写墓碑 → 删 `log` → 删 `open_intents` → 删 `timers` → 删 `runnable` → 删 `sessions`。
+通过后，在**一个事务**里：写墓碑 → 删 `log` → 删 `open_intents` → 删 `timers` → 删 `pending_inputs` → 删 `sessions`。
 
 - **只删整会话**。裁前缀会产生 `seq` 洞（违反 G3）并让恢复从错误检查点折叠；按事件保留会让信封与投影失去一致性。
 - **`idle` 就是「没有非 compaction 的 open intent」**：open turn / step / 工具 / timer / signal / 子会话等待都会让会话非 idle（[storage.md](storage.md) §5 的 `open_intents`）。唯一例外是 `CompactionStarted`，它没有副作用，丢弃它是安全的，因此退役不需要扫描日志。
@@ -140,7 +141,7 @@ CREATE TABLE retired_sessions (
 );
 ```
 
-- 墓碑**不是派生索引**，无法由日志重建（日志已删）；它是退役的真相。G7 仍只覆盖 `sessions` / `open_intents` / `timers` / `runnable`。
+- 墓碑**不是派生索引**，无法由日志重建（日志已删）；它是退役的真相。G7 仍只覆盖 `sessions` / `open_intents` / `timers` / `pending_inputs`。
 - 退役：`BEGIN IMMEDIATE` 内完成 §5 的检查与删除；检查与删除对 append 原子。
 - 导出的稳定前缀由现有 `scan` 保证；实现不需要为导出新增读事务或快照机制。
 
@@ -151,7 +152,7 @@ CREATE TABLE retired_sessions (
 | `Asterpath::open_session` | `AgentError::NotFound` |
 | `EventLog::scan` | 空流（未知 session 与空 session 不可区分） |
 | `EventLog::frontier` | `None` |
-| `Storage::claim` / `due_timers` | 没有该会话的行 |
+| `Storage::wakeable` / `due_timers` | 不返回该会话 |
 | `UsageQuery` | `UsageError::NotFound { session }` |
 | `UsageQuery::SessionSubtree` | 根退役 → `NotFound`；存活根只汇总存活后代 |
 | `TraceQuery` | `TraceError::NotFound { session }` |
@@ -167,7 +168,7 @@ CREATE TABLE retired_sessions (
 - **追踪**：退役后 span 一并消失；trace 是日志的投影，没有独立存储。已导出的 trace 不受影响。
 - **子会话**：不级联；父会话必须 `idle`；调用方自底向上删除。父记录缺失（父已退役）时子作为独立 session 继续。
 - **插件**：插件清单不持久化，退役无需处理。
-- **持久等待**：timer 与 runnable 行随会话删除；退役后不会再有该会话的唤醒。
+- **持久等待**：timer 与 pending_inputs 行随会话删除；退役后不会再有该会话的唤醒。
 - **配置**：保留策略不进 `ConfigSnapshot`，不随 session 持久化。
 
 ## 11. 验收场景
@@ -182,7 +183,7 @@ CREATE TABLE retired_sessions (
 | R6 | 父会话非 idle 时退役 idle 子会话 | `ParentNotIdle` |
 | R7 | 退役后重启进程再重试 | 墓碑仍在；同一 frontier 返回成功，不重新删除 |
 | R8 | 退役子会话后查询父会话子树用量 | 不报错；总量只含存活会话（U16） |
-| R9 | 退役后 timer / runnable 残留 | 无该会话的行；不再产生唤醒 |
+| R9 | 退役后 timer / pending_inputs 残留 | 无该会话的行；不再产生唤醒 |
 
 ## 12. 边界与非目标
 

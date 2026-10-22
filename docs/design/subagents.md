@@ -380,7 +380,9 @@ recover(child):
 - 聚合：session 总量 = 自身 + 后代，查询时按 session 树 rollup；不存冗余、不重复计数。查询 API 见 [usage.md](usage.md)：`Session` scope 只返回自身，`SessionSubtree` 分开返回 `own` / `descendants`。
 - `ChildSessionCompleted` 不携带 usage；避免"父日志 + 子日志"双重计数。
 
-## 11. 默认配置
+## 11. 可配置默认
+
+数值是 `SubagentConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
 pub struct SubagentConfig {

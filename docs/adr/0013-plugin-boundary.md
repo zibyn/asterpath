@@ -1,6 +1,6 @@
 # 外部插件用清单加载，进程内模块编译期组装
 
-**Status**: accepted (2026-10-22)
+**Status**: accepted (2026-10-22)；实现里程碑 M5（post-v1，[#32](https://github.com/zibyn/asterpath/issues/32)）
 **来源**: [#16](https://github.com/zibyn/asterpath/issues/16)
 
 ## Context

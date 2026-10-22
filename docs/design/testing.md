@@ -7,7 +7,7 @@
 
 ## 1. 决策摘要
 
-- 六个注入点中，**五个是 `asterpath-testing` 里的 trait 装饰器**，一个是**手动时钟**；core / protocol 不新增注入钩子。
+- 五个注入点中，**四个是 `asterpath-testing` 里的 trait 装饰器**，一个是**手动时钟**；core / protocol 不新增注入钩子。
 - 装饰器命中后的动作只有两档：`Halt`（写 marker 后永久挂起，由父进程 `SIGKILL`）与 `Panic`（进程内测试）。
 - **不用 panic / `abort` / `exit` / 注入异常冒充崩溃**；进程级验收一律真 `SIGKILL`（[acceptance.md](../spec/acceptance.md) §1）。
 - core 新增最小 `Clock { now() }` + `SystemClock`；`Storage` 保持显式 `now: Timestamp`（#5 不变）；`ManualClock` 在 `asterpath-testing`。
@@ -17,7 +17,7 @@
 
 ## 2. 注入点与实现
 
-六个规范名称（配置、marker、日志引用均用这些字符串）：
+五个规范名称（配置、marker、日志引用均用这些字符串）：
 
 | 注入点 | 实现 | 包住的调用 |
 | --- | --- | --- |
@@ -25,7 +25,6 @@
 | `append:after_commit` | `FailpointEventLog` | 委托返回后、调用方拿到 `LogId` **之前**触发 |
 | `tool:before_effect` | `FailpointTool` | 委托 `Tool::invoke` **之前**触发 |
 | `tool:after_effect` | `FailpointTool` | `invoke` 返回后、agent loop 写 `ToolResult` **之前**触发 |
-| `queue:before_ack` | `FailpointStorage` | 委托 `Storage::ack` **之前**触发 |
 | `clock:advance` | `ManualClock::advance` | 不是装饰器；显式推进时钟而非崩溃 |
 
 ### 2.1 API 形状（`asterpath-testing`）
@@ -40,7 +39,6 @@ pub enum Point {
     AppendAfterCommit,
     ToolBeforeEffect,
     ToolAfterEffect,
-    QueueBeforeAck,
 }
 
 impl Point {
@@ -65,14 +63,10 @@ impl Failpoint {
 }
 
 pub struct FailpointEventLog { inner: Arc<dyn EventLog>, failpoint: Failpoint, hits: AtomicUsize }
-pub struct FailpointStorage  { inner: Arc<dyn Storage>,  failpoint: Failpoint, hits: AtomicUsize }
 pub struct FailpointTool     { inner: Arc<dyn Tool>,     failpoint: Failpoint, hits: AtomicUsize }
 
 impl FailpointEventLog {
     pub fn new(inner: Arc<dyn EventLog>, failpoint: Failpoint) -> Self;
-}
-impl FailpointStorage {
-    pub fn new(inner: Arc<dyn Storage>, failpoint: Failpoint) -> Self;
 }
 impl FailpointTool {
     pub fn new(inner: Arc<dyn Tool>, failpoint: Failpoint) -> Self;
@@ -87,7 +81,7 @@ impl FailpointTool {
 ### 2.2 动作语义
 
 - `Halt`：向 stdout 写一行 `{"event":"failpoint","point":"<name>"}` 并 flush，然后 `std::future::pending().await`，不再返回。进程保持存活，直到父测试 `SIGKILL`。这是进程级场景唯一的 failpoint 动作。
-- `Panic`：断言消息为 `failpoint <name>`。用于进程内测试验证「未提交 / 未 ack / 未写终态」的中间状态；不用于证明崩溃安全。
+- `Panic`：断言消息为 `failpoint <name>`。用于进程内测试验证「未提交 / 未写终态」的中间状态；不用于证明崩溃安全。
 - `testdrive` 的 `--failpoint <point>[=<n>]` 只构造 `Halt`；未知点或非法组合 = 配置错误，退出码 2。可重复传入以嵌套多个装饰器。
 
 ## 3. 时钟接缝
@@ -121,9 +115,9 @@ impl ManualClock {
 impl Clock for ManualClock { /* 读 AtomicI64 */ }
 ```
 
-- `Storage::claim` / `due_timers` / `recover_at_startup` 继续收显式 `now`（#5 / ADR-0005 不变）。`runtime`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
+- `Storage::wakeable` / `due_timers` 继续收显式 `now`（#5 / ADR-0005 不变）。`runtime`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
 - `recorded_at` 仍由存储模块用自己的墙钟写入；它不参与恢复、投影或断言（#3 I8 / #12），因此存储不需要 `Clock`。
-- `clock:advance` 注入点 = `ManualClock::advance`，用于 timer 到期、租约过期。它不产生 marker，也不模拟崩溃。
+- `clock:advance` 注入点 = `ManualClock::advance`，用于 timer 到期。它不产生 marker，也不模拟崩溃。
 
 ## 4. 后端中立契约套件
 
@@ -149,7 +143,7 @@ pub fn storage_contract(factory: &impl BackendFactory);
 | G2 幂等 `(session, event_kind, dedup_key)` | 支持 | 支持 | 共享 |
 | G3 `seq` 全序、无洞、存储分配 | 支持 | 支持 | 共享 |
 | G4 游标扫描与 frontier | 支持 | 支持 | 共享 |
-| G5 至少一次唤醒、合并、ack 不吃新一代 | 支持 | 支持 | 共享 |
+| G5 唤醒发现完备、同 session 不重复 | 支持 | 支持 | 共享 |
 | G6 无跨流原子性 | 支持 | 支持 | 共享 |
 | G7 派生索引可重建 | 支持 | 支持 | 共享 |
 | G8 退役原子性（`SessionRetirement`） | 不实现 | 支持 | 仅 SQLite |
@@ -159,10 +153,10 @@ pub fn storage_contract(factory: &impl BackendFactory);
 - G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对六对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`TimerScheduled`/`TimerFired`/`TimerCancelled`、`SignalAwaited`/`SignalReceived`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
 - G3：串行与并发 append 后 `seq` 严格递增无洞；只由存储分配。
 - G4：`scan(after)` 只返回已提交、按 `seq` 升序、`limit` 有界；`frontier` 等于末条 `log_id`。
-- G5：`append` 派生入队；同 session 合并并递增 `generation`；`ack` 代次不符不删除新唤醒；租约过期可重新 `claim`；启动清租约并入队。
+- G5：有非 compaction open intent、待处理输入或到期 timer 的 session 出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录。
 - G6：两个 session 的 append 不构成原子组；一个流的可见性不受另一个流影响。
-- G7：丢弃派生状态后，仅凭日志与显式唤醒查询重建 `sessions` / `timers` / `runnable`。
-- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、S9（timer 恰一次）、claim/ack 不丢唤醒也在此层。
+- G7：丢弃派生状态后，仅凭日志重建 `sessions` / `open_intents` / `timers` / `pending_inputs`。
+- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、S9（timer 恰一次）、`pending_inputs` 在 `StepStarted` 前保留也在此层。
 
 仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 
@@ -182,7 +176,7 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它不实�
 | A2 / S2 | `{"event":"effect_applied"}` | `Unsafe` 工具副作用已发生、结果未写 |
 | A3 / S3 | `{"event":"stream_open"}` | 模型流中途 |
 | (c) / S6 | `{"event":"parent_waiting"}` | 父会话已写子 spawn、处于持久等待 |
-| 精确边界 | `{"event":"failpoint","point":"<name>"}` | `append:before_commit` / `append:after_commit` / `queue:before_ack` |
+| 精确边界 | `{"event":"failpoint","point":"<name>"}` | `append:before_commit` / `append:after_commit` |
 
 - 有自然 marker 的场景**不用** failpoint；failpoint 只补没有自然窗口的边界。
 - 父测试等待 marker 上限 **15 秒**，超时即失败并杀掉子进程；不做 `SIGTERM` 升级，直接 `SIGKILL`。

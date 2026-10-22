@@ -6,6 +6,8 @@
 >
 > 相关 ADR：[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 >
+> **2026-10-22 #32 范围调整**：本文件的设计保留，实现归 **M5（post-v1）**；不属于 v1 交付，也不进 M0–M4 验收。
+>
 > 本票对 #7 的修订（已同步到 `tools.md`）：
 >
 > - `ToolError` 增加 `Denied` 变体：沙箱在进程启动前按策略拒绝 spawn 时，需要模型可见的「被拒绝」分类；`ToolErrorKind` 不变。

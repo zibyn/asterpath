@@ -6,7 +6,7 @@
 
 ## Context
 
-[#5](../design/storage.md) 固定了六个故障注入点的名字（`append:before_commit`、`append:after_commit`、`tool:before_effect`、`tool:after_effect`、`clock:advance`、`queue:before_ack`），但把它们的物理形态、动作与 CI 编排留给了 #19。约束有四条：
+[#5](../design/storage.md) 固定了故障注入点的名字（`append:before_commit`、`append:after_commit`、`tool:before_effect`、`tool:after_effect`、`clock:advance`、`queue:before_ack`），但把它们的物理形态、动作与 CI 编排留给了 #19。约束有四条：
 
 - **core / protocol 无 feature**（ADR-0015）；注入逻辑不能进 Tier 1 稳定面，也不能让生产构建带钩子。
 - **验收必须是真崩溃**（[acceptance.md](../spec/acceptance.md) §1）：用 `SIGKILL` 验证 OS 级持久性，panic / `abort` / 注入异常都不算。
@@ -15,16 +15,17 @@
 
 ## Decision
 
-- **五个注入点是 `asterpath-testing` 里的 trait 装饰器**：`FailpointEventLog`（`append` 前/后）、`FailpointStorage`（`ack` 前）、`FailpointTool`（`invoke` 前/后）。装饰器实现 core/protocol 的既有 trait，core / protocol 零改动。一个装饰器承载一个点，多点嵌套。
-- **六个点中的 `clock:advance` 不是装饰器**：core 新增最小 `Clock { fn now(&self) -> Timestamp }` 与 `SystemClock`；`asterpath-testing` 提供 `ManualClock`（`set` / `advance`）。`Storage` 签名不变，仍收显式 `now`。
+- **四个注入点是 `asterpath-testing` 里的 trait 装饰器**：`FailpointEventLog`（`append` 前/后）、`FailpointTool`（`invoke` 前/后）。装饰器实现 core/protocol 的既有 trait，core / protocol 零改动。一个装饰器承载一个点，多点嵌套。
+- **`clock:advance` 不是装饰器**：core 新增最小 `Clock { fn now(&self) -> Timestamp }` 与 `SystemClock`；`asterpath-testing` 提供 `ManualClock`（`set` / `advance`）。`Storage` 签名不变，仍收显式 `now`。
 - **动作只有两档**：`Halt`（写一行 JSON marker 到 stdout 后永久挂起，由父测试 `SIGKILL`）与 `Panic`（进程内测试断言中间状态）。`testdrive --failpoint <point>[=<n>]` 只构造 `Halt`；未知点 = 退出码 2。
-- **进程级验收仍用真 `SIGKILL`**：有自然 marker 的场景（A1–A3、(c)）沿用工具/provider 自己的 marker；failpoint 只补没有自然窗口的边界（append、ack）。不用注入点替代任何进程级验收。
+- **进程级验收仍用真 `SIGKILL`**：有自然 marker 的场景（A1–A3、(c)）沿用工具/provider 自己的 marker；failpoint 只补没有自然窗口的边界（append）。不用注入点替代任何进程级验收。
 - **后端中立契约套件**：G2–G7 在 in-memory 与 SQLite 上共享同一套测试；G1、G8、`Corrupt`、WAL/`flock`、迁移只测 SQLite。in-memory 显式声明不支持 G1，且不实现 `SessionRetirement`。
 - **CI 三层**：单测+契约 5 分钟；进程级验收仅 Linux、整套 5 分钟、单 marker 等待 15 秒；feature 矩阵 5 分钟。进程级测试不得 `#[ignore]`。
 - **验收 fixture 单一来源**：`asterpath-acceptance/fixtures/*.json`；#6 的 L 场景与 #17 的 R 场景复用，不在各自 crate 内另建。
 
 ## Consequences
 
+- **2026-10-22 #32 修订**：存储不再有 `ack` / 租约，`queue:before_ack` 与 `FailpointStorage` 删除；注入点从六个降为五个（四个装饰器 + `clock:advance`）。
 - 生产构建里没有任何注入钩子；`asterpath-testing` 是 Tier 3，可自由变形。
 - core 多了一个一方法的 `Clock` trait；`Storage` 的显式 `now` 保持不变，不引入两套时间来源。
 - in-memory 后端不能满足 G1，因此它不能用于崩溃恢复测试；这是刻意的能力差异，必须写进它的文档。

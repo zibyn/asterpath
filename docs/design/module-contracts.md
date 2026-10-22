@@ -5,6 +5,7 @@
 > 本文件是 v1 spec 的"模块契约"章节草稿；最终 crate 打包由 #15 收敛。
 >
 > **2026-10-22 范围调整**：不做通用工作流引擎（[ADR-0003](../adr/0003-single-session-stream-topology.md)）。模块图中的 `asterpath-workflow` 已移除，编排相关表述以本文件为准已更新；#10 出界，调度 API 原型见 #17。
+> **2026-10-22 #32 修订**：`asterpath-plugin-host` 与 MCP adapter 归 M5（post-v1），不进 v1 workspace；模块契约本身不变。
 
 ## 1. 决策摘要
 
@@ -33,7 +34,7 @@ modules (each crate; no module→module edges)
   asterpath-tracing
   asterpath-usage
   asterpath-scheduler        子会话调度与持久等待 (#8/#17)
-  asterpath-plugin-host      subprocess/MCP adapter (#7)
+  asterpath-plugin-host      subprocess/MCP adapter (#7)；M5（post-v1）
   asterpath-testing          in-memory fakes / harness
         │
         ▼
@@ -182,7 +183,7 @@ pub enum WakeCause {
     Timer(TimerId),
     Signal(SignalId),
     ChildCompleted(SessionId),
-    Startup,                          // 仅启动入队使用
+    Startup,                          // 仅宿主恢复循环使用
 }
 
 pub trait DurableExecutor: Send + Sync {
@@ -218,7 +219,7 @@ pub struct ApprovalEndpoint;
 - agent 管线在 `Ask` 前查 `is_open()`；关闭时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4）。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
 - `Clock` 是时间来源接缝：`runtime` / `scheduler` 注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
-- `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
+- `Storage` 负责 session、唤醒发现、定时器；方法集由 #5 定。
 - `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `EventLog::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。

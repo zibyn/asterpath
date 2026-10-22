@@ -6,42 +6,42 @@
 
 ## 1. 决策摘要
 
-- workspace = 17 个库/应用成员 + 1 个 `xtask`；一模块一 crate，模块之间零依赖。
+- v1 workspace = 16 个库/应用成员 + 1 个 `xtask`，按里程碑增量创建（M0 只建 7 个 crate + `xtask`）；一模块一 crate，模块之间零依赖。`asterpath-plugin-host` 等扩展归 M5（post-v1）。
 - 依赖方向固定 `core ← protocol ← modules ← app`，由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade、core、protocol 与日志 schema**，模块 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
 - `core` / `protocol` 无 feature；feature 只出现在 facade、CLI 与后端 crate。
 - 没有后台 driver：宿主显式调用 `SessionHandle::drive()`；同一 session 单飞；丢弃流不等于取消。
-- 参考 CLI 七命令，退出码 `0/1/2`；审批在 TTY 上默认 `ask`，非 TTY 默认 `deny`。
-- 三段验收由 `asterpath-acceptance` 的 `testdrive` 二进制 + 真 `SIGKILL` 驱动；#19 只负责六个注入点工具链。
+- 参考 CLI 六命令，退出码 `0/1/2`；审批在 TTY 上默认 `ask`，非 TTY 默认 `deny`。
+- 三段验收由 `asterpath-acceptance` 的 `testdrive` 二进制 + 真 `SIGKILL` 驱动；#19 只负责五个注入点工具链。
 - v1 的 provider/model 在 session 创建时快照，**不支持 turn 内切换**；验收 (b) 验证的是 adapter 可替换性与规范化历史等价。
 
 ## 2. Workspace 成员与依赖
 
-| crate | 职责 | 允许的 workspace 依赖 | v1 交付 |
+| crate | 职责 | 允许的 workspace 依赖 | 引入里程碑 |
 | --- | --- | --- | --- |
-| `asterpath-core` | 模块宿主、事件总线、`EventLog` / `Storage` / `SessionCatalog` / `DurableExecutor` 契约、ID、错误 | 无 | 是 |
-| `asterpath-protocol` | 规范化模型、`Provider` / `Tool` / `ToolRegistry` / `AgentRunner` / `Compactor`、会话事件、`ConfigSnapshot`、`AgentEvent` | `core` | 是 |
-| `asterpath-agent` | `AgentRunner` 实现（turn/step loop） | `core`, `protocol` | 是 |
-| `asterpath-tools` | `ToolRegistry` 实现 | `core`, `protocol` | 是 |
-| `asterpath-storage-sqlite` | `EventLog` + `Storage` + `SessionCatalog` + `SessionRetirement` 的 SQLite 实现 | `core`, `protocol` | 是 |
-| `asterpath-runtime` | `DurableExecutor` 实现（timer / signal / wake） | `core`, `protocol` | 是 |
-| `asterpath-scheduler` | `SubagentSpawner` 实现；子会话准入与等待 | `core`, `protocol` | 是 |
-| `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | 是；**可选装配**，M0 不引入 |
-| `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol` | 是 |
-| `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol` | 是 |
-| `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | 是 |
-| `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | 是 |
-| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol` | 图内留位，不进 v1 验收 |
-| `asterpath-testing` | in-memory fakes、`ScriptedProvider`、五个故障注入装饰器 + `ManualClock`（六点，见 [testing.md](testing.md)） | `core`, `protocol` | 是 |
-| `asterpath` | facade / 默认组装根；暴露稳定 API | 任意 | 是 |
-| `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | 是 |
-| `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | 是（仅测试） |
-| `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | 是（仅工具） |
+| `asterpath-core` | 模块宿主、事件总线、`EventLog` / `Storage` / `SessionCatalog` / `DurableExecutor` 契约、ID、错误 | 无 | M0 |
+| `asterpath-protocol` | 规范化模型、`Provider` / `Tool` / `ToolRegistry` / `AgentRunner` / `Compactor`、会话事件、`ConfigSnapshot`、`AgentEvent` | `core` | M0 |
+| `asterpath-agent` | `AgentRunner` 实现（turn/step loop） | `core`, `protocol` | M0 |
+| `asterpath-tools` | `ToolRegistry` 实现 | `core`, `protocol` | M0 |
+| `asterpath-storage-sqlite` | `EventLog` + `Storage` + `SessionCatalog` + `SessionRetirement` 的 SQLite 实现 | `core`, `protocol` | M0 |
+| `asterpath-runtime` | `DurableExecutor` 实现（timer / signal / wake） | `core`, `protocol` | M3 |
+| `asterpath-scheduler` | `SubagentSpawner` 实现；子会话准入与等待 | `core`, `protocol` | M3 |
+| `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | M3；**可选装配**，不进通过条件 |
+| `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol` | M2 |
+| `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol` | M2 |
+| `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | M3 |
+| `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | M3 |
+| `asterpath-testing` | in-memory fakes、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)） | `core`, `protocol` | M0 |
+| `asterpath` | facade / 默认组装根；暴露稳定 API | 任意 | M0 |
+| `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | M4 |
+| `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | M1 |
+| `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | M0 |
+| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol` | M5（post-v1） |
 
-- 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（合约，[#21](https://github.com/zibyn/asterpath/issues/21) 已定，见 [sandbox.md](sandbox.md)）、`asterpath-sandbox-linux` / `asterpath-sandbox-macos`（后端，v1 不建）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18) 已收敛：内核只有 `SessionRetirement` 接缝，策略与归档由宿主实现；v1 不建）、MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
+- 上表不含 `asterpath-sandbox`：它是独立合约 crate（[#21](https://github.com/zibyn/asterpath/issues/21)，见 [sandbox.md](sandbox.md)），与 `asterpath-sandbox-linux` / `asterpath-sandbox-macos` 一起归 M5。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：模块 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件（SQLite 即如此），`cargo xtask check-deps` 只校验普通依赖边。
-- 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
+- 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建，随里程碑增长）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。
 
 ### 2.1 `ConfigSnapshot`（对 #11 的补齐）
@@ -65,11 +65,11 @@ pub struct ConfigSnapshot {
 - 执行仍调用活注册表：工具已消失走 `NotFound`（[plugins.md](plugins.md) §8）；恢复按 `ToolCallRequested` 上已记录的 `replay` / `provenance` 决定是否重跑，不重新解析描述符。
 - `ReasoningBinding.tools_hash` 按快照 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9），因此同一 session 内稳定，fork 收窄工具集时自然不匹配。
 - 审批策略不进快照：它是宿主代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
-- MCP/插件配置不进快照：plugin-host 不在 v1 交付内；将来纳入时按 log schema 规则 bump 版本（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
+- MCP/插件配置不进快照：plugin-host 归 M5（post-v1）；将来纳入时按 log schema 规则 bump 版本（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 
 ## 3. 公共 API
 
-类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` 在 `asterpath-protocol`；`InputId` 与其他 opaque ID、`Clock` / `Timestamp` 在 `asterpath-core`；`PluginManifest` 在 `asterpath-plugin-host`（仅 `plugin-host` feature）；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。
+类型归属：`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` 在 `asterpath-protocol`；`InputId` 与其他 opaque ID、`Clock` / `Timestamp` 在 `asterpath-core`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` 在 facade。`PluginManifest` 属于 M5 的 `asterpath-plugin-host`，不属于 v1 公共 API。
 
 ### 3.1 稳定层级与版本
 
@@ -101,8 +101,6 @@ pub struct AsterpathConfig {
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
     pub session_retirement: Option<Arc<dyn SessionRetirement>>,
-    #[cfg(feature = "plugin-host")]
-    pub plugins: Vec<PluginManifest>,           // 仅 plugin-host feature
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
@@ -125,10 +123,10 @@ impl Asterpath {
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
-- `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 与 plugin 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
+- `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
 - 关闭 `sqlite` feature 时，`event_log` / `storage` / `session_catalog` 必须注入；`session_retirement` 仍是可选的。
-- `plugins` 字段只在 `plugin-host` feature 下存在；其他 build 不引入 `asterpath-plugin-host`（[plugins.md](plugins.md)）。
+- v1 的 `AsterpathConfig` 没有插件字段；插件清单属于 M5 的 `asterpath-plugin-host`（[plugins.md](plugins.md)）。
 - 没有 `executor` 注入：v1 只有一套 `DurableExecutor` 实现；需要替换它的嵌入者直接使用 `asterpath-core` 的 `ModuleHost`。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 替换超过一个模块、或需要自定义 `Module` 生命周期的嵌入者，直接使用 `asterpath-core` 的 `ModuleHost`；facade 不覆盖该场景。
@@ -237,13 +235,13 @@ pub enum AsterError {
 
 | crate | features | 默认 |
 | --- | --- | --- |
-| `asterpath` | `anthropic`, `openai`, `sqlite`, `plugin-host` | `anthropic`, `openai`, `sqlite` |
+| `asterpath` | `anthropic`, `openai`, `sqlite` | `anthropic`, `openai`, `sqlite` |
 | `asterpath-cli` | 同 facade | 同 facade |
 | 模块 crate | 无 | — |
 | `core` / `protocol` | 无 | — |
 
 - `sqlite` 关闭时必须经 `AsterpathConfig.event_log` / `.storage` 注入实现。
-- `plugin-host` 默认关闭；关闭时 `plugin list` 命令返回用法错误（退出码 2）并说明该 build 未启用。
+- v1 没有 `plugin-host` feature；插件宿主是 M5 的独立扩展（[plugins.md](plugins.md)）。
 - feature 不得改变公共契约类型（ADR-0001）。
 
 ## 4. 参考 CLI
@@ -257,7 +255,6 @@ pub enum AsterError {
 | `asterpath inspect [OPTIONS] <SESSION>` | 打印投影摘要与未闭合意图；`--json` 输出完整投影 |
 | `asterpath trace [OPTIONS] <SESSION>` | 打印 span 树（`TraceQuery`）；`--json` |
 | `asterpath usage [OPTIONS] <SESSION>` | 分列 `own` / `descendants`；`--json` |
-| `asterpath plugin list [OPTIONS]` | 从配置读取插件清单并显示加载状态；需要 `plugin-host` feature |
 | `asterpath config check [OPTIONS]` | 只解析与校验配置，不初始化模块；成功退出 0，失败退出 2 |
 
 通用选项：`--config <path>`、`--db <path>`、`--provider <id>`、`--model <id>`、`--approval <ask|allow|deny>`、`--json`。
@@ -306,9 +303,6 @@ model = "claude-fable-5-1"
 
 [approval]
 default = "ask"               # ask | allow | deny
-
-[[plugins]]
-# PluginManifest；仅 plugin-host feature
 ```
 
 - API key **只从环境变量读**：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`。配置文件出现 `api_key` / `secret` / `token` 字段直接报错（退出码 2）。
@@ -330,18 +324,32 @@ default = "ask"               # ask | allow | deny
 
 | 里程碑 | 范围 | 通过条件 |
 | --- | --- | --- |
-| M0 骨架 | workspace、`core` / `protocol` / `storage-sqlite` / `agent` / `tools` / `testing` / facade + `ScriptedProvider` | 编译通过；`cargo xtask check-deps` 通过；单回合（模型 + 工具）可跑 |
-| M1 恢复 | 场景 (a) | `acceptance` 的 A1–A3 通过 |
+| M0 骨架 | 7 个 crate：`core` / `protocol` / `storage-sqlite` / `agent` / `tools` / `testing` / facade，加 `xtask` 与 `ScriptedProvider` | 编译通过；`cargo xtask check-deps` 通过；单回合（模型 + 工具）可跑 |
+| M1 恢复 | 场景 (a)；引入 `asterpath-acceptance` | `acceptance` 的 A1–A3 通过 |
 | M2 双协议 | 两个 provider crate + adapter 测试 | 场景 (b) 通过 |
-| M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage | 场景 (c) 通过 |
-| M4 CLI | `asterpath-cli` 七命令、配置、审批端 | CLI 场景测试通过 |
+| M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；`asterpath-compaction` 可选接入 | 场景 (c) 通过 |
+| M4 CLI | `asterpath-cli` 六命令、配置、审批端 | CLI 场景测试通过 |
+| M5 扩展（post-v1） | `asterpath-plugin-host`（清单、子进程、MCP adapter）、`asterpath-sandbox` 合约与后端、插件分发 | 不参与 v1 验收；实现时各自定闸门 |
 
-- `asterpath-plugin-host` 与扩展 crate 不参与 M0–M4 的通过条件；[#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21) 已定，各自实现时再加闸门。
-- M0 组装 `compactor: None`；`asterpath-compaction` 不在 M0 crate 列表，压缩从后续里程碑接入（[compaction.md](compaction.md) §2）。
+- M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；v1 workspace 在 M4 截止，M5 成员在 M5 才加入。
+- M0 组装 `compactor: None`；`asterpath-compaction` 从 M3 起可选接入，不进 M0–M4 通过条件（[compaction.md](compaction.md) §2）。
 - CI 顺序：`cargo xtask check-deps` → `cargo fmt --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --workspace` → `cargo test -p asterpath-acceptance --test acceptance` → `cargo doc --workspace --no-deps`。
 - 另跑 feature 矩阵：`cargo check -p asterpath --no-default-features` 与 `--features anthropic` / `openai` / `sqlite` 各自组合。
 - CI 分层与超时（[testing.md](testing.md) §6）：`cargo test --workspace` 预算 5 分钟；进程级验收预算 5 分钟、单 marker 等待上限 15 秒；feature 矩阵 5 分钟。
 - 验收测试只在 Linux CI 上跑（`cfg(unix)`）；框架本身不禁 Windows，但 v1 不为验收提供 Windows 的强杀实现。进程级与 failpoint 测试不得 `#[ignore]`。
+
+### 5.1 默认值性质
+
+下列数值是**默认值**，不是不变量。不变量只在各文档的「保证 / 验收」节。
+
+| 值 | 性质 | 归口 |
+| --- | --- | --- |
+| `initial_backoff` 1s、`max_backoff` 30s、`request_timeout` 600s、`cancel_grace` 10s | 可配置默认 | `TurnConfig`（agent-loop.md §10） |
+| `max_output_bytes` 64 KiB、`max_output_bytes_per_step` 256 KiB、`external_timeout` 120s、`kill_grace` 5s | 可配置默认 | `ToolConfig`（tools.md §9） |
+| `max_depth` 3、每父并发 8、全局 32 | 可配置默认 | `SubagentConfig`（subagents.md） |
+| `target_ratio` 0.5、`max_summary_tokens` 2048 | 可配置默认 | `CompactionConfig`（compaction.md §8） |
+| `bytes/3` 估算 | 实现常量（口径，不是可调参数） | compaction 模块内部 |
+| CI 5 分钟 / 单 marker 15 秒 | 运维目标（非契约） | CI 配置 |
 
 ## 6. 验证协议：spec 是否可开工
 

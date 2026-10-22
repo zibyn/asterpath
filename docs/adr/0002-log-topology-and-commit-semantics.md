@@ -13,7 +13,7 @@
 - `EventLog` 以 `StreamId`（`Session` | `Workflow`）分片，每个 stream 一条 append-only 日志；stream 之间无事务。子智能体是独立 session stream，父流只记一条 `ChildSessionSpawned`。
 - 提交单位是**终态条目**（完整 assistant message、工具调用意图、工具结果、step/turn 提交），不是流式 delta。
 - 不变量「模型可见即已记录」：进入下一次请求或产生副作用之前，先提交记录。
-- 日志层**没有 ack**。完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
+- 日志层**没有 ack**。完成 = 写了终态记录。（2026-10-22 #32：存储侧后来也删除了租约与 ack，见 [ADR-0005](0005-storage-contract-and-sqlite.md)。）
 - 检查点 = 最后一个 `StepCommitted` 边界，不写独立 checkpoint 记录。
 - 恢复只处理未闭合意图：`Safe` 重跑，`Unsafe` 补写 `Interrupted` 终态。
 - 工作流实例的确定性重放只读，不写记录；session 恢复写一条非模型可见的 `StreamResumed`。

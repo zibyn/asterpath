@@ -24,7 +24,7 @@
 - **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件。工具语义见 [tools.md](tools.md)。
 - **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
 - **2026-10-22 #29 修订**：`caused_by` 指向 `ChildSessionSpawned` 的 timer 不在恢复预扫描里收尾，交给 spawn 重放（先 R3 查子终态，再处理 deadline）；排队按 open spawn `ToolCallRequested` 重建。
-- 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
+- 日志层**没有 ack**：完成 = 写了终态记录。存储也没有租约或 ack；唤醒是只读发现（[storage.md](storage.md) §7）。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起；signal 等待的意图记录是 `SignalAwaited`。
@@ -249,7 +249,7 @@ recover(session):
                         重放先查子终态（R3），有终态则记 Completed + TimerCancelled，
                         无终态且已过期则补 TimerFired 并取消子会话
         Timer        -> if caused_by 已终结: append(TimerCancelled{timer_id})
-                        else if deadline 已过: 立即入队 fire
+                        else if deadline 已过: 立即 append(TimerFired)
                         else: 重新挂起
         ChildSession -> 不在本步骤预收尾；交给 spawn 工具重放：
                           spawn 做 R1/R2，await_completion 查子终态、
@@ -275,7 +275,7 @@ recover(session):
 
 - **检查点**：`entries.iter().rposition(|e| e 是 StepCommitted).unwrap_or(0)`。
 - **恢复点**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。前缘（`EventLog::frontier`，最后一条已提交记录）在它之前一条。
-- **已完成但未 ack**：本层不存在这个状态。调度队列的 ack 属于 `Storage`（#5）。
+- **已完成但未确认**：本层不存在这个状态。终态记录即完成；存储侧没有 ack，重复驱动由幂等 append 与 `drive()` 单飞吸收。
 - 补记完成后，驱动方从恢复点继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
 - 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 - 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`TimerCancelled`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
@@ -296,12 +296,12 @@ recover(session):
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 | S12 | 同一 key、不同事件类型各 append 一次（六对共享 key 见 §4） | 两条记录都落盘，互不抑制 |
-| S13 | 在 open step 中到达 `InputRecorded`（steering）、`TimerFired`、`SignalReceived`（审批或匹配等待）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；启动恢复入队；`open_intents` 与日志折叠一致 |
+| S13 | 在 open step 中到达 `InputRecorded`（steering）、`TimerFired`、`SignalReceived`（审批或匹配等待）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；重启后出现在 `wakeable`；`open_intents` 与日志折叠一致 |
 | S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
 | S17 | 恢复遇到 `ToolCallRequested{provenance: Unknown}` | 恰写一条 `ToolResult{Failed, NotFound}`；不查审批、不重跑；模型可见 |
-| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 可经 `runnable` 被认领并开始回合；输入恰被投影一次 |
+| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Storage::wakeable`；宿主 `open_session` + `drive()` 后输入恰被投影一次 |
 
 ## 8. 留给下游
 

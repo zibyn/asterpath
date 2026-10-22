@@ -276,7 +276,9 @@ pub enum ToolErrorKind {
 
 - 工具执行本身不消耗 token；不新增工具级 token 口径（#13）。
 
-## 9. 默认配置
+## 9. 可配置默认
+
+数值是 `ToolConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
 pub struct ToolConfig {
