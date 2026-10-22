@@ -8,6 +8,7 @@ members = [
     "crates/asterpath-tools",
     "crates/asterpath-provider-openai",
     "crates/asterpath-storage-sqlite",
+    "crates/asterpath-provider-anthropic",
     "crates/asterpath-testing",
     "crates/asterpath",
     "xtask",
