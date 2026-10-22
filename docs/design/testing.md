@@ -218,5 +218,5 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它不实�
 
 ## 8. 留给下游
 
-- **#20 / #21**：#20 已定：MCP adapter 的断连场景（stdio 进程死亡、HTTP 流中断、调用中超时）按 [mcp.md](mcp.md) §11 与本文的 `Halt` + marker 模式扩展；沙箱的测试工具链归 #21。
+- **#20 / #21**：#20 已定：MCP adapter 的断连场景（stdio 进程死亡、HTTP 流中断、调用中超时）按 [mcp.md](mcp.md) §11 与本文的 `Halt` + marker 模式扩展。#21 已定：沙箱不新增注入点；`confine` 在 `Tool::invoke` 内，由 `tool:before_effect` / `tool:after_effect` 覆盖，场景见 [sandbox.md](sandbox.md) §12。
 - **实现方**：failpoint 类型只存在于 `asterpath-testing`；若某个新崩溃窗口需要注入，先扩展本文的 `Point` 与装饰器，不在 core/protocol 加 hook。

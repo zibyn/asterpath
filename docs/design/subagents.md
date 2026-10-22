@@ -236,7 +236,7 @@ ContextForked {
   - `model_alias` 必须来自宿主提供的 alias 集合（pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
   - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
-- 沙箱/隔离由扩展模块或宿主按其继承策略决定；内核只带 `Provenance`（#7）。
+- 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionCatalog` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
 - 子的工具调用走自己的 session 与审批策略；父的审批不覆盖子。
 - 恢复一致性：物化子会话时断言 `SessionCreated.config == ChildSessionSpawned.config`；不一致是硬错误。
 

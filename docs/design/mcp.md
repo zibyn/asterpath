@@ -270,6 +270,6 @@ pub enum AdapterError {
 
 ## 12. 留给下游
 
-- **#21**：sandbox 由 adapter 包装或扩展模块提供；本票只保留 `Provenance` 与 pre/post-execute hook。
+- **#21**：已定。stdio server 在启动时经 `SandboxProvider` 约束，server 内部调用不再单独 confine；HTTP 没有本地进程，不在沙箱范围。见 [sandbox.md](sandbox.md)。
 - **#15**：`TransportKind` 与 `PluginAdapter` 的最终 crate 位置；plugin-host 仍不进 v1 验收。
 - **v1 明确不做**：`Mcp-Param-*` 头投影、OAuth 2.1、`subscriptions/listen`、MRTR、server `instructions` 注入、resources/prompts/completions、`outputSchema` 校验、自动重试/重连。

@@ -231,7 +231,7 @@ pub trait AgentRunner: Send + Sync {
 
 | 扩展 | 接入方式 | 内核提供的 seam |
 | --- | --- | --- |
-| 沙箱/隔离 | adapter 或工具包装模块 | `Provenance`、pre/post-execute hook、`Tool` 包装 |
+| 沙箱/隔离 | 进程启动点的 `SandboxProvider` 变换（独立合约 crate，v1 不建） | 内核只带 `Provenance`；见 [sandbox.md](sandbox.md) |
 | 成本/预算 | 消费 usage 的模块 + pre-step gate | `UsageRecorded` / `UsageQuery`、pre-step waterfall（#13） |
 | trace 导出/采样 | exporter 模块订阅 tracing 模块 | 原生 trace 模型/查询、事件日志 |
 | 日志保留/归档 | storage admin 扩展 | `SessionRetirement` 可选能力（#18，见 [retention.md](retention.md)） |
@@ -258,7 +258,7 @@ pub trait AgentRunner: Send + Sync {
 
 - 进程内模块随宿主编译，`Module` 永远是进程内、受信的。
 - 外部插件是子进程或 MCP server；由进程内 adapter 模块连接，并把它们的工具注册为 `Provenance::External { transport }`。
-- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）。
+- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）；沙箱接缝见 [sandbox.md](sandbox.md)（#21）。
 - 动态发现、热替换不属于 v1；安装/分发是 host 责任；清单、加载与版本协商见 [plugins.md](plugins.md) §7。
 
 ## 7. 可检查的解耦
@@ -295,6 +295,7 @@ pub trait AgentRunner: Send + Sync {
 | #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
 | #16 插件分发 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现出界 |
+| #21 沙箱 | 已定。接缝在独立合约 crate；core 零改动，protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |
 
 ## 9. 明确留给下游的点
 

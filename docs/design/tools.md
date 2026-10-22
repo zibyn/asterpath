@@ -10,7 +10,7 @@
 > - `ToolCallRequested.raw_args` 明确为 pre-execute 之后的 **effective args**。
 > - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。
 >
-> 相关 ADR：[0007 审批是框架管线，隔离与内容安全是扩展模块责任](../adr/0007-approval-and-sandbox-layers.md)。
+> 相关 ADR：[0007 审批是框架管线，隔离与内容安全是扩展模块责任](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
@@ -59,6 +59,7 @@ pub struct ToolOutput {
 pub enum ToolError {
     InvalidArgs { message: String },
     NotFound { message: String },      // 运行期目标消失，例如 MCP unknown tool
+    Denied { message: String },        // 沙箱在进程启动前按策略拒绝 spawn（#21）
     Transport { message: String },
     Internal { message: String },
 }
@@ -229,7 +230,7 @@ pub enum ToolErrorKind {
 - 截断以 `Part` 为单位：文本 Part 可在 UTF-8 边界截断；非文本 Part 不拆分，整块放不下时丢弃。最后在 content 末尾附 `"[output truncated: N bytes omitted]"`；`truncated = true`。
 - **完整输出不落日志**；日志是模型可见内容的有界记录，不是工具的原始输出存储。
 
-状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。`NotFound` 既可由管线在注册表缺失时产生，也可由工具在运行期发现目标消失时返回（例如 MCP server 报 unknown tool），因此 `ToolError` 有 `NotFound` 变体；`ToolErrorKind` 仍是事件级分类。
+状态保持三种（与 #3 一致）；`Denied` / `Timeout` / `Panic` 等通过 `error.kind` 表达，不新增 status。`NotFound` 既可由管线在注册表缺失时产生，也可由工具在运行期发现目标消失时返回（例如 MCP server 报 unknown tool），因此 `ToolError` 有 `NotFound` 变体；`ToolErrorKind` 仍是事件级分类。`Denied` 同理：管线因 pre-execute/审批拒绝而产生，工具在沙箱启动前被策略拒绝时返回 `ToolError::Denied`（#21），两者在事件里都是 `Failed{Denied}`。
 
 ## 8. 结果去向
 
@@ -289,7 +290,7 @@ pub struct ToolConfig {
 
 以下能力由模块/插件实现，内核只提供接入点：
 
-- **沙箱/隔离**：adapter 或工具包装模块；内核只带 `Provenance`，不建模 profile。包装器可以在 `invoke` 前后做隔离、审计或拒绝。
+- **沙箱/隔离**：`SandboxProvider` 在进程启动点变换命令；内核只带 `Provenance`。纯进程内工具没有进程边界，包装器只能在 `invoke` 前后拒绝或审计。接缝、策略与错误分类见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。
 - **内容脱敏/密钥**：host 或 `post-execute` 模块；内核不提供默认规则。`post-execute` 在落盘前运行，是唯一接入点。
 - **成本/预算**：不是工具层扩展；usage 与 pre-step gate 见 [usage.md](usage.md) / [agent-loop.md](agent-loop.md)。
 - **内置工具**：可选模块或参考 CLI，不在内核。
@@ -304,3 +305,4 @@ pub struct ToolConfig {
 - **#17**：已定。`DurableExecutor::await_signal` 以 `SignalIntent::AlreadyRecorded` 支持审批等待，不写 `SignalAwaited`；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。
 - **#20**：已定。MCP 外部工具的发现、结果/错误映射、失败矩阵与 ACP 出界见 [mcp.md](mcp.md)；`Provenance` 只带 `TransportKind::{Stdio, Http}`。
+- **#21**：已定。沙箱是 spawn 点变换；启动前拒绝映射为 `ToolError::Denied`。接缝与策略见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。

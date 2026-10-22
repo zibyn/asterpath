@@ -131,7 +131,7 @@ pub struct PluginTimeouts {
 - `command` 直接交给操作系统执行，**不经过 shell**；`args` 原样传递，不做变量替换。
 - `env` 追加到宿主进程的环境；同键覆盖。框架不做 `${VAR}` 展开，host 在构造 manifest 前解析。
 - 秘密可以放在 `env` 或 HTTP `headers` 里；`Debug` 必须脱敏，错误信息只报字段名，不报值。
-- 插件进程**继承宿主进程的环境变量**；需要最小权限的宿主应在自己的进程中先净化环境。manifest 不是沙箱，进程隔离与文件/网络边界由宿主或扩展模块负责（#21）。
+- 插件进程**继承宿主进程的环境变量**；需要最小权限的宿主应在自己的进程中先净化环境。manifest 不是沙箱，也不声明沙箱档位；受限策略由宿主的 `SandboxProvider` 在进程启动前施加，provider 可经 `ConfinedSpawn.env` 收窄环境（[sandbox.md](sandbox.md)）。
 - manifest 本身不进入事件日志、trace 或 usage；它只是启动期配置。
 
 ## 5. 加载规则
