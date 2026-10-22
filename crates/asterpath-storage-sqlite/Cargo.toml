@@ -1,0 +1,18 @@
+[package]
+name = "asterpath-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterpath-core = { path = "../asterpath-core" }
+asterpath-protocol = { path = "../asterpath-protocol" }
+futures-core = "0.3"
+futures-util = "0.3"
+libc = "0.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+
+[dev-dependencies]
+asterpath-testing = { path = "../asterpath-testing" }
+futures-executor = "0.3"
