@@ -441,18 +441,6 @@ async fn spawn_honours_model_alias_and_rejects_invalid_narrowing() {
             .await,
         Err(SpawnError::InvalidArgs { .. })
     ));
-    assert!(matches!(
-        scheduler
-            .spawn(request(
-                None,
-                None,
-                ContextPolicy::Fork {
-                    at: LogId::from_i64(1)
-                }
-            ))
-            .await,
-        Err(SpawnError::InvalidArgs { .. })
-    ));
     assert_eq!(
         events(&*log, SessionId::from_bytes([1; 16]))
             .await
@@ -1069,4 +1057,756 @@ impl AgentRunner for StubRunner {
             })
         })
     }
+}
+
+// --- #49: fork materialization and replay --------------------------------
+
+const PARENT: SessionId = SessionId::from_bytes([1; 16]);
+const CALL_A: ToolCallId = ToolCallId::from_bytes([0x21; 16]);
+const CALL_SIBLING: ToolCallId = ToolCallId::from_bytes([0x22; 16]);
+const CALL_SPAWN: ToolCallId = ToolCallId::from_bytes([3; 16]);
+const FORK_TURN: TurnId = TurnId::from_bytes([2; 16]);
+const STEP_1: asterpath_core::StepId = asterpath_core::StepId::from_bytes([0x11; 16]);
+const STEP_2: asterpath_core::StepId = asterpath_core::StepId::from_bytes([0x12; 16]);
+
+fn raw(provider: &str, kind: &str) -> asterpath_protocol::RawProviderData {
+    asterpath_protocol::RawProviderData {
+        provider: ProviderId::new(provider),
+        model: Some(ModelId::new("model-1")),
+        kind: kind.to_owned(),
+        json: asterpath_protocol::JsonString::new("{\"sig\":1}"),
+    }
+}
+
+fn reasoning(provider: &str) -> Item {
+    Item::Reasoning {
+        summary: vec![text("thought")],
+        binding: asterpath_protocol::ReasoningBinding {
+            provider: ProviderId::new(provider),
+            model: ModelId::new("model-1"),
+            prefix_epoch: 0,
+            tools_hash: "hash".to_owned(),
+        },
+        raw: raw(provider, "thinking"),
+    }
+}
+
+fn assistant_at(step: asterpath_core::StepId, items: Vec<Item>) -> SessionEvent {
+    SessionEvent::AssistantMessage {
+        turn_id: FORK_TURN,
+        step_id: step,
+        items,
+        raw: None,
+        model: config(3).model,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }
+}
+
+fn spawn_record(child: SessionId, context: ContextPolicy) -> SessionEvent {
+    SessionEvent::ChildSessionSpawned {
+        child,
+        task: vec![text("fork task")],
+        config: config(3),
+        context,
+        parent_tool_call_id: CALL_SPAWN,
+        caused_by: LogId::from_i64(1),
+    }
+}
+
+fn fork_parent_ref() -> asterpath_protocol::ParentRef {
+    asterpath_protocol::ParentRef {
+        session: PARENT,
+        turn: FORK_TURN,
+        tool_call: CALL_SPAWN,
+    }
+}
+
+async fn append_keyed(
+    log: &dyn EventLog,
+    session: SessionId,
+    event: SessionEvent,
+    key: DedupKey,
+) -> LogId {
+    let entry = encode_entry(session, Some(key), &event).expect("encodes");
+    log.append(entry).await.expect("appends")
+}
+
+/// Parent history before the spawn step, then the spawn step itself
+/// (assistant message and sibling tool result) that the fork must not see.
+async fn seed_fork_parent(log: &dyn EventLog) -> (LogId, LogId) {
+    append(
+        log,
+        PARENT,
+        SessionEvent::SessionCreated {
+            config: config(3),
+            parent: None,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::TurnStarted { turn_id: FORK_TURN },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::InputRecorded {
+            input: vec![text("earlier request")],
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        assistant_at(
+            STEP_1,
+            vec![
+                reasoning("p"),
+                Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("earlier answer")],
+                },
+                Item::ToolCall {
+                    call_id: "call-A".to_owned(),
+                    provider_item_id: Some("item-A".to_owned()),
+                    name: ToolName::new("echo"),
+                    raw_args: asterpath_protocol::JsonString::new("{}"),
+                    raw: Some(raw("p", "tool_use")),
+                },
+            ],
+        ),
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::ToolCallRequested {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+            tool_call_id: CALL_A,
+            provider_call_id: "call-A".to_owned(),
+            name: ToolName::new("echo"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::ToolResult {
+            tool_call_id: CALL_A,
+            status: asterpath_protocol::ToolResultStatus::Completed,
+            output: Some(vec![text("tool output")]),
+            error: None,
+            truncated: false,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::StepCommitted {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+        },
+    )
+    .await;
+    let at = append(
+        log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        assistant_at(
+            STEP_2,
+            vec![
+                Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("spawn now")],
+                },
+                Item::ToolCall {
+                    call_id: "spawn-call".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: asterpath_protocol::JsonString::new("{}"),
+                    raw: None,
+                },
+                Item::ToolCall {
+                    call_id: "sib".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("echo"),
+                    raw_args: asterpath_protocol::JsonString::new("{}"),
+                    raw: None,
+                },
+            ],
+        ),
+    )
+    .await;
+    let caused_by = append(
+        log,
+        PARENT,
+        SessionEvent::ToolCallRequested {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+            tool_call_id: CALL_SPAWN,
+            provider_call_id: "spawn-call".to_owned(),
+            name: ToolName::new("spawn_agent"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::ToolCallRequested {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+            tool_call_id: CALL_SIBLING,
+            provider_call_id: "sib".to_owned(),
+            name: ToolName::new("echo"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+    append(
+        log,
+        PARENT,
+        SessionEvent::ToolResult {
+            tool_call_id: CALL_SIBLING,
+            status: asterpath_protocol::ToolResultStatus::Completed,
+            output: Some(vec![text("sibling result")]),
+            error: None,
+            truncated: false,
+        },
+    )
+    .await;
+    (caused_by, at)
+}
+
+fn fork_request(caused_by: LogId, at: LogId) -> SpawnRequest {
+    let mut request = SpawnRequest::new(fork_parent_ref(), caused_by, vec![text("fork task")]);
+    request.context = ContextPolicy::Fork { at };
+    request
+}
+
+fn fork_event(events: &[SessionEvent]) -> &SessionEvent {
+    events
+        .iter()
+        .find(|event| matches!(event, SessionEvent::ContextForked { .. }))
+        .expect("ContextForked record")
+}
+
+#[tokio::test]
+async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let (caused_by, at) = seed_fork_parent(&*log).await;
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+
+    let child = scheduler
+        .spawn(fork_request(caused_by, at))
+        .await
+        .expect("fork spawn");
+
+    let child_events = events(&*log, child.child).await;
+    assert_eq!(
+        child_events
+            .iter()
+            .map(SessionEvent::kind)
+            .collect::<Vec<_>>(),
+        ["SessionCreated", "ContextForked", "InputRecorded"]
+    );
+    let SessionEvent::ContextForked {
+        source,
+        source_log,
+        items,
+    } = fork_event(&child_events)
+    else {
+        unreachable!()
+    };
+    assert_eq!(source, &fork_parent_ref());
+    assert_eq!(*source_log, at);
+    assert_eq!(
+        items,
+        &vec![
+            Item::Message {
+                role: Role::User,
+                parts: vec![text("earlier request")],
+            },
+            reasoning("p"),
+            Item::Message {
+                role: Role::Assistant,
+                parts: vec![text("earlier answer")],
+            },
+            Item::ToolCall {
+                call_id: "call-A".to_owned(),
+                provider_item_id: Some("item-A".to_owned()),
+                name: ToolName::new("echo"),
+                raw_args: asterpath_protocol::JsonString::new("{}"),
+                raw: Some(raw("p", "tool_use")),
+            },
+            Item::ToolResult {
+                call_id: "call-A".to_owned(),
+                provider_item_id: None,
+                parts: vec![text("tool output")],
+                is_error: false,
+                raw: None,
+            },
+        ],
+        "the snapshot stops at the spawn step's StepStarted"
+    );
+    assert!(
+        !items.iter().any(|item| matches!(item, Item::Message { parts, .. }
+            if parts.iter().any(|part| matches!(part, Part::Text { text } if text == "spawn now")))),
+        "the spawn AssistantMessage is not part of the snapshot"
+    );
+    assert!(
+        !items.iter().any(|item| matches!(item, Item::ToolResult { parts, .. }
+            if parts.iter().any(|part| matches!(part, Part::Text { text } if text == "sibling result")))),
+        "sibling tool results from the same step are not part of the snapshot"
+    );
+    let SessionEvent::InputRecorded { input } = &child_events[2] else {
+        unreachable!()
+    };
+    assert_eq!(input, &vec![text("fork task")]);
+}
+
+#[tokio::test]
+async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes() {
+    let log = Arc::new(InMemoryEventLog::new());
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::SessionCreated {
+            config: config(3),
+            parent: None,
+        },
+    )
+    .await;
+    let turn = append(
+        &*log,
+        PARENT,
+        SessionEvent::TurnStarted { turn_id: FORK_TURN },
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+        },
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::InputRecorded {
+            input: vec![text("old user")],
+        },
+    )
+    .await;
+    let old_answer = append(
+        &*log,
+        PARENT,
+        assistant_at(
+            STEP_1,
+            vec![Item::Message {
+                role: Role::Assistant,
+                parts: vec![text("old answer")],
+            }],
+        ),
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::StepCommitted {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+        },
+    )
+    .await;
+    // The spawn step starts, then a forced in-step compaction rewrites the
+    // prefix. `CompactionApplied` folds regardless of the waterline.
+    let at = append(
+        &*log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+        },
+    )
+    .await;
+    let key = dedup::compaction(at);
+    append_keyed(
+        &*log,
+        PARENT,
+        SessionEvent::CompactionStarted {
+            trigger: asterpath_protocol::CompactionTrigger::ProviderError,
+            replaces_from: turn,
+            caused_by: at,
+        },
+        key.clone(),
+    )
+    .await;
+    append_keyed(
+        &*log,
+        PARENT,
+        SessionEvent::CompactionApplied {
+            first_kept: at,
+            summary: vec![text("summary")],
+            replaces: asterpath_core::LogIdRange {
+                first: turn,
+                last: old_answer,
+            },
+            model: config(3).model,
+            usage: Usage::default(),
+            raw: None,
+        },
+        key,
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        assistant_at(
+            STEP_2,
+            vec![Item::ToolCall {
+                call_id: "spawn-call".to_owned(),
+                provider_item_id: None,
+                name: ToolName::new("spawn_agent"),
+                raw_args: asterpath_protocol::JsonString::new("{}"),
+                raw: None,
+            }],
+        ),
+    )
+    .await;
+    let caused_by = append(
+        &*log,
+        PARENT,
+        SessionEvent::ToolCallRequested {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+            tool_call_id: CALL_SPAWN,
+            provider_call_id: "spawn-call".to_owned(),
+            name: ToolName::new("spawn_agent"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+    let request = fork_request(caused_by, at);
+    let child = scheduler.spawn(request.clone()).await.expect("fork spawn");
+
+    let snapshot = match fork_event(&events(&*log, child.child).await) {
+        SessionEvent::ContextForked { items, .. } => items.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        snapshot,
+        vec![Item::Compaction {
+            parts: vec![text("summary")]
+        }],
+        "the snapshot is the projection after compaction, not the raw records"
+    );
+
+    // Parent compaction/extension after the spawn cannot rewrite the child.
+    let later = append(
+        &*log,
+        PARENT,
+        SessionEvent::InputRecorded {
+            input: vec![text("parent-only later input")],
+        },
+    )
+    .await;
+    append_keyed(
+        &*log,
+        PARENT,
+        SessionEvent::CompactionApplied {
+            first_kept: later,
+            summary: vec![text("later summary")],
+            replaces: asterpath_core::LogIdRange {
+                first: turn,
+                last: later,
+            },
+            model: config(3).model,
+            usage: Usage::default(),
+            raw: None,
+        },
+        dedup::compaction(later),
+    )
+    .await;
+
+    let again = scheduler.spawn(request).await.expect("replay spawn");
+    assert_eq!(again.child, child.child);
+    let child_events = events(&*log, again.child).await;
+    assert_eq!(
+        child_events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ContextForked { .. }))
+            .count(),
+        1,
+        "replay never duplicates ContextForked"
+    );
+    assert_eq!(
+        match fork_event(&child_events) {
+            SessionEvent::ContextForked { items, .. } => items,
+            _ => unreachable!(),
+        },
+        &snapshot,
+        "the materialized snapshot is independent of later parent changes"
+    );
+}
+
+#[tokio::test]
+async fn fork_drops_foreign_provider_opaque_items_without_translation() {
+    let log = Arc::new(InMemoryEventLog::new());
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::SessionCreated {
+            config: config(3),
+            parent: None,
+        },
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::TurnStarted { turn_id: FORK_TURN },
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_1,
+        },
+    )
+    .await;
+    append(
+        &*log,
+        PARENT,
+        assistant_at(
+            STEP_1,
+            vec![
+                reasoning("q"),
+                Item::ProviderOpaque {
+                    provider: ProviderId::new("q"),
+                    kind: "unknown".to_owned(),
+                    raw: raw("q", "unknown"),
+                },
+                Item::ServerToolCall {
+                    provider: ProviderId::new("q"),
+                    name: "web".to_owned(),
+                    call_id: None,
+                    raw: raw("q", "server_tool"),
+                },
+                Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        text("kept text"),
+                        Part::ProviderOpaque {
+                            provider: ProviderId::new("q"),
+                            kind: "opaque".to_owned(),
+                            raw: raw("q", "opaque"),
+                        },
+                        Part::ProviderOpaque {
+                            provider: ProviderId::new("p"),
+                            kind: "opaque".to_owned(),
+                            raw: raw("p", "opaque"),
+                        },
+                    ],
+                },
+                reasoning("p"),
+                Item::ProviderOpaque {
+                    provider: ProviderId::new("p"),
+                    kind: "known".to_owned(),
+                    raw: raw("p", "known"),
+                },
+            ],
+        ),
+    )
+    .await;
+    let at = append(
+        &*log,
+        PARENT,
+        SessionEvent::StepStarted {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+        },
+    )
+    .await;
+    let caused_by = append(
+        &*log,
+        PARENT,
+        SessionEvent::ToolCallRequested {
+            turn_id: FORK_TURN,
+            step_id: STEP_2,
+            tool_call_id: CALL_SPAWN,
+            provider_call_id: "spawn-call".to_owned(),
+            name: ToolName::new("spawn_agent"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+    let child = scheduler
+        .spawn(fork_request(caused_by, at))
+        .await
+        .expect("fork spawn");
+
+    let child_events = events(&*log, child.child).await;
+    let SessionEvent::ContextForked { items, .. } = fork_event(&child_events) else {
+        unreachable!()
+    };
+    assert_eq!(
+        items,
+        &vec![
+            Item::Message {
+                role: Role::Assistant,
+                parts: vec![
+                    text("kept text"),
+                    Part::ProviderOpaque {
+                        provider: ProviderId::new("p"),
+                        kind: "opaque".to_owned(),
+                        raw: raw("p", "opaque"),
+                    },
+                ],
+            },
+            reasoning("p"),
+            Item::ProviderOpaque {
+                provider: ProviderId::new("p"),
+                kind: "known".to_owned(),
+                raw: raw("p", "known"),
+            },
+        ],
+        "foreign opaque items are dropped verbatim; same-provider raw is kept"
+    );
+}
+
+#[tokio::test]
+async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let (caused_by, at) = seed_fork_parent(&*log).await;
+    let child = SessionId::from_bytes([0x77; 16]);
+    append_keyed(
+        &*log,
+        PARENT,
+        spawn_record(child, ContextPolicy::Fork { at }),
+        dedup::child_session(child),
+    )
+    .await;
+
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+    let request = fork_request(caused_by, at);
+
+    // Window: ChildSessionSpawned committed, child stream still empty.
+    let spawned = scheduler.spawn(request.clone()).await.expect("R2 fill");
+    assert_eq!(spawned.child, child);
+    assert_eq!(
+        events(&*log, child)
+            .await
+            .iter()
+            .map(SessionEvent::kind)
+            .collect::<Vec<_>>(),
+        ["SessionCreated", "ContextForked", "InputRecorded"]
+    );
+
+    // Window: SessionCreated committed, fork/input records missing.
+    let second = SessionId::from_bytes([0x78; 16]);
+    let second_call = ToolCallId::from_bytes([0x23; 16]);
+    append_keyed(
+        &*log,
+        PARENT,
+        SessionEvent::ChildSessionSpawned {
+            child: second,
+            task: vec![text("fork task")],
+            config: config(3),
+            context: ContextPolicy::Fork { at },
+            parent_tool_call_id: second_call,
+            caused_by: LogId::from_i64(1),
+        },
+        dedup::child_session(second),
+    )
+    .await;
+    append(
+        &*log,
+        second,
+        SessionEvent::SessionCreated {
+            config: config(3),
+            parent: Some(fork_parent_ref()),
+        },
+    )
+    .await;
+    let mut second_request = fork_request(caused_by, at);
+    second_request.parent.tool_call = second_call;
+    let filled = scheduler.spawn(second_request).await.expect("R2 fill");
+    assert_eq!(filled.child, second);
+    assert_eq!(
+        events(&*log, second)
+            .await
+            .iter()
+            .map(SessionEvent::kind)
+            .collect::<Vec<_>>(),
+        ["SessionCreated", "ContextForked", "InputRecorded"]
+    );
+
+    // A replay writes nothing twice.
+    scheduler.spawn(request).await.expect("replay");
+    assert_eq!(
+        events(&*log, child)
+            .await
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ContextForked { .. }))
+            .count(),
+        1
+    );
 }

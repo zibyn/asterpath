@@ -63,4 +63,7 @@ pub use tracing::{
     SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
     ToolCallAttrs, TraceError, TraceId, TraceQuery, TraceTap, TurnAttrs, WaitAttrs, WaitKind,
 };
-pub use usage::{InputTokens, OutputTokens, Usage};
+pub use usage::{
+    InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageError, UsageFilter,
+    UsageQuery, UsageRecord, UsageRecorded, UsageReport, UsageScope, UsageTotals,
+};
