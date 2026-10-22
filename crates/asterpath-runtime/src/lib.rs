@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath_core::{
-    AwaitSignal, Clock, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, ExecutionError,
+    AwaitSignal, Clock, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, ExecutionError, Fnv,
     LifecycleError, LogId, LogQuery, Module, ModuleCtx, ServiceId, SessionId, SignalDelivery,
     SignalId, SignalIntent, SignalName, SignalPayload, Storage, TimerId, TimerRequest, WakeCause,
 };
@@ -432,32 +432,6 @@ fn derive_timer_id(session: SessionId, caused_by: LogId, slot: TimerId) -> Timer
     hasher.write(&caused_by.as_i64().to_be_bytes());
     hasher.write(slot.as_bytes());
     TimerId::from_bytes(hasher.finish_128())
-}
-
-/// Deterministic 128-bit FNV-1a; avoids a hashing dependency for stable ids.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    /// Two differently seeded passes; the second consumes the first.
-    fn finish_128(&self) -> [u8; 16] {
-        let mut second = Fnv::new(self.0 ^ 0x9e3779b97f4a7c15);
-        second.write(&self.0.to_be_bytes());
-        let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&self.0.to_be_bytes());
-        bytes[8..].copy_from_slice(&second.0.to_be_bytes());
-        bytes
-    }
 }
 
 async fn collect<S>(mut stream: S) -> Result<Vec<asterpath_core::LogEntry>, ExecutionError>

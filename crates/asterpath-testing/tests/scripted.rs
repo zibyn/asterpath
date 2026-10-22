@@ -36,7 +36,7 @@ fn replays_a_scripted_response_in_canonical_order() {
         Usage::default(),
     );
 
-    let events: Vec<_> = futures_executor::block_on(async {
+    let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;
         provider
             .stream(request(&RequestConfig::default()))
@@ -80,7 +80,7 @@ fn records_the_received_request() {
         ..RequestConfig::default()
     };
 
-    let _ = futures_executor::block_on(async {
+    let _ = futures::executor::block_on(async {
         use futures_util::StreamExt;
         provider
             .stream(ModelRequest::new(
@@ -109,7 +109,7 @@ fn mid_stream_failure_never_ends_the_response() {
     let provider = ScriptedProvider::new("scripted")
         .partial_then_fail(vec![assistant_message("partial")], error.clone());
 
-    let events: Vec<_> = futures_executor::block_on(async {
+    let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;
         provider
             .stream(request(&RequestConfig::default()))
@@ -146,7 +146,7 @@ fn capability_mismatch_fails_before_the_script_is_used() {
         ..RequestConfig::default()
     };
 
-    let events: Vec<_> = futures_executor::block_on(async {
+    let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;
         provider
             .stream(request(&request_config))

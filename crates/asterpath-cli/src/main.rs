@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_core::{
+    Clock, EventLog, InputId, LogEntry, LogQuery, SessionId, SystemClock, unique_bytes,
+};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
     Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, TurnEndReason,
@@ -212,7 +214,20 @@ async fn run(args: RunArgs) -> CliResult<()> {
         .map_err(aster_error)?;
 
     let outcome = drive_approving(&asterpath, &handle, approval).await?;
-    if let Some(text) = final_text(&asterpath, &handle).await? {
+    finish(asterpath, &handle, outcome, false).await
+}
+
+/// Shared tail: print the result, close the composition root and map the turn
+/// reason to the process exit code.
+async fn finish(
+    asterpath: Asterpath,
+    handle: &SessionHandle,
+    outcome: DriveOutcome,
+    print_idle: bool,
+) -> CliResult<()> {
+    if print_idle && outcome.idle {
+        println!("idle");
+    } else if let Some(text) = final_text(&asterpath, handle).await? {
         println!("{text}");
     }
     asterpath.shutdown().await.map_err(aster_error)?;
@@ -237,17 +252,7 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     let handle = asterpath.open_session(session).await.map_err(aster_error)?;
 
     let outcome = drive_approving(&asterpath, &handle, approval).await?;
-    if outcome.idle {
-        println!("idle");
-    } else if let Some(text) = final_text(&asterpath, &handle).await? {
-        println!("{text}");
-    }
-    asterpath.shutdown().await.map_err(aster_error)?;
-
-    match outcome.reason {
-        None | Some(TurnEndReason::Completed) => Ok(()),
-        Some(other) => Err(CliError::run(format!("turn ended with {other:?}"))),
-    }
+    finish(asterpath, &handle, outcome, true).await
 }
 
 async fn inspect(args: SessionArgs) -> CliResult<()> {
@@ -632,20 +637,7 @@ fn aster_error(error: AsterError) -> CliError {
 }
 
 fn fresh_input_id() -> InputId {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut bytes = [0u8; 16];
-    bytes[..8]
-        .copy_from_slice(&(nanos ^ (std::process::id() as u64).rotate_left(17)).to_le_bytes());
-    bytes[8..].copy_from_slice(&counter.to_le_bytes());
-    InputId::from_bytes(bytes)
+    InputId::from_bytes(unique_bytes(SystemClock.now()))
 }
 
 #[cfg(test)]

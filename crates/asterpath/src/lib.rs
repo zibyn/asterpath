@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use asterpath_agent::Agent;
 use asterpath_core::{
-    ApprovalGate, DurableExecutor, EventLog, InputId, LogQuery, ModuleCtx, ModuleHost,
+    ApprovalGate, Clock, DurableExecutor, EventLog, InputId, LogQuery, ModuleCtx, ModuleHost,
     SessionCatalog, SessionId, SessionRetirement, SignalDelivery, Storage, ToolCallId,
+    unique_bytes,
 };
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
@@ -58,6 +59,7 @@ pub struct Asterpath {
     executor: Arc<dyn DurableExecutor>,
     gate: Arc<ApprovalGate>,
     cancellations: Arc<CancellationRegistry>,
+    clock: Arc<dyn Clock>,
     trace: Arc<dyn TraceQuery>,
     trace_tap: Arc<dyn TraceTap>,
     bus: Option<ModuleCtx>,
@@ -191,6 +193,7 @@ impl Asterpath {
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
+        let clock = Arc::clone(&config.clock);
 
         let agent = config.agent.unwrap_or_else(|| {
             Arc::new(
@@ -223,6 +226,7 @@ impl Asterpath {
             executor,
             gate,
             cancellations,
+            clock,
             trace: tracing_module.query(),
             trace_tap: tracing_module.tap(),
             bus,
@@ -269,7 +273,7 @@ impl Asterpath {
             }
         };
 
-        let session = SessionId::from_bytes(fresh_id());
+        let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
         let event = SessionEvent::SessionCreated {
             config: spec.snapshot(tools),
             parent: None,
@@ -466,21 +470,4 @@ impl SessionHandle {
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError> {
         Ok(self.agent.compact_now(self.session).await?)
     }
-}
-
-fn fresh_id() -> [u8; 16] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut bytes = [0u8; 16];
-    bytes[..8]
-        .copy_from_slice(&(nanos ^ (std::process::id() as u64).rotate_left(17)).to_le_bytes());
-    bytes[8..].copy_from_slice(&counter.to_le_bytes());
-    bytes
 }
