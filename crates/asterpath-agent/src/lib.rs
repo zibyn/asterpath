@@ -33,7 +33,7 @@ use asterpath_protocol::{
     ResumeReason, RunRequest, SessionEvent, SessionState, StopReason, StreamEvent, Tool, ToolArgs,
     ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind, ToolName,
     ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor,
-    approval_signal_id, approval_signal_name, decode_entry, dedup,
+    UsageBucket, UsageRecorded, approval_signal_id, approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -132,13 +132,96 @@ impl Agent {
         event: SessionEvent,
         key: Option<DedupKey>,
     ) -> Result<LogId, AgentError> {
-        let entry = asterpath_protocol::encode_entry(session, key, &event).map_err(|error| {
-            AgentError::Corrupt {
+        let entry =
+            asterpath_protocol::encode_entry(session, key.clone(), &event).map_err(|error| {
+                AgentError::Corrupt {
+                    session,
+                    detail: error.to_string(),
+                }
+            })?;
+        let log_id = self.log.append(entry).await?;
+        // The loop is the unique writer of every usage terminal, so it is the
+        // only emitter. Awaiting keeps the event ordered before the next gate.
+        if let Some(hooks) = &self.hooks {
+            let recorded = match &event {
+                SessionEvent::AssistantMessage {
+                    turn_id,
+                    step_id,
+                    model,
+                    usage,
+                    ..
+                } => Some(UsageRecorded {
+                    session,
+                    turn: Some(*turn_id),
+                    step: Some(*step_id),
+                    model: model.clone(),
+                    bucket: UsageBucket::ModelCall,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                SessionEvent::CompactionApplied { model, usage, .. } => Some(UsageRecorded {
+                    session,
+                    turn: self.compaction_turn(session, key.as_ref()).await?,
+                    step: None,
+                    model: model.clone(),
+                    bucket: UsageBucket::Compaction,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                SessionEvent::ModelCallAborted {
+                    turn_id,
+                    step_id,
+                    model,
+                    usage: Some(usage),
+                    ..
+                } => Some(UsageRecorded {
+                    session,
+                    turn: Some(*turn_id),
+                    step: Some(*step_id),
+                    model: model.clone(),
+                    bucket: UsageBucket::Partial,
+                    usage: *usage,
+                    log: log_id,
+                }),
+                _ => None,
+            };
+            if let Some(recorded) = recorded {
+                hooks.emit(recorded).await;
+            }
+        }
+        Ok(log_id)
+    }
+
+    /// The turn a compaction belongs to: the open turn at its
+    /// `CompactionStarted`, which is the turn of the `caused_by` frontier.
+    async fn compaction_turn(
+        &self,
+        session: SessionId,
+        key: Option<&DedupKey>,
+    ) -> Result<Option<TurnId>, AgentError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let mut current = None;
+        for entry in self.scan(session).await? {
+            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
+            })?;
+            match &event {
+                SessionEvent::TurnStarted { turn_id } => current = Some(*turn_id),
+                SessionEvent::TurnCommitted { turn_id, .. } => {
+                    if current == Some(*turn_id) {
+                        current = None;
+                    }
+                }
+                SessionEvent::CompactionStarted { .. } if entry.dedup_key.as_ref() == Some(key) => {
+                    return Ok(current);
+                }
+                _ => {}
             }
-        })?;
-        Ok(self.log.append(entry).await?)
+        }
+        Ok(None)
     }
 
     async fn execute(&self, session: SessionId, cancel: &CancelToken, events: &EventSink) {
