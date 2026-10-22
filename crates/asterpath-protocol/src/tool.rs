@@ -97,6 +97,8 @@ pub enum ToolError {
     Denied { message: String },
     #[error("cancelled: {message}")]
     Cancelled { message: String },
+    #[error("timed out: {message}")]
+    Timeout { message: String },
     #[error("transport error: {message}")]
     Transport { message: String },
     #[error("internal error: {message}")]
@@ -110,6 +112,7 @@ impl ToolError {
             | Self::NotFound { message }
             | Self::Denied { message }
             | Self::Cancelled { message }
+            | Self::Timeout { message }
             | Self::Transport { message }
             | Self::Internal { message } => message,
         }
@@ -121,6 +124,7 @@ impl ToolError {
             Self::NotFound { .. } => ToolErrorKind::NotFound,
             Self::Denied { .. } => ToolErrorKind::Denied,
             Self::Cancelled { .. } => ToolErrorKind::Cancelled,
+            Self::Timeout { .. } => ToolErrorKind::Timeout,
             Self::Transport { .. } => ToolErrorKind::Transport,
             Self::Internal { .. } => ToolErrorKind::Internal,
         }

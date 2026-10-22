@@ -1,6 +1,7 @@
 //! The model-visible `spawn_agent` tool: a thin wrapper over spawn + wait.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use asterpath_core::ExecutionError;
 use asterpath_protocol::{
@@ -21,6 +22,9 @@ struct SpawnArgs {
     model_alias: Option<String>,
     #[serde(default)]
     tool_allowlist: Option<Vec<String>>,
+    /// Per-call spawn deadline in milliseconds; overrides the config default.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 pub struct SpawnTool {
@@ -57,6 +61,11 @@ impl Tool for SpawnTool {
                     message: "task must not be empty".to_owned(),
                 });
             }
+            if args.timeout_ms == Some(0) {
+                return Err(ToolError::InvalidArgs {
+                    message: "timeout_ms must be greater than zero".to_owned(),
+                });
+            }
 
             let caused_by = self
                 .scheduler
@@ -79,22 +88,54 @@ impl Tool for SpawnTool {
             request.tool_allowlist = args
                 .tool_allowlist
                 .map(|names| names.into_iter().map(ToolName::new).collect());
+            request.timeout = args.timeout_ms.map(Duration::from_millis);
 
-            let child = match self.scheduler.spawn(request).await {
-                Ok(child) => child,
-                // Depth and argument errors mean no child exists and the model
-                // must fix its call.
-                Err(SpawnError::DepthExceeded) | Err(SpawnError::InvalidArgs { .. }) => {
-                    return Err(ToolError::InvalidArgs {
-                        message: "sub-agent spawn rejected: depth or arguments".to_owned(),
-                    });
+            // Queued or admitted, the spawn observes the turn's token. A
+            // queued entry is dropped (no child); an admitted child is
+            // cancelled and closed, then the future parks until the pipeline's
+            // grace writes `Interrupted`.
+            let mut spawning = self.scheduler.spawn(request.clone());
+            let child = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    drop(spawning);
+                    if let Some(child) = self
+                        .scheduler
+                        .spawned_child(request.parent.clone())
+                        .await
+                        .map_err(infra)?
+                    {
+                        self.scheduler.cancel_wait(child).await.map_err(wait_error)?;
+                    }
+                    return std::future::pending().await;
                 }
-                Err(SpawnError::Execution(error)) => {
-                    return Err(infra(error));
-                }
+                result = &mut spawning => match result {
+                    Ok(child) => child,
+                    // Depth and argument errors mean no child exists and the
+                    // model must fix its call.
+                    Err(SpawnError::DepthExceeded) | Err(SpawnError::InvalidArgs { .. }) => {
+                        return Err(ToolError::InvalidArgs {
+                            message: "sub-agent spawn rejected: depth or arguments".to_owned(),
+                        });
+                    }
+                    Err(SpawnError::Execution(error)) => {
+                        return Err(infra(error));
+                    }
+                },
             };
 
-            match self.scheduler.await_completion(&child).await {
+            let mut waiting = self.scheduler.await_completion(&child);
+            let result = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    drop(waiting);
+                    self.scheduler.cancel_wait(child).await.map_err(wait_error)?;
+                    return std::future::pending().await;
+                }
+                result = &mut waiting => result,
+            };
+
+            match result {
                 Ok(ChildOutcome::Completed { summary }) => Ok(ToolOutput::new(summary.items)),
                 Ok(ChildOutcome::Failed { reason, summary }) => {
                     let mut parts = vec![Part::Text {
@@ -115,9 +156,7 @@ impl Tool for SpawnTool {
                 Err(WaitError::Cancelled) => Err(ToolError::Cancelled {
                     message: "sub-agent wait cancelled".to_owned(),
                 }),
-                // #48 owns the persistent spawn timeout and its Failed{Timeout}
-                // mapping; v1 has no timeout timer yet.
-                Err(WaitError::Timeout) => Err(ToolError::Internal {
+                Err(WaitError::Timeout) => Err(ToolError::Timeout {
                     message: "sub-agent wait timed out".to_owned(),
                 }),
                 Err(WaitError::Execution(error)) => Err(infra(error)),
@@ -129,6 +168,18 @@ impl Tool for SpawnTool {
 fn infra(error: ExecutionError) -> ToolError {
     ToolError::Internal {
         message: error.to_string(),
+    }
+}
+
+fn wait_error(error: WaitError) -> ToolError {
+    match error {
+        WaitError::Cancelled => ToolError::Cancelled {
+            message: "sub-agent wait cancelled".to_owned(),
+        },
+        WaitError::Timeout => ToolError::Timeout {
+            message: "sub-agent wait timed out".to_owned(),
+        },
+        WaitError::Execution(error) => infra(error),
     }
 }
 
@@ -155,6 +206,11 @@ fn descriptor() -> ToolDescriptor {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional subset of the parent's tools."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional deadline for the child in milliseconds."
                 }
             },
             "required": ["task"],
