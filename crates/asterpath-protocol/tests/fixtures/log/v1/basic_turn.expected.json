@@ -1,0 +1,16 @@
+{
+  "frontier": 5,
+  "items": [
+    {
+      "Compaction": {
+        "parts": [{ "Text": { "text": "summary of hi" } }]
+      }
+    },
+    {
+      "Message": {
+        "role": "Assistant",
+        "parts": [{ "Text": { "text": "new" } }]
+      }
+    }
+  ]
+}
