@@ -1,6 +1,6 @@
 # 子智能体：子会话、上下文、等待与恢复
 
-> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复。具体 API 签名归 [#17](https://github.com/zibyn/asterpath/issues/17)，`Item` / `Part` / `ConfigSnapshot` / `Usage` 类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，token 聚合口径归 [#13](https://github.com/zibyn/asterpath/issues/13)。
+> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复。具体 API 签名归 [#17](https://github.com/zibyn/asterpath/issues/17)，`Item` / `Part` / `ConfigSnapshot` / `Usage` 类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，token 聚合口径见 [usage.md](usage.md)（#13）。
 >
 > 对齐：[#3 事件日志与检查点恢复](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)、[#7 工具契约](./tools.md)。
 >
@@ -326,7 +326,7 @@ recover(child):
 
 - trace：子会话是独立 trace；父 trace 的 `subagent` span 挂在 spawn 的 tool span 下，子 trace 的根 span 用 `parent_trace` / `parent_span` 指回它。关联键 `parent_tool_call_id` / `caused_by`；`ContextForked.source_log` 记在子 session span 上。见 [tracing.md](tracing.md)。
 - usage：子的 `AssistantMessage.usage` 只写子流；父日志不复制。
-- 聚合：session 总量 = 自身 + 后代，查询时按 session 树 rollup；不存冗余、不重复计数。口径与查询 API 归 #13。
+- 聚合：session 总量 = 自身 + 后代，查询时按 session 树 rollup；不存冗余、不重复计数。查询 API 见 [usage.md](usage.md)：`Session` scope 只返回自身，`SessionSubtree` 分开返回 `own` / `descendants`。
 - `ChildSessionCompleted` 不携带 usage；避免"父日志 + 子日志"双重计数。
 
 ## 11. 默认配置
@@ -395,7 +395,7 @@ pub struct SubagentConfig {
 - **#9**：子会话内的压缩策略；fork 快照尊重父的 `CompactionApplied`，但物化后与父压缩解耦。
 - **#11**：已定。`Item` / `Part`、`ConfigSnapshot`、`ContextPolicy`、`ChildOutcome` 的最终类型与 summary 的渲染见 [protocol.md](protocol.md)。
 - **#12**：已定。父 `subagent` span 与子 trace 根 span 的链接、`caused_by` / `source_log` 映射见 [tracing.md](tracing.md)。
-- **#13**：session 树 rollup、去重口径、子 usage 是否单独查询。
+- **#13**：已定。session 树 rollup、去重口径与子 usage 查询见 [usage.md](usage.md)；树边由 core 的 `SessionCatalog` 提供。
 - **#15**：spawn 工具的最终命名/参数 schema；`SubagentSpawner` 的打包位置。
 - **#16**：`spawn_agent` 的命名空间与重名策略。
 - **#17**：`SubagentSpawner` 精确签名、排队/唤醒实现、与 `DurableExecutor` 的接缝。

@@ -5,6 +5,8 @@
 > **2026-10-22 范围调整**：移除 `Workflow` 流、确定性重放与 activity/timer 编排引擎，见 [ADR-0003](../adr/0003-single-session-stream-topology.md)。本文件只描述 session 流；子智能体是子 session。
 >
 > **2026-10-22 #12 修订**：信封增加诊断时间 `recorded_at`（只供 trace/审计读取，不参与逻辑）；新增 `CompactionStarted` 与 `SignalAwaited` 意图记录。追踪模型见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
+>
+> **2026-10-22 #13 修订**：`AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`；用量桶、聚合与去重口径见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md)。`UsageRecorded` 是事件总线上的瞬时通知，不是 session 事件，不落日志。
 
 ## 1. 决策摘要
 
@@ -54,9 +56,10 @@ pub enum SessionEvent {
     StepStarted { turn_id: TurnId, step_id: StepId },
     AssistantMessage { turn_id: TurnId, step_id: StepId,
                        items: Vec<Item>, raw: Option<RawProviderData>,
-                       usage: Usage, stop_reason: StopReason },
+                       model: ModelSpec, usage: Usage, stop_reason: StopReason },
     ModelCallAborted { turn_id: TurnId, step_id: StepId, attempt: u32,
                        kind: AbortKind, partial: Option<Vec<Item>>,
+                       model: ModelSpec,
                        usage: Option<Usage> },  // 非模型可见；usage 为 best-effort
     ToolCallRequested { turn_id: TurnId, step_id: StepId,
                         tool_call_id: ToolCallId, name: ToolName,
@@ -71,7 +74,8 @@ pub enum SessionEvent {
                         replaces_from: LogId, caused_by: LogId },
     CompactionApplied { first_kept: LogId, summary: Vec<Part>,
                         replaces: LogIdRange,
-                        usage: Usage, raw: Option<RawProviderData> },
+                        model: ModelSpec, usage: Usage,
+                        raw: Option<RawProviderData> },
     ChildSessionSpawned { child: SessionId, task: Vec<Part>,
                           config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
@@ -105,7 +109,8 @@ pub enum TurnEndReason {
 - `ToolResult` 是工具调用的唯一终态：`Failed` 必带 `error`；`Interrupted` 的 `output` / `error` 为 `None`。
 - 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
-- `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。
+- `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。`model` 记在三个承载 usage 的终态记录上，是发起请求的 `ModelSpec`（#13）。
+- `usage` 的桶、聚合与重放去重规则见 [usage.md](usage.md)；日志层只负责让每条终态记录唯一。
 - `CompactionStarted` 是摘要调用的意图记录，`CompactionApplied` 是它的终态；失败的摘要 attempt 不落日志。`CompactionApplied` 不是 step：可在回合内 BetweenSteps 或回合外 Idle 追加；成功摘要调用的 `usage` / `raw` 挂在事件上。`replaces` 起点为流首或上一条 `replaces` 起点，投影只保留最新 summary（[compaction.md](compaction.md)）。
 - `AbortKind::Transport` 是可重试的传输/服务端错误；`Rejected` 是 provider 拒绝请求（不可重试）。
 - 同一 timer 只写 `TimerFired` 或 `TimerCancelled` 之一（执行器保证）；dedup key 只防同一事件重复。`caused_by` 指向触发该等待或压缩的日志记录（例如开启审批的 `ToolCallRequested`、声明等待的 `SignalAwaited`、触发压缩的 frontier 记录）。

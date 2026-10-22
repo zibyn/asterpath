@@ -19,7 +19,7 @@
 - **供应商特有数据按 item 保留为原始 JSON 字符串**；同 provider + model + `prefix_epoch` 时逐字节回放，不 parse/re-serialize。
 - **流式事件规范化**为 `ResponseStarted → ItemStarted / PartDelta / ItemCompleted → ResponseEnded`；只有 `ItemCompleted` 落日志，delta 是瞬态的。
 - **能力标志按 `ModelSpec` 声明**；loop 只按标志分支，不认 provider 身份；请求需要而能力不支持时返回 `Unsupported`，不静默降级。
-- **usage 统一为 exclusive 口径**：未缓存输入、缓存读、缓存写、输出、推理分开；原始 usage 留在 raw。聚合口径归 #13。
+- **usage 统一为 exclusive 口径**：未缓存输入、缓存读、缓存写、输出、推理分开；原始 usage 留在 raw。聚合口径见 [usage.md](usage.md)（#13）。
 - **错误由 adapter 分类**为 `ProviderError`；loop 只读 `retryable` 与 `ContextExceeded`，不映射 HTTP 状态。
 - **跨 provider / 压缩后旧 reasoning 不回放**；规范可见部分保留，不把 summary 伪装成文本。trace 记录丢弃项。
 - **`Provider` 只有 `capabilities` + `stream`**；adapter 管传输、格式、归一化、raw；loop 管重试、日志、工具、投影、压缩。
@@ -386,7 +386,8 @@ impl Usage {
 - 统一为 **exclusive** 口径：`input_total = uncached + cache_read + cache_write`；OpenAI 的 inclusive `input_tokens` 必须减去缓存部分。
 - 缺失字段按 0 处理；原始 usage 留在 `raw`，不伪造。
 - `Usage` 只描述一次模型响应；`AssistantMessage.usage` 与 `CompactionApplied.usage` 使用它；失败 attempt 的 usage 是 best-effort `Option<Usage>`。
-- 聚合、桶与 partial usage 归 [#13](https://github.com/zibyn/asterpath/issues/13)。
+- 聚合、桶与 partial usage 见 [usage.md](usage.md)（#13）。承载 usage 的日志事件（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）各带 `model: ModelSpec`，用于按模型聚合；`raw` 只作原始回放，不参与归因。
+- 失败 attempt 的已知用量经 `ProviderError.partial_usage` 交给 loop；它只作诊断，不进总量。
 
 ## 8. 错误归一化
 
@@ -397,6 +398,7 @@ pub struct ProviderError {
     pub retry_after: Option<Duration>,
     pub request_id: Option<String>,
     pub message: String,
+    pub partial_usage: Option<Usage>,   // 流已给出的已知用量；仅诊断
     pub raw: Option<RawProviderData>,
 }
 
@@ -437,6 +439,7 @@ pub enum ProviderErrorKind {
 - HTTP 状态、SSE `error`、`Retry-After`、`request-id` / `x-request-id`、上下文超限识别全部在 adapter。
 - loop 只读 `retryable` 与 `kind == ContextExceeded`；重试次数、退避、取消归 #6。
 - `request_id` 来自响应头或响应 id；`raw` 保存错误 body 的原始文本。
+- `partial_usage` 是 adapter 的 best-effort：只填 provider 已明确给出的部分（例如 Anthropic `message_start` 的输入侧），缺的部分按 0，不估算。loop 原样写入 `ModelCallAborted.usage`（#13）。
 - 流中途失败前已 `ItemCompleted` 的 item 由 loop 组成 `ModelCallAborted.partial`；不写 `AssistantMessage`（#6 I9）。
 
 ## 9. 原始 JSON 保留与回放
@@ -657,7 +660,7 @@ pub enum ProviderErrorKind {
 ## 15. 留给下游
 
 - **#12**：`StreamEvent`、`ResponseStarted` / `ResponseEnded`、`protocol.dropped_items` 到 trace span 的命名与属性。
-- **#13**：`Usage` 的聚合、桶、partial usage 与 session 树 rollup。
+- **#13**：已定。`Usage` 的聚合、桶、partial usage 与 session 树 rollup 见 [usage.md](usage.md)；`ProviderError.partial_usage` 与三个事件上的 `model` 字段已回写本文件与 #3。
 - **#15**：`ProviderId` / `ModelId` / `ToolName` / `JsonString` 的精确类型与打包；`Provider` 注册与模型解析；`max_output_tokens` 的宿主配置。
 - **#16**：provider 插件、模型 alias、`RawProviderData.kind` 的跨版本兼容责任。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。

@@ -158,12 +158,12 @@ struct AttemptEvent {
     kind: AbortKind,              // Transport | Rejected | Cancelled | Crash
     error_type: ErrorType,
     backoff_before_ms: u64,       // 本次 attempt 之前的退避；首次为 0
-    partial_usage: Option<Usage>, // best-effort，默认不计入 #13 总量
+    partial_usage: Option<Usage>, // 来自 ProviderError.partial_usage；默认不计入总量
     replayed: bool,               // 该 attempt 发生在 StreamResumed 之后
 }
 ```
 
-- 失败 attempt 的 `partial_usage` 只作诊断；#13 的 token 总量只取 span 的 `usage`。
+- 失败 attempt 的 `partial_usage` 只作诊断；token 总量只取 span 的 `usage`（[usage.md](usage.md)）。
 - 最终成功的 `model_call` 即使中间有可重试错误，`status = Ok`；被重试处理的错误不置 `Error`（与 OTel Recording Errors 一致）。
 - 重试耗尽 / `Rejected` → `status = Error`，`error_type` 取最后一次 attempt。
 
@@ -237,7 +237,7 @@ pub enum TraceError { Corrupt { session: SessionId, detail: String }, Backend(St
 | #8 子智能体 | 父 trace 的 `subagent` span；子 trace 根 span 的 `parent_trace` / `parent_span`；`fork_source_log` |
 | #9 压缩 | `CompactionStarted` → `CompactionApplied` 构成 compaction span；usage 单列 |
 | #11 协议 | §2 的类型进 `asterpath-protocol` |
-| #13 token | span `usage` 即归一化口径；`partial_usage` 默认不计；compaction usage 单列 |
+| #13 token | 已定。span `usage` 与 [usage.md](usage.md) 的 `model_calls` / `compaction` 必须对账（U12）；`partial` 不进总量 |
 | #17 调度 | `SignalAwaited` 的写入点；timer/signal 等待的 `caused_by` 锚点 |
 | #18 保留/归档 | trace 不拥有存储；日志被归档后重建范围随之缩小，由扩展声明 |
 | #19 测试 | 确定性重建与崩溃恢复的 trace 断言 |

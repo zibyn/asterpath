@@ -124,6 +124,14 @@ pub trait EventLog: Send + Sync {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 }
 
+// 会话树只读视图，由存储模块实现；用量子树汇总与归档使用（#13/#18）。
+pub trait SessionCatalog: Send + Sync {
+    fn parent(&self, session: SessionId)
+        -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
+    fn children(&self, session: SessionId)
+        -> BoxStream<'_, Result<SessionId, StorageError>>;
+}
+
 pub trait DurableExecutor: Send + Sync {
     fn schedule_timer(&self, deadline: Timestamp)
         -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
@@ -204,7 +212,7 @@ pub trait AgentRunner: Send + Sync {
 | 扩展 | 接入方式 | 内核提供的 seam |
 | --- | --- | --- |
 | 沙箱/隔离 | adapter 或工具包装模块 | `Provenance`、pre/post-execute hook、`Tool` 包装 |
-| 成本/预算 | 消费 usage 的模块 + pre-step gate | `AssistantMessage.usage`、pre-step waterfall |
+| 成本/预算 | 消费 usage 的模块 + pre-step gate | `UsageRecorded` / `UsageQuery`、pre-step waterfall（#13） |
 | trace 导出/采样 | exporter 模块订阅 tracing 模块 | 原生 trace 模型/查询、事件日志 |
 | 日志保留/归档 | storage admin 扩展 | `EventLog` / `Storage` 的扩展能力（#18） |
 | 内容脱敏/密钥 | host 或 post-execute 模块 | `post-execute` hook |
@@ -263,7 +271,7 @@ pub trait AgentRunner: Send + Sync {
 | #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
 | #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
-| #13 token 统计 | 订阅 usage 事件；usage 类型在 protocol |
+| #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 最终 crate 列表、门面、CLI 打包 |
 | #16 插件分发 | 插件清单、发现、版本协商 |
 

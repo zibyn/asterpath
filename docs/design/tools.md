@@ -283,14 +283,14 @@ pub struct ToolConfig {
 
 - **沙箱/隔离**：adapter 或工具包装模块；内核只带 `Provenance`，不建模 profile。包装器可以在 `invoke` 前后做隔离、审计或拒绝。
 - **内容脱敏/密钥**：host 或 `post-execute` 模块；内核不提供默认规则。`post-execute` 在落盘前运行，是唯一接入点。
-- **成本/预算**：不是工具层扩展；usage 与 pre-step gate 见 #13 / agent loop。
+- **成本/预算**：不是工具层扩展；usage 与 pre-step gate 见 [usage.md](usage.md) / [agent-loop.md](agent-loop.md)。
 - **内置工具**：可选模块或参考 CLI，不在内核。
 
 ## 12. 留给下游
 
 - **#11**：已定。`Part`、`Item`、`JsonString`、`JsonValue`、`Usage`；工具参数保持原始 JSON 字符串；session `ToolResult` 映射为规范 `ToolResult` item（`is_error = status != Completed`）。类型与映射见 [protocol.md](protocol.md)。
 - **#12**：tool span 命名与属性；默认只记元数据。
-- **#13**：工具输出计入下一次模型请求的 input tokens，不单独统计。
+- **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：工具名命名空间与重名策略、插件清单与加载、外部工具的版本协商。
 - **#17**：`DurableExecutor::await_signal` 必须支持审批等待；signal name 约定由本文件定义。

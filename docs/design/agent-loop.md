@@ -251,7 +251,7 @@ StepCommitted
 - 退避：指数 ×2，jitter，cap 30s；可被取消打断。
 - 每次 attempt 受 `request_timeout` 约束；超时按可重试 `Transport` 处理。
 - 部分流：不写 `AssistantMessage`；`partial` 仅作诊断，不投影（I9）。
-- 失败 attempt 的 usage 是 best-effort（`Option<Usage>`），是否计入归 #13。
+- 失败 attempt 的 usage 是 best-effort（`ProviderError.partial_usage` → `ModelCallAborted.usage`）；只进 `partial` 桶，不计入总量（[usage.md](usage.md)）。
 - **工具失败不重试**：`ToolResult{Failed}` 是模型可见结果，回合继续。超时、panic 的映射见 [tools.md](tools.md) §6。
 
 ## 8. 结束路径
@@ -276,7 +276,8 @@ StepCommitted
 - span 层级：session → turn → step → model_call / tool_call / wait；transport attempt 折叠为 `model_call` span 上的 event。见 [tracing.md](tracing.md)。
 - 成功的模型调用在 `AssistantMessage` 收尾，`usage` 挂在这里；失败的 attempt 在 `ModelCallAborted` 收尾。
 - step 在 `StepCommitted` 收尾，回合在 `TurnCommitted` 收尾。
-- token 总量 = 该范围内 `AssistantMessage.usage` 求和；中断 attempt 的 partial usage 单独标注（#13）。
+- token 总量 = 该范围内 `AssistantMessage.usage` 求和；中断 attempt 的 partial usage 单独标注（[usage.md](usage.md)）。
+- 每次 append 承载 usage 的终态记录后，loop 发一条 `UsageRecorded`（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）；它是唯一发射点（#13）。
 
 ## 10. 默认配置
 
@@ -302,7 +303,7 @@ pub struct TurnConfig {
 | `tool_kill_grace` | `5s` | 超时/取消后强杀外部工具的宽限（#7） |
 | pre-step gate | 无 | 宿主注册 waterfall |
 | host stop | 无 | 宿主经 gate 返回 `Stopped { reason }` |
-| cost/budget 扩展 | 无 | 模块订阅 usage，经 gate 返回 `Stopped { reason }`；价格表/币种不在内核 |
+| cost/budget 扩展 | 无 | 模块订阅 `UsageRecorded`，经 gate 返回 `Stopped { reason }`；最多超支一个 step；价格表/币种不在内核（#13） |
 
 ## 11. 验收场景
 
@@ -329,6 +330,6 @@ pub struct TurnConfig {
 - **#9**：已定。触发、保留、摘要调用、事件与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
-- **#13**：token 聚合与中断 attempt 的 partial usage 口径。
+- **#13**：已定。token 聚合、`partial` 桶、`UsageRecorded` 发射点见 [usage.md](usage.md)。
 - **#15**：`AgentRunner::run` / `SessionHandle` 的精确签名。
 - **#17**：timer/signal API；`TimerScheduled.caused_by` 与等待归属；取消如何触发。

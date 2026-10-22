@@ -60,7 +60,7 @@ pub enum CompactResult {
 - **窗口**：`ModelSpec.context_window: Option<u32>`，由宿主配置；`ProviderCapabilities` 可给 advisory 默认值，但不作为真相（两家 API 都不返回窗口）。类型归 [#11](https://github.com/zibyn/asterpath/issues/11)。
 - **usable window** = `context_window − reserve_output_tokens`。
 - **估算**：`estimated_input = 最近一次 AssistantMessage.usage 的归一化 input tokens + 其后新增模型可见内容的 bytes/3`。
-  - 归一化口径归 [#13](https://github.com/zibyn/asterpath/issues/13)（Anthropic 三者相加，OpenAI inclusive）。
+  - 归一化沿用 #11 的 exclusive 口径（Anthropic 三者相加，OpenAI inclusive），聚合见 [usage.md](usage.md)。
   - 最近一次 usage 已含 system / tools 的静态前缀，因此**不需要**单独估算它们。
   - `bytes/3` 是刻意偏高估（中文约 1 token/字；英文约 4 bytes/token），宁可早压。
   - 第一个 step 之前没有 usage，不做自动压缩。
@@ -100,6 +100,7 @@ CompactionApplied {
     first_kept: LogId,
     summary: Vec<Part>,
     replaces: LogIdRange,
+    model: ModelSpec,
     usage: Usage,
     raw: Option<RawProviderData>,
 }
@@ -154,7 +155,7 @@ project(entries):
 
 - **前缀缓存**：压缩必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
 - **追踪**：`CompactionStarted` → `CompactionApplied` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
-- **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。最终口径归 [#13](https://github.com/zibyn/asterpath/issues/13)。
+- **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取 `CompactionStarted.caused_by` 所在回合；最终口径见 [usage.md](usage.md)（#13）。
 
 ## 8. 默认配置
 
@@ -202,6 +203,6 @@ pub struct CompactionConfig {
 
 - **#11**：已定。`Item::Compaction` 的形状与双协议渲染、`ModelSpec.context_window`、`Usage`、`Compactor` trait 见 [protocol.md](protocol.md)。
 - **#12**：已定。`CompactionStarted` → `CompactionApplied` 的 span 见 [tracing.md](tracing.md)。
-- **#13**：`compaction` 桶与 turn / session / 子会话 rollup 的最终口径；估算与 usage 归一化的关系。
+- **#13**：已定。`compaction` 桶、turn / session / 子会话 rollup 与估算边界见 [usage.md](usage.md)。
 - **#15**：`Compactor`、`SessionHandle::compact_now()` 的精确签名与错误类型。
 - **#19**：C3 / C4 / C10 的崩溃注入点与确定性测试。
