@@ -19,8 +19,9 @@ pub mod tool;
 pub mod usage;
 
 pub use agent::{
-    AgentError, AgentEvent, AgentRunner, ApprovalRequest, CompactResult, CompactionError,
-    CompactionOutcome, RunRequest, RunTrigger, SessionSpec, ToolSelection, UserInput,
+    AgentError, AgentEvent, AgentRunner, ApprovalRequest, CancelRegistration, CancellationRegistry,
+    CompactResult, CompactionError, CompactionOutcome, PreStepGateDecision, PreStepGateError,
+    PreStepGateEvent, RunRequest, RunTrigger, SessionSpec, ToolSelection, UserInput,
 };
 
 pub use config::{
