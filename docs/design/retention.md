@@ -79,15 +79,15 @@ pub enum RetirementError {
 | 墓碑存在且 `expected_frontier == last_log_id` | 幂等成功 |
 | 墓碑存在但 frontier 不同 | `FrontierMoved { actual: Some(last_log_id) }` |
 | 墓碑与活会话都不存在 | `NotFound` |
-| `sessions.state != idle` | `NotIdle` |
+| 存在非 compaction 的 open intent | `NotIdle` |
 | 当前 frontier != `expected_frontier` | `FrontierMoved { actual }` |
 | 存在 `parent_id = session` 的活会话 | `HasChildren` |
-| 父会话存在且其 `state != idle` | `ParentNotIdle` |
+| 父会话存在且有非 compaction 的 open intent | `ParentNotIdle` |
 
-通过后，在**一个事务**里：写墓碑 → 删 `log` → 删 `timers` → 删 `runnable` → 删 `sessions`。
+通过后，在**一个事务**里：写墓碑 → 删 `log` → 删 `open_intents` → 删 `timers` → 删 `runnable` → 删 `sessions`。
 
 - **只删整会话**。裁前缀会产生 `seq` 洞（违反 G3）并让恢复从错误检查点折叠；按事件保留会让信封与投影失去一致性。
-- **`idle` 已覆盖恢复相关的未闭合意图**：open step / 工具 / timer / signal / 子会话等待都会把状态推离 `idle`。唯一例外是 `CompactionStarted`，它没有副作用，丢弃它是安全的，因此退役不需要扫描事件。
+- **`idle` 就是「没有非 compaction 的 open intent」**：open turn / step / 工具 / timer / signal / 子会话等待都会让会话非 idle（[storage.md](storage.md) §5 的 `open_intents`）。唯一例外是 `CompactionStarted`，它没有副作用，丢弃它是安全的，因此退役不需要扫描日志。
 - **`ParentNotIdle`** 是“父会话没有未闭合 spawn 意图”的可强制执行形式：父会话 `idle` 意味着它所有工具意图都已闭合，`ChildSessionCompleted` 必已写入。调用方仍负责自底向上删除；级联删除不做。
 - **幂等重试**：退役是单事务，提交后、调用方收到结果前崩溃时，用同一 `expected_frontier` 重试返回成功。frontier 不同说明会话在导出后被推进过，必须先重新导出。
 - 退役由单写者串行化；CAS 针对的是同进程内并发驱动，不是多进程。
@@ -140,7 +140,7 @@ CREATE TABLE retired_sessions (
 );
 ```
 
-- 墓碑**不是派生索引**，无法由日志重建（日志已删）；它是退役的真相。G7 仍只覆盖 `sessions` / `timers` / `runnable`。
+- 墓碑**不是派生索引**，无法由日志重建（日志已删）；它是退役的真相。G7 仍只覆盖 `sessions` / `open_intents` / `timers` / `runnable`。
 - 退役：`BEGIN IMMEDIATE` 内完成 §5 的检查与删除；检查与删除对 append 原子。
 - 导出的稳定前缀由现有 `scan` 保证；实现不需要为导出新增读事务或快照机制。
 
@@ -177,7 +177,7 @@ CREATE TABLE retired_sessions (
 | R1 | 先取 frontier、导出、期间又有 append | 导出最后一条 `log_id` = 捕获的 frontier；用该 frontier 退役返回 `FrontierMoved`，新记录不丢 |
 | R2 | 导出、按 frontier 退役、再查询 | `open_session` = `NotFound`；`scan` 空流；`frontier` = `None`；用量/追踪 = `NotFound` |
 | R3 | 同一 frontier 重试退役 | 返回成功；墓碑只有一行 |
-| R4 | 非 idle（step_open / waiting）会话退役 | `NotIdle`；日志与派生行不变 |
+| R4 | 存在未闭合 turn/step/tool/wait 意图的会话退役 | `NotIdle`；日志与派生行不变 |
 | R5 | 有活子会话时退役父会话 | `HasChildren`；先删子再删父成功 |
 | R6 | 父会话非 idle 时退役 idle 子会话 | `ParentNotIdle` |
 | R7 | 退役后重启进程再重试 | 墓碑仍在；同一 frontier 返回成功，不重新删除 |

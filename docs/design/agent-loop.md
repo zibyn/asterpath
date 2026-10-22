@@ -51,7 +51,7 @@
 
 状态是日志的投影，不是额外记录：
 
-- `Idle`：最后一条是 `SessionCreated` 或 `TurnCommitted`。
+- `Idle`：没有未闭合的 turn / step / tool / wait 意图（compaction 除外）。
 - `TurnOpen`：`TurnStarted` 无 `TurnCommitted`。
   - `BetweenSteps`：没有 open step（`TurnStarted` 之后、`StepStarted` 之前，或刚 `StepCommitted`）。
   - `ModelCalling`：`StepStarted` 无 `AssistantMessage`。

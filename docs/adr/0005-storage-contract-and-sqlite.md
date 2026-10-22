@@ -17,7 +17,7 @@
 - **`journal_mode=WAL` + `synchronous=FULL` 默认。** append 返回即 fsync；`NORMAL` 是显式选项，只用于测试/开发。
 - **进程独占写者。** `<db>.lock` 上非阻塞 `flock`，生命周期持有，不续约；第二个进程 `WriterBusy`。租约表只做诊断，不判权。
 - **一条记录一个事务**；`seq` 用 `MAX(seq)+1` 在事务内分配。timer 火化 / signal 到达与入队同事务；父子会话跨流不原子。
-- **派生索引在 `append` 内维护**：`sessions`、`timers`、`runnable` 可由日志重建，撤销了单独 enqueue API 的必要。
+- **派生索引在 `append` 内维护**：`sessions`、`open_intents`、`timers`、`runnable` 可由日志重建，撤销了单独 enqueue API 的必要；会话 `idle` 由未闭合意图推导，不缓存状态列（#23）。
 - **幂等键按事件类型隔离。** `log` 表存 `event_kind`（payload 顶层变体名），唯一约束与查重 SQL 都用 `(session_id, event_kind, dedup_key)`。意图与终态刻意共用原始 key（如 `tool_call_id`）作为关联，不能互相抑制；因此解码提前到查重之前，以便同时得到 `event_kind`。
 - **没有 torn-tail 修复**：SQLite 提交原子，解码失败是硬错误而不是可截断的尾巴。
 - **v1 不做投影快照**；恢复从检查点折叠。

@@ -12,7 +12,8 @@
 - **`journal_mode=WAL` + `synchronous=FULL` 为默认。** `NORMAL` 只作为显式配置项，供测试/开发用。
 - **写者是进程独占的。** `flock` 写者锁在打开时非阻塞获取，进程死亡由 OS 释放；不续约、不过期。第二个进程打开即 `WriterBusy`。
 - **一条日志记录 = 一个事务。** 不做多记录批量事务；`seq` 在事务内用 `MAX(seq)+1` 分配。
-- **派生表在 `append` 内同一事务维护**：`sessions`、`timers`、`runnable` 都是日志的派生索引，不是真相源。
+- **派生表在 `append` 内同一事务维护**：`sessions`、`open_intents`、`timers`、`runnable` 都是日志的派生索引，不是真相源。
+- **`idle` 是未闭合意图的谓词，不是缓存列。** `sessions` 没有 `state`；存在任一非 compaction 的 open intent 即非 `idle`。storage 与恢复共用同一个折叠函数（[event-log-recovery.md](event-log-recovery.md) §6）。
 - **没有 torn tail 修复。** SQLite 提交原子；解码失败一律硬错误。
 - **v1 不做投影快照。** 恢复从检查点折叠日志。
 
@@ -119,8 +120,15 @@ PRAGMA user_version = 1;
 CREATE TABLE sessions (
     session_id  BLOB    PRIMARY KEY,           -- SessionId 的 16 字节
     parent_id   BLOB,                          -- 子会话指向父会话
-    state       TEXT    NOT NULL,              -- idle | step_open | tool_pending | waiting
     created_at  INTEGER NOT NULL                -- 诊断用，不参与任何逻辑
+);
+
+-- 未闭合意图；idle = 没有非 compaction 行。由日志折叠重建。
+CREATE TABLE open_intents (
+    session_id BLOB NOT NULL,
+    kind       TEXT NOT NULL,   -- turn | step | tool | timer | child | signal | compaction
+    ref_id     BLOB NOT NULL,   -- 各事件 id；compaction 用 frontier LogId（8 字节大端）
+    PRIMARY KEY (session_id, kind, ref_id)
 );
 
 CREATE TABLE log (
@@ -170,7 +178,9 @@ CREATE TABLE retired_sessions (
 );
 ```
 
-- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `timers` / `runnable`。
+- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `open_intents` / `timers` / `runnable`。
+
+- `open_intents` 是派生索引：`idle` 谓词为「不存在 `kind != 'compaction'` 的行」。compaction 行用于恢复重做，不影响 `idle`；其 `ref_id` 取 dedup key 里的 frontier `LogId`。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
@@ -193,28 +203,37 @@ BEGIN IMMEDIATE
   seq = COALESCE((SELECT MAX(seq) FROM log WHERE session_id=?), 0) + 1
   recorded_at = now_ms()                        -- 存储层本地时钟
   INSERT INTO log (..., event_kind, recorded_at, ...)
-  apply_derived(event)                           -- sessions/timers/runnable，同一事务
+  apply_derived(event, dedup_key)                -- open_intents/timers/runnable，同一事务
 COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
 - 解码在查重之前，同时给出 `event_kind` 与派生输入；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
-- 派生规则（与恢复的分类器共享同一个函数，不各写一套）：
+- 派生规则（`open_intents` 的折叠与恢复的分类器共享同一个 `OpenIntents` 函数，不各写一套）：
 
-| 事件 | `sessions.state` | 派生动作 |
+| 事件 | `open_intents` 动作 | 其他派生动作 |
 | --- | --- | --- |
-| `SessionCreated` | `idle` | 插入 sessions 行 |
-| `InputRecorded` | `idle` | — |
-| `TurnStarted` / `StepStarted` / `AssistantMessage` / `StepCommitted` / `ToolResult` | `step_open` | — |
-| `ToolCallRequested` | `tool_pending` | — |
-| `TimerScheduled` | `waiting` | 插入 timers 行 |
-| `TimerFired` | `idle` | 标记 `fired_at`；入队 `runnable` |
-| `SignalReceived` | `idle` | 入队 `runnable` |
-| `ChildSessionSpawned` | `waiting` | — |
-| `ChildSessionCompleted` | `idle` | 入队父会话 `runnable` |
-| `TurnCommitted` | `idle` | — |
-| `SignalAwaited` | `waiting` | — |
-| `CompactionStarted` / `CompactionApplied` | 不变 | — |
-| `ModelCallAborted` / `StreamResumed` | 不变 | — |
+| `SessionCreated` | — | 插入 sessions 行 |
+| `InputRecorded` | 不变 | — |
+| `TurnStarted` | 插入 `(turn, turn_id)` | — |
+| `TurnCommitted` | 删除 `(turn, turn_id)` | — |
+| `StepStarted` | 插入 `(step, step_id)` | — |
+| `StepCommitted` | 删除 `(step, step_id)` | — |
+| `ToolCallRequested` | 插入 `(tool, tool_call_id)` | — |
+| `ToolResult` | 删除 `(tool, tool_call_id)` | — |
+| `TimerScheduled` | 插入 `(timer, timer_id)` | 插入 timers 行 |
+| `TimerFired` | 删除 `(timer, timer_id)` | 标记 `fired_at`；入队 `runnable` |
+| `TimerCancelled` | 删除 `(timer, timer_id)` | 删除 timers 行 |
+| `SignalAwaited` | 插入 `(signal, signal_id)` | — |
+| `SignalReceived` | 删除匹配的 `(signal, signal_id)`；无匹配则不变 | 入队 `runnable` |
+| `ChildSessionSpawned` | 插入 `(child, child_session_id)` | — |
+| `ChildSessionCompleted` | 删除 `(child, child_session_id)` | 入队父会话 `runnable` |
+| `CompactionStarted` | 插入 `(compaction, frontier LogId)` | — |
+| `CompactionApplied` | 删除 `(compaction, frontier LogId)` | — |
+| `AssistantMessage` / `ModelCallAborted` / `StreamResumed` / `ContextForked` | 不变 | — |
+
+- 删除按键**精确匹配**。审批的 `SignalReceived` 没有对应 `SignalAwaited`，因此不删除任何行；steering 的 `InputRecorded` 也不改变状态。
+- **`idle` = `open_intents` 中没有 `kind != 'compaction'` 的行。** compaction 行只供恢复重做（#24/#27），不影响退役与启动入队。
+- `TimerCancelled` 删除 timers 行：日志是真相，`due_timers` 只查 `fired_at IS NULL`。
 
 入队是 upsert：`generation = generation + 1`，`not_before = min(现在, 事件时间)`，`reason` 取最新来源。
 
@@ -222,7 +241,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 
 | 写入 | 事务 |
 | --- | --- |
-| 任意一条日志记录 + 其派生行 | 一个事务，提交后返回 |
+| 任意一条日志记录 + 其派生行（sessions / open_intents / timers / runnable） | 一个事务，提交后返回 |
 | `TimerFired` + `fired_at` + 入队 | 同一个 append 事务 |
 | `SignalReceived` + 入队 | 同一个 append 事务 |
 | 子会话终态（子流）与 `ChildSessionCompleted`（父流） | 两个事务，不跨流；靠幂等键修复 |
@@ -247,7 +266,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - `ack(wake)`：`DELETE ... WHERE session_id=? AND generation=?`。generation 不匹配说明期间有新的唤醒，保留该行。
 - `due_timers`：只读索引查询，返回 `deadline <= now AND fired_at IS NULL`。追加 `TimerFired` 由调度方（#17）完成；append 同时标记 `fired_at` 并入队。
 - 启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（必要时前向迁移）→ `recover_at_startup`。
-- `recover_at_startup`：清空所有 `lease_owner`（本进程已是唯一写者），把所有 `state != 'idle'` 的 session 入队（`reason=startup`）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
+- `recover_at_startup`：清空所有 `lease_owner`（本进程已是唯一写者），把所有存在非 compaction open intent 的 session 入队（`reason=startup`）。只有 `CompactionStarted` 未闭合的 session 仍视为 idle，不入队（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
 
 ## 8. 保证清单
 
@@ -259,7 +278,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
 - **G5 至少一次唤醒**：入队的唤醒最终会被 `claim`；同 session 合并；`ack` 不会吃掉新一代唤醒。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
-- **G7 索引可重建**：`sessions` / `timers` / `runnable` 可完全由日志（加显式唤醒查询）重建，不是真相源。
+- **G7 索引可重建**：`sessions` / `open_intents` / `timers` / `runnable` 可完全由日志（加显式唤醒查询）重建，不是真相源。`open_intents` 折叠出的集合必须与恢复的 `OpenIntents` 折叠一致。
 - **G8 退役原子性（可选能力）**：`SessionRetirement::retire` 在同一事务里写墓碑、删日志与全部派生行；要么全部生效，要么全部不生效；退役后的会话对 `EventLog` / `Storage` / `SessionCatalog` 不可见。契约见 [retention.md](retention.md)。
 
 trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、`flock`、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。
@@ -280,12 +299,13 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 | 场景 | 归属 |
 | --- | --- |
 | S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；S9 timer 恰触发一次；claim/ack 不丢唤醒；启动回收租约 | 存储 crate 单测 |
+| S13 `open_intents` 派生与日志折叠一致；steering / timer / signal / 子会话完成在 open step 中到达后仍非 idle；仅 compaction 未闭合时视为 idle | 存储 crate 单测（与 #6 / #8 的分类器共享用例） |
 | S1 `Safe` 工具中 kill、S2 `Unsafe` 工具中 kill、S3 模型流中 kill、S6 父等子时 kill | #6 / #17 的进程级验收；本轮只固定注入点契约 |
 | S7 `CompactionApplied` 投影 | #9 / #6 |
 
 ## 10. 留给下游
 
-- **#6**：turn/step 的终止条件、取消宽限期，决定 `sessions.state` 的完整转移。
+- **#6**：turn/step 的终止条件、取消宽限期，决定哪些意图在何时闭合；`idle` 由未闭合意图推导。
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
 - **#17**：claim 循环、`TimerFired` 追加、signal 投递、租约时长。

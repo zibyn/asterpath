@@ -19,6 +19,7 @@
 - **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
 - 日志层**没有 ack**：完成 = 写了终态记录。租约与 ack 只属于存储的调度队列。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
+- **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
 - **等待是事件**：timer、外部 signal、子会话完成都以意图 + 终态记录，崩溃后重新挂起；signal 等待的意图记录是 `SignalAwaited`。
 - **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合。
 - 幂等：`(session, 事件类型, dedup_key)` 唯一，重复 append 返回原 `LogId`。
@@ -174,7 +175,7 @@ pub struct LogEntry {
 
 ```rust
 pub enum StreamState {
-    Idle,                                   // 最后一条是 TurnCommitted，或 stream 刚创建
+    Idle,                                   // 没有非 compaction 的未闭合意图
     TurnOpen { step: Option<StepState> },   // TurnStarted 无 TurnCommitted
 }
 
@@ -184,7 +185,11 @@ pub enum StepState {
 }
 ```
 
-「未闭合意图」的精确定义：`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`SignalAwaited` 无 `SignalReceived`；`CompactionStarted` 无 `CompactionApplied`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
+「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`TimerScheduled` 无 `TimerFired` / `TimerCancelled`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`SignalAwaited` 无 `SignalReceived`；`CompactionStarted` 无 `CompactionApplied`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
+
+- `OpenIntents`（protocol）是唯一的折叠实现：`apply(event)` 维护 `(kind, id)` 集合，`is_idle()` 排除 `compaction`。storage 在同一事务里把集合物化为 `open_intents` 表；恢复对日志折叠得到同一集合；两者不一致即违反 G7。
+- 关闭事件按键精确匹配。审批的 `SignalReceived` 没有对应 `SignalAwaited`，不关闭任何意图；`InputRecorded` 不是意图。
+- `Idle` 只看非 compaction 意图：只有 `CompactionStarted` 未闭合时仍是 `Idle`（丢弃一次摘要调用是安全的，见 [retention.md](retention.md) §5）。
 
 ### 算法
 
@@ -255,6 +260,7 @@ recover(session):
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 | S12 | 同一 key、不同事件类型各 append 一次（六对共享 key 见 §4） | 两条记录都落盘，互不抑制 |
+| S13 | 在 open step 中到达 `InputRecorded`（steering）、`TimerFired`、`SignalReceived`（审批或匹配等待）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；启动恢复入队；`open_intents` 与日志折叠一致 |
 
 ## 8. 留给下游
 
