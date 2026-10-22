@@ -1,6 +1,6 @@
 # 日志按 stream 分片，只提交终态，日志层没有 ack
 
-**Status**: accepted (2026-10-22)
+**Status**: accepted (2026-10-22); superseded in part by [ADR-0003](0003-single-session-stream-topology.md)（Workflow 流类型与工作流重放已移除，其余决定仍有效）
 
 **来源**: [#3 事件日志与检查点恢复语义](https://github.com/zibyn/asterpath/issues/3)
 

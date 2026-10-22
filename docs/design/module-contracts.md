@@ -3,6 +3,8 @@
 > 票 [#2](https://github.com/zibyn/asterpath/issues/2) 的决策记录，2026-10-22 已定。
 > 相关 ADR：[0001 依赖方向](../adr/0001-dependency-direction.md)。
 > 本文件是 v1 spec 的"模块契约"章节草稿；最终 crate 打包由 #15 收敛。
+>
+> **2026-10-22 范围调整**：不做通用工作流引擎（[ADR-0003](../adr/0003-single-session-stream-topology.md)）。模块图中的 `asterpath-workflow` 已移除，编排相关表述以本文件为准已更新；#10 出界，调度 API 原型见 #17。
 
 ## 1. 决策摘要
 
@@ -29,7 +31,7 @@ modules (each crate; no module→module edges)
   asterpath-provider-openai
   asterpath-tracing
   asterpath-usage
-  asterpath-workflow         orchestration API (#10)
+  asterpath-scheduler        子会话调度与持久等待 (#8/#17)
   asterpath-plugin-host      subprocess/MCP adapter (#7)
   asterpath-testing          in-memory fakes / harness
         │
@@ -122,8 +124,6 @@ pub trait EventLog: Send + Sync {
 }
 
 pub trait DurableExecutor: Send + Sync {
-    fn schedule_activity(&self, request: ActivityRequest)
-        -> BoxFuture<'_, Result<ActivityId, ExecutionError>>;
     fn schedule_timer(&self, deadline: Timestamp)
         -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
     fn await_signal(&self, name: SignalName)
@@ -131,22 +131,22 @@ pub trait DurableExecutor: Send + Sync {
 }
 ```
 
-- `Storage` 负责 session、租约、队列、定时器；方法集由 #4 定。
-- `EventLog` 负责 append/scan/frontier；事件枚举、schema 与恢复算法由 #3/#4 定。
-- `DurableExecutor` 是编排 seam；action 身份、重放比对、重试策略由 #3/#10 定。
+- `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
+- `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
+- `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定。v1 没有 activity / workflow。
 - `LogEntry` 是 `{ kind, schema_version, payload }`；带类型的会话事件在 protocol，core 不依赖 protocol。
 
 ### 3.5 错误与 ID
 
 - 每类能力一个 `#[non_exhaustive]` 枚举：`LifecycleError`、`StorageError`、`ExecutionError` 在 core；`ProtocolError`、`ProviderError`、`ToolError` 在 protocol。
 - `AsterError` 在门面 crate，对上述错误求和；core 不反向依赖 protocol。
-- `SessionId`、`TurnId`、`StepId`、`ToolCallId`、`LogId`、`ActivityId` 是 core 里的 opaque newtype。
+- `SessionId`、`TurnId`、`StepId`、`ToolCallId`、`LogId`、`TimerId`、`SignalId` 是 core 里的 opaque newtype。
 - `anyhow` 只允许出现在 CLI/二进制；库契约不暴露 `Box<dyn Error>`。
 
 ### 3.6 运行时与配置
 
 - tokio 是唯一支持的运行时；公共 async 签名按 tokio 生态的 `BoxFuture`/`BoxStream` 表达，不引入泛型 executor 或运行时无关抽象。
-- 确定性所需的 clock / random / timer 用注入 seam 解决，不靠替换运行时。
+- 可测试性所需的 clock / random / timer 用注入 seam 解决，不靠替换运行时。
 - core 本身不 spawn 任务；spawn 归宿主或执行器模块所有，并受 effect 约束。
 - 配置装载不在内核：内核只收显式构造参数，不读文件、不读环境变量。
 
@@ -238,9 +238,9 @@ pub trait AgentRunner: Send + Sync {
 | #5 存储与 SQLite | `Storage` 方法集与 schema；实现是模块 |
 | #6 agent loop | `AgentRunner` 在 protocol |
 | #7 工具与审批 | `Tool` / `ToolRegistry` / `Provenance` 在 protocol；adapter 是模块 |
-| #8 子智能体 | 基于 `AgentRunner` / workflow 能力 |
+| #8 子智能体 | 基于 `AgentRunner` + `DurableExecutor`（timer/signal） |
 | #9 上下文压缩 | 消费 `EventLog` 与 `Provider` |
-| #10 编排 API | `DurableExecutor` 在 core |
+| #17 调度 API | `DurableExecutor` 在 core；不做通用 workflow |
 | #11 协议模型 | 规范模型与 `Provider` 在 protocol |
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 订阅 usage 事件；usage 类型在 protocol |
