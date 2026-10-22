@@ -14,7 +14,9 @@ use asterpath_core::{
     LifecycleError, LogId, LogQuery, Module, ModuleCtx, ServiceId, SessionId, SignalDelivery,
     SignalId, SignalIntent, SignalName, SignalPayload, Storage, TimerId, TimerRequest, WakeCause,
 };
-use asterpath_protocol::{APPROVAL_SIGNAL_PREFIX, SessionEvent, decode_entry, dedup, encode_entry};
+use asterpath_protocol::{
+    APPROVAL_SIGNAL_PREFIX, RecordAppended, SessionEvent, decode_entry, dedup, encode_entry,
+};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -63,6 +65,8 @@ pub struct RuntimeExecutor {
     waiters: Waiters,
     /// Serializes fire/cancel so only one terminal is ever appended.
     timer_lock: tokio::sync::Mutex<()>,
+    /// Set by the module wrapper so committed waits reach the trace tap.
+    bus: Mutex<Option<ModuleCtx>>,
 }
 
 impl RuntimeExecutor {
@@ -73,7 +77,12 @@ impl RuntimeExecutor {
             clock,
             waiters: Waiters::default(),
             timer_lock: tokio::sync::Mutex::new(()),
+            bus: Mutex::new(None),
         }
+    }
+
+    pub fn set_event_bus(&self, ctx: ModuleCtx) {
+        *self.bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
     }
 
     async fn append(
@@ -83,7 +92,16 @@ impl RuntimeExecutor {
         key: Option<asterpath_core::DedupKey>,
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, event).map_err(backend)?;
-        self.log.append(entry).await.map_err(backend)
+        let log_id = self.log.append(entry).await.map_err(backend)?;
+        let bus = self
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(bus) = bus {
+            bus.emit(RecordAppended { session }).await;
+        }
+        Ok(log_id)
     }
 
     async fn scan(&self, session: SessionId) -> Result<Vec<SessionEvent>, ExecutionError> {
@@ -386,6 +404,7 @@ impl Module for RuntimeModule {
 
     fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
         let executor: Arc<dyn DurableExecutor> = self.executor.clone();
+        self.executor.set_event_bus(ctx.clone());
         let result = ctx.provide(DURABLE_EXECUTOR_SERVICE, executor);
         Box::pin(async move { result.map(|_| ()) })
     }

@@ -138,6 +138,7 @@ impl Module for SchedulerModule {
     ) -> BoxFuture<'a, Result<(), asterpath_core::LifecycleError>> {
         Box::pin(async move {
             let registry = ctx.require(TOOL_REGISTRY_SERVICE)?;
+            self.scheduler.set_event_bus(ctx.clone());
             let spawner: std::sync::Arc<dyn SubagentSpawner> = self.scheduler.clone();
             ctx.provide(SUBAGENT_SPAWNER_SERVICE, spawner)?;
             registry.register(std::sync::Arc::new(SpawnTool::new(self.scheduler.clone())));

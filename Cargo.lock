@@ -82,6 +82,7 @@ dependencies = [
  "asterpath-storage-sqlite",
  "asterpath-testing",
  "asterpath-tools",
+ "asterpath-tracing",
  "futures-core",
  "futures-util",
  "serde_json",
@@ -266,6 +267,19 @@ dependencies = [
  "asterpath-core",
  "asterpath-protocol",
  "futures-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-tracing"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-testing",
+ "futures-core",
+ "futures-util",
  "serde_json",
  "tokio",
 ]

@@ -1,16 +1,16 @@
 //! Spawn, materialization, outcome mapping and the durable wait.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use asterpath_core::{
-    DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
-    SessionId, ToolCallId, WakeCause,
+    DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, ModuleCtx,
+    SessionCatalog, SessionId, ToolCallId, WakeCause,
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, ChildFailure, ChildOutcome, ConfigSnapshot,
-    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
+    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, RecordAppended, Role, RunRequest,
+    RunTrigger, SessionEvent, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -30,6 +30,7 @@ pub struct Scheduler {
     /// reaches the module bus and this scheduler, so an Arc here would leak the
     /// whole composition root.
     runner: OnceLock<Weak<dyn AgentRunner>>,
+    bus: Mutex<Option<ModuleCtx>>,
 }
 
 impl Scheduler {
@@ -45,7 +46,31 @@ impl Scheduler {
             executor,
             aliases,
             runner: OnceLock::new(),
+            bus: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_event_bus(&self, ctx: ModuleCtx) {
+        *self.bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
+    }
+
+    async fn append(
+        &self,
+        session: SessionId,
+        event: SessionEvent,
+        key: Option<asterpath_core::DedupKey>,
+    ) -> Result<LogId, ExecutionError> {
+        let entry = encode_entry(session, key, &event).map_err(backend)?;
+        let log_id = self.log.append(entry).await.map_err(backend)?;
+        let bus = self
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(bus) = bus {
+            bus.emit(RecordAppended { session }).await;
+        }
+        Ok(log_id)
     }
 
     /// Late-bind the runner so the scheduler and the agent never own each other.
@@ -163,8 +188,7 @@ impl SubagentSpawner for Scheduler {
             };
 
             let child = fresh_session_id();
-            append(
-                &*self.log,
+            self.append(
                 req.parent.session,
                 SessionEvent::ChildSessionSpawned {
                     child,
@@ -345,8 +369,7 @@ impl Scheduler {
             }
             Some(_) => {}
             None => {
-                append(
-                    &*self.log,
+                self.append(
                     child,
                     SessionEvent::SessionCreated {
                         config: config.clone(),
@@ -366,8 +389,7 @@ impl Scheduler {
             .iter()
             .any(|(_, event)| matches!(event, SessionEvent::InputRecorded { .. }))
         {
-            append(
-                &*self.log,
+            self.append(
                 child,
                 SessionEvent::InputRecorded {
                     input: task.to_vec(),
@@ -388,8 +410,7 @@ impl Scheduler {
         child: &ChildRef,
         outcome: ChildOutcome,
     ) -> Result<(), WaitError> {
-        append(
-            &*self.log,
+        self.append(
             child.parent.session,
             SessionEvent::ChildSessionCompleted {
                 child: child.child,
@@ -589,16 +610,6 @@ async fn scan(
         events.push((entry, event));
     }
     Ok(events)
-}
-
-async fn append(
-    log: &dyn EventLog,
-    session: SessionId,
-    event: SessionEvent,
-    key: Option<asterpath_core::DedupKey>,
-) -> Result<LogId, ExecutionError> {
-    let entry = encode_entry(session, key, &event).map_err(backend)?;
-    log.append(entry).await.map_err(backend)
 }
 
 fn backend(error: impl std::fmt::Display) -> ExecutionError {
