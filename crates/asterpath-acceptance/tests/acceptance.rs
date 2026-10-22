@@ -5,8 +5,9 @@ mod common;
 
 use std::path::Path;
 
-use asterpath_protocol::{SessionEvent, ToolResultStatus, TurnEndReason};
+use asterpath_protocol::{Item, Part, Role, SessionEvent, ToolResultStatus, TurnEndReason};
 use common::{Scenario, Testdrive, markers, scan, session_id};
+use serde_json::{Value, json};
 
 async fn session_entries(
     db: &Path,
@@ -283,4 +284,244 @@ async fn a3_model_stream_crash_records_crash_abort_and_retries_the_step() {
     assert_eq!(started_steps(&events).len(), 1, "the same step is retried");
     assert_one_assistant_per_step(&events);
     assert_one_commit_per_step(&events);
+}
+
+/// Assistant model output across the committed steps, in log order.
+fn assistant_items(events: &[SessionEvent]) -> Vec<Item> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::AssistantMessage { items, .. } => Some(items.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn visible_part(part: &Part) -> Option<Value> {
+    match part {
+        Part::Text { text } => Some(json!({"kind": "text", "text": text})),
+        Part::Refusal { text } => Some(json!({"kind": "refusal", "text": text})),
+        Part::Image { media_type, .. } => Some(json!({"kind": "image", "media_type": media_type})),
+        // Provider-local content is not translatable across providers.
+        Part::ProviderOpaque { .. } => None,
+    }
+}
+
+/// The provider-independent projection: raw payloads (and reasoning replay
+/// bindings, which name the producing provider) are provider-local metadata.
+fn visible_projection(items: &[Item]) -> Vec<Value> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Message { role, parts } => Some(json!({
+                "kind": "message",
+                "role": role,
+                "parts": parts.iter().filter_map(visible_part).collect::<Vec<_>>(),
+            })),
+            Item::Reasoning { summary, .. } => Some(json!({
+                "kind": "reasoning",
+                "summary": summary.iter().filter_map(visible_part).collect::<Vec<_>>(),
+            })),
+            Item::ToolCall {
+                call_id,
+                name,
+                raw_args,
+                ..
+            } => Some(json!({
+                "kind": "tool_call",
+                "call_id": call_id,
+                "name": name.as_str(),
+                "args": serde_json::from_str::<Value>(raw_args.as_str()).unwrap_or(Value::Null),
+            })),
+            Item::ToolResult {
+                call_id,
+                parts,
+                is_error,
+                ..
+            } => Some(json!({
+                "kind": "tool_result",
+                "call_id": call_id,
+                "parts": parts.iter().filter_map(visible_part).collect::<Vec<_>>(),
+                "is_error": is_error,
+            })),
+            Item::Compaction { parts } => Some(json!({
+                "kind": "compaction",
+                "parts": parts.iter().filter_map(visible_part).collect::<Vec<_>>(),
+            })),
+            // Server-tool and opaque items belong to one provider's protocol.
+            _ => None,
+        })
+        .collect()
+}
+
+fn effective_tool_calls(items: &[Item]) -> Vec<(String, Value)> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall { name, raw_args, .. } => Some((
+                name.as_str().to_owned(),
+                serde_json::from_str::<Value>(raw_args.as_str()).unwrap_or(Value::Null),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn final_assistant_text(items: &[Item]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        Item::Message {
+            role: Role::Assistant,
+            parts,
+        } => Some(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+        ),
+        _ => None,
+    })
+}
+
+fn reasoning_raw(items: &[Item]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Reasoning { raw, .. } => Some((raw.kind.clone(), raw.json.as_str().to_owned())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn committed_count(lines: &[String], reason: &str) -> usize {
+    markers(lines, "turn_committed")
+        .iter()
+        .filter(|marker| marker["reason"] == reason)
+        .count()
+}
+
+#[tokio::test]
+async fn b1_both_providers_produce_the_same_normalized_history() {
+    let fixture_path = common::fixture("b1_equivalent.json");
+    let fixture: asterpath_testing::Fixture = serde_json::from_str(
+        &std::fs::read_to_string(&fixture_path).expect("read scenario (b) fixture"),
+    )
+    .expect("parse scenario (b) fixture");
+
+    let anthropic = common::mock::MockServer::start(common::mock::anthropic_replies(&fixture));
+    let openai = common::mock::MockServer::start(common::mock::openai_replies(&fixture));
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let anthropic_db = dir.path().join("anthropic.sqlite");
+    let openai_db = dir.path().join("openai.sqlite");
+    let anthropic_effect = dir.path().join("anthropic-effect.json");
+    let openai_effect = dir.path().join("openai-effect.json");
+
+    let anthropic_lines = Testdrive::start_provider(
+        Scenario {
+            run: true,
+            db: &anthropic_db,
+            fixture: "b1_equivalent.json",
+            effect: &anthropic_effect,
+            hold_ms: 0,
+            failpoints: Vec::new(),
+        },
+        "anthropic",
+        &anthropic.base_url(),
+    )
+    .wait_success();
+    let openai_lines = Testdrive::start_provider(
+        Scenario {
+            run: true,
+            db: &openai_db,
+            fixture: "b1_equivalent.json",
+            effect: &openai_effect,
+            hold_ms: 0,
+            failpoints: Vec::new(),
+        },
+        "openai",
+        &format!("{}/v1", openai.base_url()),
+    )
+    .wait_success();
+
+    // Each side spoke its own wire protocol, one request per scripted step.
+    assert_eq!(
+        anthropic.paths(),
+        vec!["/v1/messages".to_owned(); 2],
+        "Anthropic Messages endpoint"
+    );
+    assert_eq!(
+        openai.paths(),
+        vec!["/v1/responses".to_owned(); 2],
+        "OpenAI Responses endpoint"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&anthropic_effect).expect("effect"),
+        "{\"k\":\"v\"}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&openai_effect).expect("effect"),
+        "{\"k\":\"v\"}"
+    );
+
+    let anthropic_events = common::events(&anthropic_db, session_id(&anthropic_lines)).await;
+    let openai_events = common::events(&openai_db, session_id(&openai_lines)).await;
+
+    assert_eq!(committed_count(&anthropic_lines, "Completed"), 1);
+    assert_eq!(committed_count(&openai_lines, "Completed"), 1);
+    assert_eq!(
+        turn_reasons(&anthropic_events),
+        vec![TurnEndReason::Completed]
+    );
+    assert_eq!(turn_reasons(&openai_events), vec![TurnEndReason::Completed]);
+
+    let anthropic_items = assistant_items(&anthropic_events);
+    let openai_items = assistant_items(&openai_events);
+
+    assert_eq!(
+        visible_projection(&anthropic_items),
+        visible_projection(&openai_items),
+        "the normalized item/part projection is provider-independent"
+    );
+    assert_eq!(
+        effective_tool_calls(&anthropic_items),
+        effective_tool_calls(&openai_items)
+    );
+    assert_eq!(
+        effective_tool_calls(&anthropic_items),
+        vec![("set_marker".to_owned(), json!({"key": "k", "value": "v"}))],
+        "one tool call with the same effective args on both sides"
+    );
+    assert_eq!(
+        final_assistant_text(&anthropic_items),
+        final_assistant_text(&openai_items)
+    );
+    assert_eq!(
+        final_assistant_text(&anthropic_items).as_deref(),
+        Some("done")
+    );
+
+    // Raw provider data is present on each side, differs, and is never compared.
+    let anthropic_raw = reasoning_raw(&anthropic_items);
+    let openai_raw = reasoning_raw(&openai_items);
+    assert_eq!(anthropic_raw.len(), 1);
+    assert_eq!(openai_raw.len(), 1);
+    assert_eq!(anthropic_raw[0].0, "anthropic.thinking");
+    assert_eq!(openai_raw[0].0, "openai.reasoning");
+    assert_ne!(
+        anthropic_raw, openai_raw,
+        "provider raw payloads are intentionally different"
+    );
+}
+
+/// The loop is one implementation for every provider (ADR 0010): it branches on
+/// capabilities, never on a provider identity.
+#[test]
+fn agent_loop_contains_no_provider_branch() {
+    let source = include_str!("../../asterpath-agent/src/lib.rs");
+    assert!(!source.contains("anthropic"));
+    assert!(!source.contains("openai"));
 }

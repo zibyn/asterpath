@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath_core::{ApprovalGate, Clock, EventLog, SessionCatalog, Storage, SystemClock};
+use asterpath_core::{
+    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
+};
 use asterpath_protocol::{
     AgentRunner, ApprovalPolicy, CompactionConfig, DefaultApprovalPolicy, ModelAlias, ModelSpec,
     Provider, SubagentConfig, Tool, ToolConfig, TurnConfig,
@@ -23,6 +25,8 @@ pub struct AsterpathConfig {
     pub event_log: Option<Arc<dyn EventLog>>,
     pub storage: Option<Arc<dyn Storage>>,
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
+    /// Optional: injected storage may not implement retirement.
+    pub session_retirement: Option<Arc<dyn SessionRetirement>>,
     pub clock: Arc<dyn Clock>,
     /// Defaults to the built-in policy over [`Self::gate`].
     pub approval: Arc<dyn ApprovalPolicy>,
@@ -46,6 +50,7 @@ impl Default for AsterpathConfig {
             event_log: None,
             storage: None,
             session_catalog: None,
+            session_retirement: None,
             clock: Arc::new(SystemClock),
             approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
             gate,
@@ -134,8 +139,32 @@ impl AsterpathBuilder {
     }
 
     #[must_use]
+    pub fn session_retirement(mut self, retirement: Arc<dyn SessionRetirement>) -> Self {
+        self.config.session_retirement = Some(retirement);
+        self
+    }
+
+    #[must_use]
     pub fn turn(mut self, turn: TurnConfig) -> Self {
         self.config.turn = turn;
+        self
+    }
+
+    #[must_use]
+    pub fn compaction(mut self, compaction: CompactionConfig) -> Self {
+        self.config.compaction = compaction;
+        self
+    }
+
+    #[must_use]
+    pub fn subagents(mut self, subagents: SubagentConfig) -> Self {
+        self.config.subagents = subagents;
+        self
+    }
+
+    #[must_use]
+    pub fn model_aliases(mut self, model_aliases: BTreeMap<ModelAlias, ModelSpec>) -> Self {
+        self.config.model_aliases = model_aliases;
         self
     }
 

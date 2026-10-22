@@ -20,12 +20,12 @@ use std::sync::Arc;
 use asterpath_agent::Agent;
 use asterpath_core::{
     ApprovalGate, DurableExecutor, EventLog, InputId, LogQuery, ModuleHost, SessionCatalog,
-    SessionId, SignalDelivery, Storage, ToolCallId,
+    SessionId, SessionRetirement, SignalDelivery, Storage, ToolCallId,
 };
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult, OpenIntents,
-    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, ToolRegistry,
-    ToolSelection, UserInput, approval_signal_id, approval_signal_name, dedup,
+    AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
+    OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
+    ToolRegistry, ToolSelection, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
 use asterpath_scheduler::SchedulerModule;
@@ -47,6 +47,7 @@ pub struct Asterpath {
     event_log: Arc<dyn EventLog>,
     storage: Arc<dyn Storage>,
     session_catalog: Arc<dyn SessionCatalog>,
+    session_retirement: Option<Arc<dyn SessionRetirement>>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<dyn ToolRegistry>,
     agent: Arc<dyn AgentRunner>,
@@ -94,6 +95,7 @@ impl Asterpath {
         let event_log;
         let storage;
         let session_catalog;
+        let session_retirement;
 
         let mut module_host = ModuleHost::new();
         let tools_module = Arc::new(ToolsModule::new());
@@ -107,6 +109,7 @@ impl Asterpath {
                     message: "session_catalog is required when event_log and storage are injected"
                         .to_owned(),
                 })?;
+                session_retirement = config.session_retirement;
             }
             (None, None) => {
                 #[cfg(feature = "sqlite")]
@@ -120,6 +123,7 @@ impl Asterpath {
                     module_host.register(Arc::new(SqliteStorageModule::new(backend.clone())));
                     event_log = backend.clone();
                     storage = backend.clone();
+                    session_retirement = Some(Arc::clone(&backend) as Arc<dyn SessionRetirement>);
                     session_catalog = backend;
                 }
                 #[cfg(not(feature = "sqlite"))]
@@ -189,6 +193,7 @@ impl Asterpath {
             event_log,
             storage,
             session_catalog,
+            session_retirement,
             providers,
             tools,
             agent,
@@ -263,6 +268,11 @@ impl Asterpath {
     }
 
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError> {
+        // Unknown and retired sessions are indistinguishable: both have no
+        // committed frontier (retention.md §9).
+        if self.event_log.frontier(id).await?.is_none() {
+            return Err(AsterError::Agent(AgentError::NotFound { session: id }));
+        }
         Ok(SessionHandle {
             session: id,
             event_log: Arc::clone(&self.event_log),
@@ -287,6 +297,11 @@ impl Asterpath {
 
     pub fn session_catalog(&self) -> Arc<dyn SessionCatalog> {
         Arc::clone(&self.session_catalog)
+    }
+
+    /// `None` when the injected backend does not implement retirement.
+    pub fn session_retirement(&self) -> Option<Arc<dyn SessionRetirement>> {
+        self.session_retirement.clone()
     }
 
     /// Register an RAII endpoint here while the host can answer approvals.
