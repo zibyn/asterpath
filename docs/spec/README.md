@@ -10,8 +10,8 @@
 
 ## 状态
 
-- 内核与打包决策已全部定稿（[#2](https://github.com/zibyn/asterpath/issues/2)–[#17](https://github.com/zibyn/asterpath/issues/17)）。
-- 扩展 seam 仍有开放票：[#18](https://github.com/zibyn/asterpath/issues/18) 日志保留/归档、[#19](https://github.com/zibyn/asterpath/issues/19) 崩溃注入工具链、[#20](https://github.com/zibyn/asterpath/issues/20) MCP/ACP 映射、[#21](https://github.com/zibyn/asterpath/issues/21) 沙箱。这些不影响 M0–M4 开工。
+- 内核、打包、保留/归档与测试工具链已定稿（[#2](https://github.com/zibyn/asterpath/issues/2)–[#19](https://github.com/zibyn/asterpath/issues/19)）。
+- 扩展 seam 仍有开放票：[#20](https://github.com/zibyn/asterpath/issues/20) MCP/ACP 映射、[#21](https://github.com/zibyn/asterpath/issues/21) 沙箱。这些不影响 M0–M4 开工。
 - `asterpath-plugin-host` 与扩展 crate 在图上留位，但不进 v1 验收。
 
 ## 阅读顺序
@@ -22,7 +22,7 @@
 4. [Agent loop](../design/agent-loop.md)：turn/step、取消、steering、失败重试。
 5. [工具契约、执行管线与审批边界](../design/tools.md)：管线、审批、并行、超时。
 6. [子智能体模型](../design/subagents.md)：spawn、fork、取消、孤儿恢复。
-7. [上下文压缩](../design/compaction.md)、[规范化协议](../design/protocol.md)、[追踪](../design/tracing.md)、[用量](../design/usage.md)、[存储](../design/storage.md)、[插件](../design/plugins.md)。
+7. [上下文压缩](../design/compaction.md)、[规范化协议](../design/protocol.md)、[追踪](../design/tracing.md)、[用量](../design/usage.md)、[存储](../design/storage.md)、[保留/归档](../design/retention.md)、[插件](../design/plugins.md)、[测试工具链](../design/testing.md)。
 8. [验收场景](acceptance.md)：三段验收的精确断言。
 9. [ADR 目录](../adr/) 与 [GLOSSARY](../../GLOSSARY.md)。
 
@@ -43,7 +43,7 @@ G1 计划闸与 G2 骨架闸的 prompt、通过条件与回灌流程见 [packagi
 ## 未决问题
 
 - 内核与打包：无。
-- 扩展 seam：由 #18 / #19 / #20 / #21 在各自票内回答；不属于 v1 交付闸门。
+- 扩展 seam：保留/归档已定（[retention.md](../design/retention.md)）；测试工具链已定（[testing.md](../design/testing.md)）；#20 / #21 在各自票内回答；都不属于 v1 交付闸门。
 - 已知解释：验收 (b) 验证 adapter 等价，不验证 turn 内切换 provider；v1 的 provider/model 在 session 创建时快照。
 
 ## 出界

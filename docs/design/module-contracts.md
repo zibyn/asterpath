@@ -145,9 +145,17 @@ pub trait DurableExecutor: Send + Sync {
         -> BoxFuture<'_, Result<(), ExecutionError>>;
     fn wake(&self, session: SessionId, cause: WakeCause);   // 仅内存
 }
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+pub struct SystemClock;
 ```
 
+- `Clock` 是时间来源接缝：`runtime` / `scheduler` 注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - `Storage` 负责 session、租约、队列、定时器；方法集由 #5 定。
+- `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定（[ADR-0014](../adr/0014-subagent-scheduling-api.md)）。v1 没有 activity / workflow。
 - timer id 由 `(session, caused_by, slot)` 确定性派生；审批 signal id 即 `tool_call_id`，通用 signal id 由 `(session, name)` 派生。重复注册返回同一 id，恢复重放不会制造第二个等待。
@@ -226,7 +234,7 @@ pub trait AgentRunner: Send + Sync {
 | 沙箱/隔离 | adapter 或工具包装模块 | `Provenance`、pre/post-execute hook、`Tool` 包装 |
 | 成本/预算 | 消费 usage 的模块 + pre-step gate | `UsageRecorded` / `UsageQuery`、pre-step waterfall（#13） |
 | trace 导出/采样 | exporter 模块订阅 tracing 模块 | 原生 trace 模型/查询、事件日志 |
-| 日志保留/归档 | storage admin 扩展 | `EventLog` / `Storage` 的扩展能力（#18） |
+| 日志保留/归档 | storage admin 扩展 | `SessionRetirement` 可选能力（#18，见 [retention.md](retention.md)） |
 | 内容脱敏/密钥 | host 或 post-execute 模块 | `post-execute` hook |
 | 内置工具 | 可选模块或参考 CLI | `ToolRegistry` |
 | 插件安装/分发 | 生态工具或 host | 插件清单/加载（#16） |

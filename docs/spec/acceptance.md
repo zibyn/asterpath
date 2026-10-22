@@ -16,7 +16,7 @@
 | 组件 | 位置 | 职责 |
 | --- | --- | --- |
 | `ScriptedProvider` | `asterpath-testing` | 按 fixture 回放模型响应，并断言收到的 `ModelRequest` |
-| 六个故障注入装饰器 | `asterpath-testing` | `append:before_commit`、`append:after_commit`、`tool:before_effect`、`tool:after_effect`、`clock:advance`、`queue:before_ack`（[storage.md](../design/storage.md) §9） |
+| 五个故障注入装饰器 + `ManualClock` | `asterpath-testing` | `append:before_commit`、`append:after_commit`、`tool:before_effect`、`tool:after_effect`、`queue:before_ack`；`clock:advance` = `ManualClock::advance`（[testing.md](../design/testing.md)） |
 | `testdrive` 二进制 | `asterpath-acceptance` | `run` / `resume` / `inspect`；用真实模块组装，向 stdout 输出 JSON 行进度标记 |
 | mock HTTP server | `asterpath-acceptance` | 场景 (b) 回放 Anthropic / OpenAI 线上协议（wiremock 或等价） |
 
@@ -108,8 +108,9 @@
 ## 6. 与 #19 的边界
 
 - #15 固定场景、断言与 `testdrive` 约定。
-- #19 负责六个注入点的装饰器实现、CI 场景编排与故障矩阵；只要断言不变，装饰器内部实现可变。
-- 注入点不足以覆盖的崩溃窗口，用真 `SIGKILL` + stdout 标记；不用注入点替代进程级验收。
+- #19 已定（[testing.md](../design/testing.md)）：五个装饰器 + `ManualClock`、`Halt` / `Panic` 动作、G2–G7 契约套件、CI 分层与 fixture 归属。只要断言不变，装饰器内部实现可变。
+- 注入点不足以覆盖的崩溃窗口，用真 `SIGKILL` + stdout 标记；不用注入点替代进程级验收。有自然 marker 的场景不用 failpoint。
+- `testdrive --failpoint <point>[=<n>]` 只构造 `Halt`；父测试等待 marker 上限 15 秒，随后 `SIGKILL`。
 
 ## 7. 通过条件
 

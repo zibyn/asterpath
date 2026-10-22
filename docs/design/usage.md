@@ -86,6 +86,7 @@ pub trait UsageQuery: Send + Sync {
 
 #[non_exhaustive]
 pub enum UsageError {
+    NotFound { session: SessionId },   // 会话已退役或不存在
     Corrupt { session: SessionId, detail: String },
     Backend(String),
 }
@@ -159,7 +160,7 @@ pub trait SessionCatalog: Send + Sync {
 ```
 
 - `SessionSubtree(root)` 返回 `own = root 自身`、`descendants = 全部后代之和`；后代表达式按深度优先或逐层展开均可，顺序不影响结果。
-- 查询只覆盖当前仍在存储中的日志。保留/归档扩展删掉某个后代日志时，子树总量相应变小；该扩展必须声明覆盖范围（#18）。
+- 查询只覆盖当前仍在存储中的日志。已退役的会话对 `UsageQuery` 返回 `NotFound`；存活会话的子树只汇总仍存在的后代，删掉后代日志时总量相应变小（[retention.md](retention.md) §9）。
 
 ## 5. 查询语义
 
@@ -245,7 +246,7 @@ pub struct UsageRecorded {
 ## 10. 留给下游
 
 - **#15**：`asterpath-usage` 进 crate 列表；门面暴露 `UsageQuery`；参考 CLI 的用量展示与验收场景。
-- **#18**：保留/归档必须声明日志覆盖范围；子树汇总只对现存日志负责。
+- **#18**：已定。退役会话返回 `NotFound`；子树只汇总存活会话，见 [retention.md](retention.md)。
 - **#19**：崩溃注入要覆盖 U9 / U10 两个 usage 窗口。
 - **#14**：exporter 可把 `Usage` 映射到 OTel `gen_ai.usage.*`，但内部模型不采用 OTel 的 token 语义。
 - **#17**：无接口变化；子会话调度不影响用量归因。

@@ -375,7 +375,7 @@ recover(child):
         正常恢复（#3 §6）
 ```
 
-- 父记录**缺失**（保留/归档扩展删除了父流）：v1 视为扩展违约，子作为独立 session 继续；不因父缺失而自杀。
+- 父记录**缺失**（父已退役或数据缺失）：子作为独立 session 继续；不因父缺失而自杀。退役 seam 保证父会话 `idle` 且无活子会话时才能删除，因此这里覆盖的是防御性场景（[retention.md](retention.md)）。
 - 父流**损坏**：按 #5 硬错误，不做孤儿判定。
 - 取消不是持久事件（#6）：父在取消收尾记录落盘前崩溃，恢复会续跑该 turn。这是 #6 已接受的窗口；R4 只兜底"父已经写下不再等待"的情况。
 
@@ -467,5 +467,5 @@ pub struct SubagentConfig {
 - **#15**：spawn 工具的最终命名/参数 schema；`SubagentSpawner` 的打包位置。
 - **#16**：已定。`spawn_agent` 是进程内工具的裸名；外部工具一律 `<plugin_id>__<tool>`，`__` 保留，因此不与 `spawn_agent` 冲突。见 [plugins.md](plugins.md) §6。
 - **#17**：已定。`SubagentSpawner` 签名与 spawn/await/cancel 分工、持久超时、恢复委托、`DurableExecutor` 接缝见 §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；原型在 `prototype/subagent-api` 分支。
-- **#18**：保留/归档必须保证父子流在对方仍活跃时不被删除；违反时按 §9 的缺失策略处理。
+- **#18**：已定。退役要求会话 `idle`、无活子会话、父会话 `idle`，因此父子任一方仍活跃时不会被删除；子侧父记录缺失分支保留为防御性违约处理。见 [retention.md](retention.md)。
 - **#19**：R1–R4 的崩溃注入点与确定性测试。

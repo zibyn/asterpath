@@ -24,7 +24,7 @@
 | `asterpath-protocol` | 规范化模型、`Provider` / `Tool` / `ToolRegistry` / `AgentRunner` / `Compactor`、会话事件、`ConfigSnapshot`、`AgentEvent` | `core` | 是 |
 | `asterpath-agent` | `AgentRunner` 实现（turn/step loop） | `core`, `protocol` | 是 |
 | `asterpath-tools` | `ToolRegistry` 实现 | `core`, `protocol` | 是 |
-| `asterpath-storage-sqlite` | `EventLog` + `Storage` + `SessionCatalog` 的 SQLite 实现 | `core`, `protocol` | 是 |
+| `asterpath-storage-sqlite` | `EventLog` + `Storage` + `SessionCatalog` + `SessionRetirement` 的 SQLite 实现 | `core`, `protocol` | 是 |
 | `asterpath-runtime` | `DurableExecutor` 实现（timer / signal / wake） | `core`, `protocol` | 是 |
 | `asterpath-scheduler` | `SubagentSpawner` 实现；子会话准入与等待 | `core`, `protocol` | 是 |
 | `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | 是 |
@@ -33,13 +33,13 @@
 | `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | 是 |
 | `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | 是 |
 | `asterpath-plugin-host` | 外部插件清单与子进程/MCP adapter；实现依赖 [#20](https://github.com/zibyn/asterpath/issues/20) | `core`, `protocol` | 图内留位，不进 v1 验收 |
-| `asterpath-testing` | in-memory fakes、`ScriptedProvider`、六个故障注入装饰器 | `core`, `protocol` | 是 |
+| `asterpath-testing` | in-memory fakes、`ScriptedProvider`、五个故障注入装饰器 + `ManualClock`（六点，见 [testing.md](testing.md)） | `core`, `protocol` | 是 |
 | `asterpath` | facade / 默认组装根；暴露稳定 API | 任意 | 是 |
 | `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | 是 |
 | `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | 是（仅测试） |
 | `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | 是（仅工具） |
 
-- 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（[#21](https://github.com/zibyn/asterpath/issues/21)）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18)）、MCP/ACP adapter（#20）。对应票定稿前不创建。
+- 预留但不进 workspace 的 crate 名：`asterpath-sandbox`（[#21](https://github.com/zibyn/asterpath/issues/21)）、`asterpath-storage-admin`（[#18](https://github.com/zibyn/asterpath/issues/18) 已收敛：内核只有 `SessionRetirement` 接缝，策略与归档由宿主实现；v1 不建）、MCP/ACP adapter（#20）。
 - `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。
 - 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。
@@ -105,6 +105,7 @@ impl Asterpath {
     pub fn event_log(&self) -> Arc<dyn EventLog>;
     pub fn storage(&self) -> Arc<dyn Storage>;
     pub fn session_catalog(&self) -> Arc<dyn SessionCatalog>;
+    pub fn session_retirement(&self) -> Option<Arc<dyn SessionRetirement>>;  // 后端未提供时为 None
     pub fn usage(&self) -> Arc<dyn UsageQuery>;
     pub fn trace(&self) -> Arc<dyn TraceQuery>;
 }
@@ -297,7 +298,8 @@ default = "ask"               # ask | allow | deny
 - `asterpath-plugin-host` 与扩展 crate 不参与 M0–M4 的通过条件；它们在 [#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21) 定稿后各自加闸门。
 - CI 顺序：`cargo xtask check-deps` → `cargo fmt --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --workspace` → `cargo test -p asterpath-acceptance --test acceptance` → `cargo doc --workspace --no-deps`。
 - 另跑 feature 矩阵：`cargo check -p asterpath --no-default-features` 与 `--features anthropic` / `openai` / `sqlite` 各自组合。
-- 验收测试只在 Linux CI 上跑（`cfg(unix)`）；框架本身不禁 Windows，但 v1 不为验收提供 Windows 的强杀实现。
+- CI 分层与超时（[testing.md](testing.md) §6）：`cargo test --workspace` 预算 5 分钟；进程级验收预算 5 分钟、单 marker 等待上限 15 秒；feature 矩阵 5 分钟。
+- 验收测试只在 Linux CI 上跑（`cfg(unix)`）；框架本身不禁 Windows，但 v1 不为验收提供 Windows 的强杀实现。进程级与 failpoint 测试不得 `#[ignore]`。
 
 ## 6. 验证协议：spec 是否可开工
 

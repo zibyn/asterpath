@@ -159,7 +159,17 @@ CREATE TABLE writer_lease (
     holder      TEXT    NOT NULL,
     acquired_at INTEGER NOT NULL                -- 仅诊断，不参与判权
 );
+
+-- 退役会话的身份记录；退役接缝使用，见 retention.md
+CREATE TABLE retired_sessions (
+    session_id   BLOB    PRIMARY KEY,
+    parent_id    BLOB,
+    last_log_id  INTEGER NOT NULL,
+    retired_at   INTEGER NOT NULL               -- 仅诊断
+);
 ```
+
+- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `timers` / `runnable`。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
@@ -225,7 +235,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - `busy_timeout=0`：任何 `SQLITE_BUSY` 立即以 `Backend` 暴露，不静默等待。
 - 连接模型：一个 `Mutex<Connection>`，所有操作经 `spawn_blocking`。ops 串行化；扫描长到阻塞写路径时，再升级为 writer 线程 + WAL 只读连接（模块内优化，不动 trait）。
 - 文件创建时权限 `0600`。
-- 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档由扩展模块或 host 负责，seam 见 #18。
+- 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档的 seam 见 [retention.md](retention.md)。删除释放页供复用，不保证文件缩小。
 
 ## 7. 唤醒队列与 timer
 
@@ -243,16 +253,17 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G1 前缀持久**：`append` 返回后，该条记录排在崩溃可见的前缀里；FULL 下扛掉电。
 - **G2 幂等**：`(session, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写派生行。
 - **G3 全序**：`seq` 在 session 内严格单调、无洞，只由存储分配。
-- **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。
+- **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
 - **G5 至少一次唤醒**：入队的唤醒最终会被 `claim`；同 session 合并；`ack` 不会吃掉新一代唤醒。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
 - **G7 索引可重建**：`sessions` / `timers` / `runnable` 可完全由日志（加显式唤醒查询）重建，不是真相源。
+- **G8 退役原子性（可选能力）**：`SessionRetirement::retire` 在同一事务里写墓碑、删日志与全部派生行；要么全部生效，要么全部不生效；退役后的会话对 `EventLog` / `Storage` / `SessionCatalog` 不可见。契约见 [retention.md](retention.md)。
 
 trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、`flock`、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。
 
 ## 9. 故障注入与测试
 
-`asterpath-testing` 提供六个注入点（装饰器实现，不进 core/protocol）：
+`asterpath-testing` 提供六个注入点（装饰器实现，不进 core/protocol）；API 形状、动作与 CI 编排见 [testing.md](testing.md) 与 [ADR-0017](../adr/0017-fault-injection-and-test-tooling.md)。前五个点是 trait 装饰器，`clock:advance` 由 `ManualClock::advance` 提供。
 
 | 注入点 | 模拟 |
 | --- | --- |
@@ -275,5 +286,5 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
 - **#17**：claim 循环、`TimerFired` 追加、signal 投递、租约时长。
-- **#18**：保留/归档扩展模块的 seam（导出/删除 API 或 storage admin capability）；策略不在内核。
+- **#18**：已定。只保留 `SessionRetirement` 可选能力（整会话退役、墓碑）；导出由宿主用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
 - **#19**：六个注入点的工具链与 CI 场景。

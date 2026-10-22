@@ -218,10 +218,15 @@ pub trait TraceTap: Send + Sync {
 }
 
 #[non_exhaustive]
-pub enum TraceError { Corrupt { session: SessionId, detail: String }, Backend(String) }
+pub enum TraceError {
+    NotFound { session: SessionId },   // 会话已退役或不存在
+    Corrupt { session: SessionId, detail: String },
+    Backend(String),
+}
 ```
 
 - `TraceQuery` 从注入的 `EventLog` 流式折叠，内存有界；没有 trace 表，也不需要额外索引。
+- 日志被退役后，该会话的 span 一并消失：`TraceQuery` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
 - `TraceTap` 由 `asterpath-tracing` 在事件总线之上运行，向 exporter 发 `Started` / `Ended`；它不改变日志，也不参与恢复。
 - **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `EventLog` 读取权限，并自行脱敏。默认导出不含内容。
@@ -239,7 +244,7 @@ pub enum TraceError { Corrupt { session: SessionId, detail: String }, Backend(St
 | #11 协议 | §2 的类型进 `asterpath-protocol` |
 | #13 token | 已定。span `usage` 与 [usage.md](usage.md) 的 `model_calls` / `compaction` 必须对账（U12）；`partial` 不进总量 |
 | #17 调度 | `SignalAwaited` 的写入点；timer/signal 等待的 `caused_by` 锚点 |
-| #18 保留/归档 | trace 不拥有存储；日志被归档后重建范围随之缩小，由扩展声明 |
+| #18 保留/归档 | 已定。退役会话返回 `NotFound`；重建范围随之缩小，见 [retention.md](retention.md) |
 | #19 测试 | 确定性重建与崩溃恢复的 trace 断言 |
 
 ## 9. 验收场景
