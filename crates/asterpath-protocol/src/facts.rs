@@ -88,25 +88,30 @@ pub struct SessionFacts {
 impl SessionFacts {
     /// Fold a scanned log in `seq` order.
     pub fn fold(entries: &[LogEntry]) -> Result<Self, LogDecodeError> {
-        let mut facts = Self::default();
-        let mut ordered: Vec<&LogEntry> = entries.iter().collect();
-        ordered.sort_by_key(|entry| entry.seq);
-        for entry in ordered {
-            let event = decode_entry(entry)?;
-            facts.apply(entry.seq, entry.log_id, entry.dedup_key.as_ref(), &event);
-        }
-        Ok(facts)
+        let events = entries
+            .iter()
+            .map(decode_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::fold_decoded(entries.iter().zip(&events)))
     }
 
-    /// Apply one decoded event with its envelope fields. Compaction intents
-    /// are keyed by their dedup key, so terminals close exactly that intent.
-    pub fn apply(
-        &mut self,
-        seq: u64,
-        log_id: LogId,
-        dedup_key: Option<&DedupKey>,
-        event: &SessionEvent,
-    ) {
+    /// Fold already-decoded entries in `seq` order.
+    pub fn fold_decoded<'a>(
+        decoded: impl IntoIterator<Item = (&'a LogEntry, &'a SessionEvent)>,
+    ) -> Self {
+        let mut ordered: Vec<_> = decoded.into_iter().collect();
+        ordered.sort_by_key(|(entry, _)| entry.seq);
+        let mut facts = Self::default();
+        for (entry, event) in ordered {
+            facts.apply(entry, event);
+        }
+        facts
+    }
+
+    /// Apply one decoded event with its envelope. Compaction intents are
+    /// keyed by their dedup key, so terminals close exactly that intent.
+    pub fn apply(&mut self, entry: &LogEntry, event: &SessionEvent) {
+        let (seq, log_id, dedup_key) = (entry.seq, entry.log_id, entry.dedup_key.as_ref());
         self.last = Some((seq, log_id));
         match event {
             SessionEvent::SessionCreated { parent, .. } => self.parent = parent.clone(),

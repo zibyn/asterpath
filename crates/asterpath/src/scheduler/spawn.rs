@@ -174,7 +174,9 @@ impl Scheduler {
 
             // Rebuild this parent's queue and Running count from the log first;
             // a result that landed since then also closes its queue entry.
-            let parent_facts = fold_facts(&parent_events);
+            let parent_facts = SessionFacts::fold_decoded(
+                parent_events.iter().map(|(entry, event)| (entry, event)),
+            );
             self.recover_parent(req.parent.session, &parent_facts)
                 .await
                 .map_err(SpawnError::Execution)?;
@@ -1048,14 +1050,6 @@ async fn drive_child(agent: &Agent, session: SessionId) -> Result<(), AgentError
         event?;
     }
     Ok(())
-}
-
-fn fold_facts(events: &[(LogEntry, SessionEvent)]) -> SessionFacts {
-    let mut facts = SessionFacts::default();
-    for (entry, event) in events {
-        facts.apply(entry.seq, entry.log_id, entry.dedup_key.as_ref(), event);
-    }
-    facts
 }
 
 async fn scan(

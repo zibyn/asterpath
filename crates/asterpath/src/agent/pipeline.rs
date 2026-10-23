@@ -16,16 +16,16 @@ use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest,
     ApprovalVerdict, AwaitSignal, CancelReason, CancelToken, ChildOutcome, Clock, DedupKey,
     HookError, Hooks, Item, LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance,
-    ReplaySafety, SessionEvent, SessionId, SessionStore, SignalPayload, StepId, Tool, ToolArgs,
-    ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
-    ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnId,
-    UsageLookup, approval_signal_id, approval_signal_name, dedup, scan_all, unique_bytes,
+    ReplaySafety, SessionEvent, SessionFacts, SessionId, SessionStore, SignalPayload, StepId, Tool,
+    ToolArgs, ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError,
+    ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
+    TurnId, UsageLookup, approval_signal_id, approval_signal_name, dedup, scan_all, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
-use super::{EventSink, caught, decode_entries, fold_facts};
+use super::{EventSink, caught, decode_entries};
 use crate::scheduler::SPAWN_TOOL_NAME;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
@@ -371,7 +371,7 @@ impl ToolPipeline {
         pending: &[ToolCallId],
     ) -> Result<(), AgentError> {
         let decoded = decode_entries(scan_all(&*self.log, step.session).await?, step.session)?;
-        let facts = fold_facts(&decoded);
+        let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
         let step_calls: HashSet<ToolCallId> = decoded
             .iter()
             .filter_map(|(_, event)| match event {
@@ -833,7 +833,7 @@ impl Recorded {
                 _ => {}
             }
         }
-        let facts = fold_facts(decoded);
+        let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
         recorded.closed = recorded
             .intents
             .values()

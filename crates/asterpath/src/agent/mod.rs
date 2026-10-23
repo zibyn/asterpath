@@ -192,7 +192,8 @@ impl Agent {
                 detail: "session log has no SessionCreated".to_owned(),
             })?;
 
-        let mut facts = fold_facts(&decoded);
+        let mut facts =
+            SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
 
         // R4: a child whose parent already stopped waiting is an orphan; close
         // its open intents as cancelled and never open another turn.
@@ -208,7 +209,7 @@ impl Agent {
                 .await?
         {
             decoded = decode_entries(self.scan(session).await?, session)?;
-            facts = fold_facts(&decoded);
+            facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
             if let SessionState::TurnOpen { turn, step } = facts.state() {
                 if step.is_some()
                     && let Some(open) = open_step(&facts, turn)
@@ -266,7 +267,10 @@ impl Agent {
             step,
             seq: watermark,
             ..
-        }) = open_step(&fold_facts(&current), turn)
+        }) = open_step(
+            &SessionFacts::fold_decoded(current.iter().map(|(entry, event)| (entry, event))),
+            turn,
+        )
         else {
             // Between steps: the last committed step decides whether the turn
             // goes on, exactly as it did live.
@@ -972,7 +976,10 @@ impl Agent {
 
     async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
-        Ok(fold_facts(&decoded).has_pending_input())
+        Ok(
+            SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)))
+                .has_pending_input(),
+        )
     }
 
     /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
@@ -1080,7 +1087,9 @@ impl Agent {
     ) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
         Box::pin(async move {
             let entries = decode_entries(self.scan(session).await?, session)?;
-            if !fold_facts(&entries).is_idle() {
+            if !SessionFacts::fold_decoded(entries.iter().map(|(entry, event)| (entry, event)))
+                .is_idle()
+            {
                 return Err(AgentError::Busy { session });
             }
             // Share the drive single-flight; compact_now is turn-free.
@@ -1461,14 +1470,6 @@ fn last_log_id(facts: &SessionFacts) -> LogId {
         .last()
         .map(|(_, log_id)| log_id)
         .unwrap_or_else(|| LogId::from_i64(0))
-}
-
-fn fold_facts(decoded: &[(LogEntry, SessionEvent)]) -> SessionFacts {
-    let mut facts = SessionFacts::default();
-    for (entry, event) in decoded {
-        facts.apply(entry.seq, entry.log_id, entry.dedup_key.as_ref(), event);
-    }
-    facts
 }
 
 /// Where the attempt policy left a step: its watermark, attempt history and

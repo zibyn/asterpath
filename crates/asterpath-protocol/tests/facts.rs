@@ -205,7 +205,16 @@ fn fold(events: &[Keyed]) -> SessionFacts {
     let mut facts = SessionFacts::default();
     for (index, (event, key)) in events.iter().enumerate() {
         let seq = index as u64 + 1;
-        facts.apply(seq, LogId::from_i64(seq as i64 * 10), key.as_ref(), event);
+        let entry = LogEntry {
+            log_id: LogId::from_i64(seq as i64 * 10),
+            session: session(0),
+            seq,
+            recorded_at: 0,
+            schema_version: LOG_SCHEMA_VERSION,
+            dedup_key: key.clone(),
+            payload: serde_json::Value::Null,
+        };
+        facts.apply(&entry, event);
     }
     facts
 }
