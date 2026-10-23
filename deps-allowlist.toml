@@ -22,6 +22,16 @@ role = "contract"
 allow = ["asterpath-core"]
 
 [[package]]
+name = "asterpath-sandbox"
+role = "contract"
+allow = []
+
+[[package]]
+name = "asterpath-sandbox-linux"
+role = "module"
+allow = ["asterpath-sandbox"]
+
+[[package]]
 name = "asterpath-agent"
 role = "module"
 allow = ["asterpath-core", "asterpath-protocol"]
@@ -70,6 +80,16 @@ allow = ["asterpath-core", "asterpath-protocol"]
 name = "asterpath-usage"
 role = "module"
 allow = ["asterpath-core", "asterpath-protocol"]
+
+[[package]]
+name = "asterpath-plugin-host"
+role = "module"
+allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox"]
+
+[[package]]
+name = "asterpath-mcp-fixture"
+role = "tool"
+allow = []
 
 [[package]]
 name = "asterpath-testing"

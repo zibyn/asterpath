@@ -6,7 +6,7 @@
 
 ## 1. 决策摘要
 
-- v1 workspace = 16 个库/应用成员 + 1 个 `xtask`，按里程碑增量创建（M0 只建 7 个 crate + `xtask`）；一模块一 crate，模块之间零依赖。`asterpath-plugin-host` 等扩展归 M5（post-v1）。
+- v1 workspace = 16 个库/应用成员 + 1 个 `xtask`，按里程碑增量创建（M0 只建 7 个 crate + `xtask`）；一模块一 crate，模块之间零依赖。M5 扩展再加 4 个成员（`asterpath-plugin-host`、`asterpath-sandbox`、`asterpath-sandbox-linux`、`asterpath-mcp-fixture`），共 20 个库/应用成员 + 1 个 `xtask`。
 - 依赖方向固定 `core ← protocol ← modules ← app`，由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade、core、protocol 与日志 schema**，模块 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
@@ -37,9 +37,12 @@
 | `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | M4 |
 | `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | M1 |
 | `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | M0 |
-| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol` | M5（post-v1） |
+| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol`, `sandbox` | M5（post-v1） |
+| `asterpath-sandbox` | 零依赖沙箱合约：`SandboxProvider` / `SpawnRequest` / `ConfinedSpawn` / 策略与错误（[sandbox.md](sandbox.md)） | 无 | M5（post-v1） |
+| `asterpath-sandbox-linux` | Linux bwrap 参考后端 | `sandbox` | M5（post-v1） |
+| `asterpath-mcp-fixture` | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） | M5（post-v1） |
 
-- 上表不含 `asterpath-sandbox`：它是独立合约 crate（[#21](https://github.com/zibyn/asterpath/issues/21)，见 [sandbox.md](sandbox.md)），与 `asterpath-sandbox-linux` / `asterpath-sandbox-macos` 一起归 M5。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
+- `asterpath-sandbox-macos` 仍为预留名，M5 不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：模块 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件（SQLite 即如此），`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建，随里程碑增长）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。
