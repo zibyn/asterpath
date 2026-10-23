@@ -20,17 +20,17 @@
 
 | crate | 角色 | 职责 | 允许的 workspace 依赖 |
 | --- | --- | --- | --- |
-| `asterpath-protocol` | protocol | ID、日志信封与存储契约（`EventLog` / `Storage` / `SessionCatalog` / `SessionRetirement`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy`）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
+| `asterpath-protocol` | protocol | ID、日志信封与存储契约（`SessionStore`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy`）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
 | `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite` |
 | `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；不属于稳定面（ADR-0026 修订） | `protocol` |
 | `asterpath-provider-anthropic` | adapter | Anthropic Messages adapter | `protocol`, `http` |
 | `asterpath-provider-openai` | adapter | OpenAI Responses adapter | `protocol`, `http` |
-| `asterpath-storage-sqlite` | adapter | `EventLog` + `Storage` + `SessionCatalog` + `SessionRetirement` 的 SQLite 实现 | `protocol` |
+| `asterpath-storage-sqlite` | adapter | `SessionStore`（含退役）的 SQLite 实现 | `protocol` |
 | `asterpath-plugin-host` | adapter | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)），加载结果为 `Vec<Arc<dyn Tool>>`（`PluginHost::tools()`）；#80 改为 `asterpath-mcp` | `protocol`, `sandbox`, `http` |
 | `asterpath-sandbox` | adapter | 沙箱合约：`SandboxProvider` / `SpawnRequest` / `ConfinedSpawn` / 策略与错误（[sandbox.md](sandbox.md)）；#80 移入 protocol | 无 |
 | `asterpath-sandbox-linux` | adapter | Linux bwrap 参考后端 | `sandbox` |
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
-| `asterpath-testing` | adapter | in-memory 后端（`InMemoryEventLog` 同时是 `SessionCatalog`）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件 | `protocol`, `sandbox` |
+| `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件 | `protocol`, `sandbox` |
 | `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
 | `asterpath-mcp-fixture` | tool | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） |
@@ -104,14 +104,11 @@ pub struct AsterpathConfig {
     pub providers: Vec<Arc<dyn Provider>>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub compactor: Option<Arc<dyn Compactor>>,   // None = 压缩不可用
-    pub event_log: Option<Arc<dyn EventLog>>,   // 覆盖 sqlite feature
-    pub storage: Option<Arc<dyn Storage>>,
+    pub store: Option<Arc<dyn SessionStore>>,   // 覆盖 sqlite feature；None 时按 database 打开 SQLite
     pub clock: Arc<dyn Clock>,                  // 默认 SystemClock
     pub approval: Arc<dyn ApprovalPolicy>,      // 默认见 tools.md §4
     pub tool: ToolConfig,                       // 管线并发、截断与外进程超时
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
-    pub session_catalog: Option<Arc<dyn SessionCatalog>>,
-    pub session_retirement: Option<Arc<dyn SessionRetirement>>,
     pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
     pub hooks: Vec<Arc<dyn Hooks>>,             // 扩展钩子，按此顺序调用（ADR-0025）
 }
@@ -122,26 +119,25 @@ impl Asterpath {
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError>;
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
-    pub fn event_log(&self) -> Arc<dyn EventLog>;
-    pub fn storage(&self) -> Arc<dyn Storage>;
-    pub fn session_catalog(&self) -> Arc<dyn SessionCatalog>;
-    pub fn session_retirement(&self) -> Option<Arc<dyn SessionRetirement>>;  // 后端未提供时为 None
+    pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
+    pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 唤醒发现（storage.md §7）
     pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
     pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError>;
 }
 ```
 
+- 存储只有一个注入点 `store`：提供则直接使用（不需要 `database`），未提供时由 `sqlite` feature 按 `database` 打开；没有“部分注入”。注入的存储可以不实现退役（`retire` 返回 `Unsupported`）。
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应（`hooks(Arc<dyn Hooks>)` 可多次调用、逐个追加），`build().await` 按固定顺序直接构造内部组件。
 - 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
-- `event_log` / `storage` 要么同时注入，要么都留空；只注入其一是 `AsterError::Config`。同时注入时 `database` 被忽略；都留空时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
+- 注入 `store` 时 `database` 被忽略；未注入时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
-- 关闭 `sqlite` feature 时，`event_log` / `storage` 必须注入，`session_catalog` 也必须注入；`session_retirement` 仍是可选的。
+- 关闭 `sqlite` feature 时必须注入 `store`；退役仍是可选的。
 - v1 的 `AsterpathConfig` 没有插件字段；插件清单属于 M5 的 `asterpath-plugin-host`（[plugins.md](plugins.md)）。也没有技能字段：技能由宿主发现并组成 `system` / 工具，见 [skills.md](skills.md) §8。
 - 没有 `agent` / `executor` 注入：agent 循环与持久等待是引擎内部类型，不可替换（ADR-0026）。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
@@ -218,7 +214,7 @@ pub enum AgentError {
 ```
 
 - agent 循环是引擎内部的 `Agent`，不是 trait、不可替换（ADR-0026）；`SessionHandle::drive()` / `compact_now()` 是它的公开入口。
-- `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `EventLog` / `trace(session)`。
+- `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
@@ -252,7 +248,7 @@ pub enum AsterError {
 | 适配器 crate | 无 | — |
 | `protocol` | 无 | — |
 
-- `sqlite` 关闭时必须经 `AsterpathConfig.event_log` / `.storage` 注入实现。
+- `sqlite` 关闭时必须经 `AsterpathConfig.store` 注入实现。
 - v1 没有 `plugin-host` feature；插件宿主是 M5 的独立扩展（[plugins.md](plugins.md)）。
 - feature 不得改变公共契约类型（ADR-0026）。
 

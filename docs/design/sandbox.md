@@ -184,7 +184,7 @@ pub enum SandboxError {
 ## 10. 子会话
 
 - **要求**：子会话继承父的已解析策略，且只能收窄；父不能通过 spawn 参数把更宽的策略传给子，子也不能自行放宽。
-- **机制归宿主**：宿主解析器用 `SessionCatalog` 的父子边向上找到最近的已知 session，继承其策略；在 spawn 工具里拒绝任何 sandbox 覆盖参数。
+- **机制归宿主**：宿主解析器用 `SessionStore` 会话目录的父子边向上找到最近的已知 session，继承其策略；在 spawn 工具里拒绝任何 sandbox 覆盖参数。
 - `SubagentConfig` / `ConfigSnapshot` 不变；每子沙箱 profile 不在 v1（与 [#8](./subagents.md) §5 一致）。
 - 宿主解析不到子会话策略时回落到部署默认，不是 `FullAccess`。
 

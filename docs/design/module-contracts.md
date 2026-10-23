@@ -11,7 +11,7 @@
 
 ## 1. 决策摘要
 
-- 公开 trait 只有适配器与钩子（ADR-0026）：`Provider`、`Tool`、存储后端（`EventLog` + `Storage` + `SessionCatalog`，可选 `SessionRetirement`）、`Compactor`、`ApprovalPolicy`、`SandboxProvider`、`Clock`、`Hooks`。它们与值类型、日志信封一起在 `asterpath-protocol`。
+- 公开 trait 只有适配器与钩子（ADR-0026）：`Provider`、`Tool`、存储后端（`SessionStore`：日志 + 会话目录，可选退役）、`Compactor`、`ApprovalPolicy`、`SandboxProvider`、`Clock`、`Hooks`。它们与值类型、日志信封一起在 `asterpath-protocol`。
 - 引擎（agent 循环、scheduler、持久等待、工具表、trace / usage 视图、默认压缩）是 `asterpath` 的内部模块，不可替换；替换能力只经适配器，观察 / 拦截只经 `Hooks`。
 - 消息只出现在跨进程与跨恢复边界；进程内是直接调用。
 - 插件是外部传输，不是特权层。外部能力带 `Provenance::External`，经进程内 adapter 以 `Tool` 暴露。
@@ -33,7 +33,7 @@ engine (one crate; facade + internal modules)
         ▼
 adapters (depend on protocol and listed peers only)
   asterpath-provider-anthropic, asterpath-provider-openai   Provider
-  asterpath-storage-sqlite                                  EventLog + Storage + SessionCatalog + SessionRetirement
+  asterpath-storage-sqlite                                  SessionStore
   asterpath-http                                            shared SSE / HTTP plumbing
   asterpath-plugin-host (+ asterpath-sandbox, -sandbox-linux)  external tools (M5; #80 → asterpath-mcp)
   asterpath-skills                                          load_skill tool (M6)
@@ -92,23 +92,25 @@ pub type Timestamp = i64;        // Unix epoch 毫秒；唯一允许的时间表
 pub struct DedupKey(String);
 pub struct SignalName(String);
 
-pub trait EventLog: Send + Sync {
+// 唯一的存储适配器（ADR-0023）：日志 + 会话目录 + 可选退役。
+pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
-}
-
-// 一个会话的全部已提交记录（按 seq）：引擎与宿主共用的整段扫描（#77）。
-pub async fn scan_all(log: &dyn EventLog, session: SessionId)
-    -> Result<Vec<LogEntry>, StorageError>;
-
-// 会话树只读视图，由存储后端实现；用量子树汇总与归档使用（#13/#18）。
-pub trait SessionCatalog: Send + Sync {
+    // 会话目录：用量子树汇总、spawn 深度、唤醒发现与归档使用（#13/#18/#73）。
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
     fn parent(&self, session: SessionId)
         -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
     fn children(&self, session: SessionId)
         -> BoxStream<'_, Result<SessionId, StorageError>>;
+    // 默认 Err(RetirementError::Unsupported)；见 retention.md。
+    fn retire(&self, session: SessionId, expected_frontier: LogId)
+        -> BoxFuture<'_, Result<(), RetirementError>>;
 }
+
+// 一个会话的全部已提交记录（按 seq）：引擎与宿主共用的整段扫描（#77）。
+pub async fn scan_all(log: &dyn SessionStore, session: SessionId)
+    -> Result<Vec<LogEntry>, StorageError>;
 
 pub type SignalPayload = serde_json::Value;
 
@@ -148,11 +150,11 @@ pub struct ApprovalEndpoint;
 - `ApprovalGate` 由宿主经 facade 的 `Asterpath::approval_gate()` 取得；宿主在能够应答审批时 `register()`，句柄 drop 即失效。
 - agent 管线在 `Ask` 前查 `is_open()`；关闭时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4）。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
-- `Clock` 是时间来源接缝：引擎（agent / scheduler）注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
-- `Storage` 负责唤醒发现；方法集由 #5 定。
-- `SessionRetirement` 是存储后端的**可选**能力（整会话退役），由存储后端实现、经 facade 的 `session_retirement()` 取得；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
-- `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
-- `EventLog::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
+- `Clock` 是时间来源接缝：引擎（agent / scheduler）注入 `Arc<dyn Clock>` 取 `now`；存储不读时间（`recorded_at` 只供诊断）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
+- 唤醒发现不在存储：facade 的 `Asterpath::wakeable()` 对 `sessions()` 逐个折叠会话事实（[storage.md](storage.md) §7）。
+- 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），宿主经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
+- 事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
+- `SessionStore::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
 - 持久等待是引擎内部的 `waits::Waits`（`await_signal` / `deliver_signal` / `await_wake` / `wake`），不是 trait：持久等待只有审批与子会话完成，没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。`AwaitSignal` / `SignalDelivery` / `WakeCause` 是它的值类型，留在 protocol。v1 没有 activity / workflow。
 - 审批 signal id 即 `tool_call_id`；等待意图是 open `ToolCallRequested`，`await_signal` 不写记录，`deliver_signal` 以 signal id 为 dedup key 写 `SignalReceived`，重复投递不产生第二条。
 - `wake` 只在内存；终态记录的写者先 append 再 wake。等待者表不持久化，恢复靠扫描日志重建。
@@ -212,7 +214,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | --- | --- | --- |
 | `Provider` | 两个 provider crate、`ScriptedProvider` | `AsterpathConfig.providers` |
 | `Tool` | 宿主、`asterpath-skills`、plugin-host 的外部工具 | `AsterpathConfig.tools` |
-| `EventLog` / `Storage` / `SessionCatalog` / `SessionRetirement` | `asterpath-storage-sqlite`、`asterpath-testing` 的 in-memory 后端 | `sqlite` feature 或 `AsterpathConfig.event_log` 等 |
+| `SessionStore` | `asterpath-storage-sqlite`、`asterpath-testing` 的 in-memory 后端 | `sqlite` feature 或 `AsterpathConfig.store` |
 | `Compactor` | 引擎的 `DefaultCompactor`（facade 再导出） | `AsterpathConfig.compactor` |
 | `ApprovalPolicy` | 内置 `DefaultApprovalPolicy` 或宿主 | `AsterpathConfig.approval` |
 | `SandboxProvider` | `asterpath-sandbox-linux`（#80 起 trait 在 protocol） | plugin-host |
@@ -233,7 +235,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | 沙箱/隔离 | 进程启动点的 `SandboxProvider` 变换（独立合约 crate，v1 不建） | 内核只带 `Provenance`；见 [sandbox.md](sandbox.md) |
 | 成本/预算 | 宿主钩子 | `Hooks::before_step` + `StepCtx::usage()`，或 `on_record` + `usage_of`（#13、ADR-0025） |
 | trace 导出/采样 | 宿主钩子 | `Hooks::on_record`、`Asterpath::trace(session)`、事件日志 |
-| 日志保留/归档 | storage admin 扩展 | `SessionRetirement` 可选能力（#18，见 [retention.md](retention.md)） |
+| 日志保留/归档 | storage admin 扩展 | `SessionStore::retire` 可选能力（#18，见 [retention.md](retention.md)） |
 | 内容脱敏/密钥 | 宿主钩子 | `Hooks::after_tool` |
 | 内置工具 | 可选适配器或参考 CLI | `Tool` + `AsterpathConfig.tools` |
 | 插件安装/分发 | 生态工具或 host | 插件清单/加载（#16） |
@@ -279,9 +281,9 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 
 | 票 | 契约落点 |
 | --- | --- |
-| #3 事件日志与恢复 | `EventLog` / `Storage` 在 protocol；持久等待是引擎内部的 `Waits` |
+| #3 事件日志与恢复 | `SessionStore` 在 protocol；持久等待是引擎内部的 `Waits` |
 | #4 日志版本与迁移 | `LogEntry.schema_version`、upcasting、重放兼容 |
-| #5 存储与 SQLite | `Storage` 方法集与 schema；实现是适配器 |
+| #5 存储与 SQLite | `SessionStore` 方法集与 schema；实现是适配器（#73） |
 | #6 agent loop | 引擎内部的 `Agent`（不可替换，ADR-0026）；turn/step、取消、steering 见 [agent-loop.md](agent-loop.md) |
 | #7 工具与审批 | 已定。`Tool` / `Provenance` 在 protocol，工具表是引擎内部的 `ToolTable`；管线与审批见 [tools.md](tools.md)、[ADR-0007](../adr/0007-approval-and-sandbox-layers.md) |
 | #8 子智能体 | 已定。spawn 是同步工具调用拥有的独立子会话；调度是引擎内部的 `Scheduler`，见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md) |
@@ -289,7 +291,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | #17 调度 API | 已定。持久等待与调度都是引擎内部类型（`Waits`、`Scheduler`，ADR-0026）；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；不做通用 workflow |
 | #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
 | #12 追踪 | 查询是 facade 方法 `trace(session)`；没有推送，实时导出走 `Hooks::on_record` |
-| #13 token 统计 | 已定。查询是 facade 方法 `usage(scope)`，`usage_of` 与 `SessionCatalog` 在 protocol（实时观察走 `Hooks::on_record`）；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
+| #13 token 统计 | 已定。查询是 facade 方法 `usage(scope)`，`usage_of` 与 `SessionStore` 的会话目录在 protocol（实时观察走 `Hooks::on_record`）；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
 | #16 插件清单 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现与分发出界 |
 | #21 沙箱 | 已定。接缝在 `asterpath-sandbox`（#80 起移入 protocol）；protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |
@@ -297,7 +299,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 ## 9. 明确留给下游的点
 
 - 持久等待的方法集与等待 id 派生：已定，见 §3.4 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；等待语义归 #3。
-- `Storage` 方法与 SQLite schema：#4。
+- `SessionStore` 方法与 SQLite schema：#5 / #73。
 - `LogEntry` 编码与 schema 版本：#3/#4。
 - 会话生命周期事件枚举：#3/#11。
 - 插件清单/加载/版本协商：已定，见 [plugins.md](plugins.md)；发现与分发出界。

@@ -47,7 +47,7 @@ G1 计划闸与 G2 骨架闸的 prompt、通过条件与回灌流程见 [packagi
 ## 未决问题
 
 - 内核与打包：无。
-- 扩展 seam：保留/归档的 `SessionRetirement` 接缝属 v1（[retention.md](../design/retention.md)）；测试工具链已定（[testing.md](../design/testing.md)）；MCP adapter、沙箱与插件宿主已定但归 M5（[mcp.md](../design/mcp.md)、[sandbox.md](../design/sandbox.md)、[plugins.md](../design/plugins.md)），都不属于 v1 交付闸门。
+- 扩展 seam：保留/归档的退役接缝（`SessionStore::retire`）属 v1（[retention.md](../design/retention.md)）；测试工具链已定（[testing.md](../design/testing.md)）；MCP adapter、沙箱与插件宿主已定但归 M5（[mcp.md](../design/mcp.md)、[sandbox.md](../design/sandbox.md)、[plugins.md](../design/plugins.md)），都不属于 v1 交付闸门。
 - 已知解释：验收 (b) 验证 adapter 等价，不验证 turn 内切换 provider；v1 的 provider/model 在 session 创建时快照。
 
 ## 出界

@@ -5,7 +5,7 @@
 **前置**: [ADR-0005](0005-storage-contract-and-sqlite.md)、[ADR-0016](0016-retention-and-archive-seam.md)、[ADR-0022](0022-facade-accepts-host-modules.md)
 **修订**: ADR-0005 的派生索引、ADR-0016 的退役空闲判定、ADR-0022 的服务清单
 **2026-10-23 ADR-0024 修订**: `is_wakeable` 不再含到期 timer（通用 timer 已删除），见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
-**2026-10-23 #73 扩展修订**: `EventLog`、`SessionCatalog`、`SessionRetirement` 合并为一个 `SessionStore` trait（`retire` 默认 `Unsupported`）；facade 只接收一个 `store`；存储契约套件异步化并覆盖目录与退役，memory 后端实现退役。
+**2026-10-23 #73 扩展修订**: `EventLog`、`SessionCatalog`、`SessionRetirement` 合并为一个 `SessionStore` trait（`retire` 默认 `Unsupported`）；facade 只接收一个 `store`；存储契约套件异步化并覆盖目录与退役，memory 后端实现退役。下文的 `Asterpath::wakeable(now)` 落地为不带参数的 `wakeable()`（通用 timer 删除后不再需要 `now`），`session_catalog` 注入入口落地为 `store`。
 
 ## Context
 

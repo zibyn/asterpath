@@ -25,7 +25,7 @@
 - **一个逻辑模型调用一个 span**，所有 transport attempt 折叠为 span event；等待（approval / child）是独立 span。
 - **身份确定**：`TraceId = SessionId`，`SpanId` 由开启该 span 的日志记录确定性派生。重建得到相同 ID；恢复复用已存在的开启记录，不产生重复 span。
 - **恢复不新建 trace**：`StreamResumed` 记为 session span 上的 `resume` event；跨恢复的 span 标 `replay`。
-- **只有 pull 查询**：`Asterpath::trace(session)` 按需从 `EventLog` 折叠该会话的全部 span。值类型在 `asterpath-protocol`，折叠在引擎内部（`views::trace`）。没有推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠（ADR-0026）。
+- **只有 pull 查询**：`Asterpath::trace(session)` 按需从 `SessionStore` 的日志折叠该会话的全部 span。值类型在 `asterpath-protocol`，折叠在引擎内部（`views::trace`）。没有推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠（ADR-0026）。
 - **内容永不进 trace**：span 只带 `log_range` 引用。采样、过滤、格式、内容捕获与脱敏由 exporter/host 决定，默认关闭内容。
 
 ## 2. 类型（`asterpath-protocol`）
@@ -264,11 +264,11 @@ pub enum TraceError {
 }
 ```
 
-- `trace(session)` 从注入的 `EventLog` 折叠该会话；没有 trace 表，也不需要额外索引。`SpanFilter` 是引擎内部按 turn / step / kind 等收窄的同一折叠，facade 只按会话查询。
+- `trace(session)` 从注入的 `SessionStore` 折叠该会话；没有 trace 表，也不需要额外索引。`SpanFilter` 是引擎内部按 turn / step / kind 等收窄的同一折叠，facade 只按会话查询。
 - 日志被退役后，该会话的 span 一并消失：`trace(session)` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
 - 实时导出：宿主在 `Hooks::on_record` 上按本文的开启 / 终态规则自行增量折叠（每条开启记录开 span，只有终态记录关 span；session span 不关）。框架不维护推送状态，trace 不改变日志，也不参与恢复。
-- **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `EventLog` 读取权限，并自行脱敏。默认导出不含内容。
+- **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `SessionStore` 读取权限，并自行脱敏。默认导出不含内容。
 - **采样、过滤、格式、批量、重试**：全归 exporter。内核与 tracing 模块不做 head sampling。
 - 导出格式（OTLP/JSON/其他）与 `gen_ai.*` 映射只在 exporter 中出现；核心类型不使用字符串属性名。
 
@@ -302,7 +302,7 @@ pub enum TraceError {
 | T10 | `kill -9` 于 `Safe` 工具中 | 恢复后仍只有一个 tool span（同一 `SpanId`）；`replay=true`；恰一个 `ToolResult` |
 | T11 | `kill -9` 于模型流中 | 恢复后同一 `model_call` span；新增带 `replayed=true` 的 attempt event；最终恰一条 `AssistantMessage` |
 | T12 | compaction（BetweenSteps 与 Idle） | 各一个 `compact {model}` span，父分别为 turn / session；`trigger`、`replaces`、usage 正确 |
-| T13 | 内容边界 | 任何 span 都不含 prompt/completion/工具参数全文；内容只能通过 `log_range` 从 `EventLog` 取 |
+| T13 | 内容边界 | 任何 span 都不含 prompt/completion/工具参数全文；内容只能通过 `log_range` 从 `SessionStore` 取 |
 | T14 | exporter 实时订阅 | 除 session span 与 frontier 外，每个 span 收到成对的 `Started` / `Ended`；session 只有 `Started`；顺序与日志一致；tracing 模块不改变任何日志记录 |
 
 ## 10. 非目标

@@ -216,7 +216,7 @@ ContextForked {
   - `model_alias` 必须来自宿主提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（v1 provider 在 session 创建时快照，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
   - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
-- 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionCatalog` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
+- 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
 - 子的工具调用走自己的 session 与审批策略；父的审批不覆盖子。
 - 恢复一致性：物化子会话时断言 `SessionCreated.config == ChildSessionSpawned.config`；不一致是硬错误。
 
@@ -251,7 +251,7 @@ pub struct Summary {
 
 - `summary` 取子会话**最后一条已提交 `AssistantMessage`** 的 text/refusal item；剥掉 reasoning 与工具调用；可能为空（例如最后一步只有工具调用）。
 - 结果进入父上下文时受 #7 的截断上限（默认 64 KiB/调用）。
-- 父不自动获得子的完整 transcript；宿主可通过 `EventLog` 读取子流。
+- 父不自动获得子的完整 transcript；宿主可通过 `Asterpath::store()` 读取子流。
 
 映射：
 
@@ -450,7 +450,7 @@ pub struct SubagentConfig {
 - **#9**：子会话内的压缩策略；fork 快照尊重父的 `CompactionApplied`，但物化后与父压缩解耦。
 - **#11**：已定。`Item` / `Part`、`ConfigSnapshot`、`ContextPolicy`、`ChildOutcome` 的最终类型与 summary 的渲染见 [protocol.md](protocol.md)。
 - **#12**：已定。父 `subagent` span 与子 trace 根 span 的链接、`caused_by` / `source_log` 映射见 [tracing.md](tracing.md)。
-- **#13**：已定。session 树 rollup、去重口径与子 usage 查询见 [usage.md](usage.md)；树边由 protocol 的 `SessionCatalog` 提供。
+- **#13**：已定。session 树 rollup、去重口径与子 usage 查询见 [usage.md](usage.md)；树边由 protocol 的 `SessionStore` 会话目录提供。
 - **#15**：spawn 工具的最终命名/参数 schema；#79 起调度在引擎内部（ADR-0026）。
 - **#16**：已定。`spawn_agent` 是进程内工具的裸名；外部工具一律 `<plugin_id>__<tool>`，`__` 保留，因此不与 `spawn_agent` 冲突。见 [plugins.md](plugins.md) §6。
 - **#17**：已定。spawn/await/cancel 分工、持久超时、恢复委托与持久等待见 §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；原型在 `prototype/subagent-api` 分支。

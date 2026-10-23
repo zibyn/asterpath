@@ -214,7 +214,7 @@ pub enum StepState {
 
 「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`CompactionStarted` 无 `CompactionApplied` / `CompactionAborted`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
-- `SessionFacts`（protocol，会话事实）是唯一的折叠实现：`fold(&[LogEntry])` 批量解码折叠，`apply(seq, log_id, dedup_key, &event)` 逐事件折叠；`is_idle()` 排除 `compaction`。它同时回答未闭合意图的元数据（打开时 seq、所属回合/步骤、工具名、子会话的父工具调用与 `deadline`）、open step 及其起始 seq、是否有待处理输入、父会话。agent 恢复、scheduler 准入、facade `state()` / `facts()`、CLI `inspect` 与内存后端都读它，不各写折叠。`IntentDelta::of(event, dedup_key)` 是无状态的逐事件 delta（含待处理输入的设置/清除）；sqlite 目前仍用它在同一事务里物化 `open_intents` 表（#73 删除该表）；两者不一致即违反 G7。
+- `SessionFacts`（protocol，会话事实）是唯一的折叠实现：`fold(&[LogEntry])` 批量解码折叠，`apply(seq, log_id, dedup_key, &event)` 逐事件折叠；`is_idle()` 排除 `compaction`。它同时回答未闭合意图的元数据（打开时 seq、所属回合/步骤、工具名、子会话的父工具调用与 `deadline`）、open step 及其起始 seq、是否有待处理输入、父会话。agent 恢复、scheduler 准入、facade `state()` / `facts()` / `wakeable()`、存储退役的空闲判定与 CLI `inspect` 都读它，不各写折叠。`is_wakeable()` = 非 idle 或有待处理输入；不存在物化的意图表（#73，ADR-0023）。
 - 关闭事件按键精确匹配。审批的 `SignalReceived` 不关闭任何意图（工具意图由 `ToolResult` 关闭）；`InputRecorded` 不是意图。
 - `Idle` 只看非 compaction 意图：只有 `CompactionStarted` 未闭合时仍是 `Idle`（丢弃一次摘要调用是安全的，见 [retention.md](retention.md) §5）。
 
@@ -267,7 +267,7 @@ recover(session):
 ```
 
 - **检查点**：`entries.iter().rposition(|e| e 是 StepCommitted).unwrap_or(0)`。
-- **恢复点**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。前缘（`EventLog::frontier`，最后一条已提交记录）在它之前一条。
+- **恢复点**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。前缘（`SessionStore::frontier`，最后一条已提交记录）在它之前一条。
 - **已完成但未确认**：本层不存在这个状态。终态记录即完成；存储侧没有 ack，重复驱动由幂等 append 与 `drive()` 单飞吸收。
 - 补记完成后，驱动方从恢复点继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
 - 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
@@ -289,12 +289,12 @@ recover(session):
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 | S12 | 同一 key、不同事件类型各 append 一次（共享 key 见 §4） | 两条记录都落盘，互不抑制 |
-| S13 | 在 open step 中到达 `InputRecorded`（steering）、`SignalReceived`（审批）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；重启后出现在 `wakeable`；`open_intents` 与日志折叠一致 |
+| S13 | 在 open step 中到达 `InputRecorded`（steering）、`SignalReceived`（审批）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；重启后出现在 `Asterpath::wakeable()` |
 | S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
 | S17 | 恢复遇到 `ToolCallRequested{provenance: Unknown}` | 恰写一条 `ToolResult{Failed, NotFound}`；不查审批、不重跑；模型可见 |
-| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Storage::wakeable`；宿主 `open_session` + `drive()` 后输入恰被投影一次 |
+| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Asterpath::wakeable()`；宿主 `open_session` + `drive()` 后输入恰被投影一次 |
 
 ## 8. 留给下游
 

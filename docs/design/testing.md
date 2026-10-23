@@ -21,7 +21,7 @@
 
 | 注入点 | 实现 | 包住的调用 |
 | --- | --- | --- |
-| `append:before_commit` | `FailpointEventLog` | 委托 `EventLog::append` **之前**触发 |
+| `append:before_commit` | `FailpointEventLog` | 委托 `SessionStore::append` **之前**触发 |
 | `append:after_commit` | `FailpointEventLog` | 委托返回后、调用方拿到 `LogId` **之前**触发 |
 | `tool:before_effect` | `FailpointTool` | 委托 `Tool::invoke` **之前**触发 |
 | `tool:after_effect` | `FailpointTool` | `invoke` 返回后、agent loop 写 `ToolResult` **之前**触发 |
@@ -62,11 +62,11 @@ impl Failpoint {
     pub fn with_occurrence(self, n: NonZeroUsize) -> Self;
 }
 
-pub struct FailpointEventLog { inner: Arc<dyn EventLog>, failpoint: Failpoint, hits: AtomicUsize }
+pub struct FailpointEventLog { inner: Arc<dyn SessionStore>, failpoint: Failpoint, hits: AtomicUsize }
 pub struct FailpointTool     { inner: Arc<dyn Tool>,     failpoint: Failpoint, hits: AtomicUsize }
 
 impl FailpointEventLog {
-    pub fn new(inner: Arc<dyn EventLog>, failpoint: Failpoint) -> Self;
+    pub fn new(inner: Arc<dyn SessionStore>, failpoint: Failpoint) -> Self;   // 其余方法原样转发
 }
 impl FailpointTool {
     pub fn new(inner: Arc<dyn Tool>, failpoint: Failpoint) -> Self;
@@ -115,26 +115,20 @@ impl ManualClock {
 impl Clock for ManualClock { /* 读 AtomicI64 */ }
 ```
 
-- `Storage::wakeable` 继续收显式 `now`（#5 / ADR-0005 不变）。`runtime`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
+- 存储契约不收时间（#73 删除了 `Storage::wakeable(now)`）。`waits`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
 - `recorded_at` 仍由存储模块用自己的墙钟写入；它不参与恢复、投影或断言（#3 I8 / #12），因此存储不需要 `Clock`。
 - `clock:advance` 注入点 = `ManualClock::advance`，用于 spawn 截止时间过期等时间推进。它不产生 marker，也不模拟崩溃。
 
 ## 4. 后端中立契约套件
 
-`asterpath-testing` 提供共享套件；套件代码只依赖 protocol。in-memory 后端在 `asterpath-testing` 自己的测试里实现 `BackendFactory` 并运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入依赖规则（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
+`asterpath-testing` 提供共享套件；套件代码只依赖 protocol。套件是 async 的，由调用方的 `#[tokio::test]` 驱动。in-memory 后端在 `asterpath-testing` 自己的测试里经 `MemoryBackend`（实现 `StoreFactory`）运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入依赖规则（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
 
 ```rust
-pub struct BackendHandle {
-    pub log: Arc<dyn EventLog>,
-    pub storage: Arc<dyn Storage>,
+pub trait StoreFactory {
+    fn open(&self) -> Arc<dyn SessionStore>;   // 被测后端
 }
 
-pub trait BackendFactory {
-    fn open(&self) -> BackendHandle;   // 新句柄，语义上重新打开同一后端
-}
-
-pub fn event_log_contract(factory: &impl BackendFactory);
-pub fn storage_contract(factory: &impl BackendFactory);
+pub async fn session_store_contract<F: StoreFactory>(factory: &F);
 ```
 
 | 保证 | in-memory | SQLite | 套件 |
@@ -143,28 +137,29 @@ pub fn storage_contract(factory: &impl BackendFactory);
 | G2 幂等 `(session, event_kind, dedup_key)` | 支持 | 支持 | 共享 |
 | G3 `seq` 全序、无洞、存储分配 | 支持 | 支持 | 共享 |
 | G4 游标扫描与 frontier | 支持 | 支持 | 共享 |
-| G5 唤醒发现完备、同 session 不重复 | 支持 | 支持 | 共享 |
+| G5 会话目录（`sessions` / `parent` / `children`） | 支持 | 支持 | 共享 |
 | G6 无跨流原子性 | 支持 | 支持 | 共享 |
-| G7 派生索引可重建 | 支持 | 支持 | 共享 |
-| G8 退役原子性（`SessionRetirement`） | 不实现 | 支持 | 仅 SQLite |
+| G7 `sessions` 目录可重建 | 支持 | 支持 | 共享（经 G5） |
+| 退役语义 R1–R7（`SessionStore::retire`） | 支持 | 支持 | 共享；后端返回 `Unsupported` 时跳过 |
+| G8 退役原子性（事务回滚、跨重启幂等） | — | 支持 | 仅 SQLite |
 
 共享套件清单（对应 [storage.md §8–§9](storage.md#8-保证清单)）：
 
-- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
+- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`；参数化 fixture 对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
 - G3：串行与并发 append 后 `seq` 严格递增无洞；只由存储分配。
 - G4：`scan(after)` 只返回已提交、按 `seq` 升序、`limit` 有界；`frontier` 等于末条 `log_id`。
-- G5：有非 compaction open intent 或待处理输入的 session 出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录。
+- G5：`sessions()` 列出每个有 `SessionCreated` 的会话一次（含子会话、按 id 排序，重放的 `SessionCreated` 不重复）；`parent` / `children` 与 `SessionCreated.parent` 一致。唤醒判定不在后端套件：它是 facade 的 `wakeable()` 折叠，由 facade 双后端测试（`crates/asterpath/tests/wake.rs`）覆盖 S13、S18 与仅 compaction 未闭合不可唤醒。
 - G6：两个 session 的 append 不构成原子组；一个流的可见性不受另一个流影响。
-- G7：丢弃派生状态后，仅凭日志重建 `sessions` / `open_intents` / `pending_inputs`。
-- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、`pending_inputs` 在 `StepStarted` 前保留也在此层。
+- 退役：未知会话 `NotFound`；退役后 `scan` 空、`frontier` 为 `None`、目录不再列出；同 frontier 重试成功，不同 frontier 报墓碑的 `FrontierMoved`；CAS（R1）、`NotIdle` 先于 frontier（R4）、仅 compaction 未闭合可退役、`HasChildren`（R5）、`ParentNotIdle` 且 `HasChildren` 优先（R6）。
+- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）也在此层。
 
 仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 
 - G1：`append` 返回后 `SIGKILL`，重启能读到该条；FULL 下的掉电承诺以 `synchronous=FULL` 配置测试，不在 CI 模拟真实掉电。
-- `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version` 迁移。
-- G8 与墓碑幂等（[retention.md](retention.md)）。
+- `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version` 迁移（v1 库打开后升到 v2、三张派生表消失、日志可读）。
+- G8：退役事务中途失败整体回滚；跨重启的墓碑幂等与残留行（[retention.md](retention.md)）。
 
-in-memory 后端在文档与代码中显式标注 **不满足 G1**；它不实现 `SessionRetirement`，facade 的 `session_retirement()` 对它返回 `None`。
+in-memory 后端在文档与代码中显式标注 **不满足 G1**；它实现退役，语义与 SQLite 一致（同一把锁内判定、CAS、删除、墓碑）。
 
 ## 5. 进程级场景编排
 

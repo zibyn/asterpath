@@ -12,7 +12,7 @@
 >
 > - `ProviderError` 增加 `partial_usage: Option<Usage>`（#11）。
 > - `AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`（#3）。
-> - core 增加 `SessionCatalog` 合约，由存储模块实现（#2/#5）。
+> - core 增加 `SessionCatalog` 合约，由存储模块实现（#2/#5）；#73 起并入 `SessionStore`。
 
 ## 1. 决策摘要
 
@@ -21,7 +21,7 @@
 - **三个桶**：`model_calls`（成功的 `AssistantMessage`）、`compaction`（成功的 `CompactionApplied`）、`partial`（失败/中断 attempt 已确认的用量，只作诊断）。`total = model_calls + compaction`；`partial` 不进总量。
 - **用量不是独立日志事件**：它是 `AssistantMessage` / `CompactionApplied` / `ModelCallAborted` 上的字段；聚合是事件日志的确定性投影，恢复与重放天然幂等。
 - **归因按会话树**：子会话 usage 只写子流，父日志不含子 usage。`own` 与 `SessionSubtree` 分开返回，`own + descendants` 结构上不会重复计数；`fork` 不继承父用量。
-- **查询纯折叠**：facade 方法 `Asterpath::usage(scope)`（pull，ADR-0026）从 `EventLog` 折叠，v1 不建 usage 派生表；实时观察是 `Hooks::on_record`（每条提交记录一次）配合 `usage_of`。
+- **查询纯折叠**：facade 方法 `Asterpath::usage(scope)`（pull，ADR-0026）从 `SessionStore` 的日志折叠，v1 不建 usage 派生表；实时观察是 `Hooks::on_record`（每条提交记录一次）配合 `usage_of`。
 - **成本/预算不在内核**：价格表、币种、告警、预算执行都在扩展模块；内核只提供用量、`usage_of`、`Hooks::on_record` 与 `Hooks::before_step`（#6 的 pre-step gate）。
 - **全局跨 session 聚合出界**：v1 查询面限于单会话及其子树。
 
@@ -93,7 +93,7 @@ pub enum UsageError {
 }
 ```
 
-- 值类型在 `asterpath-protocol`，折叠是引擎内部的 `views::usage::UsageService`；它只依赖注入的 `EventLog` 与 `SessionCatalog`，不读 trace。`UsageFilter`（bucket / model / since / until / limit）与逐条 `UsageRecord` 是该折叠的内部形状：facade 只报 scope 合计，钩子上下文的 `usage()` 报会话子树合计。
+- 值类型在 `asterpath-protocol`，折叠是引擎内部的 `views::usage::UsageService`；它只依赖注入的 `SessionStore`（日志与会话目录），不读 trace。`UsageFilter`（bucket / model / since / until / limit）与逐条 `UsageRecord` 是该折叠的内部形状：facade 只报 scope 合计，钩子上下文的 `usage()` 报会话子树合计。
 - `Usage`、`ModelSpec`、`Timestamp`、各类 ID 的既有定义见 [protocol.md](protocol.md) 与 [module-contracts.md](module-contracts.md)；本票不新增 token 计数类型。
 
 ## 3. 桶与计数规则
@@ -166,17 +166,7 @@ pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option
 
 ### 会话树
 
-- 树边以 `SessionCreated.parent`（存储的 `sessions.parent_id`）为准，经 protocol 的 `SessionCatalog` 读取：
-
-```rust
-// asterpath-protocol
-pub trait SessionCatalog: Send + Sync {
-    fn parent(&self, session: SessionId)
-        -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
-    fn children(&self, session: SessionId)
-        -> BoxStream<'_, Result<SessionId, StorageError>>;
-}
-```
+- 树边以 `SessionCreated.parent`（存储的 `sessions.parent_id`）为准，经 protocol 的 `SessionStore` 会话目录（`parent` / `children`，见 [storage.md](storage.md) §3）读取。
 
 - `SessionSubtree(root)` 返回 `own = root 自身`、`descendants = 全部后代之和`；后代表达式按深度优先或逐层展开均可，顺序不影响结果。
 - 查询只覆盖当前仍在存储中的日志。已退役的会话对 `usage(scope)` 返回 `NotFound`；存活会话的子树只汇总仍存在的后代，删掉后代日志时总量相应变小（[retention.md](retention.md) §9）。
@@ -189,7 +179,7 @@ pub trait SessionCatalog: Send + Sync {
 - 时间分桶（按小时/天）由调用方对 `records()` 自行分组；v1 没有 `group_by` API。
 - 任一目标 session 的日志损坏 → `UsageError::Corrupt`，整个查询失败，不跳过坏 session（与 #5 的硬错误一致）。
 - v1 不建 usage 派生表、不维护计数器；日志是唯一真相。查询成本与日志长度线性，可流式提前终止。
-- 没有 `UsageScope::All`：全局报表由宿主自己的会话注册表遍历根会话完成；`SessionCatalog` 不提供 `roots()`。
+- 没有 `UsageScope::All`：全局报表由宿主自己的会话注册表遍历根会话完成；会话目录不提供 `roots()`。
 
 ## 6. 实时事件与成本接缝
 
@@ -204,7 +194,7 @@ pub trait SessionCatalog: Send + Sync {
 
 - 价格表、币种、告警阈值、预算策略全部在宿主钩子，内核不提供相关类型。
 - 执行点是 `Hooks::before_step`：用 `StepCtx::usage()`（本会话 `own` 与子树 `descendants`）判定，超预算返回 `Gate::EndTurn { reason }` → `Stopped { reason }`。gate 只在 step 之间运行，**最多超支一个 step**；不在模型流中间打断。这是明确接受的语义。
-- 跨会话累计（例如按 root session）由钩子在 `on_record` 里用 `SessionCatalog.parent` 归并；进程重启后用 `usage(scope)` 重建。
+- 跨会话累计（例如按 root session）由钩子在 `on_record` 里用 `SessionStore::parent` 归并；进程重启后用 `usage(scope)` 重建。
 - 是否把 `Partial` 计入预算由宿主决定。
 
 ## 7. 重放与幂等
@@ -220,7 +210,7 @@ pub trait SessionCatalog: Send + Sync {
 ## 8. 边界与非目标
 
 - 本地 tokenizer / 估算用量进账：不做；估算只属于压缩模块的窗口判断。
-- 全局跨 session 聚合、`SessionCatalog::roots()`：v1 不做。
+- 全局跨 session 聚合、会话目录的 `roots()`：v1 不做。
 - 价格、币种、预算、告警、成本归因到工具/用户：扩展模块或宿主。
 - 把 `partial` 混入总量、或对丢失的用量做估算补偿：不做。
 - turn / step 级子树汇总：不做；子会话只进 session 树。

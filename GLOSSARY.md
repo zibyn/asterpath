@@ -390,7 +390,7 @@ _Avoid_: 会话视图、会话快照、派生索引（后者是存储层的物�
 最近一个完整提交的步骤边界；它之前的模型可见历史无需重放。
 
 **前缘（Frontier）**：
-日志中最后一条已提交记录的位置；append 只会推进它，`EventLog::frontier` 返回该 `LogId`。
+日志中最后一条已提交记录的位置；append 只会推进它，`SessionStore::frontier` 返回该 `LogId`。
 _Avoid_: 队列头、恢复位置
 
 **恢复点（Resume Point）**：
