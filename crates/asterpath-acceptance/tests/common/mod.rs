@@ -59,29 +59,47 @@ pub fn mcp_fixture() -> PathBuf {
     bin
 }
 
-/// Proves a crashed host left no sandbox or fixture process behind. `delay` is
-/// the unique `--fault-delay-ms` value of the run under test.
+/// Proves a crashed host leaves no sandbox or fixture process behind. Because
+/// the adapter now spawns its server in its own process group, a SIGKILL of the
+/// driver does not reach it: leftovers matching the fixture path and `delay`
+/// (a unique `--fault-delay-ms` value) are killed here before asserting.
 pub fn assert_no_process(fixture: &Path, delay: &str) {
-    let fixture = fixture.to_string_lossy();
+    let fixture = fixture.to_string_lossy().into_owned();
     for _ in 0..100 {
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir("/proc").expect("proc") {
-            let Ok(entry) = entry else { continue };
-            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-                continue;
-            };
-            let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
-            if args.iter().any(|arg| *arg == fixture.as_bytes()) && args.contains(&delay.as_bytes())
-            {
-                found.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
+        let found = matching_pids(&fixture, delay);
         if found.is_empty() {
             return;
         }
+        for pid in found {
+            // SAFETY: best-effort cleanup of processes started by the test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("processes still running for fixture {fixture} delay {delay}");
+    panic!(
+        "processes still running for fixture {fixture} delay {delay}: {:?}",
+        matching_pids(&fixture, delay)
+    );
+}
+
+fn matching_pids(fixture: &str, delay: &str) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("proc") {
+        let Ok(entry) = entry else { continue };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+        if args.contains(&fixture.as_bytes()) && args.contains(&delay.as_bytes()) {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 pub fn open(db: &Path) -> std::sync::Arc<SqliteStorage> {
@@ -147,6 +165,7 @@ pub struct PluginScenario<'a> {
     pub effect: &'a Path,
     pub manifests: &'a [PathBuf],
     pub sandbox: &'a str,
+    pub kill_grace_ms: Option<u64>,
 }
 
 impl Testdrive {
@@ -169,6 +188,9 @@ impl Testdrive {
             command.arg("--plugin-manifest").arg(manifest);
         }
         command.arg("--sandbox").arg(scenario.sandbox);
+        if let Some(grace) = scenario.kill_grace_ms {
+            command.arg("--kill-grace-ms").arg(grace.to_string());
+        }
         Self::spawn(command, name)
     }
 

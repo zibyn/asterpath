@@ -128,6 +128,30 @@ fn workspace_write_binds_each_root_in_order() {
 }
 
 #[test]
+fn workspace_write_rejects_empty_and_relative_roots() {
+    // Validation happens before bwrap resolution, so a missing binary still
+    // reports the policy error.
+    let provider = LinuxSandbox::with_bwrap_program("/nonexistent/asterpath-bwrap");
+    let env = env();
+    for policy in [
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+        },
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![PathBuf::from("relative/dir")],
+        },
+    ] {
+        let request = SpawnRequest::new(OsStr::new("/bin/true"), &[], None, &env, &policy);
+        match provider.confine(&request) {
+            Err(SandboxError::Unsupported { reason }) => {
+                assert!(reason.contains("writable root"), "{reason}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn full_access_is_pass_through_without_bwrap() {
     let provider = LinuxSandbox::with_bwrap_program("/nonexistent/asterpath-bwrap");
     let env = env();

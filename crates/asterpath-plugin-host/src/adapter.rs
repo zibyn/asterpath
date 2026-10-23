@@ -44,6 +44,18 @@ pub enum AdapterError {
     Transport { message: String },
 }
 
+impl AdapterError {
+    /// The stage-specific message without the stage prefix.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Spawn { message }
+            | Self::Handshake { message }
+            | Self::Discovery { message }
+            | Self::Transport { message } => message,
+        }
+    }
+}
+
 pub trait PluginAdapter: Send + Sync + 'static {
     fn handshake(&mut self) -> BoxFuture<'_, Result<AdapterHandshake, AdapterError>>;
     fn discover(&mut self) -> BoxFuture<'_, Result<Vec<AdapterTool>, AdapterError>>;

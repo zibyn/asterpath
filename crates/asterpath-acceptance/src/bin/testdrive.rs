@@ -18,9 +18,9 @@ use asterpath_plugin_host::{PluginHost, PluginManifest, PluginStatus};
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
     ModelSpec, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
-    RequestConfig, SessionSpec, StreamEvent, Tool, ToolArgs, ToolContext, ToolDescriptor,
-    ToolError, ToolName, ToolOutput, ToolRegistry, ToolSelection, TurnConfig, TurnEndReason,
-    UserInput, decode_entry,
+    RequestConfig, SessionSpec, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext,
+    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolSelection, TurnConfig,
+    TurnEndReason, UserInput, decode_entry,
 };
 use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
@@ -59,6 +59,7 @@ struct Args {
     plugin_manifests: Vec<PathBuf>,
     sandbox: SandboxPolicy,
     sandbox_provider: bool,
+    kill_grace: Duration,
 }
 
 fn usage_error(message: &str) -> i32 {
@@ -82,6 +83,7 @@ fn run() -> Result<i32, String> {
     let mut policy = "full".to_owned();
     let mut writable_roots = Vec::new();
     let mut sandbox_provider = true;
+    let mut kill_grace = ToolConfig::default().kill_grace;
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,6 +105,15 @@ fn run() -> Result<i32, String> {
                 None => return Ok(usage_error("--writable-root needs a value")),
             },
             "--no-sandbox-provider" => sandbox_provider = false,
+            "--kill-grace-ms" => match args.next() {
+                Some(value) => {
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --kill-grace-ms value {value}"))?;
+                    kill_grace = Duration::from_millis(millis);
+                }
+                None => return Ok(usage_error("--kill-grace-ms needs a value")),
+            },
             "--failpoint" => match args.next() {
                 Some(spec) => specs.push(spec),
                 None => return Ok(usage_error("--failpoint needs a value")),
@@ -141,6 +152,7 @@ fn run() -> Result<i32, String> {
         plugin_manifests,
         sandbox,
         sandbox_provider,
+        kill_grace,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -441,6 +453,11 @@ async fn assemble(
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let hold = Duration::from_millis(hold_millis(args.command == "run"));
     for name in &fixture.tools {
+        // External names are registered by plugin-host (or, after a resume
+        // without a manifest, intentionally absent).
+        if name.as_str().contains("__") {
+            continue;
+        }
         // Plugin tools are already registered by the plugin host.
         if plugin_registry
             .as_ref()
@@ -466,7 +483,11 @@ async fn assemble(
     let mut builder = AsterpathBuilder::new()
         .providers(vec![provider])
         .tools(tools)
-        .clock(clock);
+        .clock(clock)
+        .tool(ToolConfig {
+            kill_grace: args.kill_grace,
+            ..ToolConfig::default()
+        });
     if !args.plugin_manifests.is_empty() {
         // External tools are `Ask` by default and there is no approval endpoint
         // in this driver, so the M5 scenarios allow them explicitly.

@@ -23,6 +23,10 @@ fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
 }
 
+fn is_name_char(ch: char) -> bool {
+    ch.is_ascii() && is_name_byte(ch as u8)
+}
+
 /// Validates a bare, in-process tool name: `[A-Za-z0-9_-]{1,64}` without `__`.
 pub fn validate_tool_name(name: &str) -> Result<(), ToolNameError> {
     if name.is_empty() || name.len() > 64 || !name.bytes().all(is_name_byte) {
@@ -30,6 +34,15 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolNameError> {
     }
     if name.contains("__") {
         return Err(ToolNameError::ReservedSeparator);
+    }
+    Ok(())
+}
+
+/// Validates an externally registered composed name: `[A-Za-z0-9_-]{1,64}`.
+/// `__` is allowed because plugin-host composes `<plugin_id>__<tool>`.
+pub fn validate_external_tool_name(name: &str) -> Result<(), ToolNameError> {
+    if name.is_empty() || name.len() > 64 || !name.bytes().all(is_name_byte) {
+        return Err(ToolNameError::InvalidToolName);
     }
     Ok(())
 }
@@ -51,13 +64,7 @@ pub fn validate_plugin_id(id: &str) -> Result<(), ToolNameError> {
 /// Replaces every character outside `[A-Za-z0-9_-]` with `_`, keeping case.
 pub fn sanitize_tool_name(raw: &str) -> String {
     raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
+        .map(|ch| if is_name_char(ch) { ch } else { '_' })
         .collect()
 }
 
@@ -154,6 +161,19 @@ mod tests {
             external_tool_name("weather", "ünicode").unwrap(),
             ToolName::new("weather___nicode")
         );
+    }
+
+    #[test]
+    fn external_names_allow_the_separator_but_keep_the_charset() {
+        assert!(validate_external_tool_name("plugin__tool").is_ok());
+        assert!(validate_external_tool_name(&"x".repeat(64)).is_ok());
+        for name in ["", "a.b", "a b", "é", "a__b\n", &"x".repeat(65)] {
+            assert_eq!(
+                validate_external_tool_name(name),
+                Err(ToolNameError::InvalidToolName),
+                "{name}"
+            );
+        }
     }
 
     #[test]

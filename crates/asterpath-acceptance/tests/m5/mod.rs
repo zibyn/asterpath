@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use asterpath_core::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_plugin_host::{
@@ -12,8 +13,8 @@ use asterpath_plugin_host::{
     PluginStatus, PluginTimeouts, PluginTransport,
 };
 use asterpath_protocol::{
-    CancelToken, JsonString, Part, Provenance, SessionEvent, ToolContext, ToolName, ToolRegistry,
-    ToolResultStatus, TransportKind, TurnEndReason,
+    CancelToken, JsonString, Part, Provenance, SessionEvent, ToolContext, ToolErrorKind, ToolName,
+    ToolRegistry, ToolResultStatus, TransportKind, TurnEndReason,
 };
 use asterpath_sandbox::SandboxPolicy;
 use asterpath_tools::InMemoryToolRegistry;
@@ -40,6 +41,24 @@ fn write_manifest(dir: &Path, name: &str, delay_ms: Option<u64>) -> PathBuf {
             "args": args,
         },
         "timeouts": {"startup_ms": 30000, "call_ms": 120000},
+    });
+    let path = dir.join(name);
+    std::fs::write(&path, manifest.to_string()).expect("write manifest");
+    path
+}
+
+fn write_timeout_manifest(dir: &Path, name: &str, call_ms: u64, delay_ms: u64) -> PathBuf {
+    let manifest = json!({
+        "manifest_version": 1,
+        "id": "fixture",
+        "protocol": "mcp",
+        "protocol_versions": ["2026-07-28"],
+        "transport": {
+            "kind": "stdio",
+            "command": common::mcp_fixture().to_string_lossy(),
+            "args": ["--stdio", "--fault-delay-ms", delay_ms.to_string()],
+        },
+        "timeouts": {"startup_ms": 30000, "call_ms": call_ms},
     });
     let path = dir.join(name);
     std::fs::write(&path, manifest.to_string()).expect("write manifest");
@@ -88,6 +107,18 @@ fn results(events: &[SessionEvent]) -> Vec<(ToolResultStatus, bool, bool)> {
         .collect()
 }
 
+fn result_errors(events: &[SessionEvent]) -> Vec<(ToolResultStatus, Option<ToolErrorKind>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { status, error, .. } => {
+                Some((*status, error.as_ref().map(|error| error.kind)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn turns(events: &[SessionEvent]) -> Vec<TurnEndReason> {
     events
         .iter()
@@ -125,6 +156,7 @@ async fn e2e_stdio_plugin_loads_and_calls_inside_a_read_only_sandbox() {
         effect: &effect,
         manifests: std::slice::from_ref(&manifest),
         sandbox: "read-only",
+        kill_grace_ms: None,
     })
     .wait_success();
     let session = common::session_id(&lines);
@@ -177,6 +209,7 @@ async fn safe_external_tool_reruns_once_after_a_host_sigkill() {
         effect: &effect,
         manifests: std::slice::from_ref(&run_manifest),
         sandbox: "read-only",
+        kill_grace_ms: None,
     });
     let started: Value = serde_json::from_str(&run.wait_marker("\"event\":\"tool_started\""))
         .expect("tool_started json");
@@ -192,6 +225,7 @@ async fn safe_external_tool_reruns_once_after_a_host_sigkill() {
         effect: &effect,
         manifests: std::slice::from_ref(&resume_manifest),
         sandbox: "read-only",
+        kill_grace_ms: None,
     })
     .wait_success();
     assert_eq!(common::session_id(&resume_lines), session);
@@ -229,6 +263,7 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
         effect: &effect,
         manifests: std::slice::from_ref(&run_manifest),
         sandbox: "read-only",
+        kill_grace_ms: None,
     });
     let started: Value = serde_json::from_str(&run.wait_marker("\"event\":\"tool_started\""))
         .expect("tool_started json");
@@ -244,6 +279,7 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
         effect: &effect,
         manifests: std::slice::from_ref(&resume_manifest),
         sandbox: "read-only",
+        kill_grace_ms: None,
     })
     .wait_success();
     assert_eq!(common::session_id(&resume_lines), session);
@@ -335,6 +371,97 @@ async fn http_plugin_loads_and_calls_without_a_sandbox() {
         }]
     );
     fixture.stop().await;
+}
+
+/// Scenario 6: a per-call deadline kills the stdio server; the next call is
+/// rejected by the dead adapter, so the pipeline records Timeout then Transport.
+#[tokio::test]
+async fn pipeline_timeout_kills_the_server_and_later_calls_fail_transport() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("m5.sqlite");
+    let effect = dir.path().join("unused");
+    let manifest = write_timeout_manifest(dir.path(), "plugin.json", 200, 5_000);
+
+    let started = Instant::now();
+    let lines = Testdrive::start_plugin(PluginScenario {
+        run: true,
+        db: &db,
+        fixture: "m5_timeout.json",
+        effect: &effect,
+        manifests: std::slice::from_ref(&manifest),
+        sandbox: "read-only",
+        kill_grace_ms: Some(100),
+    })
+    .wait_success();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "timeout scenario took {:?}",
+        started.elapsed()
+    );
+    let session = common::session_id(&lines);
+
+    let events = events(&db, session).await;
+    assert_eq!(requested(&events, "fixture__echo").len(), 2);
+    assert_eq!(
+        result_errors(&events),
+        vec![
+            (ToolResultStatus::Failed, Some(ToolErrorKind::Timeout)),
+            (ToolResultStatus::Failed, Some(ToolErrorKind::Transport)),
+        ]
+    );
+    assert_eq!(turns(&events), vec![TurnEndReason::Completed]);
+}
+
+/// Scenario 7: crash mid-call on a `Safe` external tool, then resume with no
+/// plugin manifest. The tool is absent from the snapshot, so recovery records
+/// exactly one intent and one `NotFound` result and never reruns it.
+#[tokio::test]
+async fn safe_external_tool_missing_after_resume_is_not_found_and_not_rerun() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("m5.sqlite");
+    let effect = dir.path().join("unused");
+    let run_manifest = write_manifest(dir.path(), "run.json", Some(60_003));
+
+    let mut run = Testdrive::start_plugin(PluginScenario {
+        run: true,
+        db: &db,
+        fixture: "m5_echo.json",
+        effect: &effect,
+        manifests: std::slice::from_ref(&run_manifest),
+        sandbox: "read-only",
+        kill_grace_ms: None,
+    });
+    let started: Value = serde_json::from_str(&run.wait_marker("\"event\":\"tool_started\""))
+        .expect("tool_started json");
+    assert_eq!(started["tool"], "fixture__echo");
+    let run_lines = run.kill();
+    let session = common::session_id(&run_lines);
+    common::assert_no_process(&common::mcp_fixture(), "60003");
+
+    let resume_lines = Testdrive::start_plugin(PluginScenario {
+        run: false,
+        db: &db,
+        fixture: "m5_echo.json",
+        effect: &effect,
+        manifests: &[],
+        sandbox: "read-only",
+        kill_grace_ms: None,
+    })
+    .wait_success();
+    assert_eq!(common::session_id(&resume_lines), session);
+
+    let events = events(&db, session).await;
+    assert_eq!(
+        requested(&events, "fixture__echo").len(),
+        1,
+        "the open intent is not requested twice"
+    );
+    assert_eq!(
+        result_errors(&events),
+        vec![(ToolResultStatus::Failed, Some(ToolErrorKind::NotFound))],
+        "the missing tool is not rerun"
+    );
+    assert_eq!(turns(&events), vec![TurnEndReason::Completed]);
 }
 
 fn context() -> ToolContext {

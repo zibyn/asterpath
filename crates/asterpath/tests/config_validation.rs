@@ -7,7 +7,7 @@ use asterpath::{AsterError, Asterpath};
 use asterpath_protocol::{
     ModelAlias, ModelId, ModelSpec, Parallelism, Provenance, Provider, ProviderId, ReplaySafety,
     SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
-    TurnConfig,
+    TransportKind, TurnConfig,
 };
 use asterpath_testing::{BackendFactory, BackendHandle, MemoryBackend, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -107,6 +107,47 @@ async fn p8_in_process_tool_names_must_not_contain_the_external_separator() {
         .unwrap_err();
     assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
     assert!(error.to_string().contains("a__b"), "{error}");
+}
+
+#[tokio::test]
+async fn p2_external_tool_names_are_validated_at_the_facade() {
+    let descriptor = |name: &str, provenance: Provenance| ToolDescriptor {
+        name: ToolName::new(name),
+        description: String::new(),
+        schema: serde_json::json!({"type": "object"}),
+        parallelism: Parallelism::Parallel,
+        replay: ReplaySafety::Safe,
+        side_effect: SideEffect::ReadOnly,
+        provenance,
+        timeout: None,
+        max_output_bytes: None,
+    };
+    let external = Provenance::External {
+        transport: TransportKind::Stdio,
+    };
+    let error = Asterpath::builder()
+        .tools(vec![Arc::new(DummyTool(descriptor("bad.name", external)))])
+        .build()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+    assert!(error.to_string().contains("bad.name"), "{error}");
+
+    let path = std::env::temp_dir().join(format!(
+        "asterpath-external-name-{}.sqlite",
+        std::process::id()
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&path)
+        .tools(vec![Arc::new(DummyTool(descriptor(
+            "plugin__tool",
+            external,
+        )))])
+        .build()
+        .await
+        .expect("an external composed name is registrable");
+    asterpath.shutdown().await.expect("shutdown");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

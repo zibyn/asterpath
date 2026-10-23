@@ -31,9 +31,13 @@ Transport:
 
 Options:
   --page-size <N>            tools pushed per tools/list page (default 2)
+  --tool-set <SET>           tools exposed: default | collision | oversized
+                             (collision: a.b + a_b; oversized: one over-long name)
   --supported-versions <V>   comma-separated versions advertised by server/discover
                              (default 2026-07-28)
   --force-version-mismatch   server/discover always returns -32022 with data.supported
+  --fault-repeat-cursor      tools/list always repeats the current cursor
+  --fault-endless-pages      tools/list always returns a fresh nextCursor
   --fault-error-code <CODE>  every tools/call returns this JSON-RPC error code
   --fault-crash-after <N>    answer N tools/call requests; the next one exits the process
   --fault-delay-ms <MS>      sleep before answering every tools/call
@@ -56,10 +60,20 @@ enum Mode {
     Http(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolSet {
+    Default,
+    Collision,
+    Oversized,
+}
+
 struct Config {
     page_size: usize,
+    tool_set: ToolSet,
     supported_versions: Vec<String>,
     force_version_mismatch: bool,
+    fault_repeat_cursor: bool,
+    fault_endless_pages: bool,
     fault_error_code: Option<i64>,
     fault_crash_after: Option<u64>,
     fault_delay_ms: Option<u64>,
@@ -73,8 +87,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             page_size: 2,
+            tool_set: ToolSet::Default,
             supported_versions: vec![PROTOCOL_VERSION.to_string()],
             force_version_mismatch: false,
+            fault_repeat_cursor: false,
+            fault_endless_pages: false,
             fault_error_code: None,
             fault_crash_after: None,
             fault_delay_ms: None,
@@ -136,6 +153,14 @@ fn parse_args(args: Vec<String>) -> Result<(Mode, Config), String> {
                 set_mode(&mut mode, Mode::Http(addr))?;
             }
             "--page-size" => config.page_size = next_value(&mut args, "--page-size")?,
+            "--tool-set" => {
+                config.tool_set = match next_value::<String>(&mut args, "--tool-set")?.as_str() {
+                    "default" => ToolSet::Default,
+                    "collision" => ToolSet::Collision,
+                    "oversized" => ToolSet::Oversized,
+                    other => return Err(format!("unknown --tool-set value: {other}")),
+                };
+            }
             "--supported-versions" => {
                 let value = next_value::<String>(&mut args, "--supported-versions")?;
                 let versions: Vec<String> = value
@@ -150,6 +175,8 @@ fn parse_args(args: Vec<String>) -> Result<(Mode, Config), String> {
                 config.supported_versions = versions;
             }
             "--force-version-mismatch" => config.force_version_mismatch = true,
+            "--fault-repeat-cursor" => config.fault_repeat_cursor = true,
+            "--fault-endless-pages" => config.fault_endless_pages = true,
             "--fault-error-code" => {
                 config.fault_error_code = Some(next_value(&mut args, "--fault-error-code")?);
             }
@@ -248,7 +275,7 @@ fn discover(state: &State, id: Value, message: &Value) -> Value {
 }
 
 fn list(state: &State, id: Value, message: &Value) -> Value {
-    let tools = tools();
+    let tools = tools(&state.config);
     let start = match message.pointer("/params/cursor") {
         None | Some(Value::Null) => 0,
         Some(Value::String(cursor)) => match cursor.parse::<usize>() {
@@ -257,6 +284,22 @@ fn list(state: &State, id: Value, message: &Value) -> Value {
         },
         Some(_) => return error(id, -32602, "invalid cursor", None),
     };
+    if state.config.fault_repeat_cursor {
+        // Echo the current cursor (or "0" for the first page): discovery must
+        // reject the repeat instead of looping.
+        let next = match message.pointer("/params/cursor") {
+            Some(Value::String(cursor)) => cursor.clone(),
+            _ => "0".to_owned(),
+        };
+        return result(id, json!({"tools": &tools[..1], "nextCursor": next}));
+    }
+    if state.config.fault_endless_pages {
+        // One tool per page with a fresh cursor: discovery hits the 100-page cap.
+        return result(
+            id,
+            json!({"tools": &tools[..1], "nextCursor": (start + 1).to_string()}),
+        );
+    }
     if start > tools.len() {
         return error(id, -32602, "invalid cursor", None);
     }
@@ -268,30 +311,43 @@ fn list(state: &State, id: Value, message: &Value) -> Value {
     result(id, page)
 }
 
-fn tools() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "echo",
-            "description": "Echo text back (read-only)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "additionalProperties": false,
-            },
-            "annotations": {"readOnlyHint": true},
-        }),
-        json!({
-            "name": "mutate",
-            "description": "Increment a counter (mutating)",
-            "inputSchema": {"type": "object", "properties": {}},
-        }),
-        json!({
-            "name": "content",
-            "description": "Emit every MCP content block type (read-only)",
-            "inputSchema": {"type": "object", "properties": {}},
-            "annotations": {"readOnlyHint": true},
-        }),
-    ]
+fn tools(config: &Config) -> Vec<Value> {
+    match config.tool_set {
+        ToolSet::Default => vec![
+            json!({
+                "name": "echo",
+                "description": "Echo text back (read-only)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "additionalProperties": false,
+                },
+                "annotations": {"readOnlyHint": true},
+            }),
+            json!({
+                "name": "mutate",
+                "description": "Increment a counter (mutating)",
+                "inputSchema": {"type": "object", "properties": {}},
+            }),
+            json!({
+                "name": "content",
+                "description": "Emit every MCP content block type (read-only)",
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {"readOnlyHint": true},
+            }),
+        ],
+        // Both sanitize to `a_b`: composition must fail atomically.
+        ToolSet::Collision => vec![simple_tool("a.b"), simple_tool("a_b")],
+        ToolSet::Oversized => vec![simple_tool(&"x".repeat(70))],
+    }
+}
+
+fn simple_tool(name: &str) -> Value {
+    json!({
+        "name": name,
+        "description": "",
+        "inputSchema": {"type": "object", "properties": {}},
+    })
 }
 
 async fn call(state: &State, id: Value, message: &Value) -> Value {

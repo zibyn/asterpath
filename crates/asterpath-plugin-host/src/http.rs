@@ -74,9 +74,10 @@ impl HttpAdapter {
     }
 
     /// Version drift means the negotiated protocol no longer matches; later
-    /// calls fail immediately instead of guessing.
+    /// calls fail immediately instead of guessing. `-32020` (transport error)
+    /// fails only the current call (`mcp.md` §7.3).
     fn note_protocol_error(&self, code: i64) {
-        if matches!(code, -32022..=-32020) {
+        if matches!(code, -32022..=-32021) {
             self.dead.store(true, Ordering::SeqCst);
         }
     }
@@ -341,8 +342,11 @@ mod tests {
         let adapter = adapter();
         adapter.note_protocol_error(-32603);
         assert!(!adapter.dead.load(std::sync::atomic::Ordering::SeqCst));
+        // -32020 fails only the call that received it.
+        adapter.note_protocol_error(-32020);
+        assert!(!adapter.dead.load(std::sync::atomic::Ordering::SeqCst));
 
-        adapter.note_protocol_error(-32022);
+        adapter.note_protocol_error(-32021);
         let error = adapter
             .post("tools/call", "{}", None, None)
             .await
@@ -351,5 +355,12 @@ mod tests {
             matches!(&error, crate::mcp::RpcFailure::Transport(message) if message.contains("closed")),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_common_version_also_marks_the_adapter_dead() {
+        let adapter = adapter();
+        adapter.note_protocol_error(-32022);
+        assert!(adapter.dead.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
