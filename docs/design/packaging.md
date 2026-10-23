@@ -331,9 +331,9 @@ default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级
 | M2 双协议 | 两个 provider crate + adapter 测试 | 场景 (b) 通过 |
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；`asterpath-compaction` 可选接入 | 场景 (c) 通过 |
 | M4 CLI | `asterpath-cli` 六命令、配置、审批端 | CLI 场景测试通过 |
-| M5 扩展（post-v1） | `asterpath-plugin-host`（清单、子进程、MCP adapter）、`asterpath-sandbox` 合约与后端、插件分发 | 不参与 v1 验收；实现时各自定闸门 |
+| M5 扩展（post-v1） | `asterpath-plugin-host`（清单、子进程、MCP adapter）、`asterpath-sandbox` 合约与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
 
-- M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#18](https://github.com/zibyn/asterpath/issues/18) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；v1 workspace 在 M4 截止，M5 成员在 M5 才加入。
+- M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；v1 workspace 在 M4 截止，M5 成员在 M5 才加入。插件分发、ACP 与 WASM 出界，归 host 或生态工具。
 - M0 组装 `compactor: None`；`asterpath-compaction` 从 M3 起可选接入，不进 M0–M4 通过条件（[compaction.md](compaction.md) §2）。
 - CI 顺序：`cargo xtask check-deps` → `cargo fmt --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --workspace` → `cargo test -p asterpath-acceptance --test acceptance` → `cargo doc --workspace --no-deps`。
 - 另跑 feature 矩阵：`cargo check -p asterpath --no-default-features` 与 `--features anthropic` / `openai` / `sqlite` 各自组合。

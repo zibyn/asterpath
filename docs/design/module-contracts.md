@@ -5,7 +5,7 @@
 > 本文件是 v1 spec 的"模块契约"章节草稿；最终 crate 打包由 #15 收敛。
 >
 > **2026-10-22 范围调整**：不做通用工作流引擎（[ADR-0003](../adr/0003-single-session-stream-topology.md)）。模块图中的 `asterpath-workflow` 已移除，编排相关表述以本文件为准已更新；#10 出界，调度 API 原型见 #17。
-> **2026-10-22 #32 修订**：`asterpath-plugin-host` 与 MCP adapter 归 M5（post-v1），不进 v1 workspace；模块契约本身不变。
+> **2026-10-22 #32 修订 / 2026-10-23 M5 范围**：`asterpath-plugin-host` 与 MCP adapter 归 M5（post-v1，进行中），不进 v1 workspace；模块契约本身不变。
 
 ## 1. 决策摘要
 
@@ -363,7 +363,7 @@ pub trait AgentRunner: Send + Sync {
 | #12 追踪 | 订阅事件；查询 API 在自己的模块 |
 | #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
-| #16 插件分发 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现出界 |
+| #16 插件清单 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现与分发出界 |
 | #21 沙箱 | 已定。接缝在独立合约 crate；core 零改动，protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |
 
 ## 9. 明确留给下游的点
