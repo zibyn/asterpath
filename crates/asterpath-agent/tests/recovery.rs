@@ -11,7 +11,7 @@ use std::time::Duration;
 use asterpath_core::{
     ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
     LifecycleError, LogEntry, LogId, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId,
-    SignalDelivery, SignalPayload, StepId, TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
+    SignalDelivery, SignalPayload, StepId, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
@@ -325,18 +325,6 @@ fn harness(
 struct NoopExecutor;
 
 impl DurableExecutor for NoopExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn cancel_timer(
-        &self,
-        _session: SessionId,
-        _timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
     fn await_signal(
         &self,
         _req: AwaitSignal,
@@ -363,7 +351,7 @@ impl DurableExecutor for NoopExecutor {
 }
 
 /// In-process executor for approval waits: records delivered decisions and
-/// wakes the waiter. Approvals write no `SignalAwaited` record.
+/// wakes the waiter. The open tool call is the only wait record.
 #[derive(Default)]
 struct TestExecutor {
     signals: Mutex<HashMap<asterpath_core::SignalId, SignalPayload>>,
@@ -371,18 +359,6 @@ struct TestExecutor {
 }
 
 impl DurableExecutor for TestExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn cancel_timer(
-        &self,
-        _session: SessionId,
-        _timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
     fn await_signal(
         &self,
         req: AwaitSignal,
@@ -1350,7 +1326,6 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
     assert_eq!(calls.lock().unwrap().len(), 1);
     let entries = scan(&log).await;
     assert_eq!(results(&entries)[0].1, ToolResultStatus::Completed);
-    assert_eq!(count(&entries, "SignalAwaited"), 0);
 }
 
 #[tokio::test]
@@ -1399,157 +1374,6 @@ async fn undecided_ask_with_a_closed_gate_denies() {
 }
 
 // --- waits ----------------------------------------------------------------
-
-#[tokio::test]
-async fn due_timer_fires_exactly_once_and_an_invalidated_timer_is_cancelled() {
-    let log = seed(config(Vec::new())).await;
-    let step_started = {
-        append_event(&log, SessionEvent::TurnStarted { turn_id: TURN }, None).await;
-        append_event(
-            &log,
-            SessionEvent::StepStarted {
-                turn_id: TURN,
-                step_id: STEP,
-            },
-            None,
-        )
-        .await
-    };
-    // Terminal source: a tool intent + result.
-    let call_log = append_event(
-        &log,
-        intent(CALL, "c1", "echo", ReplaySafety::Safe),
-        Some(dedup::tool_call(CALL)),
-    )
-    .await;
-    append_event(
-        &log,
-        SessionEvent::ToolResult {
-            tool_call_id: CALL,
-            status: ToolResultStatus::Completed,
-            output: None,
-            error: None,
-            truncated: false,
-        },
-        Some(dedup::tool_result(CALL)),
-    )
-    .await;
-    let due = TimerId::from_bytes([1; 16]);
-    let invalidated = TimerId::from_bytes([2; 16]);
-    append_event(
-        &log,
-        SessionEvent::TimerScheduled {
-            timer_id: due,
-            deadline: ManualClock::BASE,
-            caused_by: step_started,
-        },
-        Some(dedup::timer(due)),
-    )
-    .await;
-    append_event(
-        &log,
-        SessionEvent::TimerScheduled {
-            timer_id: invalidated,
-            deadline: ManualClock::BASE + 60_000,
-            caused_by: call_log,
-        },
-        Some(dedup::timer(invalidated)),
-    )
-    .await;
-
-    let provider = Arc::new(ScriptedProvider::new("p").respond(
-        completed(),
-        StopReason::EndTurn,
-        Usage::default(),
-    ));
-    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
-    let _ = drive(&harness.agent).await;
-    let entries = scan(&log).await;
-    assert_eq!(count(&entries, "TimerFired"), 1);
-    assert_eq!(count(&entries, "TimerCancelled"), 1);
-
-    // A second drive must not mint another terminal.
-    let _ = drive(&harness.agent).await;
-    let entries = scan(&log).await;
-    assert_eq!(count(&entries, "TimerFired"), 1);
-    assert_eq!(count(&entries, "TimerCancelled"), 1);
-}
-
-#[tokio::test]
-async fn signal_waits_stay_waiting() {
-    let log = seed(config(Vec::new())).await;
-    open_turn(&log).await;
-    let signal = asterpath_core::SignalId::from_bytes([5; 16]);
-    append_event(
-        &log,
-        SessionEvent::SignalAwaited {
-            signal_id: signal,
-            name: asterpath_core::SignalName::new("external"),
-            caused_by: LogId::from_i64(1),
-        },
-        Some(dedup::signal(signal)),
-    )
-    .await;
-
-    let provider = Arc::new(ScriptedProvider::new("p").respond(
-        completed(),
-        StopReason::EndTurn,
-        Usage::default(),
-    ));
-    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
-    let _ = drive(&harness.agent).await;
-
-    let entries = scan(&log).await;
-    assert_eq!(count(&entries, "SignalReceived"), 0);
-    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
-    assert!(!intents.is_idle(), "the signal wait remains open");
-}
-
-#[tokio::test]
-async fn child_deadline_timers_are_left_to_spawn_replay() {
-    let log = seed(config(Vec::new())).await;
-    open_turn(&log).await;
-    let child = SessionId::from_bytes([7; 16]);
-    let spawned = append_event(
-        &log,
-        SessionEvent::ChildSessionSpawned {
-            child,
-            task: vec![text("child task")],
-            config: config(Vec::new()),
-            context: asterpath_protocol::ContextPolicy::Fresh,
-            parent_tool_call_id: CALL,
-            caused_by: LogId::from_i64(1),
-        },
-        Some(dedup::child_session(child)),
-    )
-    .await;
-    let timer = TimerId::from_bytes([8; 16]);
-    append_event(
-        &log,
-        SessionEvent::TimerScheduled {
-            timer_id: timer,
-            // Already past: a due timer would normally fire on recovery.
-            deadline: ManualClock::BASE,
-            caused_by: spawned,
-        },
-        Some(dedup::timer(timer)),
-    )
-    .await;
-
-    let provider = Arc::new(ScriptedProvider::new("p").respond(
-        completed(),
-        StopReason::EndTurn,
-        Usage::default(),
-    ));
-    let harness = harness(Arc::clone(&log), Arc::clone(&provider), Vec::new());
-    let _ = drive(&harness.agent).await;
-
-    let entries = scan(&log).await;
-    assert_eq!(count(&entries, "TimerFired"), 0);
-    assert_eq!(count(&entries, "TimerCancelled"), 0);
-    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
-    assert!(!intents.is_idle(), "the child wait is still open");
-}
 
 #[tokio::test]
 async fn unclosed_compaction_keeps_the_session_idle_and_untouched() {
@@ -1680,6 +1504,7 @@ async fn seed_parent_waiting(log: &Arc<InMemoryEventLog>) {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: CALL,
             caused_by: LogId::from_i64(1),
+            deadline: None,
         },
         Some(dedup::child_session(SESSION)),
     )
@@ -1796,17 +1621,6 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         Some(dedup::tool_call(CALL)),
     )
     .await;
-    let timer = TimerId::from_bytes([1; 16]);
-    append_event(
-        &log,
-        SessionEvent::TimerScheduled {
-            timer_id: timer,
-            deadline: ManualClock::BASE + 60_000,
-            caused_by: LogId::from_i64(1),
-        },
-        Some(dedup::timer(timer)),
-    )
-    .await;
     append_event(
         &log,
         SessionEvent::ChildSessionSpawned {
@@ -1816,6 +1630,7 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: ToolCallId::from_bytes([0x55; 16]),
             caused_by: LogId::from_i64(1),
+            deadline: None,
         },
         Some(dedup::child_session(GRANDCHILD)),
     )
@@ -1831,9 +1646,7 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
 
     let provider = Arc::new(ScriptedProvider::new("p"));
     let gate = Arc::new(ApprovalGate::new());
-    let executor = Arc::new(TimerCancellingExecutor {
-        log: Arc::clone(&log),
-    });
+    let executor = Arc::new(UnusedExecutor);
     let agent = agent_with(
         Arc::clone(&log),
         Arc::clone(&provider),
@@ -1868,11 +1681,9 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
             "TurnStarted",
             "StepStarted",
             "ToolCallRequested",
-            "TimerScheduled",
             "ChildSessionSpawned",
             "StreamResumed",
             "ToolResult",
-            "TimerCancelled",
             "ChildSessionCompleted",
             "StepCommitted",
             "TurnCommitted",
@@ -2074,36 +1885,10 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
     assert_eq!(count(&entries, "StreamResumed"), 0);
 }
 
-/// Emits `TimerCancelled` like the runtime executor's `cancel_timer`.
-struct TimerCancellingExecutor {
-    log: Arc<InMemoryEventLog>,
-}
+/// Orphan closing never waits, so every wait fails loudly.
+struct UnusedExecutor;
 
-impl DurableExecutor for TimerCancellingExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn cancel_timer(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        let log = Arc::clone(&self.log);
-        Box::pin(async move {
-            let entry = encode_entry(
-                session,
-                Some(dedup::timer(timer)),
-                &SessionEvent::TimerCancelled { timer_id: timer },
-            )
-            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
-            log.append(entry)
-                .await
-                .map(|_| ())
-                .map_err(|error| ExecutionError::Backend(error.to_string()))
-        })
-    }
-
+impl DurableExecutor for UnusedExecutor {
     fn await_signal(
         &self,
         _req: AwaitSignal,

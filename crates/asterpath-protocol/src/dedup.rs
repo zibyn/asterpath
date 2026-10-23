@@ -4,9 +4,7 @@
 //! `(session, event_kind, dedup_key)`, so two event kinds may deliberately
 //! share one key (for example `ToolCallRequested` and `ToolResult`).
 
-use asterpath_core::{
-    DedupKey, InputId, LogId, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId,
-};
+use asterpath_core::{DedupKey, InputId, LogId, SessionId, SignalId, StepId, ToolCallId, TurnId};
 
 pub fn session_created(session: SessionId) -> DedupKey {
     DedupKey::new(session.to_hex())
@@ -56,10 +54,6 @@ pub fn compaction_frontier(key: &DedupKey) -> Option<LogId> {
 
 pub fn child_session(child: SessionId) -> DedupKey {
     DedupKey::new(child.to_hex())
-}
-
-pub fn timer(timer: TimerId) -> DedupKey {
-    DedupKey::new(timer.to_hex())
 }
 
 pub fn signal(signal: SignalId) -> DedupKey {

@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
-    Clock, DueTimer, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, Storage,
-    StorageError, SystemClock, Timestamp,
+    Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, Storage, StorageError,
+    SystemClock, Timestamp,
 };
 use asterpath_protocol::{OpenIntents, SessionEvent, decode_entry, decode_payload};
 use futures_core::future::BoxFuture;
@@ -143,17 +143,11 @@ impl InMemoryStorage {
 struct SessionFacts {
     intents: OpenIntents,
     pending_input: bool,
-    due: Vec<DueTimer>,
 }
 
-fn session_facts(
-    session: SessionId,
-    entries: &[LogEntry],
-    now: Timestamp,
-) -> Result<SessionFacts, StorageError> {
+fn session_facts(session: SessionId, entries: &[LogEntry]) -> Result<SessionFacts, StorageError> {
     let mut intents = OpenIntents::default();
     let mut pending_input = false;
-    let mut timers: HashMap<_, Timestamp> = HashMap::new();
 
     for entry in entries {
         let event = decode_entry(entry).map_err(|error| StorageError::Corrupt {
@@ -164,32 +158,13 @@ fn session_facts(
         match event {
             SessionEvent::InputRecorded { .. } => pending_input = true,
             SessionEvent::StepStarted { .. } => pending_input = false,
-            SessionEvent::TimerScheduled {
-                timer_id, deadline, ..
-            } => {
-                timers.insert(timer_id, deadline);
-            }
-            SessionEvent::TimerFired { timer_id } | SessionEvent::TimerCancelled { timer_id } => {
-                timers.remove(&timer_id);
-            }
             _ => {}
         }
     }
 
-    let due = timers
-        .into_iter()
-        .filter(|(_, deadline)| *deadline <= now)
-        .map(|(timer_id, deadline)| DueTimer {
-            timer_id,
-            session,
-            deadline,
-        })
-        .collect();
-
     Ok(SessionFacts {
         intents,
         pending_input,
-        due,
     })
 }
 
@@ -198,19 +173,10 @@ impl Storage for InMemoryStorage {
         let result = self.wakeable_sync(now);
         Box::pin(async move { result })
     }
-
-    fn due_timers(
-        &self,
-        now: Timestamp,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>> {
-        let result = self.due_timers_sync(now, limit);
-        Box::pin(async move { result })
-    }
 }
 
 impl InMemoryStorage {
-    fn wakeable_sync(&self, now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
+    fn wakeable_sync(&self, _now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
         let mut by_session: HashMap<SessionId, Vec<LogEntry>> = HashMap::new();
         for entry in self.log.snapshot() {
             by_session.entry(entry.session).or_default().push(entry);
@@ -219,29 +185,13 @@ impl InMemoryStorage {
         let mut wakeable = Vec::new();
         for (session, mut entries) in by_session {
             entries.sort_by_key(|entry| entry.seq);
-            let facts = session_facts(session, &entries, now)?;
-            if !facts.intents.is_idle() || facts.pending_input || !facts.due.is_empty() {
+            let facts = session_facts(session, &entries)?;
+            if !facts.intents.is_idle() || facts.pending_input {
                 wakeable.push(session);
             }
         }
         wakeable.sort();
         Ok(wakeable)
-    }
-
-    fn due_timers_sync(&self, now: Timestamp, limit: usize) -> Result<Vec<DueTimer>, StorageError> {
-        let mut by_session: HashMap<SessionId, Vec<LogEntry>> = HashMap::new();
-        for entry in self.log.snapshot() {
-            by_session.entry(entry.session).or_default().push(entry);
-        }
-
-        let mut due = Vec::new();
-        for (session, mut entries) in by_session {
-            entries.sort_by_key(|entry| entry.seq);
-            due.extend(session_facts(session, &entries, now)?.due);
-        }
-        due.sort_by_key(|timer| (timer.deadline, timer.timer_id));
-        due.truncate(limit);
-        Ok(due)
     }
 }
 

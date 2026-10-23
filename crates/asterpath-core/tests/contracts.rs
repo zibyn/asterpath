@@ -1,8 +1,8 @@
 use asterpath_core::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, DueTimer, DurableExecutor, EventLog,
-    ExecutionError, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionCatalog,
-    SessionId, SessionRetirement, SignalDelivery, SignalId, SignalIntent, SignalName,
-    SignalPayload, Storage, StorageError, SystemClock, TimerId, TimerRequest, Timestamp, WakeCause,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError,
+    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionCatalog, SessionId,
+    SessionRetirement, SignalDelivery, SignalId, SignalName, SignalPayload, Storage, StorageError,
+    SystemClock, Timestamp, WakeCause,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -29,14 +29,6 @@ struct DummyStorage;
 
 impl Storage for DummyStorage {
     fn wakeable(&self, _now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn due_timers(
-        &self,
-        _now: Timestamp,
-        _limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -71,18 +63,6 @@ impl SessionRetirement for DummyRetirement {
 struct DummyExecutor;
 
 impl DurableExecutor for DummyExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Ok(TimerId::from_bytes([0; 16])) })
-    }
-
-    fn cancel_timer(
-        &self,
-        _session: SessionId,
-        _timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn await_signal(
         &self,
         _req: AwaitSignal,
@@ -141,8 +121,6 @@ fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
         session,
         signal: SignalId::from_bytes([3; 16]),
         name: SignalName::new("tool.approval.c1"),
-        caused_by: LogId::from_i64(4),
-        intent: SignalIntent::AlreadyRecorded,
     };
 }
 

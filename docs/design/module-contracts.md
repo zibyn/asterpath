@@ -153,13 +153,6 @@ pub trait SessionCatalog: Send + Sync {
         -> BoxStream<'_, Result<SessionId, StorageError>>;
 }
 
-pub struct TimerRequest {
-    pub session: SessionId,
-    pub timer: TimerId,
-    pub caused_by: LogId,
-    pub deadline: Timestamp,
-}
-
 pub type SignalPayload = serde_json::Value;
 
 pub struct SignalDelivery {
@@ -172,25 +165,15 @@ pub struct SignalDelivery {
 pub struct AwaitSignal {
     pub session: SessionId,
     pub signal: SignalId,
-    pub name: SignalName,
-    pub caused_by: LogId,
-    pub intent: SignalIntent,        // Record | AlreadyRecorded（审批）
+    pub name: SignalName,            // tool.approval.<tool_call_id>
 }
 
-pub enum SignalIntent { Record, AlreadyRecorded }
-
 pub enum WakeCause {
-    Timer(TimerId),
     Signal(SignalId),
     ChildCompleted(SessionId),
-    Startup,                          // 仅宿主恢复循环使用
 }
 
 pub trait DurableExecutor: Send + Sync {
-    fn schedule_timer(&self, req: TimerRequest)
-        -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
-    fn cancel_timer(&self, session: SessionId, timer: TimerId)
-        -> BoxFuture<'_, Result<(), ExecutionError>>;
     fn await_signal(&self, req: AwaitSignal)
         -> BoxFuture<'_, Result<SignalPayload, ExecutionError>>;
     fn deliver_signal(&self, delivery: SignalDelivery)
@@ -219,13 +202,12 @@ pub struct ApprovalEndpoint;
 - agent 管线在 `Ask` 前查 `is_open()`；关闭时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4）。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
 - `Clock` 是时间来源接缝：`runtime` / `scheduler` 注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
-- `Storage` 负责 session、唤醒发现、定时器；方法集由 #5 定。
+- `Storage` 负责唤醒发现；方法集由 #5 定。
 - `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `EventLog::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
-- `DurableExecutor` 是持久等待 seam；timer/signal 语义由 #3 定，API 由 #17 定（[ADR-0014](../adr/0014-subagent-scheduling-api.md)）。v1 没有 activity / workflow。
-- timer id 由 `(session, caused_by, slot)` 确定性派生；审批 signal id 即 `tool_call_id`，通用 signal id 由 `(session, name)` 派生。重复注册返回同一 id，恢复重放不会制造第二个等待。
-- `await_signal` 的 `SignalIntent` 区分 `Record`（写 `SignalAwaited`）与 `AlreadyRecorded`（审批：open `ToolCallRequested` 已是意图记录）。
+- `DurableExecutor` 是持久等待 seam，只剩 `await_signal` / `deliver_signal` / `wake` / `await_wake`：持久等待只有审批与子会话完成，没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。v1 没有 activity / workflow。
+- 审批 signal id 即 `tool_call_id`；等待意图是 open `ToolCallRequested`，`await_signal` 不写记录，`deliver_signal` 以 signal id 为 dedup key 写 `SignalReceived`，重复投递不产生第二条。
 - `wake` 只在内存；终态记录的写者先 append 再 wake。注册表不持久化，恢复靠扫描日志重建。
 - 日志信封只有两个形状，定义在 core：`NewEntry`（调用方提交）与 `LogEntry`（存储返回）；payload 是 core 不解释的 `serde_json::Value`，信封不设 `kind` 字段（事件类型由存储从 payload 顶层键派生，用于幂等判别）。字段与语义见 [storage.md](storage.md) §3，决定见 [ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)。带类型的 `SessionEvent` 与 upcast 归 protocol 的 `decode_entry(&LogEntry)`，core 不依赖 protocol。
 
@@ -233,7 +215,7 @@ pub struct ApprovalEndpoint;
 
 - 每类能力一个 `#[non_exhaustive]` 枚举：`LifecycleError`、`StorageError`、`ExecutionError` 在 core；`ProviderError`、`ToolError`、`LogDecodeError` 在 protocol。`LogDecodeError` 只在 protocol 内部消费，经 `AgentError::Corrupt` / `StorageError::Corrupt` 露出。
 - `AsterError` 在门面 crate，对上述错误求和；core 不反向依赖 protocol。
-- `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`TimerId`、`SignalId` 是 core 里的 opaque newtype。
+- `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId` 是 core 里的 opaque newtype。
 - `anyhow` 只允许出现在 CLI/二进制；库契约不暴露 `Box<dyn Error>`。
 
 ### 3.6 运行时与配置

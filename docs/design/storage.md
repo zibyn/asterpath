@@ -14,7 +14,7 @@
 - **`journal_mode=WAL` + `synchronous=FULL` 为默认。** `NORMAL` 只作为显式配置项，供测试/开发用。
 - **写者是进程独占的。** `flock` 写者锁在打开时非阻塞获取，进程死亡由 OS 释放；不续约、不过期。第二个进程打开即 `WriterBusy`。
 - **一条日志记录 = 一个事务。** 不做多记录批量事务；`seq` 在事务内用 `MAX(seq)+1` 分配。
-- **派生表在 `append` 内同一事务维护**：`sessions`、`open_intents`、`timers`、`pending_inputs` 都是日志的派生索引，不是真相源。
+- **派生表在 `append` 内同一事务维护**：`sessions`、`open_intents`、`pending_inputs` 都是日志的派生索引，不是真相源。（`timers` 表在 #65 删除通用 timer 后已无写入路径，表本身由 #73 的迁移删除。）
 - **`idle` 是未闭合意图的谓词，不是缓存列。** `sessions` 没有 `state`；存在任一非 compaction 的 open intent 即非 `idle`。storage 与恢复共用同一个折叠函数（[event-log-recovery.md](event-log-recovery.md) §6）。
 - **没有 torn tail 修复。** SQLite 提交原子；解码失败一律硬错误。
 - **v1 不做投影快照。** 恢复从检查点折叠日志。
@@ -23,8 +23,8 @@
 
 | 层 | 负责 | 不负责 |
 | --- | --- | --- |
-| `EventLog`（core） | append、按游标 scan、frontier | 调度、timer 索引 |
-| `Storage`（core） | 唤醒发现、timer 到期查询 | 追加日志、事件语义 |
+| `EventLog`（core） | append、按游标 scan、frontier | 调度 |
+| `Storage`（core） | 唤醒发现 | 追加日志、事件语义 |
 | `asterpath-storage-sqlite`（模块） | 同时实现两者；派生索引；写者锁；WAL | 事件解码语义（归 protocol） |
 
 同一模块实现两个 trait，是因为派生索引必须在 `append` 的同一事务里写；这是实现细节，不是 trait 契约。
@@ -66,18 +66,10 @@ pub trait EventLog: Send + Sync {
         -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 }
 
-pub struct DueTimer {
-    pub timer_id: TimerId,
-    pub session: SessionId,
-    pub deadline: Timestamp,
-}
-
 pub trait Storage: Send + Sync {
-    /// 需要被驱动的 session：存在非 compaction 未闭合意图、待处理输入或到期 timer。
+    /// 需要被驱动的 session：存在非 compaction 未闭合意图或待处理输入。
     fn wakeable(&self, now: Timestamp)
         -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
-    fn due_timers(&self, now: Timestamp, limit: usize)
-        -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>>;
 }
 
 #[non_exhaustive]
@@ -92,7 +84,7 @@ pub enum StorageError {
 
 这套信封是 core 的唯一形状（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
-`Storage` 不提供公开 `enqueue`，也没有租约或 ack：唤醒是只读查询，由 `open_intents`、`pending_inputs` 与 `timers` 派生。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。`WakeCause` 仍属 core 的 `DurableExecutor`（module-contracts.md §3.4），存储不再需要它。
+`Storage` 不提供公开 `enqueue`，也没有租约或 ack：唤醒是只读查询，由 `open_intents` 与 `pending_inputs` 派生。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。`WakeCause` 仍属 core 的 `DurableExecutor`（module-contracts.md §3.4），存储不再需要它。
 
 ## 4. SQLite schema
 
@@ -108,7 +100,7 @@ CREATE TABLE sessions (
 -- 未闭合意图；idle = 没有非 compaction 行。由日志折叠重建。
 CREATE TABLE open_intents (
     session_id BLOB NOT NULL,
-    kind       TEXT NOT NULL,   -- turn | step | tool | timer | child | signal | compaction
+    kind       TEXT NOT NULL,   -- turn | step | tool | child | compaction
     ref_id     BLOB NOT NULL,   -- 各事件 id；compaction 用 frontier LogId（8 字节大端）
     PRIMARY KEY (session_id, kind, ref_id)
 );
@@ -126,6 +118,7 @@ CREATE TABLE log (
     UNIQUE (session_id, event_kind, dedup_key)  -- 不同事件类型互不抑制；NULL 互不冲突
 );
 
+-- 遗留：#65 后无写入路径，由 #73 的迁移删除。
 CREATE TABLE timers (
     timer_id    BLOB    PRIMARY KEY,
     session_id  BLOB    NOT NULL,
@@ -150,7 +143,7 @@ CREATE TABLE retired_sessions (
 );
 ```
 
-- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `open_intents` / `timers` / `pending_inputs`。
+- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions` / `open_intents` / `pending_inputs`。
 
 - `open_intents` 是派生索引：`idle` 谓词为「不存在 `kind != 'compaction'` 的行」。compaction 行用于恢复重做，不影响 `idle`；其 `ref_id` 取 dedup key 里的 frontier `LogId`。
 
@@ -175,7 +168,7 @@ BEGIN IMMEDIATE
   seq = COALESCE((SELECT MAX(seq) FROM log WHERE session_id=?), 0) + 1
   recorded_at = now_ms()                        -- 存储层本地时钟
   INSERT INTO log (..., event_kind, recorded_at, ...)
-  apply_derived(event, dedup_key)                -- open_intents/timers/pending_inputs，同一事务
+  apply_derived(event, dedup_key)                -- open_intents/pending_inputs，同一事务
 COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
@@ -192,29 +185,22 @@ COMMIT                                           -- FULL 下返回时已 fsync
 | `StepCommitted` | 删除 `(step, step_id)` | — |
 | `ToolCallRequested` | 插入 `(tool, tool_call_id)` | — |
 | `ToolResult` | 删除 `(tool, tool_call_id)` | — |
-| `TimerScheduled` | 插入 `(timer, timer_id)` | 插入 timers 行 |
-| `TimerFired` | 删除 `(timer, timer_id)` | 标记 `fired_at` |
-| `TimerCancelled` | 删除 `(timer, timer_id)` | 删除 timers 行 |
-| `SignalAwaited` | 插入 `(signal, signal_id)` | — |
-| `SignalReceived` | 删除匹配的 `(signal, signal_id)`；无匹配则不变 | — |
+| `SignalReceived` | 不变（审批意图由 `ToolResult` 关闭） | — |
 | `ChildSessionSpawned` | 插入 `(child, child_session_id)` | — |
 | `ChildSessionCompleted` | 删除 `(child, child_session_id)` | — |
 | `CompactionStarted` | 插入 `(compaction, frontier LogId)` | — |
 | `CompactionApplied` / `CompactionAborted` | 删除 `(compaction, frontier LogId)` | — |
 | `AssistantMessage` / `ModelCallAborted` / `StreamResumed` / `ContextForked` | 不变 | — |
 
-- 删除按键**精确匹配**。审批的 `SignalReceived` 没有对应 `SignalAwaited`，因此不删除任何行；steering 的 `InputRecorded` 不改变 `open_intents`，但插入 `pending_inputs`，因此 `submit_input` 后崩溃时仍能被 `wakeable` 发现（S18）。
+- 删除按键**精确匹配**。审批的 `SignalReceived` 不删除任何行；steering 的 `InputRecorded` 不改变 `open_intents`，但插入 `pending_inputs`，因此 `submit_input` 后崩溃时仍能被 `wakeable` 发现（S18）。
 - **`idle` = `open_intents` 中没有 `kind != 'compaction'` 的行。** compaction 行只供恢复重做（#24/#27），不影响退役与唤醒发现。
-- `TimerCancelled` 删除 timers 行：日志是真相，`due_timers` 只查 `fired_at IS NULL`。
-- **唤醒不落独立队列**：`wakeable(now)` 直接读 `open_intents`、`pending_inputs` 与到期的 `timers`，按 `session_id` 去重。不存 generation、不记 reason、没有 ack；重复驱动由 `drive()` 单飞与幂等 append 吸收。
+- **唤醒不落独立队列**：`wakeable(now)` 直接读 `open_intents` 与 `pending_inputs`，按 `session_id` 去重。不存 generation、不记 reason、没有 ack；重复驱动由 `drive()` 单飞与幂等 append 吸收。
 
 ### 事务边界清单
 
 | 写入 | 事务 |
 | --- | --- |
-| 任意一条日志记录 + 其派生行（sessions / open_intents / timers / pending_inputs） | 一个事务，提交后返回 |
-| `TimerFired` + `fired_at` | 同一个 append 事务 |
-| `SignalReceived` + `open_intents` 变更 | 同一个 append 事务 |
+| 任意一条日志记录 + 其派生行（sessions / open_intents / pending_inputs） | 一个事务，提交后返回 |
 | 子会话终态（子流）与 `ChildSessionCompleted`（父流） | 两个事务，不跨流；靠幂等键修复 |
 | 取消 | 就是一条终态记录（`TurnCommitted{Cancelled}` 或 `ToolResult`），无额外事务 |
 | `ToolCallRequested` → 调用工具 | append 提交返回后才调用 |
@@ -230,10 +216,10 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - 文件创建时权限 `0600`。
 - 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档的 seam 见 [retention.md](retention.md)。删除释放页供复用，不保证文件缩小。
 
-## 7. 唤醒发现与 timer
+## 7. 唤醒发现
 
-- **没有持久队列、租约或 ack。** `wakeable(now)` 是只读查询，返回存在非 compaction 未闭合意图、待处理输入（`pending_inputs`）或到期 timer 的 session，按 `session_id` 去重。宿主的恢复循环是 `wakeable → open_session → drive`；并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
-- `due_timers`：只读索引查询，返回 `deadline <= now AND fired_at IS NULL`。追加 `TimerFired` 由驱动方（#17）完成；append 同时标记 `fired_at`。
+- **没有持久队列、租约或 ack。** `wakeable(now)` 是只读查询，返回存在非 compaction 未闭合意图或待处理输入（`pending_inputs`）的 session，按 `session_id` 去重。宿主的恢复循环是 `wakeable → open_session → drive`；并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
+- spawn 超时不经存储：截止时间在 `ChildSessionSpawned.deadline` 上，open 的子会话意图已让父会话出现在 `wakeable`，到期由 spawn 重放处理（[subagents.md](subagents.md) §9）。
 - 没有 `recover_at_startup`：派生索引在同一事务维护，恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（必要时前向迁移）→ 宿主对 `wakeable` 结果逐个驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
 
 ## 8. 保证清单
@@ -244,9 +230,9 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G2 幂等**：`(session, event_kind, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写派生行；同 key 不同事件类型互不抑制。
 - **G3 全序**：`seq` 在 session 内严格单调、无洞，只由存储分配。
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
-- **G5 唤醒发现完备**：任何存在非 compaction 未闭合意图、待处理输入或到期 timer 的 session 都出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录（幂等 append + `drive()` 单飞）。
+- **G5 唤醒发现完备**：任何存在非 compaction 未闭合意图或待处理输入的 session 都出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录（幂等 append + `drive()` 单飞）。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
-- **G7 索引可重建**：`sessions` / `open_intents` / `timers` / `pending_inputs` 可完全由日志重建，不是真相源。`open_intents` 折叠出的集合必须与恢复的 `OpenIntents` 折叠一致。
+- **G7 索引可重建**：`sessions` / `open_intents` / `pending_inputs` 可完全由日志重建，不是真相源。`open_intents` 折叠出的集合必须与恢复的 `OpenIntents` 折叠一致。
 - **G8 退役原子性（可选能力）**：`SessionRetirement::retire` 在同一事务里写墓碑、删日志与全部派生行；要么全部生效，要么全部不生效；退役后的会话对 `EventLog` / `Storage` / `SessionCatalog` 不可见。契约见 [retention.md](retention.md)。
 
 trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、`flock`、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。
@@ -261,13 +247,14 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 | `append:after_commit` | 已持久、调用方未收到结果 |
 | `tool:before_effect` | 副作用前崩溃（配合 `replay` 语义） |
 | `tool:after_effect` | 副作用已发生、终态未写 |
-| `clock:advance` | 可控时钟推进（timer 到期） |
+| `clock:advance` | 可控时钟推进（spawn 截止时间、退避） |
 
 | 场景 | 归属 |
 | --- | --- |
-| S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；S9 timer 恰触发一次；`wakeable` 完备且不重复；`pending_inputs` 保留到 `StepStarted` | 存储 crate 单测 |
-| S13 `open_intents` 派生与日志折叠一致；steering / timer / signal / 子会话完成在 open step 中到达后仍非 idle；仅 compaction 未闭合时视为 idle | 存储 crate 单测（与 #6 / #8 的分类器共享用例） |
+| S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；`wakeable` 完备且不重复；`pending_inputs` 保留到 `StepStarted` | 存储 crate 单测 |
+| S13 `open_intents` 派生与日志折叠一致；steering / 审批 / 子会话完成在 open step 中到达后仍非 idle；仅 compaction 未闭合时视为 idle | 存储 crate 单测（与 #6 / #8 的分类器共享用例） |
 | S1 `Safe` 工具中 kill、S2 `Unsafe` 工具中 kill、S3 模型流中 kill、S6 父等子时 kill | #6 / #17 的进程级验收；本轮只固定注入点契约 |
+| S9 spawn 超时在停机期间到期 | scheduler 测试（#65） |
 | S7 `CompactionApplied` 投影 | #9 / #6 |
 
 ## 10. 留给下游
@@ -275,6 +262,6 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 - **#6**：turn/step 的终止条件、取消宽限期，决定哪些意图在何时闭合；`idle` 由未闭合意图推导。
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
-- **#17**：timer 触发、`TimerFired` 追加、signal 投递；唤醒发现见 §7。
+- **#17**：审批 signal 投递与子会话等待；唤醒发现见 §7。
 - **#18**：已定。只保留 `SessionRetirement` 可选能力（整会话退役、墓碑）；导出由宿主用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
 - **#19**：五个注入点的工具链与 CI 场景。

@@ -1,22 +1,20 @@
-//! Durable executor: timers, signals and wake notifications expressed through
-//! the event log.
+//! Durable executor: approval signals and child-completion wakes expressed
+//! through the event log.
 //!
-//! Wait ids are derived from the intent record, so re-registering after a crash
-//! returns the same id and never mints a second record. The waiter registry is
-//! process memory only; recovery rebuilds waits by scanning the log.
+//! An approval wait is recorded by its open `ToolCallRequested`; delivery
+//! appends `SignalReceived` under the approval's dedup key, so a re-delivery
+//! after a crash never mints a second record. The waiter registry is process
+//! memory only; recovery rebuilds waits by scanning the log.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use asterpath_core::{
-    AwaitSignal, Clock, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, ExecutionError, Fnv,
+    AwaitSignal, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, ExecutionError,
     LifecycleError, LogId, LogQuery, Module, ModuleCtx, ServiceId, SessionId, SignalDelivery,
-    SignalId, SignalIntent, SignalName, SignalPayload, Storage, TimerId, TimerRequest, WakeCause,
+    SignalId, SignalPayload, WakeCause,
 };
-use asterpath_protocol::{
-    APPROVAL_SIGNAL_PREFIX, RecordAppended, SessionEvent, decode_entry, dedup, encode_entry,
-};
+use asterpath_protocol::{RecordAppended, SessionEvent, decode_entry, dedup, encode_entry};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -26,7 +24,6 @@ use tokio::sync::Notify;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WaitKey {
     Signal(SignalId),
-    Timer(TimerId),
     Child(SessionId),
 }
 
@@ -57,26 +54,19 @@ impl Waiters {
     }
 }
 
-/// `DurableExecutor` backed by an event log, a storage index and a clock.
+/// `DurableExecutor` backed by an event log.
 pub struct RuntimeExecutor {
     log: Arc<dyn EventLog>,
-    _storage: Arc<dyn Storage>,
-    clock: Arc<dyn Clock>,
     waiters: Waiters,
-    /// Serializes fire/cancel so only one terminal is ever appended.
-    timer_lock: tokio::sync::Mutex<()>,
     /// Set by the module wrapper so committed waits reach the trace tap.
     bus: Mutex<Option<ModuleCtx>>,
 }
 
 impl RuntimeExecutor {
-    pub fn new(log: Arc<dyn EventLog>, storage: Arc<dyn Storage>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(log: Arc<dyn EventLog>) -> Self {
         Self {
             log,
-            _storage: storage,
-            clock,
             waiters: Waiters::default(),
-            timer_lock: tokio::sync::Mutex::new(()),
             bus: Mutex::new(None),
         }
     }
@@ -134,168 +124,15 @@ impl RuntimeExecutor {
                 _ => None,
             }))
     }
-
-    async fn timer_state(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> Result<TimerState, ExecutionError> {
-        let mut deadline = None;
-        for event in self.scan(session).await? {
-            match event {
-                SessionEvent::TimerScheduled {
-                    timer_id,
-                    deadline: at,
-                    ..
-                } if timer_id == timer => deadline = Some(at),
-                SessionEvent::TimerFired { timer_id } if timer_id == timer => {
-                    return Ok(TimerState::Fired);
-                }
-                SessionEvent::TimerCancelled { timer_id } if timer_id == timer => {
-                    return Ok(TimerState::Cancelled);
-                }
-                _ => {}
-            }
-        }
-        Ok(match deadline {
-            Some(deadline) => TimerState::Pending(deadline),
-            None => TimerState::Missing,
-        })
-    }
-
-    async fn append_timer_fired(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> Result<(), ExecutionError> {
-        let _guard = self.timer_lock.lock().await;
-        match self.timer_state(session, timer).await? {
-            TimerState::Fired => return Ok(()),
-            TimerState::Cancelled => return Err(ExecutionError::Cancelled),
-            TimerState::Missing => return Err(ExecutionError::NotFound { session }),
-            TimerState::Pending(_) => {}
-        }
-        self.append(
-            session,
-            &SessionEvent::TimerFired { timer_id: timer },
-            Some(dedup::timer(timer)),
-        )
-        .await?;
-        self.waiters.wake(WaitKey::Timer(timer));
-        Ok(())
-    }
-
-    async fn await_timer(&self, session: SessionId, timer: TimerId) -> Result<(), ExecutionError> {
-        loop {
-            match self.timer_state(session, timer).await? {
-                TimerState::Fired => return Ok(()),
-                TimerState::Cancelled => return Err(ExecutionError::Cancelled),
-                TimerState::Missing => return Err(ExecutionError::NotFound { session }),
-                TimerState::Pending(deadline) => {
-                    if deadline <= self.clock.now() {
-                        self.append_timer_fired(session, timer).await?;
-                        continue;
-                    }
-                    let notify = self.waiters.notifier(WaitKey::Timer(timer));
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    // Register before re-checking so a fire or cancel in the
-                    // window cannot be missed.
-                    notified.as_mut().enable();
-                    if self.timer_state(session, timer).await?.is_terminal() {
-                        continue;
-                    }
-                    let wait = Duration::from_millis((deadline - self.clock.now()).max(1) as u64);
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = tokio::time::sleep(wait) => {}
-                    }
-                }
-            }
-        }
-    }
-}
-
-enum TimerState {
-    Missing,
-    Pending(asterpath_core::Timestamp),
-    Fired,
-    Cancelled,
-}
-
-impl TimerState {
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Fired | Self::Cancelled)
-    }
 }
 
 impl DurableExecutor for RuntimeExecutor {
-    fn schedule_timer(&self, req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async move {
-            let timer = derive_timer_id(req.session, req.caused_by, req.timer);
-            // A fired or cancelled timer stays terminal; do not resurrect it.
-            if self.timer_state(req.session, timer).await?.is_terminal() {
-                return Ok(timer);
-            }
-            self.append(
-                req.session,
-                &SessionEvent::TimerScheduled {
-                    timer_id: timer,
-                    deadline: req.deadline,
-                    caused_by: req.caused_by,
-                },
-                Some(dedup::timer(timer)),
-            )
-            .await?;
-            Ok(timer)
-        })
-    }
-
-    fn cancel_timer(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async move {
-            let _guard = self.timer_lock.lock().await;
-            match self.timer_state(session, timer).await? {
-                TimerState::Fired | TimerState::Cancelled => return Ok(()),
-                TimerState::Missing => return Err(ExecutionError::NotFound { session }),
-                TimerState::Pending(_) => {}
-            }
-            self.append(
-                session,
-                &SessionEvent::TimerCancelled { timer_id: timer },
-                Some(dedup::timer(timer)),
-            )
-            .await?;
-            self.waiters.wake(WaitKey::Timer(timer));
-            Ok(())
-        })
-    }
-
     fn await_signal(
         &self,
         req: AwaitSignal,
     ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
         Box::pin(async move {
-            let signal = signal_id(req.session, &req.name, req.signal);
-            if let Some(payload) = self.find_signal(req.session, signal).await? {
-                return Ok(payload);
-            }
-            if req.intent == SignalIntent::Record {
-                self.append(
-                    req.session,
-                    &SessionEvent::SignalAwaited {
-                        signal_id: signal,
-                        name: req.name.clone(),
-                        caused_by: req.caused_by,
-                    },
-                    Some(dedup::signal(signal)),
-                )
-                .await?;
-            }
-
+            let signal = req.signal;
             loop {
                 let notify = self.waiters.notifier(WaitKey::Signal(signal));
                 let notified = notify.notified();
@@ -314,7 +151,7 @@ impl DurableExecutor for RuntimeExecutor {
         delivery: SignalDelivery,
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
         Box::pin(async move {
-            let signal = signal_id(delivery.session, &delivery.name, delivery.signal);
+            let signal = delivery.signal;
             self.append(
                 delivery.session,
                 &SessionEvent::SignalReceived {
@@ -337,8 +174,6 @@ impl DurableExecutor for RuntimeExecutor {
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
         Box::pin(async move {
             match cause {
-                WakeCause::Startup => Ok(()),
-                WakeCause::Timer(timer) => self.await_timer(session, timer).await,
                 WakeCause::Signal(signal) => loop {
                     let notify = self.waiters.notifier(WaitKey::Signal(signal));
                     let notified = notify.notified();
@@ -372,10 +207,8 @@ impl DurableExecutor for RuntimeExecutor {
 
     fn wake(&self, _session: SessionId, cause: WakeCause) {
         let key = match cause {
-            WakeCause::Timer(timer) => WaitKey::Timer(timer),
             WakeCause::Signal(signal) => WaitKey::Signal(signal),
             WakeCause::ChildCompleted(child) => WaitKey::Child(child),
-            WakeCause::Startup => return,
         };
         self.waiters.wake(key);
     }
@@ -408,30 +241,6 @@ impl Module for RuntimeModule {
         let result = ctx.provide(DURABLE_EXECUTOR_SERVICE, executor);
         Box::pin(async move { result.map(|_| ()) })
     }
-}
-
-/// Approval signals are identified by `tool_call_id`; generic signals by
-/// `(session, name)`. The caller's `signal` is therefore only authoritative for
-/// approval names.
-fn signal_id(session: SessionId, name: &SignalName, supplied: SignalId) -> SignalId {
-    if name.as_str().starts_with(APPROVAL_SIGNAL_PREFIX) {
-        supplied
-    } else {
-        let mut hasher = Fnv::new(0xcbf29ce484222325);
-        hasher.write(session.as_bytes());
-        hasher.write(name.as_str().as_bytes());
-        SignalId::from_bytes(hasher.finish_128())
-    }
-}
-
-/// A timer id is derived from `(session, caused_by, slot)`; the request's
-/// `timer` is the caller's slot token.
-fn derive_timer_id(session: SessionId, caused_by: LogId, slot: TimerId) -> TimerId {
-    let mut hasher = Fnv::new(0xcbf29ce484222325);
-    hasher.write(session.as_bytes());
-    hasher.write(&caused_by.as_i64().to_be_bytes());
-    hasher.write(slot.as_bytes());
-    TimerId::from_bytes(hasher.finish_128())
 }
 
 async fn collect<S>(mut stream: S) -> Result<Vec<asterpath_core::LogEntry>, ExecutionError>

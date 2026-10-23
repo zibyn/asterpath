@@ -1,7 +1,7 @@
 //! The complete session event enum and the value enums its payloads carry.
 
 use asterpath_core::{
-    LogId, LogIdRange, SessionId, SignalId, SignalName, StepId, TimerId, ToolCallId, TurnId,
+    LogId, LogIdRange, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,26 +118,13 @@ pub enum SessionEvent {
         context: ContextPolicy,
         parent_tool_call_id: ToolCallId,
         caused_by: LogId,
+        /// Absolute spawn-timeout deadline, written with the spawn record.
+        #[serde(default)]
+        deadline: Option<asterpath_core::Timestamp>,
     },
     ChildSessionCompleted {
         child: SessionId,
         outcome: ChildOutcome,
-    },
-    TimerScheduled {
-        timer_id: TimerId,
-        deadline: asterpath_core::Timestamp,
-        caused_by: LogId,
-    },
-    TimerFired {
-        timer_id: TimerId,
-    },
-    TimerCancelled {
-        timer_id: TimerId,
-    },
-    SignalAwaited {
-        signal_id: SignalId,
-        name: SignalName,
-        caused_by: LogId,
     },
     SignalReceived {
         signal_id: SignalId,
@@ -168,10 +155,6 @@ impl SessionEvent {
             Self::CompactionAborted { .. } => "CompactionAborted",
             Self::ChildSessionSpawned { .. } => "ChildSessionSpawned",
             Self::ChildSessionCompleted { .. } => "ChildSessionCompleted",
-            Self::TimerScheduled { .. } => "TimerScheduled",
-            Self::TimerFired { .. } => "TimerFired",
-            Self::TimerCancelled { .. } => "TimerCancelled",
-            Self::SignalAwaited { .. } => "SignalAwaited",
             Self::SignalReceived { .. } => "SignalReceived",
         }
     }

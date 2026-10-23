@@ -9,10 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{
-    DedupKey, DurableExecutor, EventLog, LogEntry, LogQuery, SessionId, Storage, TimerId,
-    TimerRequest, ToolCallId, WakeCause,
-};
+use asterpath_core::{DedupKey, EventLog, LogEntry, LogQuery, SessionId, ToolCallId};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider,
@@ -21,8 +18,7 @@ use asterpath_protocol::{
     ToolName, ToolOutput, ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id,
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
-use asterpath_runtime::RuntimeExecutor;
-use asterpath_testing::{ManualClock, ScriptedProvider};
+use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
 
@@ -282,7 +278,6 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         asterpath_protocol::ToolResultStatus::Completed
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
-    assert_eq!(kind_count(&entries, "SignalAwaited"), 0);
     assert_eq!(kind_count(&entries, "SignalReceived"), 1);
 
     // Duplicate delivery is absorbed by the signal dedup key.
@@ -393,7 +388,6 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
             .is_some_and(|m| m.contains("no approval endpoint"))
     );
     assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(kind_count(&entries, "SignalAwaited"), 0);
     assert_eq!(kind_count(&entries, "SignalReceived"), 0);
 
     asterpath.shutdown().await.unwrap();
@@ -501,7 +495,6 @@ async fn recorded_decision_is_reused_without_reprompting() {
         results[0].0,
         asterpath_protocol::ToolResultStatus::Completed
     );
-    assert_eq!(kind_count(&entries, "SignalAwaited"), 0);
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
@@ -689,52 +682,6 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
     assert_eq!(calls.lock().unwrap().len(), 1);
 
     asterpath.shutdown().await.unwrap();
-    cleanup(&db);
-}
-
-#[tokio::test]
-async fn timer_due_across_a_restart_fires_once_on_same_sqlite() {
-    let db = temp_db("durable-timer");
-    let clock = Arc::new(ManualClock::new());
-    let session = SessionId::from_bytes([8; 16]);
-    let slot = TimerId::from_bytes([1; 16]);
-    let request = TimerRequest {
-        session,
-        timer: slot,
-        caused_by: asterpath_core::LogId::from_i64(1),
-        deadline: ManualClock::BASE + 100,
-    };
-
-    let timer = {
-        let storage = asterpath_storage_sqlite::open(&db).expect("open");
-        let log: Arc<dyn EventLog> = storage.clone();
-        let store: Arc<dyn Storage> = storage.clone();
-        let executor = Arc::new(RuntimeExecutor::new(log, store, clock.clone()));
-        executor.schedule_timer(request).await.expect("schedule")
-    };
-
-    // "Restart": the first writer is gone, time has passed meanwhile.
-    clock.advance(1_000);
-    let storage = asterpath_storage_sqlite::open(&db).expect("reopen");
-    let log: Arc<dyn EventLog> = storage.clone();
-    let store: Arc<dyn Storage> = storage.clone();
-    let executor = Arc::new(RuntimeExecutor::new(log, store, clock.clone()));
-    executor
-        .await_wake(session, WakeCause::Timer(timer))
-        .await
-        .expect("fires after restart");
-    executor
-        .await_wake(session, WakeCause::Timer(timer))
-        .await
-        .expect("already fired");
-
-    let scan_log: Arc<dyn EventLog> = storage.clone();
-    let entries = scan(scan_log, session).await;
-    assert_eq!(kind_count(&entries, "TimerFired"), 1);
-    assert_eq!(kind_count(&entries, "TimerCancelled"), 0);
-
-    drop(executor);
-    drop(storage);
     cleanup(&db);
 }
 

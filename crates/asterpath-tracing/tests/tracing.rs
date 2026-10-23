@@ -6,8 +6,7 @@
 use std::sync::Arc;
 
 use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, SignalId, StepId, TimerId, Timestamp,
-    ToolCallId, TurnId,
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     AbortKind, ApprovalDecision, ChildOutcome, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -37,14 +36,6 @@ fn step(byte: u8) -> StepId {
 
 fn call(byte: u8) -> ToolCallId {
     ToolCallId::from_bytes([byte; 16])
-}
-
-fn timer(byte: u8) -> TimerId {
-    TimerId::from_bytes([byte; 16])
-}
-
-fn signal(byte: u8) -> SignalId {
-    SignalId::from_bytes([byte; 16])
 }
 
 fn model() -> ModelSpec {
@@ -939,13 +930,11 @@ async fn t7_approval_wait_is_a_child_span_with_its_deadline_and_cause() {
 }
 
 #[tokio::test]
-async fn t8_timer_wait_keeps_its_deadline_and_resume_is_a_session_event() {
+async fn t8_resume_is_a_session_event() {
     let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
     let session = sid(8);
     let t = turn();
     let s = step(0xb1);
-    let timer_id = timer(0xb2);
-    let deadline: Timestamp = 4_000_000_000_000;
 
     append(
         &*log,
@@ -984,24 +973,6 @@ async fn t8_timer_wait_keeps_its_deadline_and_resume_is_a_session_event() {
     append(
         &*log,
         session,
-        &SessionEvent::TimerScheduled {
-            timer_id,
-            deadline,
-            caused_by: step_id,
-        },
-        Some(dedup::timer(timer_id)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::TimerFired { timer_id },
-        Some(dedup::timer(timer_id)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
         &assistant(t, s, vec![text("done")]),
         Some(dedup::assistant_message(t, s)),
     )
@@ -1028,14 +999,7 @@ async fn t8_timer_wait_keeps_its_deadline_and_resume_is_a_session_event() {
     .await;
 
     let spans = fold(&log, session).await;
-    let wait = span_of(&spans, SpanKind::Wait);
-    let SpanAttributes::Wait(attrs) = &wait.attributes else {
-        panic!("wait attrs");
-    };
-    assert_eq!(attrs.wait, WaitKind::Timer);
-    assert_eq!(attrs.deadline, Some(deadline));
-    assert_eq!(wait.parent_span, Some(span_of(&spans, SpanKind::Step).span));
-    assert_eq!(wait.status, SpanStatus::Ok);
+    assert!(spans.iter().all(|span| span.kind != SpanKind::Wait));
 
     let session_span = span_of(&spans, SpanKind::Session);
     let SpanAttributes::Session(attrs) = &session_span.attributes else {
@@ -1044,99 +1008,6 @@ async fn t8_timer_wait_keeps_its_deadline_and_resume_is_a_session_event() {
     assert_eq!(attrs.resumes.len(), 1);
     assert_eq!(attrs.resumes[0].from, step_id);
     assert_eq!(attrs.resumes[0].reason, ResumeReason::Crash);
-}
-
-#[tokio::test]
-async fn a_signal_wait_is_its_own_span_under_its_cause() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
-    let session = sid(16);
-    let t = turn();
-    let s = step(0xb3);
-    let signal_id = signal(0xb4);
-
-    append(
-        &*log,
-        session,
-        &created(session),
-        Some(dedup::session_created(session)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::TurnStarted { turn_id: t },
-        None,
-    )
-    .await;
-    let step_id = append(
-        &*log,
-        session,
-        &SessionEvent::StepStarted {
-            turn_id: t,
-            step_id: s,
-        },
-        None,
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::SignalAwaited {
-            signal_id,
-            name: asterpath_core::SignalName::new("human"),
-            caused_by: step_id,
-        },
-        Some(dedup::signal(signal_id)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::SignalReceived {
-            signal_id,
-            name: asterpath_core::SignalName::new("human"),
-            payload: serde_json::json!({}),
-        },
-        Some(dedup::signal(signal_id)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &assistant(t, s, vec![text("done")]),
-        Some(dedup::assistant_message(t, s)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::StepCommitted {
-            turn_id: t,
-            step_id: s,
-        },
-        Some(dedup::step_committed(s)),
-    )
-    .await;
-    append(
-        &*log,
-        session,
-        &SessionEvent::TurnCommitted {
-            turn_id: t,
-            reason: TurnEndReason::Completed,
-        },
-        Some(dedup::turn_committed(t)),
-    )
-    .await;
-
-    let spans = fold(&log, session).await;
-    let wait = span_of(&spans, SpanKind::Wait);
-    let SpanAttributes::Wait(attrs) = &wait.attributes else {
-        panic!("wait attrs");
-    };
-    assert_eq!(attrs.wait, WaitKind::Signal);
-    assert_eq!(attrs.caused_by, Some(step_id));
-    assert_eq!(wait.parent_span, Some(span_of(&spans, SpanKind::Step).span));
-    assert_eq!(wait.status, SpanStatus::Ok);
 }
 
 #[tokio::test]
@@ -1196,6 +1067,7 @@ async fn t9_subagent_links_parent_and_child_traces() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: c,
             caused_by: request_id,
+            deadline: None,
         },
         Some(dedup::child_session(child)),
     )

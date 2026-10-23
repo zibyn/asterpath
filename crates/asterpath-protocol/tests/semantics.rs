@@ -1,7 +1,7 @@
 //! Behaviour of the canonical model, log decoding and folds.
 
 use asterpath_core::{
-    DedupKey, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId,
+    DedupKey, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId,
 };
 use asterpath_protocol::*;
 use serde_json::{Value, json};
@@ -128,7 +128,7 @@ fn older_schema_version_goes_through_the_upcast_chain() {
 
 #[test]
 fn malformed_opaque_ids_are_decode_errors_not_panics() {
-    let payload = json!({"TimerFired": {"timer_id": "éééééééééééééééé"}});
+    let payload = json!({"TurnStarted": {"turn_id": "éééééééééééééééé"}});
     let error = decode_entry(&entry(1, LOG_SCHEMA_VERSION, payload)).unwrap_err();
     assert!(matches!(error, LogDecodeError::Decode { .. }), "{error:?}");
 }
@@ -157,14 +157,6 @@ fn dedup_keys_follow_the_shared_key_table() {
     assert_eq!(
         dedup::compaction(LogId::from_i64(7)).as_str(),
         "compaction:7"
-    );
-    assert_eq!(
-        dedup::timer(TimerId::from_bytes([1; 16])),
-        dedup::timer(TimerId::from_bytes([1; 16]))
-    );
-    assert_ne!(
-        dedup::timer(TimerId::from_bytes([1; 16])),
-        dedup::timer(TimerId::from_bytes([2; 16]))
     );
     assert_eq!(
         dedup::signal(SignalId::from_bytes([3; 16])).as_str(),
@@ -215,10 +207,14 @@ fn open_intents_is_idle_iff_no_non_compaction_intent_is_open() {
     );
 
     intents.apply(
-        &SessionEvent::TimerScheduled {
-            timer_id: TimerId::from_bytes([9; 16]),
-            deadline: 10,
+        &SessionEvent::ChildSessionSpawned {
+            child: session(9),
+            task: vec![text("task")],
+            config: config(),
+            context: ContextPolicy::Fresh,
+            parent_tool_call_id: call(1),
             caused_by: LogId::from_i64(1),
+            deadline: Some(10),
         },
         None,
     );
@@ -231,8 +227,11 @@ fn open_intents_is_idle_iff_no_non_compaction_intent_is_open() {
     );
 
     intents.apply(
-        &SessionEvent::TimerFired {
-            timer_id: TimerId::from_bytes([9; 16]),
+        &SessionEvent::ChildSessionCompleted {
+            child: session(9),
+            outcome: ChildOutcome::Cancelled {
+                reason: CancelReason::Timeout,
+            },
         },
         None,
     );

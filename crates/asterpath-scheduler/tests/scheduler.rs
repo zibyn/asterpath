@@ -10,7 +10,7 @@ use std::time::Duration;
 use asterpath_core::{
     AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId,
     LogQuery, SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, SystemClock,
-    TimerId, TimerRequest, Timestamp, ToolCallId, TurnId, WakeCause,
+    Timestamp, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, CancelReason, ChildFailure, ChildOutcome,
@@ -25,7 +25,7 @@ use asterpath_protocol::{
 use asterpath_scheduler::{
     ChildRef, Scheduler, SpawnError, SpawnRequest, SpawnTool, SubagentSpawner, WaitError,
 };
-use asterpath_testing::InMemoryEventLog;
+use asterpath_testing::{InMemoryEventLog, ManualClock};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -149,18 +149,6 @@ impl SessionCatalog for FakeCatalog {
 struct NoopExecutor;
 
 impl DurableExecutor for NoopExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn cancel_timer(
-        &self,
-        _session: SessionId,
-        _timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn await_signal(
         &self,
         _req: AwaitSignal,
@@ -536,6 +524,7 @@ async fn recorded_outcome_wins_without_reading_the_child() {
                 context: ContextPolicy::Fresh,
                 parent_tool_call_id: reference.tool_call,
                 caused_by,
+                deadline: None,
             },
             Some(dedup::child_session(child)),
         ))
@@ -585,6 +574,7 @@ async fn child_terminal_becomes_one_parent_completion() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -663,6 +653,7 @@ async fn child_failure_reasons_map_to_child_failure() {
                 context: ContextPolicy::Fresh,
                 parent_tool_call_id: reference.tool_call,
                 caused_by,
+                deadline: None,
             },
         )
         .await;
@@ -696,6 +687,7 @@ async fn child_failure_reasons_map_to_child_failure() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -735,6 +727,7 @@ async fn unreadable_child_records_lost_and_unblocks_replay() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -777,6 +770,7 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -824,6 +818,7 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -960,6 +955,7 @@ async fn spawn_tool_maps_a_recorded_lost_outcome_to_internal() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -1133,6 +1129,7 @@ fn spawn_record(child: SessionId, context: ContextPolicy) -> SessionEvent {
         context,
         parent_tool_call_id: CALL_SPAWN,
         caused_by: LogId::from_i64(1),
+        deadline: None,
     }
 }
 
@@ -1795,6 +1792,7 @@ async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
             context: ContextPolicy::Fork { at },
             parent_tool_call_id: second_call,
             caused_by: LogId::from_i64(1),
+            deadline: None,
         },
         dedup::child_session(second),
     )
@@ -2055,6 +2053,7 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: calls[0],
             caused_by: caused_by[0],
+            deadline: None,
         },
     )
     .await;
@@ -2130,6 +2129,7 @@ async fn cancel_after_a_child_terminal_still_records_cancelled_parent() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: None,
         },
     )
     .await;
@@ -2160,122 +2160,6 @@ async fn cancel_after_a_child_terminal_still_records_cancelled_parent() {
             reason: CancelReason::Parent
         })
     );
-}
-
-/// Timer executor that only supports what the R3 timeout test needs.
-struct TestExecutor {
-    log: Arc<InMemoryEventLog>,
-    clock: Arc<dyn Clock>,
-    timers: Mutex<HashMap<TimerId, TestTimer>>,
-}
-
-enum TestTimer {
-    Pending(Timestamp),
-    Fired,
-    Cancelled,
-}
-
-impl TestExecutor {
-    fn new(log: Arc<InMemoryEventLog>, clock: Arc<dyn Clock>) -> Arc<Self> {
-        Arc::new(Self {
-            log,
-            clock,
-            timers: Mutex::new(HashMap::new()),
-        })
-    }
-
-    async fn append(&self, session: SessionId, event: SessionEvent) {
-        self.log
-            .append(encode_entry(session, None, &event).expect("encodes"))
-            .await
-            .expect("appends");
-    }
-}
-
-impl DurableExecutor for TestExecutor {
-    fn schedule_timer(&self, req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async move {
-            if self.timers.lock().unwrap().contains_key(&req.timer) {
-                return Ok(req.timer);
-            }
-            self.append(
-                req.session,
-                SessionEvent::TimerScheduled {
-                    timer_id: req.timer,
-                    deadline: req.deadline,
-                    caused_by: req.caused_by,
-                },
-            )
-            .await;
-            self.timers
-                .lock()
-                .unwrap()
-                .insert(req.timer, TestTimer::Pending(req.deadline));
-            Ok(req.timer)
-        })
-    }
-
-    fn cancel_timer(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async move {
-            let pending = matches!(
-                self.timers.lock().unwrap().get(&timer),
-                Some(TestTimer::Pending(_))
-            );
-            if pending {
-                self.timers
-                    .lock()
-                    .unwrap()
-                    .insert(timer, TestTimer::Cancelled);
-                self.append(session, SessionEvent::TimerCancelled { timer_id: timer })
-                    .await;
-            }
-            Ok(())
-        })
-    }
-
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn await_wake(
-        &self,
-        session: SessionId,
-        cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async move {
-            let WakeCause::Timer(timer) = cause else {
-                return std::future::pending().await;
-            };
-            let deadline = match self.timers.lock().unwrap().get(&timer) {
-                Some(TestTimer::Pending(deadline)) => *deadline,
-                Some(TestTimer::Fired | TestTimer::Cancelled) => return Ok(()),
-                None => return Err(ExecutionError::NotFound { session }),
-            };
-            if deadline > self.clock.now() {
-                return std::future::pending().await;
-            }
-            self.timers.lock().unwrap().insert(timer, TestTimer::Fired);
-            self.append(session, SessionEvent::TimerFired { timer_id: timer })
-                .await;
-            Ok(())
-        })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
 }
 
 #[tokio::test]
@@ -2402,14 +2286,14 @@ impl AgentRunner for CompletingRunner {
 #[tokio::test]
 async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
     let log = Arc::new(InMemoryEventLog::new());
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
     let subagents = SubagentConfig {
         cancel_grace: Duration::from_millis(50),
         ..SubagentConfig::default()
     };
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     let child = SessionId::from_bytes([9; 16]);
-    let spawn_log = append(
+    append(
         &*log,
         parent,
         SessionEvent::ChildSessionSpawned {
@@ -2419,24 +2303,15 @@ async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
             context: ContextPolicy::Fresh,
             parent_tool_call_id: reference.tool_call,
             caused_by,
+            deadline: Some(clock.now() - 1),
         },
     )
     .await;
-    let executor = TestExecutor::new(log.clone(), Arc::clone(&clock));
-    executor
-        .schedule_timer(TimerRequest {
-            session: parent,
-            timer: TimerId::from_bytes([0x62; 16]),
-            caused_by: spawn_log,
-            deadline: clock.now() - 1,
-        })
-        .await
-        .expect("timer");
 
     let scheduler = new_scheduler_with(
         log.clone(),
         Arc::new(FakeCatalog::default()),
-        executor,
+        Arc::new(NoopExecutor),
         clock,
         subagents,
     );
@@ -2468,41 +2343,24 @@ async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
 }
 
 #[tokio::test]
-async fn a_committed_child_terminal_wins_over_an_expired_spawn_timer() {
+async fn a_committed_child_terminal_wins_over_an_expired_spawn_deadline() {
     let log = Arc::new(InMemoryEventLog::new());
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     let child = SessionId::from_bytes([9; 16]);
-    let spawn_log = append(
+    append(
         &*log,
         parent,
-        SessionEvent::ChildSessionSpawned {
-            child,
-            task: vec![text("task")],
-            config: config(3),
-            context: ContextPolicy::Fresh,
-            parent_tool_call_id: reference.tool_call,
-            caused_by,
-        },
+        spawn_with_deadline(child, reference.tool_call, caused_by, clock.now() - 1),
     )
     .await;
-    let executor = TestExecutor::new(log.clone(), Arc::clone(&clock));
-    executor
-        .schedule_timer(TimerRequest {
-            session: parent,
-            timer: TimerId::from_bytes([0x61; 16]),
-            caused_by: spawn_log,
-            deadline: clock.now() - 1,
-        })
-        .await
-        .expect("timer");
     // The child finished before the parent noticed the deadline.
     completed_child(&log, child, "finished", TurnEndReason::Completed).await;
 
     let scheduler = new_scheduler_with(
         log.clone(),
         Arc::new(FakeCatalog::default()),
-        executor,
+        Arc::new(NoopExecutor),
         clock,
         SubagentConfig::default(),
     );
@@ -2514,22 +2372,199 @@ async fn a_committed_child_terminal_wins_over_an_expired_spawn_timer() {
         .await
         .expect("terminal wins");
     assert!(matches!(outcome, ChildOutcome::Completed { .. }));
+    assert_eq!(completions(&*log, parent).await.len(), 1);
+}
 
-    let kinds = events(&*log, parent)
+fn spawn_with_deadline(
+    child: SessionId,
+    tool_call: ToolCallId,
+    caused_by: LogId,
+    deadline: Timestamp,
+) -> SessionEvent {
+    SessionEvent::ChildSessionSpawned {
+        child,
+        task: vec![text("task")],
+        config: config_with(
+            3,
+            SubagentConfig {
+                cancel_grace: Duration::from_millis(20),
+                ..SubagentConfig::default()
+            },
+        ),
+        context: ContextPolicy::Fresh,
+        parent_tool_call_id: tool_call,
+        caused_by,
+        deadline: Some(deadline),
+    }
+}
+
+async fn completions(log: &dyn EventLog, parent: SessionId) -> Vec<ChildOutcome> {
+    events(log, parent)
         .await
-        .iter()
-        .map(SessionEvent::kind)
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionCompleted { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A child that never reaches a terminal, however long it is driven.
+struct HangingRunner;
+
+impl AgentRunner for HangingRunner {
+    fn run(&self, _req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
+        stream::pending().boxed()
+    }
+
+    fn compact_now(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::CompactResult, AgentError>> {
+        Box::pin(async move { Err(AgentError::NotFound { session }) })
+    }
+}
+
+#[tokio::test]
+async fn spawn_records_the_timeout_as_a_deadline_on_the_spawn_record() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let clock = Arc::new(ManualClock::new());
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        clock.clone(),
+        SubagentConfig::default(),
+    );
+    let mut request = SpawnRequest::new(reference, caused_by, vec![text("task")]);
+    request.timeout = Some(Duration::from_secs(5));
+    scheduler.spawn(request.clone()).await.expect("spawn");
+    // A replayed spawn after the clock moved keeps the original deadline.
+    clock.advance(60_000);
+    scheduler.spawn(request).await.expect("replayed spawn");
+
+    let deadlines = events(&*log, parent)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { deadline, .. } => Some(deadline),
+            _ => None,
+        })
         .collect::<Vec<_>>();
-    assert!(!kinds.contains(&"TimerFired"), "R3 produces no TimerFired");
-    assert!(kinds.contains(&"TimerCancelled"));
-    assert!(
-        kinds
-            .iter()
-            .position(|kind| *kind == "ChildSessionCompleted")
-            .expect("completion")
-            < kinds
-                .iter()
-                .position(|kind| *kind == "TimerCancelled")
-                .expect("cancelled")
+    assert_eq!(deadlines, vec![Some(ManualClock::BASE + 5_000)]);
+    assert_eq!(
+        kinds(&*log, parent).await,
+        vec!["SessionCreated", "ToolCallRequested", "ChildSessionSpawned"],
+        "the deadline is the only timeout record"
+    );
+}
+
+#[tokio::test]
+async fn a_spawn_without_a_timeout_has_no_deadline() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let scheduler = new_scheduler(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        BTreeMap::new(),
+    );
+    scheduler
+        .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
+        .await
+        .expect("spawn");
+    assert!(events(&*log, parent).await.iter().any(|event| matches!(
+        event,
+        SessionEvent::ChildSessionSpawned { deadline: None, .. }
+    )));
+}
+
+#[tokio::test]
+async fn a_spawn_deadline_that_expired_while_stopped_times_out_exactly_once_after_restart() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let clock = Arc::new(ManualClock::new());
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let child = SessionId::from_bytes([9; 16]);
+    // Spawned before the stop; the deadline passed while nothing ran.
+    append(
+        &*log,
+        parent,
+        spawn_with_deadline(
+            child,
+            reference.tool_call,
+            caused_by,
+            ManualClock::BASE + 1_000,
+        ),
+    )
+    .await;
+    clock.advance(2_000);
+    let child_ref = ChildRef {
+        parent: reference,
+        child,
+    };
+
+    for _restart in 0..2 {
+        let scheduler = new_scheduler_with(
+            log.clone(),
+            Arc::new(FakeCatalog::default()),
+            Arc::new(NoopExecutor),
+            clock.clone(),
+            SubagentConfig::default(),
+        );
+        let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
+        scheduler.set_runner(Arc::clone(&runner));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.await_completion(&child_ref),
+        )
+        .await
+        .expect("an expired deadline never waits");
+        assert!(matches!(result, Err(WaitError::Timeout)), "{result:?}");
+    }
+
+    assert_eq!(
+        completions(&*log, parent).await,
+        vec![ChildOutcome::Cancelled {
+            reason: CancelReason::Timeout
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_live_wait_sleeps_until_the_spawn_deadline() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let child = SessionId::from_bytes([9; 16]);
+    append(
+        &*log,
+        parent,
+        spawn_with_deadline(child, reference.tool_call, caused_by, clock.now() + 50),
+    )
+    .await;
+    let scheduler = new_scheduler_with(
+        log.clone(),
+        Arc::new(FakeCatalog::default()),
+        Arc::new(NoopExecutor),
+        clock,
+        SubagentConfig::default(),
+    );
+    let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
+    scheduler.set_runner(Arc::clone(&runner));
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.await_completion(&ChildRef {
+            parent: reference,
+            child,
+        }),
+    )
+    .await
+    .expect("the wait ends at the deadline");
+    assert!(matches!(result, Err(WaitError::Timeout)), "{result:?}");
+    assert_eq!(
+        completions(&*log, parent).await,
+        vec![ChildOutcome::Cancelled {
+            reason: CancelReason::Timeout
+        }]
     );
 }

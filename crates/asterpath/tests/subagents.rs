@@ -1267,8 +1267,14 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
             .position(|event| event.kind() == kind)
             .expect(kind)
     };
-    assert!(position("TimerScheduled") < position("TimerFired"));
-    assert!(position("TimerFired") < position("ChildSessionCompleted"));
+    assert!(position("ChildSessionSpawned") < position("ChildSessionCompleted"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ChildSessionSpawned {
+            deadline: Some(_),
+            ..
+        }
+    )));
     assert!(position("ChildSessionCompleted") < position("ToolResult"));
     assert_eq!(
         completions(&entries),
@@ -1305,7 +1311,7 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
 }
 
 #[tokio::test]
-async fn child_completion_cancels_the_timeout_timer() {
+async fn a_child_completing_before_its_deadline_wins() {
     let db = temp_db("timeout-cancelled");
     let child: ChildReply =
         Arc::new(|_task| response_events(assistant("child done"), StopReason::EndTurn));
@@ -1329,10 +1335,6 @@ async fn child_completion_cancels_the_timeout_timer() {
     drive_all(&handle).await;
 
     let entries = scan(asterpath.event_log(), parent).await;
-    let kinds = kinds(&entries);
-    assert!(kinds.contains(&"TimerScheduled"));
-    assert!(kinds.contains(&"TimerCancelled"));
-    assert!(!kinds.contains(&"TimerFired"), "the child won the race");
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Completed {

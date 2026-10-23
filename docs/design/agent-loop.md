@@ -56,7 +56,7 @@
   - `BetweenSteps`：没有 open step（`TurnStarted` 之后、`StepStarted` 之前，或刚 `StepCommitted`）。
   - `ModelCalling`：`StepStarted` 无 `AssistantMessage`。
   - `ToolsPending`：`AssistantMessage` 已写，仍有 `ToolCallRequested` 无 `ToolResult`。
-  - `Waiting`：`ToolsPending` 且本 step 有未终结的 timer / child / signal 等待。
+  - `Waiting`：`ToolsPending` 且本 step 有未终结的子会话等待。
 
 ```mermaid
 stateDiagram-v2
@@ -247,7 +247,7 @@ StepCommitted
 - 多个输入按 `seq` 顺序进入下一次投影。
 - 模型刚返回且无工具调用时，若有 pending input，同一回合继续下一个 step。
 - 回合结束后到达的输入不属于旧回合；驱动方在 Idle 时开始新回合。
-- 持久等待中的输入不会唤醒等待：等待由 timer / signal / 子会话完成驱动；要放弃等待用取消（然后开新回合）。
+- 持久等待中的输入不会唤醒等待：等待由审批决定或子会话完成驱动；要放弃等待用取消（然后开新回合）。
 
 ## 6. 取消
 
@@ -255,7 +255,7 @@ StepCommitted
 - **模型流中**：立即 abort，写 `ModelCallAborted{Cancelled}`，不重试；`StepCommitted`；`TurnCommitted(Cancelled)`。
 - **退避等待中**：打断 sleep，同上。
 - **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。一个调用只有一个终态写入者；取消接管后不再触发该调用的超时（[tools.md](tools.md) §6）。
-- **等待意图**：到期后由驱动方收尾——`TimerScheduled` 写 `TimerCancelled`；`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled{Parent}}`（正常运行时 scheduler 是父流子生命周期记录的唯一写者）；signal 等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
+- **等待意图**：到期后由驱动方收尾——`ChildSessionSpawned` 请求 scheduler 取消子会话并写 `ChildSessionCompleted{Cancelled{Parent}}`；若 spawn 工具 future 已在宽限到期时被丢弃、scheduler 来不及写，则由关闭 step 的驱动方补写同一条 `Cancelled{Parent}`，与 scheduler 先写者赢（同类型 dedup，[subagents.md](subagents.md) §8）；审批等待由工具的 `ToolResult{Interrupted}` 收尾。子会话自己的终态见 [subagents.md](subagents.md)。
 - 顺序：取消信号 → 宽限 → 收尾等待 → `StepCommitted` → `TurnCommitted(Cancelled)`。
 - 取消不重试、不恢复：已提交的取消记录让恢复跳过该 step。
 
@@ -330,7 +330,7 @@ pub struct TurnConfig {
 | L1 | 两步正常回合（第一步工具调用） | 事件序列符合 §4.2 示例；第二步投影含 `ToolResult`；恰一条 `TurnCommitted(Completed)` |
 | L2 | step 运行中提交 steering | 输入立即 `InputRecorded`；本 step 投影不含它；下一 step 投影含它；同一回合 |
 | L3 | 模型流中取消 | `ModelCallAborted{Cancelled}` + `StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
-| L4 | 工具执行中取消，宽限到期 | 未返回工具写 `Interrupted`；回合 `Cancelled`；timer 等待写 `TimerCancelled` |
+| L4 | 工具执行中取消，宽限到期 | 未返回工具写 `Interrupted`；回合 `Cancelled`；open 子会话等待写 `Cancelled{Parent}` |
 | L5 | 可重试错误两次后成功 | 两条 `ModelCallAborted{attempt 1,2}`；恰一条 `AssistantMessage`；usage 只来自成功调用 |
 | L6 | 不可重试错误 | `ModelCallAborted{Rejected}` + `StepCommitted` + `TurnCommitted(Failed)`；恢复不重试 |
 | L7 | `max_steps_per_turn = 1` 且第一步有工具调用 | 工具完成后 `TurnCommitted(MaxStepsExceeded)` |

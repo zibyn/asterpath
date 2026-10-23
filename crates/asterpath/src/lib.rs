@@ -169,11 +169,7 @@ impl Asterpath {
             }
         }
 
-        let runtime = Arc::new(RuntimeExecutor::new(
-            Arc::clone(&event_log),
-            Arc::clone(&storage),
-            Arc::clone(&config.clock),
-        ));
+        let runtime = Arc::new(RuntimeExecutor::new(Arc::clone(&event_log)));
         module_host.register(Arc::new(RuntimeModule::new(Arc::clone(&runtime))));
         let executor: Arc<dyn DurableExecutor> = runtime;
 
