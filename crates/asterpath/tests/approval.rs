@@ -501,6 +501,130 @@ async fn recorded_decision_is_reused_without_reprompting() {
 }
 
 #[tokio::test]
+async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
+    let db = temp_db("late");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![Item::Message {
+            role: Role::Assistant,
+            parts: vec![text("done")],
+        }],
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![echo_tool(Arc::clone(&calls))])
+        .approval(Arc::new(AlwaysAsk))
+        .build()
+        .await
+        .expect("build");
+    let _endpoint = asterpath.approval_gate().register();
+    let handle = asterpath.create_session(spec()).await.unwrap();
+    let session = handle.id();
+
+    let turn = asterpath_protocol::TurnId::from_bytes([1; 16]);
+    let step = asterpath_protocol::StepId::from_bytes([2; 16]);
+    let first = ToolCallId::from_bytes([3; 16]);
+    let second = ToolCallId::from_bytes([4; 16]);
+    let call = |id: &str| Item::ToolCall {
+        call_id: id.to_owned(),
+        provider_item_id: None,
+        name: ToolName::new("echo"),
+        raw_args: JsonString::new(r#"{"q":"hi"}"#),
+        raw: None,
+    };
+    let log = asterpath.store();
+    append(
+        &log,
+        session,
+        SessionEvent::TurnStarted { turn_id: turn },
+        None,
+    )
+    .await;
+    append(
+        &log,
+        session,
+        SessionEvent::StepStarted {
+            turn_id: turn,
+            step_id: step,
+        },
+        None,
+    )
+    .await;
+    append(
+        &log,
+        session,
+        SessionEvent::AssistantMessage {
+            turn_id: turn,
+            step_id: step,
+            items: vec![call("call-1"), call("call-2")],
+            raw: None,
+            model: spec().model,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        },
+        Some(dedup::assistant_message(turn, step)),
+    )
+    .await;
+    for (id, provider_call_id) in [(first, "call-1"), (second, "call-2")] {
+        append(
+            &log,
+            session,
+            SessionEvent::ToolCallRequested {
+                turn_id: turn,
+                step_id: step,
+                tool_call_id: id,
+                provider_call_id: provider_call_id.to_owned(),
+                name: ToolName::new("echo"),
+                raw_args: JsonString::new(r#"{"q":"hi"}"#),
+                replay: ReplaySafety::Safe,
+                provenance: asterpath_protocol::Provenance::InProcess,
+            },
+            Some(dedup::tool_call(id)),
+        )
+        .await;
+    }
+
+    let mut stream = handle.drive();
+    let request = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("approval is requested")
+            .expect("event")
+            .expect("no error");
+        if let AgentEvent::ApprovalRequested(request) = event {
+            break request;
+        }
+    };
+    assert_eq!(request.tool_call_id, first);
+    // The second call is decided while the first still waits.
+    handle
+        .approve(second, ApprovalDecision::Allow)
+        .await
+        .expect("approve second");
+    handle
+        .approve(first, ApprovalDecision::Allow)
+        .await
+        .expect("approve first");
+    let mut reprompted = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::ApprovalRequested(request) = event.expect("drive") {
+            reprompted.push(request.tool_call_id);
+        }
+    }
+    assert!(
+        reprompted.is_empty(),
+        "decided call re-prompted: {reprompted:?}"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
 async fn cancel_before_deadline_wins_over_timeout() {
     let db = temp_db("cancel");
     let calls = Arc::new(Mutex::new(Vec::new()));

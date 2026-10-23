@@ -84,7 +84,7 @@ impl Waits {
         Ok(events)
     }
 
-    async fn find_signal(
+    pub(crate) async fn find_signal(
         &self,
         session: SessionId,
         signal: SignalId,

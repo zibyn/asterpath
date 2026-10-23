@@ -16,10 +16,10 @@ use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest,
     ApprovalVerdict, AwaitSignal, CancelReason, CancelToken, ChildOutcome, Clock, DedupKey,
     HookError, Hooks, Item, LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance,
-    ReplaySafety, SessionEvent, SessionId, SessionStore, SignalId, SignalPayload, StepId, Tool,
-    ToolArgs, ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
-    TurnId, UsageLookup, approval_signal_id, approval_signal_name, dedup, scan_all, unique_bytes,
+    ReplaySafety, SessionEvent, SessionId, SessionStore, SignalPayload, StepId, Tool, ToolArgs,
+    ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo,
+    ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnId,
+    UsageLookup, approval_signal_id, approval_signal_name, dedup, scan_all, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -160,7 +160,7 @@ impl ToolPipeline {
             };
             let descriptor = tool.descriptor().clone();
             match self
-                .decide_approval(step, &recorded, &admitted, &descriptor, cancel)
+                .decide_approval(step, &admitted, &descriptor, cancel)
                 .await?
             {
                 ToolDecision::Allow if cancel.is_cancelled() => {
@@ -257,8 +257,8 @@ impl ToolPipeline {
         Ok(ToolOutcome::Cancelled)
     }
 
-    /// One read of the log per step: this step's recorded intents, which of
-    /// them are closed, and every recorded approval signal.
+    /// One read of the log per step: this step's recorded intents and which
+    /// of them are closed.
     async fn recorded(&self, step: &ToolStep<'_>) -> Result<Recorded, AgentError> {
         let decoded = decode_entries(scan_all(&*self.log, step.session).await?, step.session)?;
         Ok(Recorded::of(&decoded, step.turn, step.step))
@@ -636,14 +636,15 @@ impl ToolPipeline {
     async fn decide_approval(
         &self,
         step: &ToolStep<'_>,
-        recorded: &Recorded,
         call: &Admitted,
         descriptor: &ToolDescriptor,
         cancel: &CancelToken,
     ) -> Result<ToolDecision, AgentError> {
         let signal = approval_signal_id(call.tool_call_id);
-        if let Some(payload) = recorded.approvals.get(&signal) {
-            return approval_decision(step.session, payload.clone());
+        // Read right before deciding: a decision recorded while an earlier
+        // call of this step waited for a human still wins.
+        if let Some(payload) = self.waits.find_signal(step.session, signal).await? {
+            return approval_decision(step.session, payload);
         }
 
         let request = ApprovalRequest::new(
@@ -801,8 +802,6 @@ struct Recorded {
     intents: HashMap<String, RecordedIntent>,
     /// Intents of this step that already have a result.
     closed: HashSet<ToolCallId>,
-    /// Recorded signals by id; the first one wins.
-    approvals: HashMap<SignalId, SignalPayload>,
 }
 
 impl Recorded {
@@ -830,14 +829,6 @@ impl Recorded {
                             provenance: *provenance,
                         },
                     );
-                }
-                SessionEvent::SignalReceived {
-                    signal_id, payload, ..
-                } => {
-                    recorded
-                        .approvals
-                        .entry(*signal_id)
-                        .or_insert_with(|| payload.clone());
                 }
                 _ => {}
             }
