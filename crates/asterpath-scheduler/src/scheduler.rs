@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use asterpath_core::{
     Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, ModuleCtx,
-    SessionCatalog, SessionId, SystemClock, TimerId, TimerRequest, ToolCallId, WakeCause,
-    unique_bytes,
+    SessionCatalog, SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
@@ -27,9 +26,6 @@ pub(crate) const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32)
 
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
-
-/// The one timer slot a spawn owns; the executor derives the durable id.
-const SPAWN_TIMEOUT_SLOT: TimerId = TimerId::from_bytes([0; 16]);
 
 pub struct Scheduler {
     log: Arc<dyn EventLog>,
@@ -204,10 +200,6 @@ impl SubagentSpawner for Scheduler {
 
             // R1: one child per parent tool call, ever.
             if let Some(record) = find_spawn(&parent_events, req.parent.tool_call) {
-                let completed = find_completion(&parent_events, record.child).is_some();
-                self.ensure_timeout(req.parent.session, record.log_id, timeout, completed)
-                    .await
-                    .map_err(SpawnError::Execution)?;
                 self.materialize(
                     req.parent.clone(),
                     record.child,
@@ -288,26 +280,27 @@ impl SubagentSpawner for Scheduler {
             .await;
             drop(queue_guard);
 
-            let child = SessionId::from_bytes(unique_bytes(self.clock.now()));
-            let spawn_log = self
-                .append(
-                    req.parent.session,
-                    SessionEvent::ChildSessionSpawned {
-                        child,
-                        task: req.task.clone(),
-                        config: config.clone(),
-                        context: context.clone(),
-                        parent_tool_call_id: req.parent.tool_call,
-                        caused_by: req.caused_by,
-                    },
-                    Some(dedup::child_session(child)),
-                )
-                .await
-                .map_err(SpawnError::Execution)?;
-
-            self.ensure_timeout(req.parent.session, spawn_log, timeout, false)
-                .await
-                .map_err(SpawnError::Execution)?;
+            let now = self.clock.now();
+            let child = SessionId::from_bytes(unique_bytes(now));
+            // The timeout starts at the spawn record, not at admission.
+            let deadline = timeout.map(|timeout| {
+                now.saturating_add(i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX))
+            });
+            self.append(
+                req.parent.session,
+                SessionEvent::ChildSessionSpawned {
+                    child,
+                    task: req.task.clone(),
+                    config: config.clone(),
+                    context: context.clone(),
+                    parent_tool_call_id: req.parent.tool_call,
+                    caused_by: req.caused_by,
+                    deadline,
+                },
+                Some(dedup::child_session(child)),
+            )
+            .await
+            .map_err(SpawnError::Execution)?;
 
             self.materialize(req.parent.clone(), child, &req.task, &config, &context)
                 .await
@@ -329,7 +322,6 @@ impl SubagentSpawner for Scheduler {
 
             // R3: a recorded outcome wins; the child is never queried again.
             if let Some(outcome) = find_completion(&parent_events, child.child) {
-                self.stop_timeout(&child, &parent_events).await;
                 return wait_outcome(&outcome);
             }
 
@@ -343,7 +335,6 @@ impl SubagentSpawner for Scheduler {
                     "child wait does not own the recorded child session",
                 )));
             }
-            let spawn_log = record.log_id;
 
             // An unreadable child becomes a recorded `Lost`, never a hang.
             if let Err(error) = scan(&*self.log, child.child).await {
@@ -366,7 +357,6 @@ impl SubagentSpawner for Scheduler {
 
             if let Some(outcome) = child_outcome(&child_events) {
                 self.record_completion(&child, outcome.clone()).await?;
-                self.stop_timeout(&child, &parent_events).await;
                 return wait_outcome(&outcome);
             }
 
@@ -381,7 +371,6 @@ impl SubagentSpawner for Scheduler {
                     .await
                     .map_err(WaitError::Execution)?;
                 if let Some(outcome) = find_completion(&parent_events, child.child) {
-                    self.stop_timeout(&child, &parent_events).await;
                     return wait_outcome(&outcome);
                 }
 
@@ -389,54 +378,17 @@ impl SubagentSpawner for Scheduler {
                     Ok(events) => events,
                     Err(error) => return self.lost(&child, error.to_string()).await,
                 };
-                // R3 applies to the child's own terminal too: it wins over a
-                // due timer and turns `TimerFired` into `TimerCancelled`.
+                // R3 applies to the child's own terminal too: it wins over an
+                // expired deadline, including one that passed while stopped.
                 if let Some(outcome) = child_outcome(&child_events) {
                     self.record_completion(&child, outcome.clone()).await?;
-                    self.stop_timeout(&child, &parent_events).await;
                     return wait_outcome(&outcome);
                 }
 
-                let timer_sleep = match find_timer(&parent_events, spawn_log) {
-                    Some(TimeoutTimer::Pending { timer_id, deadline }) => {
-                        if deadline <= self.clock.now() {
-                            // The child terminal was checked just above, before
-                            // any `TimerFired` is written.
-                            match self
-                                .executor
-                                .await_wake(child.parent.session, WakeCause::Timer(timer_id))
-                                .await
-                            {
-                                Ok(()) => {
-                                    match self
-                                        .time_out(&child, record.config.subagents.cancel_grace)
-                                        .await?
-                                    {
-                                        Some(outcome) => return wait_outcome(&outcome),
-                                        None => return Err(WaitError::Timeout),
-                                    }
-                                }
-                                // Another writer cancelled the timer.
-                                Err(ExecutionError::Cancelled) => None,
-                                Err(error) => return Err(WaitError::Execution(error)),
-                            }
-                        } else {
-                            Some(Duration::from_millis(
-                                (deadline - self.clock.now()).max(0) as u64
-                            ))
-                        }
-                    }
-                    Some(TimeoutTimer::Fired) => {
-                        return match self
-                            .time_out(&child, record.config.subagents.cancel_grace)
-                            .await?
-                        {
-                            Some(outcome) => wait_outcome(&outcome),
-                            None => Err(WaitError::Timeout),
-                        };
-                    }
-                    _ => None,
-                };
+                let remaining = record.deadline.map(|deadline| deadline - self.clock.now());
+                if remaining.is_some_and(|remaining| remaining <= 0) {
+                    return self.timed_out(&child, &record).await;
+                }
 
                 let drive = drive_child(Arc::clone(&runner), child.child);
                 tokio::pin!(drive);
@@ -444,21 +396,25 @@ impl SubagentSpawner for Scheduler {
                     .executor
                     .await_wake(child.parent.session, WakeCause::ChildCompleted(child.child));
                 tokio::pin!(wake);
-                let timer_wait = async {
-                    match timer_sleep {
-                        Some(wait) => tokio::time::sleep(wait).await,
+                let deadline_wait = async {
+                    match remaining {
+                        Some(millis) => {
+                            tokio::time::sleep(Duration::from_millis(millis as u64)).await
+                        }
                         None => std::future::pending().await,
                     }
                 };
-                tokio::pin!(timer_wait);
+                tokio::pin!(deadline_wait);
 
                 let driven = tokio::select! {
                     result = &mut drive => Some(result),
                     _ = &mut wake => None,
-                    _ = &mut timer_wait => None,
+                    // Re-read first: the child's terminal still wins (R3).
+                    _ = &mut deadline_wait => None,
                 };
                 match driven {
-                    // Another writer closed the wait; re-read the records.
+                    // Another writer closed the wait or the deadline passed;
+                    // re-read the records.
                     None => {}
                     Some(Ok(())) => {
                         if child_outcome(
@@ -665,45 +621,18 @@ impl Scheduler {
         }
     }
 
-    /// Schedule the durable spawn timeout exactly once.
-    async fn ensure_timeout(
+    /// The spawn deadline passed: cancel the child and report the outcome.
+    async fn timed_out(
         &self,
-        session: SessionId,
-        spawn_log: LogId,
-        timeout: Option<Duration>,
-        completed: bool,
-    ) -> Result<(), ExecutionError> {
-        let Some(timeout) = timeout else {
-            return Ok(());
-        };
-        // A completed spawn never opens a wait.
-        if completed {
-            return Ok(());
-        }
-        let millis = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
-        self.executor
-            .schedule_timer(TimerRequest {
-                session,
-                timer: SPAWN_TIMEOUT_SLOT,
-                caused_by: spawn_log,
-                deadline: self.clock.now().saturating_add(millis),
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Child completed first: `TimerCancelled` replaces `TimerFired`.
-    async fn stop_timeout(&self, child: &ChildRef, parent_events: &[(LogEntry, SessionEvent)]) {
-        let Some(record) = find_spawn(parent_events, child.parent.tool_call) else {
-            return;
-        };
-        if let Some(TimeoutTimer::Pending { timer_id, .. }) =
-            find_timer(parent_events, record.log_id)
+        child: &ChildRef,
+        record: &SpawnRecord,
+    ) -> Result<ChildOutcome, WaitError> {
+        match self
+            .time_out(child, record.config.subagents.cancel_grace)
+            .await?
         {
-            let _ = self
-                .executor
-                .cancel_timer(child.parent.session, timer_id)
-                .await;
+            Some(outcome) => wait_outcome(&outcome),
+            None => Err(WaitError::Timeout),
         }
     }
 
@@ -768,7 +697,6 @@ impl Scheduler {
             },
         )
         .await?;
-        self.stop_timeout(&child, &parent_events).await;
         Ok(())
     }
 
@@ -976,7 +904,7 @@ impl Drop for QueueGuard<'_> {
 }
 
 struct SpawnRecord {
-    log_id: LogId,
+    deadline: Option<Timestamp>,
     child: SessionId,
     task: Vec<Part>,
     config: ConfigSnapshot,
@@ -1027,52 +955,23 @@ fn resolve_context(
 }
 
 fn find_spawn(events: &[(LogEntry, SessionEvent)], tool_call: ToolCallId) -> Option<SpawnRecord> {
-    events.iter().find_map(|(entry, event)| match event {
+    events.iter().find_map(|(_, event)| match event {
         SessionEvent::ChildSessionSpawned {
             child,
             task,
             config,
             context,
             parent_tool_call_id,
+            deadline,
             ..
         } if *parent_tool_call_id == tool_call => Some(SpawnRecord {
-            log_id: entry.log_id,
+            deadline: *deadline,
             child: *child,
             task: task.clone(),
             config: config.clone(),
             context: context.clone(),
         }),
         _ => None,
-    })
-}
-
-enum TimeoutTimer {
-    Pending { timer_id: TimerId, deadline: i64 },
-    Fired,
-    Cancelled,
-}
-
-/// The spawn's timeout timer: scheduled under `caused_by = ChildSessionSpawned`.
-fn find_timer(events: &[(LogEntry, SessionEvent)], spawn_log: LogId) -> Option<TimeoutTimer> {
-    let (timer_id, deadline) = events.iter().find_map(|(_, event)| match event {
-        SessionEvent::TimerScheduled {
-            timer_id,
-            deadline,
-            caused_by,
-        } if *caused_by == spawn_log => Some((*timer_id, *deadline)),
-        _ => None,
-    })?;
-    let terminal = events.iter().rev().find_map(|(_, event)| match event {
-        SessionEvent::TimerFired { timer_id: fired } if *fired == timer_id => Some(true),
-        SessionEvent::TimerCancelled {
-            timer_id: cancelled,
-        } if *cancelled == timer_id => Some(false),
-        _ => None,
-    });
-    Some(match terminal {
-        Some(true) => TimeoutTimer::Fired,
-        Some(false) => TimeoutTimer::Cancelled,
-        None => TimeoutTimer::Pending { timer_id, deadline },
     })
 }
 

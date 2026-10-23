@@ -12,6 +12,8 @@
 >
 > 2026-10-22 [#29](https://github.com/zibyn/asterpath/issues/29) 修订：父流记录不变量纳入 timeout timer 与审批 `SignalReceived`；排队按 open `ToolCallRequested` 重建；子快照字段以 [packaging.md](packaging.md) §2.1 为准；超时先查子终态，再取消子会话；spawn 的 timeout timer 归 spawn 重放收尾。
 >
+> 2026-10-23 [#65](https://github.com/zibyn/asterpath/issues/65) 修订：spawn 超时改为 `ChildSessionSpawned.deadline`（与 spawn 同一次 append），不再有 timeout timer 记录；补充宽限到期后 spawn future 被丢弃时的交接规则（§8）。见 [ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)。
+>
 > 相关 ADR：[0008 子智能体是同步工具调用拥有的独立子会话](../adr/0008-subagent-model.md)。
 
 ## 1. 决策摘要
@@ -19,7 +21,7 @@
 - **子智能体 = 独立子会话**：独立日志流、独立恢复与取消单位；父流只记生命周期（#3）。
 - **spawn 是一次工具调用**，同步等待子会话完成；v1 没有后台/异步 spawn。fan-out = 同一 `AssistantMessage` 里多个 spawn 调用并行。
 - **默认全新上下文（fresh）**；`context: fork` 按次 opt-in，fork 是 spawn 时刻父投影的**物化快照**，不是活引用。
-- **父流只记 spawn 自身的管线记录与子生命周期**：spawn 的 `ToolCallRequested`、`ChildSessionSpawned`、timeout 的 `TimerScheduled` / `TimerFired` / `TimerCancelled`、审批 `SignalReceived`（仅策略非 `Allow` 时）、`ChildSessionCompleted`、spawn 的 `ToolResult`。子的 `TurnStarted` / `StepStarted` / `AssistantMessage` / `ToolCallRequested` / `ToolResult` 绝不进父流。
+- **父流只记 spawn 自身的管线记录与子生命周期**：spawn 的 `ToolCallRequested`、`ChildSessionSpawned`（含可选 timeout 截止时间）、审批 `SignalReceived`（仅策略非 `Allow` 时）、`ChildSessionCompleted`、spawn 的 `ToolResult`。子的 `TurnStarted` / `StepStarted` / `AssistantMessage` / `ToolCallRequested` / `ToolResult` 绝不进父流。
 - **结果 = 状态 + 任务总结**。子任务失败仍是成功的 spawn 工具结果；只有基础设施问题才是工具失败。
 - **配置在 spawn 时刻快照继承**，模型只能收窄（模型 alias 白名单、工具 allowlist），不能放宽审批或替换 system prompt。
 - **默认深度 3、每父并发 8、调度器全局 32**；并发超限 FIFO 排队，深度超限直接失败。
@@ -89,16 +91,14 @@ pub enum ContextPolicy {
 - **`spawn` = 意图 + R1/R2**：按 `parent_tool_call_id` 查已有 `ChildSessionSpawned`（R1），没有才创建；物化子流缺失记录并重新入队（R2）；返回 `ChildRef` 后立即返回，不等待完成。幂等。
 - **`await_completion` = R3 + 持久等待**：先读父流已记录的 `ChildSessionCompleted`（R3）；否则再次幂等补齐 R2，然后经 `DurableExecutor::await_wake` 等待子完成。子终态到达时由 scheduler 写 `ChildSessionCompleted`。
 - **`cancel` = 父侧收尾**：请求子会话取消，最多等 `cancel_grace`；已记录 outcome 不覆盖，否则写 `ChildSessionCompleted{Cancelled{Parent}}`。
-- **`timeout` = 持久 timer**：`spawn` 经 `DurableExecutor::schedule_timer` 写 `TimerScheduled`（`caused_by` = `ChildSessionSpawned` 的 `LogId`，deadline 为绝对时间）；到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
+- **`timeout` = spawn 记录上的截止时间**（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）：`spawn` 用注入时钟算 `now + timeout`，写进同一次 append 的 `ChildSessionSpawned.deadline`（绝对时间）；`await_completion` sleep 到 deadline，到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
 - **排队是内存状态**：Queued/Running、每父与全局并发计数、wake 注册表都不落日志。**排队 = open 的 spawn `ToolCallRequested` 且无对应 `ChildSessionSpawned`**；FIFO 按 `ToolCallRequested.seq` 重建。已有 `ChildSessionSpawned` 的恢复项是已准入（Running），不重新排队；`ChildSessionSpawned` 只表示「已占槽」。没有 `spawn_many` / join：fan-out 靠 #7 的并行工具调用。
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
 - **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的宿主取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
 `DurableExecutor` 与 `AwaitSignal` 的签名在 [module-contracts.md](module-contracts.md) §3.4（core，[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
-- timer id 由 `(session, caused_by, slot)` 确定性派生；通用 signal id 由 `(session, name)` 派生，审批 signal id 即 `tool_call_id`。重复注册返回同一 id，恢复重放不会制造第二个等待。
-- `await_signal` 只在 `SignalIntent::Record` 时写 `SignalAwaited`；审批用 `AlreadyRecorded`，由 open 的 `ToolCallRequested` 承担意图（#7）。
-- `schedule_timer` / `cancel_timer` 分别写 `TimerScheduled` / `TimerCancelled`，timer 服务写 `TimerFired`；同一 timer 只会有 `TimerFired` 或 `TimerCancelled` 之一。
+- 持久等待只有审批与子会话完成；没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。审批 signal id 即 `tool_call_id`，等待意图由 open 的 `ToolCallRequested` 承担（#7）；`await_signal` 不写任何记录。
 - `wake` 由终态记录的写者在 append 之后调用；注册表只在内存，恢复靠扫描日志重建。
 
 工具描述：
@@ -293,18 +293,19 @@ pub struct Summary {
 - **统一规则**：进入 cancelling 的等待一律记 `Cancelled{Parent}`，即使子恰好完成；唯一例外是 `ChildSessionCompleted` 已先落盘（等待已关闭），此时按 R3 使用已记录结果。scheduler 是这些记录的唯一并发写者，按等待状态线性化。
 - 排队中（尚无 `ChildSessionSpawned`）的 spawn 没有子可取消，直接 `Interrupted`。
 - 父取消不等待子写完自己的终态；`ChildSessionCompleted{Cancelled{Parent}}` 表达的是"父不再等待"，不是"子已停止"。子的实际终态归子流。
+- **交接规则（#65）**：spawn 工具 future 在 `turn.cancel_grace` 到期后被丢弃时，scheduler 可能来不及写终态；此时由关闭 step 的驱动方（agent 的取消收尾）为本 step 拥有的每个仍 open 的 `ChildSessionSpawned` 写 `ChildSessionCompleted{Cancelled{Parent}}`。它与 scheduler 的写入共用 dedup key（child id），先写者赢；后到的同类型 append 返回原 `LogId`，不产生第二条记录。
 
 ### 子取消
 
-- scheduler 发取消 → 子按 #6 协作停止：宽限内返回的工具记真实结果，其余 `Interrupted`；自己的 timer 写 `TimerCancelled`；自己的子会话递归走同一规则（自底向上）。
+- scheduler 发取消 → 子按 #6 协作停止：宽限内返回的工具记真实结果，其余 `Interrupted`；自己的子会话递归走同一规则（自底向上）。
 - 子写 `StepCommitted` + `TurnCommitted(Cancelled)`。
 - 父永不写子流；子永不写 `ChildSessionCompleted`。
 
 ### 超时
 
-- spawn 的 `timeout` 可选，默认 `None`；它是**持久 timer**（`DurableExecutor::schedule_timer`，`caused_by` = `ChildSessionSpawned` 的 `LogId`，deadline 为绝对时间），不是内存 deadline。停机期间到期的处理归 spawn 工具重放（§9），不走 #3 §6 的通用 timer 预扫描。
-- 到期时：**先查子流终态**——已有终态则按终态记录（R3 优先，`TimerFired` 不改写已提交的子终态）；否则 scheduler 请求子会话取消（与父取消同一路径，子按 #6 协作停止，写 `StepCommitted` + `TurnCommitted(Cancelled)`），然后写 `ChildSessionCompleted{Cancelled{Timeout}}`，spawn 工具返回 `Failed{Timeout}`。父不等子收尾。
-- 子先完成则取消 timer（`TimerCancelled`），不产生超时记录。
+- spawn 的 `timeout` 可选，默认 `None`；它是**持久截止时间** `ChildSessionSpawned.deadline`（绝对时间，与 spawn 同一次 append），不是内存 deadline，也没有独立 timer 记录。计时起点是 spawn 记录（排队不计）。停机期间到期的处理归 spawn 工具重放（§9）。
+- 到期时：**先查子流终态**——已有终态则按终态记录（R3 优先，超时不改写已提交的子终态）；否则 scheduler 请求子会话取消（与父取消同一路径，子按 #6 协作停止，写 `StepCommitted` + `TurnCommitted(Cancelled)`），然后写 `ChildSessionCompleted{Cancelled{Timeout}}`，spawn 工具返回 `Failed{Timeout}`。父不等子收尾。
+- 子先完成则记子终态，不产生超时记录。
 - 超时后让子继续运行（后台模式）v1 不支持。
 
 ## 9. 恢复与孤儿
@@ -327,20 +328,19 @@ for spawn tool call in open ToolCallRequested, 按 seq:
             已有 ChildSessionSpawned -> 复用同一个子，绝不新建
             没有                     -> 正常创建
         R2 物化子流缺失记录，按 seq 重新入队
-    timeout timer（若 open）:
-        先 R3 查子流终态：有 -> 按终态写 ChildSessionCompleted，并记 TimerCancelled
-        无 -> 过期则补 TimerFired，走 Cancelled{Timeout}（取消子会话）
     await_completion(child):
         R3 父流已有 ChildSessionCompleted -> 直接返回，不查子
         子流 TurnCommitted(reason)       -> Outcome = map(reason);
                                             append ChildSessionCompleted; 返回
+        deadline 已过（含停机期间到期）  -> 取消子会话，宽限后再查一次子终态；
+                                            仍无则 append ChildSessionCompleted{Cancelled{Timeout}}
         子流不存在 / 运行中              -> 重新挂起，等 await_wake
         子流不可读（Corrupt）            -> append ChildSessionCompleted{Lost};
                                             返回 Err(Execution) -> ToolResult{Failed, Internal}
 ```
 
 - 写者仍只有 scheduler（正常）或经 `SubagentSpawner` 被父驱动方调用（恢复）；两条路径不并发。
-- **spawn timeout timer 也不在 #3 §6 的通用 timer 预扫描里收尾**：`caused_by` 指向 `ChildSessionSpawned` 的 `TimerScheduled` 与 child 等待一样交给 spawn 重放；否则恢复会在读到子终态前触发超时，把已完成的子会话误记为 `Cancelled{Timeout}`。通用 timer 预扫描只处理其他 timer。
+- **spawn 超时只在 spawn 重放里处理**：它与 child 等待一起交给 `await_completion`，先 R3 查子终态再看 deadline；否则恢复会在读到子终态前超时，把已完成的子会话误记为 `Cancelled{Timeout}`。
 - 等待预扫描若发现 open `ChildSessionSpawned` 却没有对应的 open spawn 工具调用，视为日志损坏。
 
 ### 子恢复（孤儿检查）
@@ -350,7 +350,7 @@ recover(child):
     若父流有 ChildSessionCompleted{child = me}:
         # R4：父已不再等待
         append StreamResumed
-        收尾未闭合意图：工具 -> Interrupted；timer -> TimerCancelled；
+        收尾未闭合意图：工具 -> Interrupted；
                         自己的子会话 -> Cancelled
         append StepCommitted; append TurnCommitted(Cancelled)
         不再开新 turn
@@ -369,7 +369,7 @@ recover(child):
 | `ToolCallRequested` 后、`ChildSessionSpawned` 前 | R1：没有子记录 → 重新执行 spawn（Safe） |
 | `ChildSessionSpawned` 后、子 `SessionCreated` 前 | R2：物化子并启动 |
 | 子 `TurnCommitted` 后、父 `ChildSessionCompleted` 前 | 读子终态 → 写 outcome → 完成工具 |
-| 子 `TurnCommitted` 后、父 `ChildSessionCompleted` 前，且 spawn timeout 已到期 | spawn 重放先读子终态（R3），记 `Completed` + `TimerCancelled`；不产生 `TimerFired` |
+| 子 `TurnCommitted` 后、父 `ChildSessionCompleted` 前，且 spawn timeout 已到期 | spawn 重放先读子终态（R3），记 `Completed`；不产生 `Cancelled{Timeout}` |
 | `ChildSessionCompleted` 后、`ToolResult` 前 | R3：从记录完成工具，不查子 |
 | 父已写 `ChildSessionCompleted{Cancelled{Parent}}`、子尚未收尾 | R4：子恢复时按孤儿取消 |
 | 父取消请求已发出、收尾记录未落盘 | #6 语义：恢复后续跑该 turn（接受） |
@@ -402,7 +402,7 @@ pub struct SubagentConfig {
 | max_concurrent_children | 8 | 每父会话 |
 | max_live_children | 32 | 调度器全局；`AsterpathConfig` 字段，不在 `SubagentConfig` |
 | 并发超限 | FIFO 排队 | 不报错 |
-| spawn timeout | `None` | 按次参数；持久 timer（`DurableExecutor`） |
+| spawn timeout | `None` | 按次参数；持久截止时间（`ChildSessionSpawned.deadline`） |
 | cancel_grace | 10s | 沿用 #6 |
 | spawn replay | `Safe` | R1 |
 | spawn parallelism | `Parallel` | |
@@ -414,7 +414,7 @@ pub struct SubagentConfig {
 
 | # | 场景 | 断言 |
 | --- | --- | --- |
-| SA1 | fresh spawn 正常完成 | 父恰为 `ToolCallRequested` → `ChildSessionSpawned` → `ChildSessionCompleted` → `ToolResult`（无 timeout / 审批时无 timer 与 signal 记录）；子恰为 `SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`；父投影只含 summary；子的 step / tool 记录不出现在父流 |
+| SA1 | fresh spawn 正常完成 | 父恰为 `ToolCallRequested` → `ChildSessionSpawned` → `ChildSessionCompleted` → `ToolResult`（无审批时无 signal 记录；timeout 只体现为 `deadline` 字段）；子恰为 `SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`；父投影只含 summary；子的 step / tool 记录不出现在父流 |
 | SA2 | fork | 子首个模型请求含父在 `StepStarted.seq` 的投影快照 + task；不含 spawn 的 `AssistantMessage` 与兄弟工具结果 |
 | SA3 | fork 后父压缩/归档 | 子会话内容不变；子恢复不读父日志 |
 | SA4 | 崩溃于 `ChildSessionSpawned` 前后 | 前：恢复重放 spawn，父仍恰一条 `ToolCallRequested` → `ChildSessionSpawned` → …；后：R2 物化同一子，子流恰一条 `SessionCreated` → `InputRecorded` → `TurnStarted`；两分支都恰一个 `ChildSessionSpawned`、无第二个子会话 |
@@ -427,7 +427,7 @@ pub struct SubagentConfig {
 | SA11 | 并发超限 | 第 9 个 spawn 排队期间父流只有它的 `ToolCallRequested`、无 `ChildSessionSpawned`；前一个子 `ChildSessionCompleted` 后出现该 `ChildSessionSpawned`；按 `ToolCallRequested.seq` FIFO；无错误。恢复后按同一谓词重建，已 `ChildSessionSpawned` 的不重排 |
 | SA12 | fan-out 部分失败 | 三个 spawn：一个 `Failed`、两个 `Completed`；兄弟互不影响；父拿到三个独立结果 |
 | SA13 | 子 `MaxStepsExceeded` | `ChildOutcome::Failed{reason}`；spawn `ToolResult` 为 `Completed`，output 标明 failed |
-| SA14 | 超时 | 子取消，父序列 `ToolCallRequested` → `ChildSessionSpawned` → `TimerScheduled` → `TimerFired` → `ChildSessionCompleted{Cancelled{Timeout}}` → `ToolResult{Failed{Timeout}}`；子流收尾 `StepCommitted` → `TurnCommitted(Cancelled)`；子先完成则 `TimerCancelled` 取代 `TimerFired`、父记 `Completed`；崩溃于子 `TurnCommitted` 后、父 `ChildSessionCompleted` 前且 deadline 已过：恢复按 R3 记 `Completed` + `TimerCancelled`，不产生 `TimerFired` |
+| SA14 | 超时 | 子取消，父序列 `ToolCallRequested` → `ChildSessionSpawned{deadline}` → `ChildSessionCompleted{Cancelled{Timeout}}` → `ToolResult{Failed{Timeout}}`；子流收尾 `StepCommitted` → `TurnCommitted(Cancelled)`；子先完成则父记 `Completed`；deadline 在停机期间到期且子无终态：重启后恰好一条 `Cancelled{Timeout}`；崩溃于子 `TurnCommitted` 后、父 `ChildSessionCompleted` 前且 deadline 已过：恢复按 R3 记 `Completed` |
 | SA15 | 子流损坏 | `ChildSessionCompleted{Lost}`；spawn `Failed{Internal}`；父不被永久阻塞 |
 | SA16 | token 归因 | 父 session 日志不含子 usage；父总量按 session 树 rollup 等于自身 + 后代；无重复计数 |
 | SA17 | 子内审批 | 子工具调用使用子 session 的审批策略；父审批不覆盖；子审批等待可跨崩溃 |

@@ -4,12 +4,12 @@
 //! same assertions. G1, `Corrupt`, retirement and backend-specific behaviour
 //! are deliberately not here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use asterpath_core::{
-    DedupKey, DueTimer, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId,
-    SignalId, SignalName, StepId, Storage, StorageError, TimerId, Timestamp, ToolCallId, TurnId,
+    DedupKey, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId, SignalId,
+    SignalName, StepId, Storage, StorageError, Timestamp, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -57,10 +57,6 @@ fn call(byte: u8) -> ToolCallId {
 
 fn signal() -> SignalId {
     SignalId::from_bytes([3; 16])
-}
-
-fn timer() -> TimerId {
-    TimerId::from_bytes([4; 16])
 }
 
 fn model() -> ModelSpec {
@@ -149,6 +145,7 @@ fn child_spawned(child: SessionId) -> SessionEvent {
         context: ContextPolicy::Fresh,
         parent_tool_call_id: call(1),
         caused_by: LogId::from_i64(1),
+        deadline: None,
     }
 }
 
@@ -158,30 +155,6 @@ fn child_completed(child: SessionId) -> SessionEvent {
         outcome: ChildOutcome::Cancelled {
             reason: asterpath_protocol::CancelReason::Host,
         },
-    }
-}
-
-fn timer_scheduled() -> SessionEvent {
-    SessionEvent::TimerScheduled {
-        timer_id: timer(),
-        deadline: 100,
-        caused_by: LogId::from_i64(1),
-    }
-}
-
-fn timer_fired() -> SessionEvent {
-    SessionEvent::TimerFired { timer_id: timer() }
-}
-
-fn timer_cancelled() -> SessionEvent {
-    SessionEvent::TimerCancelled { timer_id: timer() }
-}
-
-fn signal_awaited() -> SessionEvent {
-    SessionEvent::SignalAwaited {
-        signal_id: signal(),
-        name: SignalName::new("wait"),
-        caused_by: LogId::from_i64(1),
     }
 }
 
@@ -328,14 +301,9 @@ fn shared_dedup_key_pairs(log: &dyn EventLog) {
             vec![child_spawned(child), child_completed(child)],
         ),
         (
-            session(24),
-            dedup::timer(timer()),
-            vec![timer_scheduled(), timer_fired(), timer_cancelled()],
-        ),
-        (
             session(25),
             dedup::signal(signal()),
-            vec![signal_awaited(), signal_received()],
+            vec![signal_received()],
         ),
         (
             session(26),
@@ -469,14 +437,6 @@ fn step_with(byte: u8) -> StepId {
     StepId::from_bytes([byte; 16])
 }
 
-fn signal_with(byte: u8) -> SignalId {
-    SignalId::from_bytes([byte; 16])
-}
-
-fn timer_with(byte: u8) -> TimerId {
-    TimerId::from_bytes([byte; 16])
-}
-
 fn turn_started_with(turn_id: TurnId) -> SessionEvent {
     SessionEvent::TurnStarted { turn_id }
 }
@@ -494,30 +454,6 @@ fn step_started_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
 
 fn step_committed_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
     SessionEvent::StepCommitted { turn_id, step_id }
-}
-
-fn timer_scheduled_with(timer_id: TimerId, deadline: Timestamp) -> SessionEvent {
-    SessionEvent::TimerScheduled {
-        timer_id,
-        deadline,
-        caused_by: LogId::from_i64(1),
-    }
-}
-
-fn timer_fired_with(timer_id: TimerId) -> SessionEvent {
-    SessionEvent::TimerFired { timer_id }
-}
-
-fn timer_cancelled_with(timer_id: TimerId) -> SessionEvent {
-    SessionEvent::TimerCancelled { timer_id }
-}
-
-fn signal_awaited_with(signal_id: SignalId) -> SessionEvent {
-    SessionEvent::SignalAwaited {
-        signal_id,
-        name: SignalName::new("wait"),
-        caused_by: LogId::from_i64(1),
-    }
 }
 
 fn signal_received_with(signal_id: SignalId, name: &str) -> SessionEvent {
@@ -540,7 +476,7 @@ fn append_in(
     append(log, session, event, dedup_key)
 }
 
-/// Backend-neutral storage suite (G5, G6, G7 plus pending-input and timer
+/// Backend-neutral storage suite (G5, G6, G7 plus pending-input
 /// semantics). The expected wake set is derived by folding the visible log, so
 /// a materialized index that disagrees with the log fails here.
 pub fn storage_contract(factory: &impl BackendFactory) {
@@ -606,118 +542,32 @@ pub fn storage_contract(factory: &impl BackendFactory) {
         Some(dedup::step_committed(input_step)),
     );
 
-    // Timers: due and unfired wake; fired, cancelled and future timers do not.
-    let s_due = session(0x62);
-    let due_timer = timer_with(1);
-    let due_id = append_in(
-        log,
-        &mut sessions,
-        s_due,
-        &timer_scheduled_with(due_timer, 900),
-        Some(dedup::timer(due_timer)),
-    );
-    let repeated = append_in(
-        log,
-        &mut sessions,
-        s_due,
-        &timer_scheduled_with(due_timer, 900),
-        Some(dedup::timer(due_timer)),
-    );
-    assert_eq!(
-        repeated, due_id,
-        "G5: repeating drive returns the original LogId"
-    );
-    assert_eq!(
-        scan(log, s_due).len(),
-        1,
-        "G5: repeating drive does not write duplicate records"
-    );
-
-    let s_fired = session(0x63);
-    let fired_timer = timer_with(2);
-    append_in(
-        log,
-        &mut sessions,
-        s_fired,
-        &timer_scheduled_with(fired_timer, 500),
-        Some(dedup::timer(fired_timer)),
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_fired,
-        &timer_fired_with(fired_timer),
-        Some(dedup::timer(fired_timer)),
-    );
-
-    let s_future = session(0x64);
-    let future_timer = timer_with(3);
-    append_in(
-        log,
-        &mut sessions,
-        s_future,
-        &timer_scheduled_with(future_timer, 2_000),
-        Some(dedup::timer(future_timer)),
-    );
-
-    let s_multi = session(0x6b);
-    let kept_timer = timer_with(4);
-    let cancelled_timer = timer_with(5);
-    append_in(
-        log,
-        &mut sessions,
-        s_multi,
-        &timer_scheduled_with(kept_timer, 400),
-        Some(dedup::timer(kept_timer)),
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_multi,
-        &timer_scheduled_with(cancelled_timer, 300),
-        Some(dedup::timer(cancelled_timer)),
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_multi,
-        &timer_cancelled_with(cancelled_timer),
-        Some(dedup::timer(cancelled_timer)),
-    );
-
-    // Awaited signals wake; matching receives close them.
-    let s_signal = session(0x65);
-    let signal_id = signal_with(1);
-    append_in(
-        log,
-        &mut sessions,
-        s_signal,
-        &signal_awaited_with(signal_id),
-        Some(dedup::signal(signal_id)),
-    );
-    assert!(
-        block_on(storage.wakeable(now))
-            .expect("wakeable")
-            .contains(&s_signal),
-        "G5: an awaited signal is wakeable"
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_signal,
-        &signal_received_with(signal_id, "wait"),
-        Some(dedup::signal(signal_id)),
-    );
-
     // Children: an open spawn wakes; completion closes it.
     let s_child = session(0x66);
     let child = session(0x67);
-    append_in(
+    let spawned = append_in(
         log,
         &mut sessions,
         s_child,
         &child_spawned(child),
         Some(dedup::child_session(child)),
+    );
+    let repeated = append_in(
+        log,
+        &mut sessions,
+        s_child,
+        &child_spawned(child),
+        Some(dedup::child_session(child)),
+    );
+    assert_eq!(
+        repeated, spawned,
+        "G5: repeating drive returns the original LogId"
+    );
+    assert!(
+        block_on(storage.wakeable(now))
+            .expect("wakeable")
+            .contains(&s_child),
+        "G5: an open child spawn is wakeable"
     );
     append_in(
         log,
@@ -751,7 +601,7 @@ pub fn storage_contract(factory: &impl BackendFactory) {
         Some(compaction_key),
     );
 
-    // Approval closes nothing: SignalReceived without SignalAwaited.
+    // Approval closes nothing: SignalReceived leaves the tool intent open.
     let s_approval = session(0x69);
     let approval_call = call(9);
     append_in(
@@ -834,85 +684,36 @@ pub fn storage_contract(factory: &impl BackendFactory) {
     );
 
     // G5/G7: the materialized wake index must equal the log fold.
-    let expected_wakeable = expected_wakeable(log, &sessions, now);
+    let expected_wakeable = expected_wakeable(log, &sessions);
     let wakeable = block_on(storage.wakeable(now)).expect("wakeable");
     assert_eq!(
         wakeable, expected_wakeable,
-        "G5/G7: wakeable must match the open-intent, pending-input and timer fold"
-    );
-
-    let expected_due = expected_due_timers(log, &sessions, now);
-    let due = block_on(storage.due_timers(now, 100)).expect("due_timers");
-    assert_eq!(
-        due, expected_due,
-        "G5: due_timers must match unfired timers at or before now"
-    );
-    assert_eq!(
-        block_on(storage.due_timers(now, 1)).expect("due_timers"),
-        expected_due[..1],
-        "G5: due_timers honours its limit"
+        "G5/G7: wakeable must match the open-intent and pending-input fold"
     );
 }
 
-fn expected_wakeable(
-    log: &dyn EventLog,
-    sessions: &BTreeSet<SessionId>,
-    now: Timestamp,
-) -> Vec<SessionId> {
+fn expected_wakeable(log: &dyn EventLog, sessions: &BTreeSet<SessionId>) -> Vec<SessionId> {
     let mut wakeable = Vec::new();
     for &session in sessions {
         let entries = scan(log, session);
         let intents = OpenIntents::fold(&entries).expect("fold open intents");
-        let (pending, timers) = pending_and_timers(&entries);
-        if !intents.is_idle() || pending || timers.values().any(|deadline| *deadline <= now) {
+        if !intents.is_idle() || pending_input(&entries) {
             wakeable.push(session);
         }
     }
     wakeable
 }
 
-fn expected_due_timers(
-    log: &dyn EventLog,
-    sessions: &BTreeSet<SessionId>,
-    now: Timestamp,
-) -> Vec<DueTimer> {
-    let mut due = Vec::new();
-    for &session in sessions {
-        let entries = scan(log, session);
-        let (_, timers) = pending_and_timers(&entries);
-        for (timer_id, deadline) in timers {
-            if deadline <= now {
-                due.push(DueTimer {
-                    timer_id,
-                    session,
-                    deadline,
-                });
-            }
-        }
-    }
-    due.sort_by_key(|timer| (timer.deadline, timer.timer_id));
-    due
-}
-
-fn pending_and_timers(entries: &[LogEntry]) -> (bool, BTreeMap<TimerId, Timestamp>) {
+fn pending_input(entries: &[LogEntry]) -> bool {
     let mut pending = false;
-    let mut timers = BTreeMap::new();
     for entry in entries {
         match decode_entry(entry).expect("decode log entry") {
             SessionEvent::InputRecorded { .. } => pending = true,
             SessionEvent::StepStarted { .. } => pending = false,
-            SessionEvent::TimerScheduled {
-                timer_id, deadline, ..
-            } => {
-                timers.insert(timer_id, deadline);
-            }
-            SessionEvent::TimerFired { timer_id } | SessionEvent::TimerCancelled { timer_id } => {
-                timers.remove(&timer_id);
-            }
             _ => {}
         }
     }
-    (pending, timers)
+    pending
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

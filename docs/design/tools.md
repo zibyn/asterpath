@@ -158,7 +158,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ```
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
-- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { intent: SignalIntent::AlreadyRecorded, name: "tool.approval.<tool_call_id>", .. })`。
+- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后 `DurableExecutor::await_signal(AwaitSignal { name: "tool.approval.<tool_call_id>", .. })`。
 - 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: ApprovalDecision }`。
 - `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是宿主的回答；两者不合并，`Ask` 只在策略侧存在。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
@@ -168,7 +168,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
 - 不引入独立的 `Approver` trait：host 在能够应答时用 `Asterpath::approval_gate().register()` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并投递 signal 来回答；等待由 `DurableExecutor` 承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - signal name 只在会话内唯一；signal id 由 `(session, name)` 确定性派生（审批 name 为 `tool.approval.<tool_call_id>`），重复注册/投递不会产生第二个等待。`DurableExecutor` 按 session 作用域等待（#17）。
-- 非审批的 `await_signal` 在等待开始前写 `SignalAwaited`（#3）；审批不写，因为 open 的 `ToolCallRequested` 已承担意图记录。
+- `await_signal` 不写意图记录：open 的 `ToolCallRequested` 已承担意图。审批是唯一的 signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
 - 未注册审批端点时，`Ask` 按 `Deny` 处理（fail closed），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：
@@ -340,7 +340,7 @@ pub struct ToolConfig {
 - **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
-- **#17**：已定。`DurableExecutor::await_signal` 以 `SignalIntent::AlreadyRecorded` 支持审批等待，不写 `SignalAwaited`；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#17**：已定。`DurableExecutor::await_signal` 支持审批等待，不写意图记录（#65 删除通用 signal）；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。
 - **#20**：已定。MCP 外部工具的发现、结果/错误映射、失败矩阵与 ACP 出界见 [mcp.md](mcp.md)；`Provenance` 只带 `TransportKind::{Stdio, Http}`。
 - **#21**：已定。沙箱是 spawn 点变换；启动前拒绝映射为 `ToolError::Denied`。接缝与策略见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。

@@ -12,6 +12,7 @@
 > - 新增 `CompactionStarted` 意图记录（#9）。
 > - 新增 `SignalAwaited` 意图记录（#3；API 见 ADR-0014）。
 > - `asterpath-storage-sqlite` 的 `log` 表增加 `recorded_at` 列（#5）。
+> - #65：删除 timer 与通用 signal 的 wait span（`WaitKind` 只剩 `Approval`，`WaitAttrs` 去掉 `deadline`）；spawn 超时表现为 subagent span 以 `Cancelled{Timeout}` 结束（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
 > - `Span` 增加 `parent_trace` / `child_trace`，原 `parent` 改名 `parent_span`；补全 `SpanAttributes` 子结构；`ErrorType` 增加 `ToolCancelled` / `ToolNotFound`；`backoff_before_ms` 来自 `ModelCallAborted.backoff_ms`；`TraceTap` 只在终态发 `Ended`（#31）。
 
 ## 1. 决策摘要
@@ -19,7 +20,7 @@
 - **trace 是事件日志的确定性投影**。没有独立 trace sink，不落 trace 表，不引入 OTel SDK 或第三方追踪框架。
 - **日志信封带诊断时间** `recorded_at`（Unix ms，存储层写入）。trace 的起止与耗时由它计算；恢复、投影、分支逻辑一律不得读取。
 - **层级**：`session → turn → step → model_call / tool_call / subagent / wait`；`compaction` 是独立的模型调用 span，挂在 turn 或 session 下。
-- **一个逻辑模型调用一个 span**，所有 transport attempt 折叠为 span event；等待（timer / signal / approval / child）是独立 span。
+- **一个逻辑模型调用一个 span**，所有 transport attempt 折叠为 span event；等待（approval / child）是独立 span。
 - **身份确定**：`TraceId = SessionId`，`SpanId` 由开启该 span 的日志记录确定性派生。重建得到相同 ID；恢复复用已存在的开启记录，不产生重复 span。
 - **恢复不新建 trace**：`StreamResumed` 记为 session span 上的 `resume` event；跨恢复的 span 标 `replay`。
 - **查询 pull + 导出 push**：`TraceQuery` 按需从 `EventLog` 折叠；`TraceTap` 实时发出 span 生命周期。类型在 `asterpath-protocol`，实现在 `asterpath-tracing`。
@@ -37,7 +38,7 @@ pub struct SpanId([u8; 8]);
 pub enum SpanKind {
     Session, Turn, Step, ModelCall, ToolCall, Subagent, Wait, Compaction,
 }
-pub enum WaitKind { Timer, Signal, Approval }
+pub enum WaitKind { Approval }
 pub enum SpanStatus { Unset, Ok, Error, Cancelled, Interrupted }
 
 #[non_exhaustive]
@@ -111,7 +112,6 @@ pub struct SubagentAttrs {
 }
 pub struct WaitAttrs {
     pub wait: WaitKind,
-    pub deadline: Option<Timestamp>,
     pub caused_by: Option<LogId>,
 }
 pub struct CompactionAttrs {
@@ -125,7 +125,7 @@ pub enum SpanUpdate { Started(Span), Ended(Span) }
 ```
 
 - `SpanId = hash(session, opening_log_id, kind)` 的前 8 字节；哈希算法是 `asterpath-tracing` 的内部细节，同一构建内固定即可。
-- `SpanId` 只由**开启记录**决定：`SessionCreated` / `TurnStarted` / `StepStarted` / `ToolCallRequested`（tool_call 与审批等待共用）/ `ChildSessionSpawned` / `TimerScheduled` / `SignalAwaited` / `CompactionStarted`。终态记录改变 `ended_at`、`status`、`log_range.last`，不改变 ID。
+- `SpanId` 只由**开启记录**决定：`SessionCreated` / `TurnStarted` / `StepStarted` / `ToolCallRequested`（tool_call 与审批等待共用）/ `ChildSessionSpawned` / `CompactionStarted`。终态记录改变 `ended_at`、`status`、`log_range.last`，不改变 ID。
 - 排序：`(started_at, opening_log_id)`。
 
 ## 3. span 层级与挂接点
@@ -139,7 +139,6 @@ flowchart TD
     ST --> TC2[tool_call]
     TC1 --> W1[wait: approval]
     TC2 --> SA[subagent]
-    ST --> W2[wait: timer/signal]
     T --> C[compaction]
     S --> C2[compaction at Idle]
     SA -. parent_trace / parent_span .-> CS[child session]
@@ -154,15 +153,13 @@ flowchart TD
 | model_call | `StepStarted` | `AssistantMessage` 或最终 `ModelCallAborted` | step | `chat {model}` |
 | tool_call | `ToolCallRequested` | `ToolResult` | step | `execute_tool {name}` |
 | subagent | `ChildSessionSpawned` | `ChildSessionCompleted` | spawn 的 tool_call | `invoke_agent {child}` |
-| wait（timer） | `TimerScheduled` | `TimerFired` / `TimerCancelled` | `caused_by` 所在 span | `wait timer` |
 | wait（approval） | `ToolCallRequested`，仅当存在 `SignalReceived{name=tool.approval.<id>}` | `SignalReceived` | tool_call | `wait approval` |
-| wait（signal） | `SignalAwaited` | `SignalReceived` | `caused_by` 所在 span | `wait signal` |
 | compaction | `CompactionStarted` | `CompactionApplied` / `CompactionAborted` | step（强制压缩）/ turn（BetweenSteps）/ session（Idle） | `compact {model}` |
 
 规则：
 
 - **attempt 不是 span**。每次 `ModelCallAborted` 是 `model_call` span 上的 `attempt` event（字段见 §5）。一个 step 的多次重试共享同一个 `model_call` span，符合 OTel“自动重试折叠进一个逻辑 span”。
-- **child 等待就是 subagent span**，不再另建 wait span，避免同一段时间两个 span。
+- **child 等待就是 subagent span**，不再另建 wait span，避免同一段时间两个 span。spawn 超时没有独立 span：subagent span 以 `Cancelled{Timeout}` 结束。
 - **审批等待**只在日志里存在 `SignalReceived{name=tool.approval.<id>}` 时建立；自动允许（无 signal）不产生 wait span。重建无法区分“未询问”和“瞬间允许”，接受。
 - **排队中的子会话**（尚无 `ChildSessionSpawned`）是内存状态，不建 span（#8 §3.4）。
 - **compaction 的父**由 `CompactionStarted.caused_by` 定位：落在 open step 内 → step；回合 open → turn；回合已提交 → session。
@@ -173,7 +170,7 @@ flowchart TD
 
 - **因果**全部来自日志：`parent_tool_call_id`、`caused_by`、`ContextForked.source_log`、`replaces`。不引入独立 correlation id。
 - **确定重建**：同一份日志扫描两次，得到相同的 `TraceId` / `SpanId` / 顺序 / 属性；`recorded_at` 是日志内容的一部分，因此耗时也稳定。
-- **恢复复用 span**：`StepStarted` / `ToolCallRequested` / `ChildSessionSpawned` / `TimerScheduled` 等开启记录只写一次（dedup key 保证），所以恢复不会产生第二个同一逻辑 span。重新执行的 attempt 仍是同一 span 上的新 event。
+- **恢复复用 span**：`StepStarted` / `ToolCallRequested` / `ChildSessionSpawned` 等开启记录只写一次（dedup key 保证），所以恢复不会产生第二个同一逻辑 span。重新执行的 attempt 仍是同一 span 上的新 event。
 - **重放标记**：span 在某个 `StreamResumed` 之后才闭合，或它的任一 attempt event 发生在 `StreamResumed` 之后 → `replay = true`。`replay_of` 只在确实新建了代表同一逻辑操作的 span 时使用；v1 的确定性身份通常让它保持 `None`。
 - `StreamResumed` 是 session span 上的 `resume` event，带 `reason`。
 - 子会话的 `ContextForked.source_log` 记在子 session span 属性上（`fork_source_log`），用于回溯 fork 水位。
@@ -282,13 +279,13 @@ pub enum TraceError {
 
 | 票 | 挂接 |
 | --- | --- |
-| #3 事件日志 | `recorded_at`；`SignalAwaited`；`CompactionStarted`；`StreamResumed` → `resume` event |
+| #3 事件日志 | `recorded_at`；`CompactionStarted`；`StreamResumed` → `resume` event |
 | #5 存储 | `log.recorded_at` 由 append 分配；索引与 trace 无关 |
 | #8 子智能体 | 父 trace 的 `subagent` span；子 trace 根 span 的 `parent_trace` / `parent_span`；`fork_source_log` |
 | #9 压缩 | `CompactionStarted` → `CompactionApplied` / `CompactionAborted` 构成 compaction span；usage 单列 |
 | #11 协议 | §2 的类型进 `asterpath-protocol` |
 | #13 token | 已定。span `usage` 与 [usage.md](usage.md) 的 `model_calls` / `compaction` 必须对账（U12）；`partial` 不进总量 |
-| #17 调度 | `SignalAwaited` 的写入点；timer/signal 等待的 `caused_by` 锚点 |
+| #17 调度 | 审批 `SignalReceived` 的写入点；spawn 超时经 subagent span 的 outcome 呈现 |
 | #18 保留/归档 | 已定。退役会话返回 `NotFound`；重建范围随之缩小，见 [retention.md](retention.md) |
 | #19 测试 | 确定性重建与崩溃恢复的 trace 断言 |
 
@@ -303,7 +300,7 @@ pub enum TraceError {
 | T5 | 工具 `Failed` | tool span `Error` + 对应 `error_type`；step 与 turn 仍为 Ok |
 | T6 | 工具 `Interrupted`（取消） | tool span `Interrupted`；step/turn `Cancelled` |
 | T7 | 审批等待跨天 | `wait approval` span 的时长等于两次 `recorded_at` 之差；`ended_at` 为 `SignalReceived` 时间 |
-| T8 | timer 等待后 fire | `wait timer` span 关闭；`deadline` 属性保留；session span 上有 `resume` event（若跨了恢复） |
+| T8 | 跨恢复 | session span 上有 `resume` event；没有 timer / 通用 signal 的 wait span |
 | T9 | 父等子会话 | 父 trace 一个 `subagent` span；子 trace 根 span 的 `parent_span` 指向 spawn 的 tool span |
 | T10 | `kill -9` 于 `Safe` 工具中 | 恢复后仍只有一个 tool span（同一 `SpanId`）；`replay=true`；恰一个 `ToolResult` |
 | T11 | `kill -9` 于模型流中 | 恢复后同一 `model_call` span；新增带 `replayed=true` 的 attempt event；最终恰一条 `AssistantMessage` |

@@ -676,7 +676,6 @@ async fn t4_undecided_ask_resuspends_after_a_restart_and_waits_for_the_answer() 
     assert_eq!(calls.lock().unwrap().len(), 1);
     let entries = scan_session(&asterpath, session).await;
     assert_eq!(results(&entries)[0].1, ToolResultStatus::Completed);
-    assert_eq!(common::kind_count(&entries, "SignalAwaited"), 0);
     asterpath.shutdown().await.expect("shutdown");
 }
 

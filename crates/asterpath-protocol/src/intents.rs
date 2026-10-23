@@ -6,9 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use asterpath_core::{
-    DedupKey, LogEntry, LogId, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId,
-};
+use asterpath_core::{DedupKey, LogEntry, LogId, SessionId, StepId, ToolCallId, TurnId};
 
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::dedup::compaction_frontier;
@@ -22,9 +20,7 @@ pub enum OpenIntent {
     Turn(TurnId),
     Step(StepId),
     Tool(ToolCallId),
-    Timer(TimerId),
     Child(SessionId),
-    Signal(SignalId),
     Compaction(LogId),
 }
 
@@ -41,9 +37,7 @@ pub struct OpenIntents {
     turns: BTreeSet<TurnId>,
     steps: BTreeSet<StepId>,
     tools: BTreeSet<ToolCallId>,
-    timers: BTreeSet<TimerId>,
     children: BTreeSet<SessionId>,
-    signals: BTreeSet<SignalId>,
     compactions: BTreeSet<DedupKey>,
 }
 
@@ -90,14 +84,6 @@ impl OpenIntents {
                 self.tools.remove(tool_call_id);
                 delta.closed.push(OpenIntent::Tool(*tool_call_id));
             }
-            SessionEvent::TimerScheduled { timer_id, .. } => {
-                self.timers.insert(*timer_id);
-                delta.opened.push(OpenIntent::Timer(*timer_id));
-            }
-            SessionEvent::TimerFired { timer_id } | SessionEvent::TimerCancelled { timer_id } => {
-                self.timers.remove(timer_id);
-                delta.closed.push(OpenIntent::Timer(*timer_id));
-            }
             SessionEvent::ChildSessionSpawned { child, .. } => {
                 self.children.insert(*child);
                 delta.opened.push(OpenIntent::Child(*child));
@@ -105,14 +91,6 @@ impl OpenIntents {
             SessionEvent::ChildSessionCompleted { child, .. } => {
                 self.children.remove(child);
                 delta.closed.push(OpenIntent::Child(*child));
-            }
-            SessionEvent::SignalAwaited { signal_id, .. } => {
-                self.signals.insert(*signal_id);
-                delta.opened.push(OpenIntent::Signal(*signal_id));
-            }
-            SessionEvent::SignalReceived { signal_id, .. } => {
-                self.signals.remove(signal_id);
-                delta.closed.push(OpenIntent::Signal(*signal_id));
             }
             SessionEvent::CompactionStarted { .. } => {
                 if let Some(key) = dedup_key {
@@ -151,9 +129,7 @@ impl OpenIntents {
         self.turns.is_empty()
             && self.steps.is_empty()
             && self.tools.is_empty()
-            && self.timers.is_empty()
             && self.children.is_empty()
-            && self.signals.is_empty()
     }
 
     pub fn compactions_are_open(&self) -> bool {
@@ -166,8 +142,7 @@ impl OpenIntents {
             Some(turn) => SessionState::TurnOpen {
                 turn: *turn,
                 step: self.steps.iter().next().map(|_| {
-                    if self.timers.is_empty() && self.children.is_empty() && self.signals.is_empty()
-                    {
+                    if self.children.is_empty() {
                         StepState::InProgress
                     } else {
                         StepState::Waiting

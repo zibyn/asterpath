@@ -8,7 +8,7 @@ use std::time::Duration;
 use asterpath_core::{
     ApprovalGate, AwaitSignal, DurableExecutor, Effect, EventLog, ExecutionError, LifecycleError,
     LogQuery, Middleware, Module, ModuleCtx, Next, SessionId, SignalDelivery, SignalPayload,
-    TimerId, TimerRequest, ToolCallId, TurnId, WakeCause,
+    ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
     AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item,
@@ -334,18 +334,6 @@ fn agent(
 struct NoopExecutor;
 
 impl DurableExecutor for NoopExecutor {
-    fn schedule_timer(&self, _req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn cancel_timer(
-        &self,
-        _session: SessionId,
-        _timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
     fn await_signal(
         &self,
         _req: AwaitSignal,

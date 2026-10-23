@@ -13,18 +13,15 @@ pub mod service;
 pub mod time;
 
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, DURABLE_EXECUTOR_SERVICE, DedupKey, DueTimer,
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, DURABLE_EXECUTOR_SERVICE, DedupKey,
     DurableExecutor, EVENT_LOG_SERVICE, EventLog, LogEntry, LogQuery, NewEntry,
     SESSION_CATALOG_SERVICE, SESSION_RETIREMENT_SERVICE, STORAGE_SERVICE, SessionCatalog,
-    SessionRetirement, SignalDelivery, SignalIntent, SignalName, SignalPayload, Storage,
-    TimerRequest, WakeCause,
+    SessionRetirement, SignalDelivery, SignalName, SignalPayload, Storage, WakeCause,
 };
 pub use error::{ExecutionError, LifecycleError, RetirementError, StorageError};
 pub use event::{Event, Handler, Middleware, Next, WaterfallEvent};
 pub use hash::Fnv;
-pub use ids::{
-    InputId, LogId, LogIdRange, SessionId, SignalId, StepId, TimerId, ToolCallId, TurnId,
-};
+pub use ids::{InputId, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId};
 pub use module::{Effect, Module, ModuleCtx, ModuleHost};
 pub use service::{ServiceId, ServiceKey, service_key};
 pub use time::{Clock, SystemClock, Timestamp, unique_bytes};

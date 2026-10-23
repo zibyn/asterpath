@@ -6,7 +6,7 @@ use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 
 use crate::error::{ExecutionError, RetirementError, StorageError};
-use crate::ids::{LogId, SessionId, SignalId, TimerId};
+use crate::ids::{LogId, SessionId, SignalId};
 use crate::service::{ServiceKey, service_key};
 use crate::time::Timestamp;
 
@@ -90,25 +90,11 @@ pub trait EventLog: Send + Sync {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 }
 
-/// A timer that is due at the given time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DueTimer {
-    pub timer_id: TimerId,
-    pub session: SessionId,
-    pub deadline: Timestamp,
-}
-
 /// Wake discovery contract: read-only, no queue and no lease.
 pub trait Storage: Send + Sync {
-    /// Sessions that need to be driven: non-compaction open intents, pending
-    /// inputs or due timers.
+    /// Sessions that need to be driven: non-compaction open intents or
+    /// pending inputs.
     fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
-
-    fn due_timers(
-        &self,
-        now: Timestamp,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>>;
 }
 
 /// Read-only view of the session tree.
@@ -138,14 +124,6 @@ pub const SESSION_RETIREMENT_SERVICE: ServiceKey<dyn SessionRetirement> =
 pub const DURABLE_EXECUTOR_SERVICE: ServiceKey<dyn DurableExecutor> =
     service_key("DurableExecutor");
 
-#[derive(Clone, Debug)]
-pub struct TimerRequest {
-    pub session: SessionId,
-    pub timer: TimerId,
-    pub caused_by: LogId,
-    pub deadline: Timestamp,
-}
-
 pub type SignalPayload = serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -161,37 +139,18 @@ pub struct AwaitSignal {
     pub session: SessionId,
     pub signal: SignalId,
     pub name: SignalName,
-    pub caused_by: LogId,
-    /// `Record` writes `SignalAwaited`; `AlreadyRecorded` is used by approval,
-    /// whose open `ToolCallRequested` already records the intent.
-    pub intent: SignalIntent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignalIntent {
-    Record,
-    AlreadyRecorded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeCause {
-    Timer(TimerId),
     Signal(SignalId),
     ChildCompleted(SessionId),
-    /// Only used by the host's startup recovery loop.
-    Startup,
 }
 
-/// Durable wait seam: timers, signals and wake notifications.
+/// Durable wait seam: approval signals and wake notifications. An approval
+/// wait is recorded by its open `ToolCallRequested`; nothing else is written
+/// until `SignalReceived`.
 pub trait DurableExecutor: Send + Sync {
-    fn schedule_timer(&self, req: TimerRequest) -> BoxFuture<'_, Result<TimerId, ExecutionError>>;
-
-    fn cancel_timer(
-        &self,
-        session: SessionId,
-        timer: TimerId,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>>;
-
     fn await_signal(
         &self,
         req: AwaitSignal,

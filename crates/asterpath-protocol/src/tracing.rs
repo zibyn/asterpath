@@ -75,8 +75,6 @@ pub enum SpanKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WaitKind {
-    Timer,
-    Signal,
     Approval,
 }
 
@@ -198,7 +196,6 @@ pub struct SubagentAttrs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitAttrs {
     pub wait: WaitKind,
-    pub deadline: Option<Timestamp>,
     pub caused_by: Option<LogId>,
 }
 

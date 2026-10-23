@@ -115,9 +115,9 @@ impl ManualClock {
 impl Clock for ManualClock { /* 读 AtomicI64 */ }
 ```
 
-- `Storage::wakeable` / `due_timers` 继续收显式 `now`（#5 / ADR-0005 不变）。`runtime`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
+- `Storage::wakeable` 继续收显式 `now`（#5 / ADR-0005 不变）。`runtime`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
 - `recorded_at` 仍由存储模块用自己的墙钟写入；它不参与恢复、投影或断言（#3 I8 / #12），因此存储不需要 `Clock`。
-- `clock:advance` 注入点 = `ManualClock::advance`，用于 timer 到期。它不产生 marker，也不模拟崩溃。
+- `clock:advance` 注入点 = `ManualClock::advance`，用于 spawn 截止时间过期等时间推进。它不产生 marker，也不模拟崩溃。
 
 ## 4. 后端中立契约套件
 
@@ -150,13 +150,13 @@ pub fn storage_contract(factory: &impl BackendFactory);
 
 共享套件清单（对应 [storage.md §8–§9](storage.md#8-保证清单)）：
 
-- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对六对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`TimerScheduled`/`TimerFired`/`TimerCancelled`、`SignalAwaited`/`SignalReceived`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
+- G2：同 `dedup_key` append 两次 → 一条记录、同一 `LogId`、派生行不重复；参数化 fixture 对共享 key 的事件（`ToolCallRequested`/`ToolResult`、`CompactionStarted`/`CompactionApplied`/`CompactionAborted`、`ChildSessionSpawned`/`ChildSessionCompleted`、`SessionCreated`/`ContextForked`/`InputRecorded`）断言同 key 不同事件类型两条都落盘。
 - G3：串行与并发 append 后 `seq` 严格递增无洞；只由存储分配。
 - G4：`scan(after)` 只返回已提交、按 `seq` 升序、`limit` 有界；`frontier` 等于末条 `log_id`。
-- G5：有非 compaction open intent、待处理输入或到期 timer 的 session 出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录。
+- G5：有非 compaction open intent 或待处理输入的 session 出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录。
 - G6：两个 session 的 append 不构成原子组；一个流的可见性不受另一个流影响。
-- G7：丢弃派生状态后，仅凭日志重建 `sessions` / `open_intents` / `timers` / `pending_inputs`。
-- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、S9（timer 恰一次）、`pending_inputs` 在 `StepStarted` 前保留也在此层。
+- G7：丢弃派生状态后，仅凭日志重建 `sessions` / `open_intents` / `pending_inputs`。
+- S4（坏 payload → `Corrupt`）、S5（幂等）、S8（`seq` 单调、`recorded_at` 不影响逻辑）、`pending_inputs` 在 `StepStarted` 前保留也在此层。
 
 仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
     EventLog, Fnv, LifecycleError, LogEntry, LogId, LogIdRange, LogQuery, Module, ModuleCtx,
-    SessionId, SignalId, StepId, StorageError, TimerId, Timestamp, ToolCallId, TurnId,
+    SessionId, SignalId, StepId, StorageError, Timestamp, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
@@ -143,8 +143,6 @@ struct Folder {
     steps: HashMap<StepId, usize>,
     tools: HashMap<ToolCallId, usize>,
     subagents: HashMap<SessionId, usize>,
-    timers: HashMap<TimerId, usize>,
-    signals: HashMap<SignalId, usize>,
     compaction_by_key: HashMap<String, usize>,
     open_compactions: Vec<usize>,
     models: HashMap<(TurnId, StepId), usize>,
@@ -214,8 +212,6 @@ impl Folder {
             steps: HashMap::new(),
             tools: HashMap::new(),
             subagents: HashMap::new(),
-            timers: HashMap::new(),
-            signals: HashMap::new(),
             compaction_by_key: HashMap::new(),
             open_compactions: Vec::new(),
             models: HashMap::new(),
@@ -674,50 +670,10 @@ impl Folder {
                 self.close(index, entry, child_status(outcome), None);
                 self.stack.retain(|open| *open != index);
             }
-            SessionEvent::TimerScheduled {
-                timer_id,
-                deadline,
-                caused_by,
-            } => {
-                self.open_wait(
-                    entry,
-                    WaitKind::Timer,
-                    Some(*deadline),
-                    Some(*caused_by),
-                    WaitTarget::Timer(*timer_id),
-                );
-            }
-            SessionEvent::TimerFired { timer_id } => {
-                if let Some(index) = self.timers.get(timer_id).copied() {
-                    self.close(index, entry, SpanStatus::Ok, None);
-                }
-            }
-            SessionEvent::TimerCancelled { timer_id } => {
-                if let Some(index) = self.timers.get(timer_id).copied() {
-                    self.close(index, entry, SpanStatus::Cancelled, None);
-                }
-            }
-            SessionEvent::SignalAwaited {
-                signal_id,
-                caused_by,
-                ..
-            } => {
-                self.open_wait(
-                    entry,
-                    WaitKind::Signal,
-                    None,
-                    Some(*caused_by),
-                    WaitTarget::Signal(*signal_id),
-                );
-            }
             SessionEvent::SignalReceived {
                 signal_id, name, ..
-            } => {
-                if name.as_str().starts_with(APPROVAL_SIGNAL_PREFIX) {
-                    self.close_approval(*signal_id, entry);
-                } else if let Some(index) = self.signals.get(signal_id).copied() {
-                    self.close(index, entry, SpanStatus::Ok, None);
-                }
+            } if name.as_str().starts_with(APPROVAL_SIGNAL_PREFIX) => {
+                self.close_approval(*signal_id, entry);
             }
             _ => {}
         }
@@ -733,58 +689,6 @@ impl Folder {
     fn step_for(&self, turn: TurnId, step: StepId) -> Option<usize> {
         let index = self.steps.get(&step).copied()?;
         (self.spans[index].turn == Some(turn)).then_some(index)
-    }
-
-    fn open_wait(
-        &mut self,
-        entry: &LogEntry,
-        wait: WaitKind,
-        deadline: Option<Timestamp>,
-        caused_by: Option<LogId>,
-        target: WaitTarget,
-    ) {
-        let opening = Opening {
-            log_id: entry.log_id,
-            seq: entry.seq,
-            at: entry.recorded_at,
-        };
-        let parent = caused_by.and_then(|log_id| self.hosts.get(&log_id).copied());
-        let (turn, step, tool_call) = parent
-            .map(|index| {
-                (
-                    self.spans[index].turn,
-                    self.spans[index].step,
-                    self.spans[index].tool_call,
-                )
-            })
-            .unwrap_or((None, None, None));
-        let span = self.new_span(
-            SpanKind::Wait,
-            match wait {
-                WaitKind::Timer => "wait timer".to_owned(),
-                WaitKind::Signal => "wait signal".to_owned(),
-                WaitKind::Approval => "wait approval".to_owned(),
-            },
-            opening,
-            parent.map(|index| self.spans[index].span),
-            turn,
-            step,
-            tool_call,
-            SpanAttributes::Wait(WaitAttrs {
-                wait,
-                deadline,
-                caused_by,
-            }),
-        );
-        let index = self.push(span, opening);
-        match target {
-            WaitTarget::Timer(timer) => {
-                self.timers.insert(timer, index);
-            }
-            WaitTarget::Signal(signal) => {
-                self.signals.insert(signal, index);
-            }
-        }
     }
 
     /// An approval wait is only materialized when its decision was recorded; the
@@ -809,7 +713,6 @@ impl Folder {
                     Some(tool_call),
                     SpanAttributes::Wait(WaitAttrs {
                         wait: WaitKind::Approval,
-                        deadline: None,
                         caused_by: Some(opening.log_id),
                     }),
                 );
@@ -885,11 +788,6 @@ impl Folder {
             .map(|index| self.spans[index].clone())
             .collect()
     }
-}
-
-enum WaitTarget {
-    Timer(TimerId),
-    Signal(SignalId),
 }
 
 fn turn_status(

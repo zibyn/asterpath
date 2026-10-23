@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use asterpath_core::{
     DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId,
-    SessionRetirement, Storage, StorageError, TimerId, TurnId,
+    SessionRetirement, Storage, StorageError, TurnId,
 };
 use asterpath_protocol::{
     CompactionTrigger, ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef,
@@ -60,18 +60,6 @@ fn turn_started() -> SessionEvent {
 
 fn input_recorded() -> SessionEvent {
     SessionEvent::InputRecorded { input: vec![] }
-}
-
-fn timer_scheduled(timer_id: TimerId) -> SessionEvent {
-    SessionEvent::TimerScheduled {
-        timer_id,
-        deadline: 0,
-        caused_by: LogId::from_i64(1),
-    }
-}
-
-fn timer_fired(timer_id: TimerId) -> SessionEvent {
-    SessionEvent::TimerFired { timer_id }
 }
 
 fn compaction_started(frontier: LogId) -> SessionEvent {
@@ -454,25 +442,17 @@ fn a_failing_delete_rolls_back_the_whole_retirement() {
 }
 
 // ---------------------------------------------------------------------------
-// R9: no timer or pending-input rows survive; no wake is produced.
+// R9: no pending-input rows survive; no wake is produced.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn retirement_leaves_no_wakeable_timer_or_pending_rows() {
+fn retirement_leaves_no_wakeable_pending_rows() {
     let dir = TempDir::new("retire-rows");
     let db = dir.db();
     let target = session(0xb8);
-    let timer = TimerId::from_bytes([0x77; 16]);
     let storage = open(&db).expect("open");
     create(storage.as_ref(), target, None);
     append(storage.as_ref(), target, &input_recorded(), None);
-    append(
-        storage.as_ref(),
-        target,
-        &timer_scheduled(timer),
-        Some(dedup::timer(timer)),
-    );
-    append(storage.as_ref(), target, &timer_fired(timer), None);
     let captured = frontier(storage.as_ref(), target).expect("frontier");
 
     retire(storage.as_ref(), target, captured);
@@ -483,21 +463,10 @@ fn retirement_leaves_no_wakeable_timer_or_pending_rows() {
             .is_empty(),
         "a retired session is never wakeable"
     );
-    assert!(
-        block_on(storage.due_timers(1_000, 10))
-            .expect("due_timers")
-            .is_empty()
-    );
     drop(storage);
 
     let conn = rusqlite::Connection::open(&db).expect("raw open");
-    for table in [
-        "log",
-        "open_intents",
-        "timers",
-        "pending_inputs",
-        "sessions",
-    ] {
+    for table in ["log", "open_intents", "pending_inputs", "sessions"] {
         assert_eq!(count(&conn, table), 0, "{table} must be empty");
     }
 }

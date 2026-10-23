@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_core::{
-    Clock, DedupKey, DueTimer, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId,
-    LogQuery, Module, ModuleCtx, NewEntry, RetirementError, SESSION_CATALOG_SERVICE,
+    Clock, DedupKey, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId, LogQuery,
+    Module, ModuleCtx, NewEntry, RetirementError, SESSION_CATALOG_SERVICE,
     SESSION_RETIREMENT_SERVICE, STORAGE_SERVICE, ServiceId, SessionCatalog, SessionId,
-    SessionRetirement, Storage, StorageError, SystemClock, TimerId, Timestamp,
+    SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{OpenIntent, OpenIntents, SessionEvent, decode_payload};
 use futures_core::future::BoxFuture;
@@ -345,11 +345,6 @@ impl SqliteStorage {
         )
         .map_err(backend)?;
         tx.execute(
-            "DELETE FROM timers WHERE session_id = ?1",
-            [session.as_bytes()],
-        )
-        .map_err(backend)?;
-        tx.execute(
             "DELETE FROM pending_inputs WHERE session_id = ?1",
             [session.as_bytes()],
         )
@@ -363,58 +358,25 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn wakeable_sync(&self, now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
+    fn wakeable_sync(&self) -> Result<Vec<SessionId>, StorageError> {
         let conn = self.conn();
         let mut statement = conn
             .prepare(
                 "SELECT session_id FROM ( \
                      SELECT session_id FROM open_intents WHERE kind <> 'compaction' \
                      UNION SELECT session_id FROM pending_inputs \
-                     UNION SELECT session_id FROM timers \
-                         WHERE fired_at IS NULL AND deadline <= ?1 \
                  ) WHERE session_id NOT IN (SELECT session_id FROM retired_sessions) \
                  ORDER BY 1",
             )
             .map_err(backend)?;
         let rows = statement
-            .query_map([now], |row| row.get::<_, Vec<u8>>(0))
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(backend)?;
         let mut sessions = Vec::new();
         for row in rows {
             sessions.push(session_from_blob(row.map_err(backend)?)?);
         }
         Ok(sessions)
-    }
-
-    fn due_timers_sync(&self, now: Timestamp, limit: usize) -> Result<Vec<DueTimer>, StorageError> {
-        let conn = self.conn();
-        let mut statement = conn
-            .prepare(
-                "SELECT timer_id, session_id, deadline FROM timers \
-                 WHERE fired_at IS NULL AND deadline <= ?1 \
-                 AND session_id NOT IN (SELECT session_id FROM retired_sessions) \
-                 ORDER BY deadline ASC, timer_id ASC LIMIT ?2",
-            )
-            .map_err(backend)?;
-        let rows = statement
-            .query_map(params![now, limit as i64], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(backend)?;
-        let mut timers = Vec::new();
-        for row in rows {
-            let (timer_id, session, deadline) = row.map_err(backend)?;
-            timers.push(DueTimer {
-                timer_id: timer_from_blob(timer_id)?,
-                session: session_from_blob(session)?,
-                deadline,
-            });
-        }
-        Ok(timers)
     }
 
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
@@ -478,16 +440,8 @@ impl SessionRetirement for SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
-    fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        Box::pin(async move { self.wakeable_sync(now) })
-    }
-
-    fn due_timers(
-        &self,
-        now: Timestamp,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<DueTimer>, StorageError>> {
-        Box::pin(async move { self.due_timers_sync(now, limit) })
+    fn wakeable(&self, _now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        Box::pin(async move { self.wakeable_sync() })
     }
 }
 
@@ -704,30 +658,6 @@ fn apply_derived(
             )
             .map_err(backend)?;
         }
-        SessionEvent::TimerScheduled {
-            timer_id, deadline, ..
-        } => {
-            tx.execute(
-                "INSERT OR REPLACE INTO timers (timer_id, session_id, deadline, fired_at) \
-                 VALUES (?1, ?2, ?3, NULL)",
-                params![timer_id.as_bytes(), session, deadline],
-            )
-            .map_err(backend)?;
-        }
-        SessionEvent::TimerFired { timer_id } => {
-            tx.execute(
-                "UPDATE timers SET fired_at = ?1 WHERE timer_id = ?2",
-                params![recorded_at, timer_id.as_bytes()],
-            )
-            .map_err(backend)?;
-        }
-        SessionEvent::TimerCancelled { timer_id } => {
-            tx.execute(
-                "DELETE FROM timers WHERE timer_id = ?1",
-                [timer_id.as_bytes()],
-            )
-            .map_err(backend)?;
-        }
         _ => {}
     }
     Ok(())
@@ -738,9 +668,7 @@ fn intent_row(intent: OpenIntent) -> (&'static str, Vec<u8>) {
         OpenIntent::Turn(id) => ("turn", id.as_bytes().to_vec()),
         OpenIntent::Step(id) => ("step", id.as_bytes().to_vec()),
         OpenIntent::Tool(id) => ("tool", id.as_bytes().to_vec()),
-        OpenIntent::Timer(id) => ("timer", id.as_bytes().to_vec()),
         OpenIntent::Child(id) => ("child", id.as_bytes().to_vec()),
-        OpenIntent::Signal(id) => ("signal", id.as_bytes().to_vec()),
         OpenIntent::Compaction(id) => ("compaction", id.as_i64().to_be_bytes().to_vec()),
         _ => unreachable!("unknown open intent variant"),
     }
@@ -786,14 +714,6 @@ fn session_from_blob(bytes: Vec<u8>) -> Result<SessionId, StorageError> {
         detail: "session id must be 16 bytes".to_owned(),
     })?;
     Ok(SessionId::from_bytes(bytes))
-}
-
-fn timer_from_blob(bytes: Vec<u8>) -> Result<TimerId, StorageError> {
-    let bytes: [u8; 16] = bytes.try_into().map_err(|_| StorageError::Corrupt {
-        session: None,
-        detail: "timer id must be 16 bytes".to_owned(),
-    })?;
-    Ok(TimerId::from_bytes(bytes))
 }
 
 /// `idle` is the absence of a non-compaction open intent (storage.md §5).

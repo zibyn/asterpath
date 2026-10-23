@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{EventLog, InputId, LogEntry, LogId, LogQuery, SessionId, TimerId};
+use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CompactResult, CompactionConfig, Item, JsonString, ModelId,
@@ -17,7 +17,7 @@ use asterpath_protocol::{
     ProviderErrorKind, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, SessionEvent,
     SessionSpec, SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolContext,
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig,
-    TurnEndReason, Usage, UserInput, decode_entry, encode_entry,
+    TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
@@ -500,76 +500,6 @@ async fn cancel_with_grace_keeps_a_tool_result_that_returns_in_time() {
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
 }
-
-#[tokio::test]
-async fn cancel_closes_an_open_timer_wait() {
-    const TIMER: TimerId = TimerId::from_bytes([7; 16]);
-
-    let db = temp_db("timer-cancel");
-    let log_slot: Arc<Mutex<Option<Arc<dyn EventLog>>>> = Arc::new(Mutex::new(None));
-    let scheduled = Arc::new(Notify::new());
-    let tool = {
-        let log_slot = Arc::clone(&log_slot);
-        let scheduled = Arc::clone(&scheduled);
-        TestTool::build("timer", move |_args, ctx| {
-            let log_slot = Arc::clone(&log_slot);
-            let scheduled = Arc::clone(&scheduled);
-            Box::pin(async move {
-                let log = log_slot.lock().unwrap().clone().expect("log installed");
-                let event = SessionEvent::TimerScheduled {
-                    timer_id: TIMER,
-                    deadline: 4_000_000_000_000,
-                    caused_by: LogId::from_i64(0),
-                };
-                log.append(encode_entry(ctx.session, None, &event).expect("encodes"))
-                    .await
-                    .expect("appends");
-                scheduled.notify_one();
-                std::future::pending::<Result<ToolOutput, ToolError>>().await
-            })
-        })
-    };
-    let provider = Arc::new(ScriptedProvider::new("p").respond(
-        vec![tool_call("call-1", "timer")],
-        StopReason::ToolUse,
-        Usage::default(),
-    ));
-    let asterpath = build(&db, provider, vec![tool], None).await;
-    *log_slot.lock().unwrap() = Some(asterpath.event_log());
-    let handle = asterpath
-        .create_session(spec(TurnConfig {
-            cancel_grace: Duration::ZERO,
-            ..TurnConfig::default()
-        }))
-        .await
-        .unwrap();
-    handle.submit_input(input(1, "go")).await.unwrap();
-
-    let mut stream = handle.drive();
-    while let Some(event) = stream.next().await {
-        let event = event.expect("drive");
-        if matches!(event, AgentEvent::ToolStarted { .. }) {
-            scheduled.notified().await;
-            handle.cancel().await.unwrap();
-        }
-    }
-
-    let entries = scan(asterpath.event_log(), handle.id()).await;
-    assert!(kinds(&entries).contains(&"TimerScheduled"));
-    assert!(
-        kinds(&entries).contains(&"TimerCancelled"),
-        "an open timer wait is closed by cancellation"
-    );
-    assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Cancelled]);
-    assert!(matches!(
-        handle.state().await.unwrap(),
-        asterpath_protocol::SessionState::Idle
-    ));
-
-    asterpath.shutdown().await.unwrap();
-    cleanup(&db);
-}
-
 // --- signal / approval wait ----------------------------------------------
 
 #[tokio::test]
@@ -608,7 +538,6 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
         tool_results(&entries),
         vec![(ToolResultStatus::Interrupted, None, false)]
     );
-    assert!(!kinds(&entries).contains(&"SignalAwaited"));
     assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Cancelled]);
     assert!(matches!(
         handle.state().await.unwrap(),

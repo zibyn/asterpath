@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use asterpath_core::{
     ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
-    LogQuery, ModuleCtx, SessionId, SignalIntent, SignalPayload, StepId, TimerId, Timestamp,
-    ToolCallId, TurnId, unique_bytes,
+    LogQuery, ModuleCtx, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId,
+    unique_bytes,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
@@ -304,8 +304,6 @@ impl Agent {
         )
         .await?;
 
-        self.recover_waits(session, decoded).await?;
-
         let current = decode_entries(self.scan(session).await?, session)?;
         let Some((step, watermark)) = open_step(&current, turn) else {
             // Between steps: continue with the turn's normal continue rules.
@@ -447,7 +445,6 @@ impl Agent {
         .await?;
 
         let mut tools = BTreeSet::new();
-        let mut timers = BTreeSet::new();
         let mut children = BTreeSet::new();
         for (_, event) in decoded {
             match event {
@@ -456,13 +453,6 @@ impl Agent {
                 }
                 SessionEvent::ToolResult { tool_call_id, .. } => {
                     tools.remove(tool_call_id);
-                }
-                SessionEvent::TimerScheduled { timer_id, .. } => {
-                    timers.insert(*timer_id);
-                }
-                SessionEvent::TimerFired { timer_id }
-                | SessionEvent::TimerCancelled { timer_id } => {
-                    timers.remove(timer_id);
                 }
                 SessionEvent::ChildSessionSpawned { child, .. } => {
                     children.insert(*child);
@@ -484,10 +474,6 @@ impl Agent {
             )
             .await?;
         }
-        for timer_id in timers {
-            // The runtime remains the single writer of timer terminals.
-            let _ = self.executor.cancel_timer(session, timer_id).await;
-        }
         for child in children {
             self.append(
                 session,
@@ -506,54 +492,6 @@ impl Agent {
         }
         self.commit_turn(session, turn, TurnEndReason::Cancelled, events)
             .await
-    }
-
-    /// Close or refresh wait intents. Timers are recovered here; signal waits
-    /// stay waiting, and child waits belong to spawn replay (#47).
-    async fn recover_waits(
-        &self,
-        session: SessionId,
-        decoded: &[(LogEntry, SessionEvent)],
-    ) -> Result<(), AgentError> {
-        let mut timers: BTreeMap<TimerId, (asterpath_core::Timestamp, LogId)> = BTreeMap::new();
-        for (_, event) in decoded {
-            match event {
-                SessionEvent::TimerScheduled {
-                    timer_id,
-                    deadline,
-                    caused_by,
-                } => {
-                    timers.insert(*timer_id, (*deadline, *caused_by));
-                }
-                SessionEvent::TimerFired { timer_id }
-                | SessionEvent::TimerCancelled { timer_id } => {
-                    timers.remove(timer_id);
-                }
-                _ => {}
-            }
-        }
-        for (timer_id, (deadline, caused_by)) in timers {
-            // A child-deadline timer is closed by spawn replay (subagents.md §9).
-            if caused_by_is_child_spawn(decoded, caused_by) {
-                continue;
-            }
-            if caused_by_is_terminal(decoded, caused_by) {
-                self.append(
-                    session,
-                    SessionEvent::TimerCancelled { timer_id },
-                    Some(dedup::timer(timer_id)),
-                )
-                .await?;
-            } else if deadline <= self.clock.now() {
-                self.append(
-                    session,
-                    SessionEvent::TimerFired { timer_id },
-                    Some(dedup::timer(timer_id)),
-                )
-                .await?;
-            }
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -829,7 +767,6 @@ impl Agent {
                             session,
                             turn,
                             step,
-                            watermark,
                             &existing,
                             calls,
                             cancel,
@@ -1021,17 +958,6 @@ impl Agent {
             })?;
 
         let existing = existing_step(&decoded, turn, step);
-        let watermark = decoded
-            .iter()
-            .find_map(|(entry, event)| match event {
-                SessionEvent::StepStarted { turn_id, step_id }
-                    if *turn_id == turn && *step_id == step =>
-                {
-                    Some(entry.seq)
-                }
-                _ => None,
-            })
-            .unwrap_or(0);
         let calls = tool_calls(&items);
         let had_calls = !calls.is_empty();
         if had_calls {
@@ -1040,7 +966,6 @@ impl Agent {
                     session,
                     turn,
                     step,
-                    watermark,
                     &existing,
                     calls,
                     cancel,
@@ -1071,7 +996,6 @@ impl Agent {
         session: SessionId,
         turn: TurnId,
         step: StepId,
-        step_started_seq: u64,
         existing: &ExistingStep,
         calls: Vec<CallItem>,
         cancel: &CancelToken,
@@ -1120,7 +1044,6 @@ impl Agent {
                                 &intent.name,
                                 &intent.args,
                                 &descriptor,
-                                intent.log_id,
                                 intent.replay,
                                 recovering,
                                 cancel,
@@ -1188,22 +1111,21 @@ impl Agent {
                 Some(descriptor) => (descriptor.replay, descriptor.provenance),
                 None => (ReplaySafety::Unsafe, Provenance::Unknown),
             };
-            let caused_by = self
-                .append(
-                    session,
-                    SessionEvent::ToolCallRequested {
-                        turn_id: turn,
-                        step_id: step,
-                        tool_call_id,
-                        provider_call_id: call.provider_call_id,
-                        name: call.name.clone(),
-                        raw_args: args.clone(),
-                        replay,
-                        provenance,
-                    },
-                    Some(dedup::tool_call(tool_call_id)),
-                )
-                .await?;
+            self.append(
+                session,
+                SessionEvent::ToolCallRequested {
+                    turn_id: turn,
+                    step_id: step,
+                    tool_call_id,
+                    provider_call_id: call.provider_call_id,
+                    name: call.name.clone(),
+                    raw_args: args.clone(),
+                    replay,
+                    provenance,
+                },
+                Some(dedup::tool_call(tool_call_id)),
+            )
+            .await?;
 
             if cancelled {
                 self.interrupt(session, turn, step, tool_call_id, events)
@@ -1253,7 +1175,6 @@ impl Agent {
                             &call.name,
                             &args,
                             &descriptor,
-                            caused_by,
                             descriptor.replay,
                             false,
                             cancel,
@@ -1298,7 +1219,7 @@ impl Agent {
         if cancelled {
             // Calls that passed approval but never started are interrupted too.
             let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
-            self.finish_cancelled_step(session, turn, step, step_started_seq, &pending, events)
+            self.finish_cancelled_step(session, turn, step, &pending, events)
                 .await?;
             return Ok(ToolOutcome::Cancelled);
         }
@@ -1364,7 +1285,7 @@ impl Agent {
         }
         drop(futures);
 
-        self.finish_cancelled_step(session, turn, step, step_started_seq, &pending, events)
+        self.finish_cancelled_step(session, turn, step, &pending, events)
             .await?;
         Ok(ToolOutcome::Cancelled)
     }
@@ -1377,7 +1298,6 @@ impl Agent {
         session: SessionId,
         turn: TurnId,
         step: StepId,
-        step_started_seq: u64,
         pending: &[ToolCallId],
         events: &EventSink,
     ) -> Result<(), AgentError> {
@@ -1386,8 +1306,7 @@ impl Agent {
         let mut step_calls = HashSet::new();
         let mut spawned_children = BTreeSet::new();
         let mut completed_children = BTreeSet::new();
-        let mut open_timers: BTreeMap<asterpath_core::TimerId, u64> = BTreeMap::new();
-        for (entry, event) in &decoded {
+        for (_, event) in &decoded {
             if let SessionEvent::ToolResult { tool_call_id, .. } = event {
                 recorded.insert(*tool_call_id);
             }
@@ -1415,19 +1334,6 @@ impl Agent {
                 }
                 _ => {}
             }
-            if entry.seq <= step_started_seq {
-                continue;
-            }
-            match event {
-                SessionEvent::TimerScheduled { timer_id, .. } => {
-                    open_timers.insert(*timer_id, entry.seq);
-                }
-                SessionEvent::TimerFired { timer_id }
-                | SessionEvent::TimerCancelled { timer_id } => {
-                    open_timers.remove(timer_id);
-                }
-                _ => {}
-            }
         }
         for child in spawned_children.difference(&completed_children) {
             self.append(
@@ -1447,11 +1353,6 @@ impl Agent {
                 self.interrupt(session, turn, step, *tool_call_id, events)
                     .await?;
             }
-        }
-        for timer in open_timers.into_keys() {
-            // A failed close must not turn cancellation into an error; the
-            // runtime remains the single writer of timer terminals.
-            let _ = self.executor.cancel_timer(session, timer).await;
         }
         Ok(())
     }
@@ -1682,7 +1583,6 @@ impl Agent {
         name: &ToolName,
         args: &ToolArgs,
         descriptor: &ToolDescriptor,
-        caused_by: LogId,
         replay: ReplaySafety,
         recovering: bool,
         cancel: &CancelToken,
@@ -1722,8 +1622,6 @@ impl Agent {
                     session,
                     signal: approval_signal_id(tool_call_id),
                     name: approval_signal_name(tool_call_id),
-                    caused_by,
-                    intent: SignalIntent::AlreadyRecorded,
                 });
                 tokio::pin!(wait);
                 let token = cancel.clone();
@@ -2231,7 +2129,6 @@ struct CallItem {
 
 struct RecordedIntent {
     tool_call_id: ToolCallId,
-    log_id: LogId,
     name: ToolName,
     args: ToolArgs,
     replay: ReplaySafety,
@@ -2553,7 +2450,7 @@ fn tool_calls(items: &[Item]) -> Vec<CallItem> {
 
 fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> ExistingStep {
     let mut existing = ExistingStep::default();
-    for (entry, event) in decoded {
+    for (_, event) in decoded {
         match event {
             SessionEvent::ToolCallRequested {
                 turn_id,
@@ -2569,7 +2466,6 @@ fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepI
                     provider_call_id.clone(),
                     RecordedIntent {
                         tool_call_id: *tool_call_id,
-                        log_id: entry.log_id,
                         name: name.clone(),
                         args: raw_args.clone(),
                         replay: *replay,
@@ -2651,70 +2547,6 @@ fn compaction_after_last_abort(
     decoded.iter().any(|(entry, event)| {
         entry.seq > abort_seq && matches!(event, SessionEvent::CompactionApplied { .. })
     })
-}
-
-/// A timer declared by a child spawn is closed by spawn replay (#47).
-fn caused_by_is_child_spawn(decoded: &[(LogEntry, SessionEvent)], caused_by: LogId) -> bool {
-    decoded.iter().any(|(entry, event)| {
-        entry.log_id == caused_by && matches!(event, SessionEvent::ChildSessionSpawned { .. })
-    })
-}
-
-/// Whether the record a wait points at already reached its own terminal.
-fn caused_by_is_terminal(decoded: &[(LogEntry, SessionEvent)], caused_by: LogId) -> bool {
-    let Some((entry, event)) = decoded.iter().find(|(entry, _)| entry.log_id == caused_by) else {
-        return false;
-    };
-    match event {
-        SessionEvent::ToolCallRequested { tool_call_id, .. } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::ToolResult { tool_call_id: done, .. } if done == tool_call_id
-            )
-        }),
-        SessionEvent::ChildSessionSpawned { child, .. } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::ChildSessionCompleted { child: done, .. } if done == child
-            )
-        }),
-        SessionEvent::SignalAwaited { signal_id, .. } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::SignalReceived { signal_id: done, .. } if done == signal_id
-            )
-        }),
-        SessionEvent::TimerScheduled { timer_id, .. } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::TimerFired { timer_id: done }
-                    | SessionEvent::TimerCancelled { timer_id: done }
-                    if done == timer_id
-            )
-        }),
-        SessionEvent::StepStarted { step_id, .. } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::StepCommitted { step_id: done, .. } if done == step_id
-            )
-        }),
-        SessionEvent::TurnStarted { turn_id } => decoded.iter().any(|(_, event)| {
-            matches!(
-                event,
-                SessionEvent::TurnCommitted { turn_id: done, .. } if done == turn_id
-            )
-        }),
-        SessionEvent::CompactionStarted { .. } => {
-            let key = entry.dedup_key.as_ref();
-            decoded.iter().any(|(entry, event)| {
-                matches!(
-                    event,
-                    SessionEvent::CompactionApplied { .. } | SessionEvent::CompactionAborted { .. }
-                ) && entry.dedup_key.as_ref() == key
-            })
-        }
-        _ => false,
-    }
 }
 
 fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {
