@@ -567,6 +567,7 @@ impl Folder {
                 trigger,
                 replaces_from: _,
                 caused_by: _,
+                turn: _,
             } => {
                 let parent = self
                     .stack

@@ -276,7 +276,7 @@ pub struct Summary {
 - `child.depth = parent.depth + 1`；root = 0；`max_depth = 3` 表示允许的最大子 depth。超限直接 `Failed{InvalidArgs}`，不创建子会话。
 - 并发按**每父会话**计：已创建且未完成的子会话数，默认 `8`。
   - spawn 是 `Parallel` 工具，同一 step 内受工具管线 `ToolConfig.max_parallel_calls`（部署级，默认 `8`）约束，因此每父实际并发 = min(`max_concurrent_children`, `max_parallel_calls`)。默认两者相等，每父上限不触发；它的用途是按会话调低，在不降低普通工具并行度的前提下单独限制子智能体（2026-10-23 越界设计审计候选 7：核实后保留）。
-- 调度器全局 `max_live_children = 32`。
+- 调度器全局 `max_live_children = 32`：部署级，配置在 `AsterpathConfig.max_live_children`，不进会话快照。
 - 超限 **FIFO 排队**，不报错；排队是内存状态（§3.4），崩溃后按 open spawn 调用重建。
 - 排队期间 spawn 工具调用保持 open；父取消时排队项直接丢弃。
 - 不做跨父公平调度、抢占或优先级；v1 只有单父内 FIFO，**跨父准入顺序无保证**（跨流没有单一 `seq` 可排序）。
@@ -390,7 +390,6 @@ pub struct SubagentConfig {
     pub default_context: ContextPolicy,         // Fresh
     pub max_depth: u8,                          // 3
     pub max_concurrent_children: NonZeroUsize,  // 8（每父会话）
-    pub max_live_children: NonZeroUsize,        // 32（调度器全局）
     pub spawn_timeout: Option<Duration>,        // None
     pub cancel_grace: Duration,                 // 10s（#6）
 }
@@ -401,7 +400,7 @@ pub struct SubagentConfig {
 | default context | `Fresh` | `fork` 按次 opt-in |
 | max_depth | 3 | 子 depth 上限；超限 `Failed{InvalidArgs}` |
 | max_concurrent_children | 8 | 每父会话 |
-| max_live_children | 32 | 调度器全局 |
+| max_live_children | 32 | 调度器全局；`AsterpathConfig` 字段，不在 `SubagentConfig` |
 | 并发超限 | FIFO 排队 | 不报错 |
 | spawn timeout | `None` | 按次参数；持久截止时间（`ChildSessionSpawned.deadline`） |
 | cancel_grace | 10s | 沿用 #6 |

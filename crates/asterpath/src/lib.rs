@@ -82,11 +82,6 @@ impl Asterpath {
     }
 
     pub(crate) async fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
-        if config.turn.max_steps_per_turn == Some(0) {
-            return Err(AsterError::Config {
-                message: "max_steps_per_turn must be greater than zero".to_owned(),
-            });
-        }
         for tool in &config.tools {
             let name = tool.descriptor().name.as_str();
             let validated = match tool.descriptor().provenance {
@@ -185,7 +180,7 @@ impl Asterpath {
             Arc::clone(&executor),
             config.model_aliases.clone(),
             Arc::clone(&config.clock),
-            config.subagents.clone(),
+            config.max_live_children,
             Arc::clone(&cancellations),
         ));
         module_host.register(scheduler_module.clone());

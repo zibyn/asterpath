@@ -448,6 +448,7 @@ fn push_compaction(
     log: &TestLog,
     session: SessionId,
     caused_by: LogId,
+    turn: Option<TurnId>,
     compaction_usage: Usage,
 ) -> LogId {
     let key = dedup::compaction(caused_by);
@@ -459,6 +460,7 @@ fn push_compaction(
             trigger: CompactionTrigger::Manual,
             replaces_from: caused_by,
             caused_by,
+            turn,
         },
         Some(key.clone()),
     );
@@ -494,7 +496,7 @@ async fn u6_in_turn_compaction_has_turn_and_no_step() {
         &committed(STEP_A),
         Some(dedup::step_committed(STEP_A)),
     );
-    push_compaction(&log, ROOT, frontier, usage(50, 5));
+    push_compaction(&log, ROOT, frontier, Some(TURN), usage(50, 5));
     let service = service(log);
 
     let turn = totals(
@@ -558,7 +560,7 @@ async fn u7_idle_compaction_has_no_turn() {
         },
         None,
     );
-    push_compaction(&log, ROOT, frontier, usage(50, 5));
+    push_compaction(&log, ROOT, frontier, None, usage(50, 5));
     let service = service(log);
 
     let found = records(&service, filter(UsageScope::Session(ROOT))).await;
@@ -682,7 +684,7 @@ async fn u12_totals_reconcile_with_trace_usage_sums() {
         &committed(STEP_A),
         Some(dedup::step_committed(STEP_A)),
     );
-    push_compaction(&log, ROOT, frontier, usage(50, 5));
+    push_compaction(&log, ROOT, frontier, Some(TURN), usage(50, 5));
 
     // An independent fold, as the tracing projection would do it: sum the
     // usage on model_call and compaction spans.

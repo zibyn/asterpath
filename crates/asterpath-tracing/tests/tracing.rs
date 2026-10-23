@@ -1445,6 +1445,7 @@ async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
             trigger: CompactionTrigger::ProviderError,
             replaces_from: step_start,
             caused_by: step_start,
+            turn: Some(t),
         },
         Some(forced_key.clone()),
     )
@@ -1483,6 +1484,7 @@ async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
             trigger: CompactionTrigger::Threshold,
             replaces_from: step_start,
             caused_by: committed,
+            turn: Some(t),
         },
         Some(between_key.clone()),
     )
@@ -1513,6 +1515,7 @@ async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
             trigger: CompactionTrigger::Manual,
             replaces_from: step_start,
             caused_by: turn_committed,
+            turn: None,
         },
         Some(idle_key.clone()),
     )
@@ -1784,6 +1787,7 @@ async fn forced_compaction_retry_keeps_the_model_call_ok() {
             trigger: CompactionTrigger::ProviderError,
             replaces_from: step_id,
             caused_by: step_id,
+            turn: Some(t),
         },
         Some(key.clone()),
     )

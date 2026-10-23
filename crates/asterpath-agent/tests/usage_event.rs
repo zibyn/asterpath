@@ -633,6 +633,66 @@ async fn idle_compaction_emits_once_with_no_turn() {
     assert_eq!(recorded[0].usage, usage(50, 5));
     assert_eq!(recorded[0].turn, None, "idle compaction has no turn");
     assert_eq!(recorded[0].step, None);
+    assert_eq!(
+        started_turns(&log).await,
+        vec![None],
+        "intent records no turn"
+    );
+}
+
+/// `turn` of every `CompactionStarted`, in log order.
+async fn started_turns(log: &Arc<InMemoryEventLog>) -> Vec<Option<TurnId>> {
+    let mut entries = log.scan(asterpath_core::LogQuery {
+        session: SESSION,
+        after: None,
+        limit: None,
+    });
+    let mut turns = Vec::new();
+    while let Some(entry) = entries.next().await {
+        if let SessionEvent::CompactionStarted { turn, .. } =
+            decode_entry(&entry.expect("scan")).expect("decode")
+        {
+            turns.push(turn);
+        }
+    }
+    turns
+}
+
+#[tokio::test]
+async fn threshold_compaction_intent_records_its_turn() {
+    let log = Arc::new(InMemoryEventLog::new());
+    seed(&log, config(Vec::new())).await;
+    submit_input(&log).await;
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![assistant("done")],
+        StopReason::EndTurn,
+        usage(10, 2),
+    ));
+    let agent = agent(
+        Arc::clone(&log),
+        provider,
+        Vec::new(),
+        None,
+        Some(Arc::new(AlwaysCompact)),
+    );
+
+    drive(agent.as_ref()).await;
+
+    let mut entries = log.scan(asterpath_core::LogQuery {
+        session: SESSION,
+        after: None,
+        limit: None,
+    });
+    let mut opened = None;
+    while let Some(entry) = entries.next().await {
+        if let SessionEvent::TurnStarted { turn_id } =
+            decode_entry(&entry.expect("scan")).expect("decode")
+        {
+            opened = Some(turn_id);
+        }
+    }
+    assert!(opened.is_some());
+    assert_eq!(started_turns(&log).await, vec![opened]);
 }
 
 #[tokio::test]
@@ -681,6 +741,7 @@ async fn in_turn_compaction_emits_with_its_turn() {
             trigger: asterpath_protocol::CompactionTrigger::Threshold,
             replaces_from: frontier,
             caused_by: frontier,
+            turn: Some(TURN),
         },
         Some(dedup::compaction(frontier)),
     )

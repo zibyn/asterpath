@@ -167,6 +167,10 @@ pub fn subagent_config(settings: &Settings) -> SubagentConfig {
     settings.file.subagent_config()
 }
 
+pub fn max_live_children(settings: &Settings) -> NonZeroUsize {
+    settings.file.max_live_children()
+}
+
 pub fn model_aliases(settings: &Settings) -> BTreeMap<ModelAlias, ModelSpec> {
     settings
         .file
@@ -530,6 +534,13 @@ impl FileConfig {
         }
     }
 
+    /// Process-wide; maps to the facade, not the per-session snapshot.
+    fn max_live_children(&self) -> NonZeroUsize {
+        self.subagents
+            .max_live_children
+            .unwrap_or(NonZeroUsize::new(32).expect("non-zero"))
+    }
+
     fn subagent_config(&self) -> SubagentConfig {
         let default = SubagentConfig::default();
         SubagentConfig {
@@ -543,10 +554,6 @@ impl FileConfig {
                 .subagents
                 .max_concurrent_children
                 .unwrap_or(default.max_concurrent_children),
-            max_live_children: self
-                .subagents
-                .max_live_children
-                .unwrap_or(default.max_live_children),
             spawn_timeout: self.subagents.spawn_timeout.or(default.spawn_timeout),
             cancel_grace: self.subagents.cancel_grace.unwrap_or(default.cancel_grace),
         }
@@ -571,5 +578,12 @@ mod tests {
             ToolChoice::Tool(ToolName::new("search"))
         );
         assert!(parse_tool_choice("").is_err());
+    }
+
+    #[test]
+    fn subagents_max_live_children_is_the_global_cap() {
+        let file = parse("[subagents]\nmax_live_children = 4\n").unwrap();
+        assert_eq!(file.max_live_children().get(), 4);
+        assert_eq!(parse("").unwrap().max_live_children().get(), 32);
     }
 }

@@ -123,7 +123,6 @@ pub struct SubagentConfig {
     pub default_context: ContextPolicy,
     pub max_depth: u8,
     pub max_concurrent_children: NonZeroUsize,
-    pub max_live_children: NonZeroUsize,
     pub spawn_timeout: Option<Duration>,
     pub cancel_grace: Duration,
 }
@@ -134,7 +133,6 @@ impl Default for SubagentConfig {
             default_context: ContextPolicy::Fresh,
             max_depth: 3,
             max_concurrent_children: NonZeroUsize::new(8).expect("non-zero"),
-            max_live_children: NonZeroUsize::new(32).expect("non-zero"),
             spawn_timeout: None,
             cancel_grace: Duration::from_secs(10),
         }

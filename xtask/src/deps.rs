@@ -305,6 +305,7 @@ mod tests {
         let roster: Vec<(&str, Role)> = vec![
             ("asterpath-core", Role::Contract),
             ("asterpath-protocol", Role::Contract),
+            ("asterpath-http", Role::Contract),
             ("asterpath-sandbox", Role::Contract),
             ("asterpath-sandbox-linux", Role::Module),
             ("asterpath-agent", Role::Module),

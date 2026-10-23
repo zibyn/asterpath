@@ -179,6 +179,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterpath-http"
+version = "0.1.0"
+dependencies = [
+ "asterpath-protocol",
+]
+
+[[package]]
 name = "asterpath-mcp-fixture"
 version = "0.1.0"
 dependencies = [
@@ -234,6 +241,7 @@ dependencies = [
 name = "asterpath-provider-openai"
 version = "0.1.0"
 dependencies = [
+ "asterpath-http",
  "asterpath-protocol",
  "futures-core",
  "futures-util",

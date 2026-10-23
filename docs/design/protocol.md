@@ -474,7 +474,7 @@ pub enum CompactionError {
 
 规则：
 
-- **单一写入者**：`Compactor` 只读、返回结果；agent 在 `plan` 返回 `Summarize` 后写 `CompactionStarted`，再用 `compact` 的结果写终态。
+- **单一写入者**：`Compactor` 只读、返回结果；agent 在 `plan` 返回 `Summarize` 后写 `CompactionStarted { trigger, replaces_from, caused_by, turn }`（`turn` 为所属回合，Idle 为 `None`；形状见 [compaction.md](compaction.md) §5），再用 `compact` 的结果写终态。
 - `ProviderCatalog` 在构造 Compactor 时注入；`CompactionInput` 不携带 provider。
 - `CompactionOutcome.model` 是摘要调用实际使用的模型；`CompactionApplied.model` 直接取它（#13 的用量归因）。
 - `plan` 不产生 I/O：读入投影、算切点与估算；`compact` 只做摘要调用与压后校验。`compact` 只返回 `Applied` / `Insufficient`。
@@ -526,6 +526,7 @@ impl Usage {
 - 缺失字段按 0 处理；原始 usage 留在 `raw`，不伪造。
 - `Usage` 只描述一次模型响应；`AssistantMessage.usage` 与 `CompactionApplied.usage` 使用它；失败 attempt 的 usage 是 best-effort `Option<Usage>`。
 - 聚合、桶与 partial usage 见 [usage.md](usage.md)（#13）。承载 usage 的日志事件（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）各带 `model: ModelSpec`，用于按模型聚合；`raw` 只作原始回放，不参与归因。
+- 记录到用量桶的判定是 protocol 的 `usage_of(event, compaction_turn) -> Option<UsageEntry>`，见 [usage.md](usage.md) §4。
 - 失败 attempt 的已知用量经 `ProviderError.partial_usage` 交给 loop；它只作诊断，不进总量。
 
 ## 8. 错误归一化
@@ -809,4 +810,4 @@ pub enum ProviderErrorKind {
 - **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。
-- **#8**：fork 复制规范 item 与 raw；跨 provider 丢弃规则同样适用。
+- **#8**：fork 原样复制规范 item 与 raw，不做过滤；跨 provider 丢弃由 adapter 渲染请求时执行。

@@ -1353,3 +1353,69 @@ async fn a_child_completing_before_its_deadline_wins() {
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
 }
+
+#[tokio::test]
+async fn the_facade_global_live_child_limit_queues_spawns() {
+    let db = temp_db("global-admission");
+    let quota = Arc::new(Quota::default());
+    let child: ChildReply =
+        Arc::new(|task| response_events(assistant(&format!("done {task}")), StopReason::EndTurn));
+    let first: Vec<Item> = (0..3)
+        .map(|index| {
+            spawn_call(
+                &format!("call-{index}"),
+                &format!(r#"{{"task":"task-{index}"}}"#),
+            )
+        })
+        .collect();
+    let provider = Arc::new(RoutingProvider {
+        first,
+        child,
+        quota: Some(Arc::clone(&quota)),
+    });
+    // The per-parent limit (8) does not bind here; the facade's global one does.
+    let asterpath = AsterpathBuilder::from_config(simple_config(
+        &db,
+        vec![provider as Arc<dyn Provider>],
+        Vec::new(),
+    ))
+    .max_live_children(NonZeroUsize::new(2).expect("non-zero"))
+    .build()
+    .await
+    .expect("facade builds");
+    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let parent = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    let driver = tokio::spawn({
+        let handle = handle.clone();
+        async move { drive_all(&handle).await }
+    });
+
+    wait_for(&asterpath, parent, "two admitted children", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+            .count()
+            == 2
+            && events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ToolCallRequested { .. }))
+                .count()
+                == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let entries = scan(asterpath.event_log(), parent).await;
+    assert_eq!(spawned(&entries).len(), 2, "the third spawn is queued");
+
+    quota.release(3);
+    tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("drive finishes")
+        .expect("driver task");
+    let entries = scan(asterpath.event_log(), parent).await;
+    assert_eq!(completions(&entries).len(), 3);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}

@@ -21,6 +21,13 @@ name = "asterpath-protocol"
 role = "contract"
 allow = ["asterpath-core"]
 
+# Shared adapter library (SseDecoder; ADR-0026 re-audit candidate 5 revision). Listed as
+# a contract so adapter modules may depend on it; it is not part of the stable surface.
+[[package]]
+name = "asterpath-http"
+role = "contract"
+allow = ["asterpath-protocol"]
+
 [[package]]
 name = "asterpath-sandbox"
 role = "contract"
@@ -64,12 +71,12 @@ allow = ["asterpath-core", "asterpath-protocol"]
 [[package]]
 name = "asterpath-provider-anthropic"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-core", "asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-provider-openai"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-core", "asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-tracing"
@@ -84,7 +91,7 @@ allow = ["asterpath-core", "asterpath-protocol"]
 [[package]]
 name = "asterpath-plugin-host"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox"]
+allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox", "asterpath-http"]
 
 [[package]]
 name = "asterpath-skills"

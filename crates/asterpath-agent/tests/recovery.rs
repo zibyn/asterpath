@@ -1385,6 +1385,7 @@ async fn unclosed_compaction_keeps_the_session_idle_and_untouched() {
             trigger: asterpath_protocol::CompactionTrigger::Manual,
             replaces_from: frontier,
             caused_by: frontier,
+            turn: None,
         },
         Some(dedup::compaction(frontier)),
     )

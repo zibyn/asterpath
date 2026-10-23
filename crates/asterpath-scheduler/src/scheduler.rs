@@ -1,6 +1,7 @@
 //! Spawn, materialization, outcome mapping and the durable wait.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -10,9 +11,9 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, ProviderId,
-    RecordAppended, Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary,
-    TurnEndReason, decode_entry, dedup, encode_entry,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, RecordAppended,
+    Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason,
+    decode_entry, dedup, encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -20,6 +21,8 @@ use futures_util::StreamExt;
 
 use crate::tool::SPAWN_TOOL_NAME;
 use crate::{ChildRef, SpawnError, SpawnRequest, SubagentSpawner, WaitError};
+
+pub(crate) const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
 
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
@@ -30,7 +33,8 @@ pub struct Scheduler {
     executor: Arc<dyn DurableExecutor>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
-    config: SubagentConfig,
+    /// Process-wide cap on live children across all parents.
+    max_live_children: NonZeroUsize,
     /// Shared with the agent runner so child drives see cancellation.
     cancellations: Arc<CancellationRegistry>,
     /// Set by the composition root after the agent is built. Weak: the agent
@@ -72,20 +76,20 @@ impl Scheduler {
             executor,
             aliases,
             Arc::new(SystemClock),
-            SubagentConfig::default(),
+            DEFAULT_MAX_LIVE_CHILDREN,
             Arc::new(CancellationRegistry::new()),
         )
     }
 
-    /// Full wiring: the facade passes the injected clock, scheduler-wide
-    /// defaults and the registry the agent shares.
+    /// Full wiring: the facade passes the injected clock, the global live-child
+    /// cap and the registry the agent shares.
     pub fn with_runtime(
         log: Arc<dyn EventLog>,
         catalog: Arc<dyn SessionCatalog>,
         executor: Arc<dyn DurableExecutor>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
-        config: SubagentConfig,
+        max_live_children: NonZeroUsize,
         cancellations: Arc<CancellationRegistry>,
     ) -> Self {
         Self {
@@ -94,7 +98,7 @@ impl Scheduler {
             executor,
             aliases,
             clock,
-            config,
+            max_live_children,
             cancellations,
             runner: OnceLock::new(),
             bus: Mutex::new(None),
@@ -271,7 +275,7 @@ impl SubagentSpawner for Scheduler {
             self.admit(
                 &mut queue_guard,
                 subagents.max_concurrent_children.get(),
-                self.config.max_live_children.get(),
+                self.max_live_children.get(),
             )
             .await;
             drop(queue_guard);
@@ -674,7 +678,8 @@ impl Scheduler {
         }
         let grace = find_spawn(&parent_events, child.parent.tool_call)
             .map(|record| record.config.subagents.cancel_grace)
-            .unwrap_or(self.config.cancel_grace);
+            // No spawn record violates an invariant; fall back to the default grace.
+            .unwrap_or(SubagentConfig::default().cancel_grace);
 
         self.drain_child(child.child, grace).await;
 
@@ -741,7 +746,6 @@ impl Scheduler {
         &self,
         parent: ParentRef,
         at: LogId,
-        provider: &ProviderId,
     ) -> Result<Vec<Item>, ExecutionError> {
         let entries = scan(&*self.log, parent.session).await?;
         let Some(at_seq) = entries
@@ -762,7 +766,7 @@ impl Scheduler {
             .map(|(entry, _)| entry)
             .collect();
         let items = asterpath_protocol::history(&prefix).map_err(backend)?;
-        Ok(drop_foreign_items(items, provider))
+        Ok(items)
     }
 
     /// R2: create the child log's records from the parent record. Every write
@@ -804,9 +808,7 @@ impl Scheduler {
                 .iter()
                 .any(|(_, event)| matches!(event, SessionEvent::ContextForked { .. }))
         {
-            let items = self
-                .fork_snapshot(parent.clone(), *at, &config.model.provider)
-                .await?;
+            let items = self.fork_snapshot(parent.clone(), *at).await?;
             self.append(
                 child,
                 SessionEvent::ContextForked {
@@ -1066,57 +1068,6 @@ fn wait_outcome(outcome: &ChildOutcome) -> Result<ChildOutcome, WaitError> {
         } => Err(WaitError::Timeout),
         other => Ok(other.clone()),
     }
-}
-
-/// Cross-provider rule (#11 §11): opaque items from another provider are not
-/// copied into the fork snapshot at all; there is no translation.
-fn drop_foreign_items(items: Vec<Item>, provider: &ProviderId) -> Vec<Item> {
-    items
-        .into_iter()
-        .filter_map(|item| match item {
-            Item::Reasoning { raw, .. } if &raw.provider != provider => None,
-            Item::ProviderOpaque {
-                provider: item_provider,
-                ..
-            }
-            | Item::ServerToolCall {
-                provider: item_provider,
-                ..
-            }
-            | Item::ServerToolResult {
-                provider: item_provider,
-                ..
-            } if &item_provider != provider => None,
-            Item::Message { role, parts } => Some(Item::Message {
-                role,
-                parts: drop_foreign_parts(parts, provider),
-            }),
-            Item::ToolResult {
-                call_id,
-                provider_item_id,
-                parts,
-                is_error,
-                raw,
-            } => Some(Item::ToolResult {
-                call_id,
-                provider_item_id,
-                parts: drop_foreign_parts(parts, provider),
-                is_error,
-                raw,
-            }),
-            other => Some(other),
-        })
-        .collect()
-}
-
-fn drop_foreign_parts(parts: Vec<Part>, provider: &ProviderId) -> Vec<Part> {
-    parts
-        .into_iter()
-        .filter(|part| {
-            !matches!(part, Part::ProviderOpaque { provider: item_provider, .. }
-                if item_provider != provider)
-        })
-        .collect()
 }
 
 fn narrow_tools(

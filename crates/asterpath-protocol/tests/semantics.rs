@@ -175,6 +175,7 @@ fn open_intents_is_idle_iff_no_non_compaction_intent_is_open() {
         trigger: CompactionTrigger::Manual,
         replaces_from: LogId::from_i64(1),
         caused_by: LogId::from_i64(1),
+        turn: None,
     };
     intents.apply(&started, Some(&compaction_key));
     // A dangling summary call is safe to discard: it does not make a session busy.
@@ -262,6 +263,7 @@ fn open_intents_closes_with_the_matching_dedup_key_only() {
             trigger: CompactionTrigger::Threshold,
             replaces_from: LogId::from_i64(1),
             caused_by: LogId::from_i64(4),
+            turn: None,
         },
         Some(&key),
     );
