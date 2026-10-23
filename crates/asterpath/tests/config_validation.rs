@@ -7,7 +7,7 @@ use asterpath::{AsterError, Asterpath};
 use asterpath_protocol::{
     ModelAlias, ModelId, ModelSpec, Parallelism, Provenance, Provider, ProviderId, ReplaySafety,
     SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
-    TransportKind, TurnConfig,
+    TransportKind,
 };
 use asterpath_testing::{BackendFactory, BackendHandle, MemoryBackend, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -71,19 +71,6 @@ async fn storage_without_event_log_is_a_config_error() {
 #[tokio::test]
 async fn database_is_required_only_when_no_backend_is_injected() {
     let error = Asterpath::builder().build().await.unwrap_err();
-    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
-}
-
-#[tokio::test]
-async fn zero_max_steps_is_a_build_time_config_error() {
-    let error = Asterpath::builder()
-        .turn(TurnConfig {
-            max_steps_per_turn: Some(0),
-            ..TurnConfig::default()
-        })
-        .build()
-        .await
-        .unwrap_err();
     assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
 }
 

@@ -204,7 +204,6 @@ fn new_scheduler_with(
     catalog: Arc<dyn SessionCatalog>,
     executor: Arc<dyn DurableExecutor>,
     clock: Arc<dyn Clock>,
-    subagents: SubagentConfig,
 ) -> Arc<Scheduler> {
     Arc::new(Scheduler::with_runtime(
         log,
@@ -212,7 +211,7 @@ fn new_scheduler_with(
         executor,
         BTreeMap::new(),
         clock,
-        subagents,
+        NonZeroUsize::new(32).expect("non-zero"),
         Arc::new(CancellationRegistry::new()),
     ))
 }
@@ -1930,7 +1929,6 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
 
     // The first call takes the only slot.
@@ -2017,7 +2015,6 @@ async fn a_spawn_cancelled_before_admission_does_not_block_a_later_spawn() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
     let child = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2065,7 +2062,6 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
 
     // R1: replay reuses the admitted child and writes no second record.
@@ -2281,10 +2277,6 @@ impl DurableExecutor for TestExecutor {
 #[tokio::test]
 async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
     let log = Arc::new(InMemoryEventLog::new());
-    let subagents = SubagentConfig {
-        default_context: ContextPolicy::Fresh,
-        ..SubagentConfig::default()
-    };
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     // The spawn tool leaves the request at its `Fresh` default.
     let scheduler = new_scheduler_with(
@@ -2292,7 +2284,6 @@ async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents,
     );
     let child = scheduler
         .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
@@ -2333,7 +2324,6 @@ async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents,
     );
     // Same request the spawn tool builds: `Fresh` unless the snapshot says otherwise.
     let child = scheduler
@@ -2438,7 +2428,6 @@ async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
         Arc::new(FakeCatalog::default()),
         executor,
         clock,
-        subagents,
     );
     let runner: Arc<dyn AgentRunner> = Arc::new(CompletingRunner {
         log: Arc::clone(&log),
@@ -2504,7 +2493,6 @@ async fn a_committed_child_terminal_wins_over_an_expired_spawn_timer() {
         Arc::new(FakeCatalog::default()),
         executor,
         clock,
-        SubagentConfig::default(),
     );
     let outcome = scheduler
         .await_completion(&ChildRef {
