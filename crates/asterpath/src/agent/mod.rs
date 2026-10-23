@@ -9,7 +9,7 @@
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,12 +22,12 @@ use asterpath_protocol::{
     ApprovalVerdict, CancelReason, CancelRegistration, CancelToken, CancellationRegistry,
     ChildOutcome, CompactPlan, CompactResult, CompactSummary, CompactionAbortReason,
     CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger, Compactor,
-    ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents,
+    ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenStep,
     Parallelism, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorKind,
-    ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState, StepCtx, StopReason,
-    StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
-    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, approval_signal_id,
+    ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx,
+    StopReason, StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
+    ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus,
+    ToolResultView, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, approval_signal_id,
     approval_signal_name, decode_entry, dedup,
 };
 use asterpath_protocol::{
@@ -191,45 +191,36 @@ impl Agent {
                 detail: "session log has no SessionCreated".to_owned(),
             })?;
 
-        let mut intents = OpenIntents::default();
-        for (entry, event) in &decoded {
-            intents.apply(event, entry.dedup_key.as_ref());
-        }
+        let mut facts = fold_facts(&decoded);
 
         // R4: a child whose parent already stopped waiting is an orphan; close
         // its open intents as cancelled and never open another turn.
-        if self.parent_recorded_completion(session, &decoded).await? {
-            return self
-                .close_orphan(session, &decoded, intents.state(), events)
-                .await;
+        if self.parent_recorded_completion(session, &facts).await? {
+            return self.close_orphan(session, &facts, events).await;
         }
 
         // A dangling compaction intent is redone only when a compactor is
         // assembled; otherwise it stays open and never blocks Idle.
         if self.compactor.is_some()
-            && intents.compactions_are_open()
             && let Some(reason) = self
-                .resolve_open_compaction(session, &decoded, &config)
+                .resolve_open_compaction(session, &facts, &config)
                 .await?
         {
             decoded = decode_entries(self.scan(session).await?, session)?;
-            intents = OpenIntents::default();
-            for (entry, event) in &decoded {
-                intents.apply(event, entry.dedup_key.as_ref());
-            }
-            if let SessionState::TurnOpen { turn, step } = intents.state() {
+            facts = fold_facts(&decoded);
+            if let SessionState::TurnOpen { turn, step } = facts.state() {
                 if step.is_some()
-                    && let Some((step_id, _)) = open_step(&decoded, turn)
+                    && let Some(open) = open_step(&facts, turn)
                 {
-                    self.commit_step(session, turn, step_id).await?;
+                    self.commit_step(session, turn, open.step).await?;
                 }
                 return self.commit_turn(session, turn, reason, events).await;
             }
         }
 
-        match intents.state() {
+        match facts.state() {
             SessionState::Idle => {
-                if !has_pending_input(&decoded) {
+                if !facts.has_pending_input() {
                     events.push(Ok(AgentEvent::Idle { session }));
                     return Ok(());
                 }
@@ -241,7 +232,7 @@ impl Agent {
                     .await
             }
             SessionState::TurnOpen { turn, .. } => {
-                self.recover(session, &decoded, &config, turn, cancel, events)
+                self.recover(session, &facts, &config, turn, cancel, events)
                     .await
             }
         }
@@ -252,20 +243,16 @@ impl Agent {
     async fn recover(
         &self,
         session: SessionId,
-        decoded: &[(LogEntry, SessionEvent)],
+        facts: &SessionFacts,
         config: &ConfigSnapshot,
         turn: TurnId,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let from = decoded
-            .last()
-            .map(|(entry, _)| entry.log_id)
-            .unwrap_or_else(|| LogId::from_i64(0));
         self.append(
             session,
             SessionEvent::StreamResumed {
-                from,
+                from: last_log_id(facts),
                 reason: ResumeReason::Crash,
             },
             None,
@@ -273,7 +260,12 @@ impl Agent {
         .await?;
 
         let current = decode_entries(self.scan(session).await?, session)?;
-        let Some((step, watermark)) = open_step(&current, turn) else {
+        let Some(OpenStep {
+            step,
+            seq: watermark,
+            ..
+        }) = open_step(&fold_facts(&current), turn)
+        else {
             // Between steps: continue with the turn's normal continue rules.
             return self
                 .run_steps(session, config, turn, None, cancel, events)
@@ -364,15 +356,9 @@ impl Agent {
     async fn parent_recorded_completion(
         &self,
         session: SessionId,
-        decoded: &[(LogEntry, SessionEvent)],
+        facts: &SessionFacts,
     ) -> Result<bool, AgentError> {
-        let Some(parent) = decoded.iter().find_map(|(_, event)| match event {
-            SessionEvent::SessionCreated {
-                parent: Some(parent),
-                ..
-            } => Some(parent.session),
-            _ => None,
-        }) else {
+        let Some(parent) = facts.parent().map(|parent| parent.session) else {
             return Ok(false);
         };
         let parent_decoded = decode_entries(self.scan(parent).await?, parent)?;
@@ -390,48 +376,24 @@ impl Agent {
     async fn close_orphan(
         &self,
         session: SessionId,
-        decoded: &[(LogEntry, SessionEvent)],
-        state: SessionState,
+        facts: &SessionFacts,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let SessionState::TurnOpen { turn, .. } = state else {
+        let SessionState::TurnOpen { turn, .. } = facts.state() else {
             events.push(Ok(AgentEvent::Idle { session }));
             return Ok(());
         };
-        let from = decoded
-            .last()
-            .map(|(entry, _)| entry.log_id)
-            .unwrap_or_else(|| LogId::from_i64(0));
         self.append(
             session,
             SessionEvent::StreamResumed {
-                from,
+                from: last_log_id(facts),
                 reason: ResumeReason::Crash,
             },
             None,
         )
         .await?;
 
-        let mut tools = BTreeSet::new();
-        let mut children = BTreeSet::new();
-        for (_, event) in decoded {
-            match event {
-                SessionEvent::ToolCallRequested { tool_call_id, .. } => {
-                    tools.insert(*tool_call_id);
-                }
-                SessionEvent::ToolResult { tool_call_id, .. } => {
-                    tools.remove(tool_call_id);
-                }
-                SessionEvent::ChildSessionSpawned { child, .. } => {
-                    children.insert(*child);
-                }
-                SessionEvent::ChildSessionCompleted { child, .. } => {
-                    children.remove(child);
-                }
-                _ => {}
-            }
-        }
-        for tool_call_id in tools {
+        for (tool_call_id, _) in facts.open_tools() {
             self.append_tool_result(
                 session,
                 tool_call_id,
@@ -442,7 +404,7 @@ impl Agent {
             )
             .await?;
         }
-        for child in children {
+        for (child, _) in facts.open_children() {
             self.append(
                 session,
                 SessionEvent::ChildSessionCompleted {
@@ -455,8 +417,8 @@ impl Agent {
             )
             .await?;
         }
-        if let Some((step, _)) = open_step(decoded, turn) {
-            self.commit_step(session, turn, step).await?;
+        if let Some(open) = open_step(facts, turn) {
+            self.commit_step(session, turn, open.step).await?;
         }
         self.commit_turn(session, turn, TurnEndReason::Cancelled, events)
             .await
@@ -1299,54 +1261,41 @@ impl Agent {
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
-        let mut recorded = HashSet::new();
-        let mut step_calls = HashSet::new();
-        let mut spawned_children = BTreeSet::new();
-        let mut completed_children = BTreeSet::new();
-        for (_, event) in &decoded {
-            if let SessionEvent::ToolResult { tool_call_id, .. } = event {
-                recorded.insert(*tool_call_id);
-            }
-            match event {
+        let facts = fold_facts(&decoded);
+        let step_calls: HashSet<ToolCallId> = decoded
+            .iter()
+            .filter_map(|(_, event)| match event {
                 SessionEvent::ToolCallRequested {
                     turn_id,
                     step_id,
                     tool_call_id,
                     ..
-                } if *turn_id == turn && *step_id == step => {
-                    step_calls.insert(*tool_call_id);
-                }
-                // #41/#48: a spawn owned by this step is a wait to close even
-                // when its tool future was dropped before the scheduler wrote
-                // the terminal. Dedup by child id makes a racing write a no-op.
-                SessionEvent::ChildSessionSpawned {
-                    child,
-                    parent_tool_call_id,
-                    ..
-                } if step_calls.contains(parent_tool_call_id) => {
-                    spawned_children.insert(*child);
-                }
-                SessionEvent::ChildSessionCompleted { child, .. } => {
-                    completed_children.insert(*child);
-                }
-                _ => {}
-            }
-        }
-        for child in spawned_children.difference(&completed_children) {
+                } if *turn_id == turn && *step_id == step => Some(*tool_call_id),
+                _ => None,
+            })
+            .collect();
+        // #41/#48: a spawn owned by this step is a wait to close even when its
+        // tool future was dropped before the scheduler wrote the terminal.
+        // Dedup by child id makes a racing write a no-op.
+        let owned_children = facts
+            .open_children()
+            .filter(|(_, child)| step_calls.contains(&child.parent_tool_call));
+        for (child, _) in owned_children {
             self.append(
                 session,
                 SessionEvent::ChildSessionCompleted {
-                    child: *child,
+                    child,
                     outcome: ChildOutcome::Cancelled {
                         reason: CancelReason::Parent,
                     },
                 },
-                Some(dedup::child_session(*child)),
+                Some(dedup::child_session(child)),
             )
             .await?;
         }
+        // Every pending call has a recorded intent; an open one has no result.
         for tool_call_id in pending {
-            if !recorded.contains(tool_call_id) {
+            if facts.open_tool(*tool_call_id).is_some() {
                 self.interrupt(session, turn, step, *tool_call_id, events)
                     .await?;
             }
@@ -1751,7 +1700,7 @@ impl Agent {
 
     async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
         let decoded = decode_entries(self.scan(session).await?, session)?;
-        Ok(has_pending_input(&decoded))
+        Ok(fold_facts(&decoded).has_pending_input())
     }
 
     /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
@@ -1859,11 +1808,7 @@ impl Agent {
     ) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
         Box::pin(async move {
             let entries = decode_entries(self.scan(session).await?, session)?;
-            let mut intents = OpenIntents::default();
-            for (entry, event) in &entries {
-                intents.apply(event, entry.dedup_key.as_ref());
-            }
-            if !intents.is_idle() {
+            if !fold_facts(&entries).is_idle() {
                 return Err(AgentError::Busy { session });
             }
             // Share the drive single-flight; compact_now is turn-free.
@@ -2085,29 +2030,13 @@ impl Agent {
     async fn resolve_open_compaction(
         &self,
         session: SessionId,
-        decoded: &[(LogEntry, SessionEvent)],
+        facts: &SessionFacts,
         config: &ConfigSnapshot,
     ) -> Result<Option<TurnEndReason>, AgentError> {
-        let mut terminal: HashSet<DedupKey> = HashSet::new();
-        for (entry, event) in decoded {
-            if matches!(
-                event,
-                SessionEvent::CompactionApplied { .. } | SessionEvent::CompactionAborted { .. }
-            ) && let Some(key) = &entry.dedup_key
-            {
-                terminal.insert(key.clone());
-            }
-        }
-        let open = decoded.iter().rev().find_map(|(entry, event)| {
-            let SessionEvent::CompactionStarted { trigger, .. } = event else {
-                return None;
-            };
-            let key = entry.dedup_key.clone()?;
-            (!terminal.contains(&key)).then_some((key, *trigger))
-        });
-        let Some((key, trigger)) = open else {
+        let Some(open) = facts.open_compactions().max_by_key(|open| open.seq) else {
             return Ok(None);
         };
+        let (key, trigger) = (open.key.clone(), open.trigger);
         let (input, frontier) = self
             .compaction_input(session, config, trigger, u64::MAX)
             .await?;
@@ -2490,31 +2419,38 @@ fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepI
                     },
                 );
             }
-            SessionEvent::ToolResult { tool_call_id, .. } => {
-                existing.results.insert(*tool_call_id);
-            }
             _ => {}
         }
     }
+    let facts = fold_facts(decoded);
+    existing.results = existing
+        .intents
+        .values()
+        .map(|intent| intent.tool_call_id)
+        .filter(|id| facts.open_tool(*id).is_none())
+        .collect();
     existing
 }
 
-fn open_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId) -> Option<(StepId, u64)> {
-    let mut open = None;
+/// The open step of `turn`, with its `StepStarted.seq` waterline.
+fn open_step(facts: &SessionFacts, turn: TurnId) -> Option<OpenStep> {
+    facts.open_step().filter(|open| open.turn == turn)
+}
+
+/// `StreamResumed.from`: the last record before recovery appends.
+fn last_log_id(facts: &SessionFacts) -> LogId {
+    facts
+        .last()
+        .map(|(_, log_id)| log_id)
+        .unwrap_or_else(|| LogId::from_i64(0))
+}
+
+fn fold_facts(decoded: &[(LogEntry, SessionEvent)]) -> SessionFacts {
+    let mut facts = SessionFacts::default();
     for (entry, event) in decoded {
-        match event {
-            SessionEvent::StepStarted { turn_id, step_id } if *turn_id == turn => {
-                open = Some((*step_id, entry.seq));
-            }
-            SessionEvent::StepCommitted { step_id, .. }
-                if open.is_some_and(|(step, _)| step == *step_id) =>
-            {
-                open = None;
-            }
-            _ => {}
-        }
+        facts.apply(entry.seq, entry.log_id, entry.dedup_key.as_ref(), event);
     }
-    open
+    facts
 }
 
 fn has_assistant_message(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> bool {
@@ -2591,18 +2527,6 @@ fn decode_entries(
             Ok((entry, event))
         })
         .collect()
-}
-
-fn has_pending_input(decoded: &[(LogEntry, SessionEvent)]) -> bool {
-    let mut pending = false;
-    for (_, event) in decoded {
-        match event {
-            SessionEvent::InputRecorded { .. } => pending = true,
-            SessionEvent::StepStarted { .. } => pending = false,
-            _ => {}
-        }
-    }
-    pending
 }
 
 /// Exponential backoff with jitter, capped at `max_backoff`. The jitter is

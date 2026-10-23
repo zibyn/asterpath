@@ -9,7 +9,8 @@ use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
     ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
+    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
+    encode_entry,
 };
 use asterpath_protocol::{
     Clock, EventLog, ExecutionError, LogEntry, LogId, SessionCatalog, SessionId, Timestamp,
@@ -178,10 +179,11 @@ impl Scheduler {
 
             // Rebuild this parent's queue and Running count from the log first;
             // a result that landed since then also closes its queue entry.
-            self.recover_parent(req.parent.session, &parent_events)
+            let parent_facts = fold_facts(&parent_events);
+            self.recover_parent(req.parent.session, &parent_facts)
                 .await
                 .map_err(SpawnError::Execution)?;
-            self.prune_queue(req.parent.session, &parent_events);
+            self.prune_queue(req.parent.session, &parent_facts);
 
             // R1: one child per parent tool call, ever.
             if let Some(record) = find_spawn(&parent_events, req.parent.tool_call) {
@@ -437,7 +439,7 @@ impl Scheduler {
     async fn recover_parent(
         &self,
         parent: SessionId,
-        events: &[(LogEntry, SessionEvent)],
+        facts: &SessionFacts,
     ) -> Result<(), ExecutionError> {
         if self
             .admission
@@ -449,43 +451,15 @@ impl Scheduler {
             return Ok(());
         }
 
-        let mut spawned: HashMap<ToolCallId, SessionId> = HashMap::new();
-        let mut completed: HashSet<SessionId> = HashSet::new();
-        let mut finished: HashSet<ToolCallId> = HashSet::new();
-        for (_, event) in events {
-            match event {
-                SessionEvent::ChildSessionSpawned {
-                    parent_tool_call_id,
-                    child,
-                    ..
-                } => {
-                    spawned.insert(*parent_tool_call_id, *child);
-                }
-                SessionEvent::ChildSessionCompleted { child, .. } => {
-                    completed.insert(*child);
-                }
-                SessionEvent::ToolResult { tool_call_id, .. } => {
-                    finished.insert(*tool_call_id);
-                }
-                _ => {}
-            }
-        }
-        let mut queue = BTreeMap::new();
-        for (entry, event) in events {
-            if let SessionEvent::ToolCallRequested {
-                tool_call_id, name, ..
-            } = event
-                && name.as_str() == SPAWN_TOOL_NAME
-                && !spawned.contains_key(tool_call_id)
-                && !finished.contains(tool_call_id)
-            {
-                queue.insert(entry.seq, *tool_call_id);
-            }
-        }
-        let running: Vec<ToolCallId> = spawned
-            .iter()
-            .filter(|(_, child)| !completed.contains(child))
-            .map(|(call, _)| *call)
+        // Queued: open spawn calls with no child yet. Running: open children.
+        let queue: BTreeMap<u64, ToolCallId> = facts
+            .open_tools()
+            .filter(|(_, tool)| tool.name.as_str() == SPAWN_TOOL_NAME && tool.spawned.is_none())
+            .map(|(call, tool)| (tool.seq, call))
+            .collect();
+        let running: Vec<ToolCallId> = facts
+            .open_children()
+            .map(|(_, child)| child.parent_tool_call)
             .collect();
 
         let mut state = self
@@ -514,23 +488,20 @@ impl Scheduler {
 
     /// Drop queue entries whose tool call already has a `ToolResult`: a spawn
     /// cancelled before admission is closed and must not hold the FIFO head.
-    fn prune_queue(&self, parent: SessionId, events: &[(LogEntry, SessionEvent)]) {
-        let finished: HashSet<ToolCallId> = events
-            .iter()
-            .filter_map(|(_, event)| match event {
-                SessionEvent::ToolResult { tool_call_id, .. } => Some(*tool_call_id),
-                _ => None,
-            })
-            .collect();
-        if finished.is_empty() {
+    fn prune_queue(&self, parent: SessionId, facts: &SessionFacts) {
+        // A queued call at or before the folded seq that is no longer open has
+        // its result; a later one was queued after this read and stays.
+        let Some((folded, _)) = facts.last() else {
             return;
-        }
+        };
         let mut state = self
             .admission
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = state.parents.get_mut(&parent) {
-            entry.queue.retain(|_, call| !finished.contains(call));
+            entry
+                .queue
+                .retain(|seq, call| *seq > folded || facts.open_tool(*call).is_some());
         }
     }
 
@@ -1082,6 +1053,14 @@ async fn drive_child(agent: &Agent, session: SessionId) -> Result<(), AgentError
         event?;
     }
     Ok(())
+}
+
+fn fold_facts(events: &[(LogEntry, SessionEvent)]) -> SessionFacts {
+    let mut facts = SessionFacts::default();
+    for (entry, event) in events {
+        facts.apply(entry.seq, entry.log_id, entry.dedup_key.as_ref(), event);
+    }
+    facts
 }
 
 async fn scan(

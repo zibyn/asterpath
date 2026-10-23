@@ -5,7 +5,6 @@
 
 mod config;
 
-use std::collections::BTreeSet;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,9 +12,9 @@ use std::sync::Arc;
 use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
-    Part, Role, SessionState, Span, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope,
-    UsageTotals, UserInput, decode_entry, history,
+    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, Part, Role, SessionState,
+    Span, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope, UsageTotals, UserInput,
+    decode_entry, history,
 };
 use asterpath_protocol::{
     Clock, EventLog, InputId, LogEntry, SessionId, SystemClock, unique_bytes,
@@ -300,7 +299,8 @@ async fn inspect(args: SessionArgs) -> CliResult<()> {
         return Err(not_found(session));
     }
 
-    let (open, state) = fold_open_intents(&entries).map_err(CliError::run)?;
+    let handle = asterpath.open_session(session).await.map_err(aster_error)?;
+    let facts = handle.facts().await.map_err(aster_error)?;
     if args.common.json {
         let items = history(&entries).map_err(|error| CliError::run(error.to_string()))?;
         let json = serde_json::to_string_pretty(&items)
@@ -309,9 +309,10 @@ async fn inspect(args: SessionArgs) -> CliResult<()> {
     } else {
         let items = history(&entries).map_err(|error| CliError::run(error.to_string()))?;
         println!("session: {}", session.to_hex());
-        println!("state: {}", state_label(state));
+        println!("state: {}", state_label(facts.state()));
         println!("entries: {}", entries.len());
         println!("projected items: {}", items.len());
+        let open = facts.open_intents();
         if open.is_empty() {
             println!("open intents: none");
         } else {
@@ -648,23 +649,6 @@ async fn scan(event_log: Arc<dyn EventLog>, session: SessionId) -> Result<Vec<Lo
     scan_all(&*event_log, session)
         .await
         .map_err(|error| error.to_string())
-}
-
-/// Fold the log once; the deltas tell the summary which intents are still open.
-fn fold_open_intents(entries: &[LogEntry]) -> Result<(Vec<OpenIntent>, SessionState), String> {
-    let mut intents = OpenIntents::default();
-    let mut open = BTreeSet::new();
-    for entry in entries {
-        let event = decode_entry(entry).map_err(|error| error.to_string())?;
-        let delta = intents.apply_delta(&event, entry.dedup_key.as_ref());
-        for intent in delta.opened {
-            open.insert(intent);
-        }
-        for intent in delta.closed {
-            open.remove(&intent);
-        }
-    }
-    Ok((open.into_iter().collect(), intents.state()))
 }
 
 fn state_label(state: SessionState) -> String {

@@ -1211,7 +1211,7 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
         vec![ToolResultStatus::Interrupted]
     );
     assert_eq!(handle.state().await.unwrap(), SessionState::Idle);
-    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("folds");
+    let intents = asterpath_protocol::SessionFacts::fold(&entries).expect("folds");
     assert!(intents.is_idle(), "no waiting intent survives cancellation");
     assert!(
         !matches!(

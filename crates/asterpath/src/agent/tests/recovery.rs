@@ -1271,9 +1271,9 @@ async fn unclosed_compaction_keeps_the_session_idle_and_untouched() {
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     assert_eq!(count(&entries, "CompactionAborted"), 0);
     assert_eq!(count(&entries, "StreamResumed"), 0);
-    let intents = asterpath_protocol::OpenIntents::fold(&entries).expect("fold");
+    let intents = asterpath_protocol::SessionFacts::fold(&entries).expect("fold");
     assert!(intents.is_idle());
-    assert!(intents.compactions_are_open());
+    assert!(intents.open_compactions().next().is_some());
 }
 
 #[tokio::test]
