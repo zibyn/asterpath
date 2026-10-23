@@ -11,7 +11,7 @@ use std::sync::{Mutex, PoisonError};
 
 use asterpath_protocol::{
     Item, ModelRequest, Part, PartDelta, Provider, ProviderCapabilities, ProviderError,
-    ProviderErrorKind, ProviderId, StopReason, StreamEvent, ToolChoice, ToolName, Usage,
+    ProviderErrorKind, ProviderId, StopReason, StreamEvent, ToolName, Usage,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -184,38 +184,11 @@ impl ScriptedProvider {
 
     /// Adapter-side capability check: runs before any transport call.
     fn capability_error(&self, request: &ModelRequest) -> Option<ProviderError> {
-        let unsupported = |detail: &str| {
-            Some(ProviderError::new(
-                ProviderErrorKind::Unsupported,
-                format!("{detail} is not supported by this model"),
-            ))
-        };
-        if !self.capabilities.forced_tool_choice
-            && matches!(
-                request.tool_choice,
-                ToolChoice::Required | ToolChoice::Tool(_)
-            )
-        {
-            return unsupported("forced tool choice");
-        }
-        if !self.capabilities.sampling && request.sampling.is_some() {
-            return unsupported("sampling");
-        }
-        if !self.capabilities.parallel_tool_calls && request.disable_parallel_tool_use {
-            return unsupported("disabling parallel tool calls");
-        }
-        if !self.capabilities.image_input
-            && request.items.iter().any(|item| {
-                matches!(
-                    item,
-                    Item::Message { parts, .. }
-                        if parts.iter().any(|part| matches!(part, Part::Image { .. }))
-                )
-            })
-        {
-            return unsupported("image input");
-        }
-        None
+        let detail = self.capabilities.unsupported_feature(request)?;
+        Some(ProviderError::new(
+            ProviderErrorKind::Unsupported,
+            format!("{detail} is not supported by this model"),
+        ))
     }
 }
 

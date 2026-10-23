@@ -76,7 +76,7 @@ pub(crate) fn stream(
     response: reqwest::Response,
     context: WireContext,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    let header_request_id = crate::request_id(&response);
+    let header_request_id = asterpath_http::request_id(response.headers());
     let state = State {
         normalizer: Normalizer::new(context, header_request_id),
         response,

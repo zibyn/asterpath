@@ -110,6 +110,36 @@ pub struct ProviderCapabilities {
     pub parallel_tool_calls: bool,
 }
 
+impl ProviderCapabilities {
+    /// The first request feature these capabilities do not support, as the
+    /// detail adapters put in their `Unsupported` error text. Wire-specific
+    /// checks stay in each adapter.
+    pub fn unsupported_feature(&self, request: &ModelRequest) -> Option<&'static str> {
+        if !self.forced_tool_choice
+            && matches!(
+                request.tool_choice,
+                ToolChoice::Required | ToolChoice::Tool(_)
+            )
+        {
+            return Some("forced tool choice");
+        }
+        if !self.sampling && request.sampling.is_some() {
+            return Some("sampling");
+        }
+        if !self.parallel_tool_calls && request.disable_parallel_tool_use {
+            return Some("disabling parallel tool calls");
+        }
+        let has_image = request.items.iter().any(|item| {
+            matches!(item, Item::Message { parts, .. }
+                if parts.iter().any(|part| matches!(part, Part::Image { .. })))
+        });
+        if !self.image_input && has_image {
+            return Some("image input");
+        }
+        None
+    }
+}
+
 /// One model provider adapter. The loop never branches on provider identity.
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderId;

@@ -3,7 +3,10 @@
 //! Not part of the stable surface (ADR-0026, re-audit candidate 5 revision).
 #![allow(clippy::result_large_err)]
 
+use std::time::Duration;
+
 use asterpath_protocol::{ProviderError, ProviderErrorKind};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 /// One dispatched server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +95,37 @@ impl SseDecoder {
         }
         None
     }
+}
+
+/// Generic class of a non-success HTTP status. Adapters check provider-specific
+/// error bodies (for example context overflow) before falling back to this.
+pub fn classify_status(status: u16) -> ProviderErrorKind {
+    match status {
+        401 | 403 => ProviderErrorKind::Auth,
+        408 => ProviderErrorKind::Timeout,
+        429 => ProviderErrorKind::RateLimited,
+        503 | 529 => ProviderErrorKind::Overloaded,
+        500..=599 => ProviderErrorKind::Server,
+        _ => ProviderErrorKind::InvalidRequest,
+    }
+}
+
+/// `Retry-After` as a delay.
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    // shortcut: only integer-seconds Retry-After; upgrade if a gateway sends HTTP-date.
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// The provider's request id (`request-id` or `x-request-id`).
+pub fn request_id(headers: &HeaderMap) -> Option<String> {
+    ["request-id", "x-request-id"]
+        .into_iter()
+        .find_map(|name| headers.get(name)?.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn protocol(message: String) -> ProviderError {

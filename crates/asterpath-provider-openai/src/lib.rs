@@ -123,7 +123,7 @@ impl Provider for OpenAiProvider {
             provider: self.id.clone(),
             spec: request.spec,
             prefix_epoch: request.prefix_epoch,
-            tools_hash: render::tools_hash(&request.tools),
+            tools_hash: asterpath_protocol::tools_hash(&request.tools),
         };
 
         stream::once(async move { connect(send).await })
@@ -156,8 +156,8 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
 
 async fn http_error(response: reqwest::Response) -> ProviderError {
     let status = response.status();
-    let request_id = request_id(&response);
-    let retry_after = retry_after(&response);
+    let request_id = asterpath_http::request_id(response.headers());
+    let retry_after = asterpath_http::retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
     let lower = body.to_lowercase();
     let context_exceeded = lower.contains("context_length_exceeded")
@@ -167,16 +167,7 @@ async fn http_error(response: reqwest::Response) -> ProviderError {
     let kind = if context_exceeded {
         ProviderErrorKind::ContextExceeded
     } else {
-        match status.as_u16() {
-            400 | 404 | 422 => ProviderErrorKind::InvalidRequest,
-            401 | 403 => ProviderErrorKind::Auth,
-            408 => ProviderErrorKind::Timeout,
-            429 => ProviderErrorKind::RateLimited,
-            500 | 502 | 504 => ProviderErrorKind::Server,
-            503 | 529 => ProviderErrorKind::Overloaded,
-            code if (400..500).contains(&code) => ProviderErrorKind::InvalidRequest,
-            _ => ProviderErrorKind::Server,
-        }
+        asterpath_http::classify_status(status.as_u16())
     };
     let message = if body.is_empty() {
         format!("openai returned HTTP {status}")
@@ -196,21 +187,4 @@ async fn http_error(response: reqwest::Response) -> ProviderError {
         });
     }
     error
-}
-
-pub(crate) fn request_id(response: &reqwest::Response) -> Option<String> {
-    ["x-request-id", "request-id"]
-        .iter()
-        .find_map(|name| response.headers().get(*name))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-}
-
-pub(crate) fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
-    response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
 }

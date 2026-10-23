@@ -103,3 +103,67 @@ fn stop_reason_carries_provider_label_for_unknown_values() {
         }
     );
 }
+
+fn capability_request() -> asterpath_protocol::ModelRequest {
+    asterpath_protocol::ModelRequest::new(
+        asterpath_protocol::ModelSpec {
+            provider: ProviderId::new("p"),
+            model: asterpath_protocol::ModelId::new("m"),
+            context_window: None,
+        },
+        0,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &asterpath_protocol::RequestConfig::default(),
+    )
+}
+
+#[test]
+fn capability_check_names_the_unsupported_feature() {
+    use asterpath_protocol::{ImageSource, Item, Part, Role, SamplingParams, ToolChoice};
+
+    let none = ProviderCapabilities::default();
+    assert_eq!(none.unsupported_feature(&capability_request()), None);
+
+    let mut forced = capability_request();
+    forced.tool_choice = ToolChoice::Required;
+    assert_eq!(
+        none.unsupported_feature(&forced),
+        Some("forced tool choice")
+    );
+
+    let mut sampling = capability_request();
+    sampling.sampling = Some(SamplingParams::default());
+    assert_eq!(none.unsupported_feature(&sampling), Some("sampling"));
+
+    let mut serial = capability_request();
+    serial.disable_parallel_tool_use = true;
+    assert_eq!(
+        none.unsupported_feature(&serial),
+        Some("disabling parallel tool calls")
+    );
+
+    let mut image = capability_request();
+    image.items.push(Item::Message {
+        role: Role::User,
+        parts: vec![Part::Image {
+            media_type: "image/png".to_owned(),
+            source: ImageSource::Url {
+                url: "https://example.invalid/x.png".to_owned(),
+            },
+        }],
+    });
+    assert_eq!(none.unsupported_feature(&image), Some("image input"));
+
+    let all = ProviderCapabilities {
+        forced_tool_choice: true,
+        sampling: true,
+        parallel_tool_calls: true,
+        image_input: true,
+        ..ProviderCapabilities::default()
+    };
+    for request in [forced, sampling, serial, image] {
+        assert_eq!(all.unsupported_feature(&request), None);
+    }
+}

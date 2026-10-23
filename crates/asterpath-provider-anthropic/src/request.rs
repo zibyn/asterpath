@@ -6,10 +6,9 @@
 
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningBinding, Role, ToolChoice, ToolDescriptor,
+    ProviderId, RawProviderData, ReasoningBinding, Role, ToolChoice,
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// One rendered JSON fragment: ordinary values are serialized compactly,
@@ -61,6 +60,9 @@ pub(crate) fn check(
     capabilities: ProviderCapabilities,
     request: &ModelRequest,
 ) -> Result<(), ProviderError> {
+    if let Some(feature) = capabilities.unsupported_feature(request) {
+        return Err(unsupported(feature));
+    }
     if !request
         .system
         .iter()
@@ -68,24 +70,12 @@ pub(crate) fn check(
     {
         return Err(invalid_request("system may only contain text parts"));
     }
-    if !capabilities.forced_tool_choice
-        && matches!(
-            request.tool_choice,
-            ToolChoice::Required | ToolChoice::Tool(_)
-        )
+    if request
+        .sampling
+        .as_ref()
+        .is_some_and(|sampling| sampling.seed.is_some())
     {
-        return Err(unsupported("forced tool choice"));
-    }
-    if let Some(sampling) = &request.sampling {
-        if !capabilities.sampling {
-            return Err(unsupported("sampling"));
-        }
-        if sampling.seed.is_some() {
-            return Err(unsupported("sampling.seed"));
-        }
-    }
-    if request.disable_parallel_tool_use && !capabilities.parallel_tool_calls {
-        return Err(unsupported("disabling parallel tool calls"));
+        return Err(unsupported("sampling.seed"));
     }
     if let Some(reasoning) = &request.reasoning {
         // Anthropic has no `effort`; `summary` is ignored by design.
@@ -96,19 +86,7 @@ pub(crate) fn check(
             return Err(unsupported("thinking"));
         }
     }
-    if !capabilities.image_input && contains_image(&request.items) {
-        return Err(unsupported("image input"));
-    }
     Ok(())
-}
-
-fn contains_image(items: &[Item]) -> bool {
-    items.iter().any(|item| match item {
-        Item::Message { parts, .. } | Item::ToolResult { parts, .. } => {
-            parts.iter().any(|part| matches!(part, Part::Image { .. }))
-        }
-        _ => false,
-    })
 }
 
 fn unsupported(detail: &str) -> ProviderError {
@@ -128,7 +106,7 @@ pub(crate) fn render(
     provider: &ProviderId,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
-    let tools_hash = tools_hash(&request.tools);
+    let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let messages = render_messages(provider, request, &tools_hash)?;
 
     let mut fields: Vec<(&str, Frag)> = vec![
@@ -385,46 +363,4 @@ fn replayable(
         && binding.model == request.spec.model
         && binding.prefix_epoch == request.prefix_epoch
         && binding.tools_hash == tools_hash
-}
-
-/// Deterministic fingerprint of the model-visible tool set (protocol.md §9).
-pub(crate) fn tools_hash(tools: &[ToolDescriptor]) -> String {
-    let mut tools: Vec<&ToolDescriptor> = tools.iter().collect();
-    tools.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-    let canonical: Vec<Value> = tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name.as_str(),
-                "description": tool.description,
-                "schema": tool.schema,
-            })
-        })
-        .collect();
-    let text = serde_json::to_string(&canonicalize(Value::Array(canonical)))
-        .expect("tool fingerprint serializes");
-    let digest = Sha256::digest(text.as_bytes());
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    hex
-}
-
-fn canonicalize(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            let mut sorted = serde_json::Map::new();
-            for key in keys {
-                let value = map.get(&key).cloned().expect("key exists");
-                sorted.insert(key, canonicalize(value));
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.into_iter().map(canonicalize).collect()),
-        other => other,
-    }
 }

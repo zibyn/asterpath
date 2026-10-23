@@ -1,14 +1,11 @@
 //! Canonical request rendering for the OpenAI Responses API.
 
-use std::fmt::Write as _;
-
 use asterpath_protocol::{
     Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
-    RawProviderData, Role, ToolChoice, ToolDescriptor,
+    RawProviderData, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::TraceSink;
 
@@ -49,46 +46,6 @@ impl TraceMark {
             kind: kind.into(),
             reason: reason.to_owned(),
         }
-    }
-}
-
-/// Canonical tool-set fingerprint from protocol.md §9.
-pub(crate) fn tools_hash(tools: &[ToolDescriptor]) -> String {
-    let mut sorted: Vec<&ToolDescriptor> = tools.iter().collect();
-    sorted.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-    let entries: Vec<Value> = sorted
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name.as_str(),
-                "description": tool.description,
-                "schema": canonical(&tool.schema),
-            })
-        })
-        .collect();
-    let bytes = serde_json::to_vec(&Value::Array(entries)).expect("tools serialize");
-    let mut hash = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(hash, "{byte:02x}").expect("hex write");
-    }
-    hash
-}
-
-/// Recursively orders object keys so the fingerprint does not depend on the
-/// incoming map implementation.
-fn canonical(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut sorted = Map::new();
-            for key in keys {
-                sorted.insert(key.clone(), canonical(&map[key]));
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
-        other => other.clone(),
     }
 }
 
@@ -172,6 +129,9 @@ fn validate(
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
 ) -> Result<(), ProviderError> {
+    if let Some(feature) = capabilities.unsupported_feature(request) {
+        return Err(unsupported(feature));
+    }
     if request.spec.provider != *provider {
         return Err(invalid_request(format!(
             "request provider {} does not match adapter {provider}",
@@ -185,19 +145,6 @@ fn validate(
     {
         return Err(invalid_request("system may only contain text parts"));
     }
-    if matches!(
-        request.tool_choice,
-        ToolChoice::Required | ToolChoice::Tool(_)
-    ) && !capabilities.forced_tool_choice
-    {
-        return Err(unsupported("forced tool choice"));
-    }
-    if request.sampling.is_some() && !capabilities.sampling {
-        return Err(unsupported("sampling"));
-    }
-    if request.disable_parallel_tool_use && !capabilities.parallel_tool_calls {
-        return Err(unsupported("disabling parallel tool calls"));
-    }
     if let Some(sampling) = &request.sampling
         && sampling.top_k.is_some()
     {
@@ -208,17 +155,7 @@ fn validate(
     {
         return Err(unsupported("reasoning budget_tokens"));
     }
-    if !capabilities.image_input && request.items.iter().any(has_message_image) {
-        return Err(unsupported("image input"));
-    }
     Ok(())
-}
-
-fn has_message_image(item: &Item) -> bool {
-    matches!(
-        item,
-        Item::Message { parts, .. } if parts.iter().any(|part| matches!(part, Part::Image { .. }))
-    )
 }
 
 fn system_text(system: &[Part]) -> Option<String> {
@@ -264,7 +201,7 @@ fn render_input(
     provider: &ProviderId,
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<Box<RawValue>>, ProviderError> {
-    let tools_hash = tools_hash(&request.tools);
+    let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let mut input = Vec::with_capacity(request.items.len());
     for item in &request.items {
         match item {

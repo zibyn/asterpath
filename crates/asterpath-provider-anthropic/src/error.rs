@@ -3,31 +3,12 @@
 //! The loop only reads `retryable` and `ContextExceeded`; every HTTP status and
 //! SSE error shape is translated here.
 
-use std::time::Duration;
-
+use asterpath_http::{request_id, retry_after};
 use asterpath_protocol::{
     JsonString, ModelId, ProviderError, ProviderErrorKind, ProviderId, RawProviderData, Usage,
 };
 use reqwest::header::HeaderMap;
 use serde_json::Value;
-
-pub(crate) fn request_id(headers: &HeaderMap) -> Option<String> {
-    for name in ["request-id", "x-request-id"] {
-        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            return Some(value.to_owned());
-        }
-    }
-    None
-}
-
-pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    // shortcut: only integer-seconds Retry-After; upgrade if a gateway sends HTTP-date.
-    headers
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-}
 
 /// Connection, DNS, TLS, reset and request-timeout failures.
 pub(crate) fn transport(
@@ -83,16 +64,7 @@ fn classify_status(status: u16, message: &str) -> ProviderErrorKind {
     if context_exceeded(message) {
         return ProviderErrorKind::ContextExceeded;
     }
-    match status {
-        401 | 403 => ProviderErrorKind::Auth,
-        408 => ProviderErrorKind::Timeout,
-        429 => ProviderErrorKind::RateLimited,
-        503 | 529 => ProviderErrorKind::Overloaded,
-        500 | 502 | 504 => ProviderErrorKind::Server,
-        status if (400..500).contains(&status) => ProviderErrorKind::InvalidRequest,
-        status if (500..600).contains(&status) => ProviderErrorKind::Server,
-        _ => ProviderErrorKind::InvalidRequest,
-    }
+    asterpath_http::classify_status(status)
 }
 
 /// An in-band SSE `error` event.

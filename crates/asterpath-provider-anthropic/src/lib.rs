@@ -88,7 +88,7 @@ impl Provider for AnthropicProvider {
             provider,
             request.spec.model.clone(),
             request.prefix_epoch,
-            request::tools_hash(&request.tools),
+            asterpath_protocol::tools_hash(&request.tools),
             body,
         );
         stream::unfold(Some(decoder), |state| async move {

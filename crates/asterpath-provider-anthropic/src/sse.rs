@@ -183,7 +183,7 @@ impl Decoder {
                 return;
             }
         };
-        self.request_id_header = error::request_id(response.headers());
+        self.request_id_header = asterpath_http::request_id(response.headers());
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();

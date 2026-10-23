@@ -6,3 +6,4 @@ publish.workspace = true
 
 [dependencies]
 asterpath-protocol = { path = "../asterpath-protocol" }
+reqwest = { version = "0.12", default-features = false }

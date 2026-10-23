@@ -93,6 +93,52 @@ pub struct ReasoningBinding {
     pub tools_hash: String,
 }
 
+/// Deterministic fingerprint of the model-visible tool set (protocol.md §9):
+/// SHA-256 hex of the name-sorted, key-sorted compact JSON array of
+/// `{name, description, schema}`. Persisted in [`ReasoningBinding::tools_hash`].
+pub fn tools_hash(tools: &[crate::ToolDescriptor]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut tools: Vec<&crate::ToolDescriptor> = tools.iter().collect();
+    tools.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    let canonical: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name.as_str(),
+                "description": tool.description,
+                "schema": tool.schema,
+            })
+        })
+        .collect();
+    let text = serde_json::to_string(&sort_keys(serde_json::Value::Array(canonical)))
+        .expect("tool fingerprint serializes");
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(text.as_bytes()) {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawProviderData {
     pub provider: ProviderId,

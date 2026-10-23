@@ -183,6 +183,7 @@ name = "asterpath-http"
 version = "0.1.0"
 dependencies = [
  "asterpath-protocol",
+ "reqwest",
 ]
 
 [[package]]
@@ -219,6 +220,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -227,13 +229,13 @@ name = "asterpath-provider-anthropic"
 version = "0.1.0"
 dependencies = [
  "asterpath-core",
+ "asterpath-http",
  "asterpath-protocol",
  "bytes",
  "futures-core",
  "futures-util",
  "reqwest",
  "serde_json",
- "sha2",
  "tokio",
 ]
 
@@ -248,7 +250,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
 ]
 
