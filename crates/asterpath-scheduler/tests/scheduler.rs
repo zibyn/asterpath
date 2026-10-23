@@ -2289,7 +2289,6 @@ async fn spawn_records_the_timeout_as_a_deadline_on_the_spawn_record() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         clock.clone(),
-        SubagentConfig::default(),
     );
     let mut request = SpawnRequest::new(reference, caused_by, vec![text("task")]);
     request.timeout = Some(Duration::from_secs(5));
@@ -2363,7 +2362,6 @@ async fn a_spawn_deadline_that_expired_while_stopped_times_out_exactly_once_afte
             Arc::new(FakeCatalog::default()),
             Arc::new(NoopExecutor),
             clock.clone(),
-            SubagentConfig::default(),
         );
         let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
         scheduler.set_runner(Arc::clone(&runner));
@@ -2401,7 +2399,6 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         clock,
-        SubagentConfig::default(),
     );
     let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
     scheduler.set_runner(Arc::clone(&runner));
