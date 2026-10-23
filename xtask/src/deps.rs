@@ -4,13 +4,29 @@ use std::fs;
 use cargo_metadata::{DependencyKind, MetadataCommand};
 use serde::Deserialize;
 
+/// Role rules (ADR-0026): the protocol crate depends on no member; adapters
+/// depend only on protocol and other adapters; the engine only on protocol and
+/// the adapters it re-exports or feature-gates. Apps and tools are bounded only
+/// by their `allow` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    Contract,
-    Module,
+    Protocol,
+    Adapter,
+    Engine,
     App,
     Tool,
+}
+
+impl Role {
+    /// Roles a crate of this role may depend on; `None` means any.
+    fn may_depend_on(self) -> Option<&'static [Role]> {
+        match self {
+            Role::Protocol => Some(&[]),
+            Role::Adapter | Role::Engine => Some(&[Role::Protocol, Role::Adapter]),
+            Role::App | Role::Tool => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,11 +59,12 @@ pub enum Violation {
         package: String,
         dependency: String,
     },
-    ModuleDependency {
+    RoleDependency {
         from: String,
         to: String,
+        role: Role,
     },
-    ContractFeatures {
+    ProtocolFeatures {
         package: String,
         features: Vec<String>,
     },
@@ -69,13 +86,13 @@ impl fmt::Display for Violation {
                 f,
                 "{package}: normal dependency on workspace crate {dependency} is not allowed"
             ),
-            Violation::ModuleDependency { from, to } => write!(
+            Violation::RoleDependency { from, to, role } => write!(
                 f,
-                "{from}: module crates must not depend on other module crates ({to})"
+                "{from}: its role must not depend on {to} (role {role:?})"
             ),
-            Violation::ContractFeatures { package, features } => write!(
+            Violation::ProtocolFeatures { package, features } => write!(
                 f,
-                "{package}: contract crates must not declare features ({})",
+                "{package}: the protocol crate must not declare features ({})",
                 features.join(", ")
             ),
         }
@@ -96,19 +113,23 @@ pub fn check(packages: &[PackageInfo], allow: &[AllowedPackage]) -> Vec<Violatio
             continue;
         };
 
-        if entry.role == Role::Contract && !package.features.is_empty() {
-            violations.push(Violation::ContractFeatures {
+        if entry.role == Role::Protocol && !package.features.is_empty() {
+            violations.push(Violation::ProtocolFeatures {
                 package: package.name.clone(),
                 features: package.features.clone(),
             });
         }
 
         for dependency in &package.normal_workspace_deps {
-            if entry.role == Role::Module && role_of(dependency) == Some(Role::Module) {
-                violations.push(Violation::ModuleDependency {
+            if let (Some(permitted), Some(role)) = (entry.role.may_depend_on(), role_of(dependency))
+                && !permitted.contains(&role)
+            {
+                violations.push(Violation::RoleDependency {
                     from: package.name.clone(),
                     to: dependency.clone(),
+                    role,
                 });
+                continue;
             }
             if !entry.allow.iter().any(|allowed| allowed == "*")
                 && !entry.allow.contains(dependency)
@@ -194,76 +215,146 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_workspace_that_follows_the_allowlist() {
+    fn accepts_a_workspace_that_follows_the_role_rules() {
         let packages = [
-            package("asterpath-core", &[], &[]),
-            package("asterpath-protocol", &[], &["asterpath-core"]),
+            package("asterpath-protocol", &[], &[]),
+            package("asterpath-http", &[], &["asterpath-protocol"]),
             package(
-                "asterpath-agent",
+                "asterpath-provider-openai",
                 &[],
-                &["asterpath-core", "asterpath-protocol"],
+                &["asterpath-protocol", "asterpath-http"],
             ),
+            package(
+                "asterpath",
+                &["openai"],
+                &["asterpath-protocol", "asterpath-provider-openai"],
+            ),
+            package("asterpath-cli", &[], &["asterpath", "asterpath-protocol"]),
         ];
         let allow = [
-            allowed("asterpath-core", Role::Contract, &[]),
-            allowed("asterpath-protocol", Role::Contract, &["asterpath-core"]),
+            allowed("asterpath-protocol", Role::Protocol, &[]),
+            allowed("asterpath-http", Role::Adapter, &["asterpath-protocol"]),
             allowed(
-                "asterpath-agent",
-                Role::Module,
-                &["asterpath-core", "asterpath-protocol"],
+                "asterpath-provider-openai",
+                Role::Adapter,
+                &["asterpath-protocol", "asterpath-http"],
             ),
+            allowed(
+                "asterpath",
+                Role::Engine,
+                &["asterpath-protocol", "asterpath-provider-openai"],
+            ),
+            allowed("asterpath-cli", Role::App, &["*"]),
         ];
 
         assert!(check(&packages, &allow).is_empty());
     }
 
     #[test]
-    fn rejects_a_module_to_module_dependency() {
+    fn rejects_any_workspace_dependency_of_the_protocol_crate() {
         let packages = [
-            package("asterpath-agent", &[], &["asterpath-tools"]),
-            package("asterpath-tools", &[], &[]),
+            package("asterpath-protocol", &[], &["asterpath-http"]),
+            package("asterpath-http", &[], &[]),
         ];
         let allow = [
-            allowed("asterpath-agent", Role::Module, &["*"]),
-            allowed("asterpath-tools", Role::Module, &["*"]),
+            allowed("asterpath-protocol", Role::Protocol, &["asterpath-http"]),
+            allowed("asterpath-http", Role::Adapter, &[]),
         ];
 
-        assert!(
-            check(&packages, &allow).contains(&Violation::ModuleDependency {
-                from: "asterpath-agent".to_string(),
-                to: "asterpath-tools".to_string(),
-            })
+        assert_eq!(
+            check(&packages, &allow),
+            [Violation::RoleDependency {
+                from: "asterpath-protocol".to_string(),
+                to: "asterpath-http".to_string(),
+                role: Role::Adapter,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_an_adapter_depending_on_the_engine_or_an_app() {
+        let packages = [
+            package("asterpath-skills", &[], &["asterpath", "asterpath-cli"]),
+            package("asterpath", &[], &[]),
+            package("asterpath-cli", &[], &[]),
+        ];
+        let allow = [
+            allowed(
+                "asterpath-skills",
+                Role::Adapter,
+                &["asterpath", "asterpath-cli"],
+            ),
+            allowed("asterpath", Role::Engine, &[]),
+            allowed("asterpath-cli", Role::App, &["*"]),
+        ];
+
+        assert_eq!(
+            check(&packages, &allow),
+            [
+                Violation::RoleDependency {
+                    from: "asterpath-skills".to_string(),
+                    to: "asterpath".to_string(),
+                    role: Role::Engine,
+                },
+                Violation::RoleDependency {
+                    from: "asterpath-skills".to_string(),
+                    to: "asterpath-cli".to_string(),
+                    role: Role::App,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_an_engine_dependency_on_an_app() {
+        let packages = [
+            package("asterpath", &[], &["asterpath-cli"]),
+            package("asterpath-cli", &[], &[]),
+        ];
+        let allow = [
+            allowed("asterpath", Role::Engine, &["asterpath-cli"]),
+            allowed("asterpath-cli", Role::App, &["*"]),
+        ];
+
+        assert_eq!(
+            check(&packages, &allow),
+            [Violation::RoleDependency {
+                from: "asterpath".to_string(),
+                to: "asterpath-cli".to_string(),
+                role: Role::App,
+            }]
         );
     }
 
     #[test]
     fn rejects_a_workspace_dependency_outside_the_allowlist() {
         let packages = [
-            package("asterpath-agent", &[], &["asterpath-tools"]),
-            package("asterpath-tools", &[], &[]),
+            package("asterpath-skills", &[], &["asterpath-http"]),
+            package("asterpath-http", &[], &[]),
         ];
         let allow = [
-            allowed("asterpath-agent", Role::Module, &["asterpath-core"]),
-            allowed("asterpath-tools", Role::Module, &[]),
+            allowed("asterpath-skills", Role::Adapter, &["asterpath-protocol"]),
+            allowed("asterpath-http", Role::Adapter, &[]),
         ];
 
-        assert!(
-            check(&packages, &allow).contains(&Violation::DependencyNotAllowed {
-                package: "asterpath-agent".to_string(),
-                dependency: "asterpath-tools".to_string(),
-            })
+        assert_eq!(
+            check(&packages, &allow),
+            [Violation::DependencyNotAllowed {
+                package: "asterpath-skills".to_string(),
+                dependency: "asterpath-http".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn rejects_features_on_a_contract_crate() {
-        let packages = [package("asterpath-core", &["std"], &[])];
-        let allow = [allowed("asterpath-core", Role::Contract, &[])];
+    fn rejects_features_on_the_protocol_crate() {
+        let packages = [package("asterpath-protocol", &["std"], &[])];
+        let allow = [allowed("asterpath-protocol", Role::Protocol, &[])];
 
         assert_eq!(
             check(&packages, &allow),
-            [Violation::ContractFeatures {
-                package: "asterpath-core".to_string(),
+            [Violation::ProtocolFeatures {
+                package: "asterpath-protocol".to_string(),
                 features: vec!["std".to_string()],
             }]
         );
@@ -284,14 +375,14 @@ mod tests {
     #[test]
     fn wildcard_allows_application_crates_to_depend_on_any_workspace_member() {
         let packages = [
-            package("asterpath", &[], &["asterpath-agent", "asterpath-tools"]),
-            package("asterpath-agent", &[], &[]),
-            package("asterpath-tools", &[], &[]),
+            package("asterpath-cli", &[], &["asterpath", "asterpath-skills"]),
+            package("asterpath", &[], &[]),
+            package("asterpath-skills", &[], &[]),
         ];
         let allow = [
-            allowed("asterpath", Role::App, &["*"]),
-            allowed("asterpath-agent", Role::Module, &[]),
-            allowed("asterpath-tools", Role::Module, &[]),
+            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath", Role::Engine, &[]),
+            allowed("asterpath-skills", Role::Adapter, &[]),
         ];
 
         assert!(check(&packages, &allow).is_empty());
@@ -303,20 +394,20 @@ mod tests {
         let file: AllowlistFile = toml::from_str(text).unwrap();
 
         let roster: Vec<(&str, Role)> = vec![
-            ("asterpath-protocol", Role::Contract),
-            ("asterpath-http", Role::Contract),
-            ("asterpath-sandbox", Role::Contract),
-            ("asterpath-sandbox-linux", Role::Module),
-            ("asterpath-storage-sqlite", Role::Module),
-            ("asterpath-provider-anthropic", Role::Module),
-            ("asterpath-provider-openai", Role::Module),
-            ("asterpath-plugin-host", Role::Module),
-            ("asterpath-skills", Role::Module),
-            ("asterpath-mcp-fixture", Role::Tool),
-            ("asterpath-testing", Role::Module),
-            ("asterpath", Role::App),
+            ("asterpath-protocol", Role::Protocol),
+            ("asterpath-http", Role::Adapter),
+            ("asterpath-sandbox", Role::Adapter),
+            ("asterpath-sandbox-linux", Role::Adapter),
+            ("asterpath-storage-sqlite", Role::Adapter),
+            ("asterpath-provider-anthropic", Role::Adapter),
+            ("asterpath-provider-openai", Role::Adapter),
+            ("asterpath-plugin-host", Role::Adapter),
+            ("asterpath-skills", Role::Adapter),
+            ("asterpath-testing", Role::Adapter),
+            ("asterpath", Role::Engine),
             ("asterpath-cli", Role::App),
             ("asterpath-acceptance", Role::App),
+            ("asterpath-mcp-fixture", Role::Tool),
             ("xtask", Role::Tool),
         ];
 
@@ -329,7 +420,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from allowlist"));
             assert_eq!(entry.role, role, "wrong role for {name}");
             match role {
-                Role::Contract | Role::Module => assert!(
+                Role::Protocol | Role::Adapter | Role::Engine => assert!(
                     !entry.allow.iter().any(|allowed| allowed == "*"),
                     "{name} must list explicit dependencies"
                 ),

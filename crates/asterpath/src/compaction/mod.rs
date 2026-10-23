@@ -278,7 +278,7 @@ impl DefaultCompactor {
 // `CompactionJob` carries the turn's retry policy, so the summary call uses the
 // same attempt/backoff/timeout shape as normal model calls.
 /// Usable window from the one configured source; `None` disables compaction.
-pub fn usable_window(model: &ModelSpec, config: &CompactionConfig) -> Option<u32> {
+pub(crate) fn usable_window(model: &ModelSpec, config: &CompactionConfig) -> Option<u32> {
     let window = model.context_window?;
     let reserve = config
         .reserve_output_tokens

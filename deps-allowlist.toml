@@ -1,77 +1,80 @@
-# Dependency allowlist for the Asterpath v1 workspace.
+# Dependency allowlist for the Asterpath workspace.
 #
 # Machine-readable source of truth; docs/design/packaging.md §2 is the normative
-# human-readable copy. `cargo xtask check-deps` enforces:
-#   - every workspace member is listed here;
-#   - every normal dependency on another workspace member is in that member's `allow`
-#     list ("*" = any workspace member);
-#   - module crates have no normal dependency on another module crate;
-#   - contract crates (`asterpath-protocol`) declare no features.
+# human-readable copy. `cargo xtask check-deps` enforces (ADR-0026):
+#   - every workspace member is listed here with its role;
+#   - every normal dependency on another workspace member is in that member's
+#     `allow` list ("*" = any workspace member, apps only);
+#   - role rules: `protocol` depends on no member and declares no features;
+#     an `adapter` depends only on protocol and other adapters; the `engine`
+#     depends only on protocol and the adapters it re-exports or feature-gates.
 #
 # Only normal dependencies are checked. Dev-dependencies are intentionally exempt
-# (module crates may dev-depend on `asterpath-testing` for contract suites).
+# (crates may dev-depend on `asterpath-testing` for contract suites).
 
 [[package]]
 name = "asterpath-protocol"
-role = "contract"
+role = "protocol"
 allow = []
 
-# Shared adapter library (SseDecoder; ADR-0026 re-audit candidate 5 revision). Listed as
-# a contract so adapter modules may depend on it; it is not part of the stable surface.
+# Shared HTTP / SSE plumbing for the adapters (ADR-0026 re-audit candidate 5
+# revision). An adapter peer, not part of the stable surface.
 [[package]]
 name = "asterpath-http"
-role = "contract"
+role = "adapter"
 allow = ["asterpath-protocol"]
 
+# `SandboxProvider` moves into protocol in #80 (ADR-0027).
 [[package]]
 name = "asterpath-sandbox"
-role = "contract"
+role = "adapter"
 allow = []
 
 [[package]]
 name = "asterpath-sandbox-linux"
-role = "module"
+role = "adapter"
 allow = ["asterpath-sandbox"]
 
 [[package]]
 name = "asterpath-storage-sqlite"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-provider-anthropic"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-provider-openai"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-plugin-host"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol", "asterpath-sandbox", "asterpath-http"]
 
 [[package]]
 name = "asterpath-skills"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol"]
 
-[[package]]
-name = "asterpath-mcp-fixture"
-role = "tool"
-allow = []
-
+# Test support: in-memory backend, scripted provider, fake sandbox, contract suites.
 [[package]]
 name = "asterpath-testing"
-role = "module"
+role = "adapter"
 allow = ["asterpath-protocol", "asterpath-sandbox"]
 
 [[package]]
 name = "asterpath"
-role = "app"
-allow = ["*"]
+role = "engine"
+allow = [
+    "asterpath-protocol",
+    "asterpath-provider-anthropic",
+    "asterpath-provider-openai",
+    "asterpath-storage-sqlite",
+]
 
 [[package]]
 name = "asterpath-cli"
@@ -82,6 +85,11 @@ allow = ["*"]
 name = "asterpath-acceptance"
 role = "app"
 allow = ["*"]
+
+[[package]]
+name = "asterpath-mcp-fixture"
+role = "tool"
+allow = []
 
 [[package]]
 name = "xtask"

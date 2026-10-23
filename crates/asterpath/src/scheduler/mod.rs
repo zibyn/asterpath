@@ -23,18 +23,18 @@ pub(crate) use tool::{SPAWN_TOOL_NAME, SpawnTool};
 /// One spawn request. `caused_by` is the parent `ToolCallRequested` log id.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
-pub struct SpawnRequest {
-    pub parent: ParentRef,
-    pub caused_by: LogId,
-    pub task: Vec<Part>,
-    pub context: ContextPolicy,
-    pub model_alias: Option<ModelAlias>,
-    pub tool_allowlist: Option<Vec<ToolName>>,
-    pub timeout: Option<Duration>,
+pub(crate) struct SpawnRequest {
+    pub(crate) parent: ParentRef,
+    pub(crate) caused_by: LogId,
+    pub(crate) task: Vec<Part>,
+    pub(crate) context: ContextPolicy,
+    pub(crate) model_alias: Option<ModelAlias>,
+    pub(crate) tool_allowlist: Option<Vec<ToolName>>,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl SpawnRequest {
-    pub fn new(parent: ParentRef, caused_by: LogId, task: Vec<Part>) -> Self {
+    pub(crate) fn new(parent: ParentRef, caused_by: LogId, task: Vec<Part>) -> Self {
         Self {
             parent,
             caused_by,
@@ -49,15 +49,15 @@ impl SpawnRequest {
 
 /// The parent's tool call and the child it owns.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChildRef {
-    pub parent: ParentRef,
-    pub child: SessionId,
+pub(crate) struct ChildRef {
+    pub(crate) parent: ParentRef,
+    pub(crate) child: SessionId,
 }
 
 /// `SpawnError` means no child session was created.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum SpawnError {
+pub(crate) enum SpawnError {
     #[error("sub-agent depth exceeded")]
     DepthExceeded,
     #[error("invalid spawn arguments: {message}")]
@@ -69,7 +69,7 @@ pub enum SpawnError {
 /// The parent-side end of a wait.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum WaitError {
+pub(crate) enum WaitError {
     #[error("sub-agent wait was cancelled")]
     Cancelled,
     #[error("sub-agent wait timed out")]

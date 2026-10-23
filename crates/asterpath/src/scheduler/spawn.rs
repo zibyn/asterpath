@@ -30,7 +30,7 @@ const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("no
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
 
-pub struct Scheduler {
+pub(crate) struct Scheduler {
     log: Arc<dyn EventLog>,
     catalog: Arc<dyn SessionCatalog>,
     executor: Arc<Waits>,
