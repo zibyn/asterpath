@@ -150,10 +150,6 @@ impl Agent {
             .insert(session)
     }
 
-    async fn scan(&self, session: SessionId) -> Result<Vec<LogEntry>, AgentError> {
-        Ok(scan_all(&*self.log, session).await?)
-    }
-
     async fn append(
         &self,
         session: SessionId,
@@ -567,7 +563,7 @@ impl Agent {
     /// Steps of `turn` already recorded.
     async fn steps_in_turn(&self, session: SessionId, turn: TurnId) -> Result<u32, AgentError> {
         let mut count = 0;
-        for entry in self.scan(session).await? {
+        for entry in scan_all(&*self.log, session).await? {
             let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
@@ -991,7 +987,7 @@ impl Agent {
         config: &ConfigSnapshot,
         watermark: u64,
     ) -> Result<ModelRequest, AgentError> {
-        let entries = self.scan(session).await?;
+        let entries = scan_all(&*self.log, session).await?;
         let mut visible = Vec::new();
         let mut prefix_epoch = 0u32;
         for entry in entries {
@@ -1043,7 +1039,7 @@ impl Agent {
     }
 
     async fn seq_of(&self, session: SessionId, log_id: LogId) -> Result<u64, AgentError> {
-        self.scan(session)
+        scan_all(&*self.log, session)
             .await?
             .into_iter()
             .find(|entry| entry.log_id == log_id)
@@ -1136,7 +1132,7 @@ impl Agent {
         trigger: CompactionTrigger,
         watermark: u64,
     ) -> Result<(CompactionInput, LogId), AgentError> {
-        let entries = self.scan(session).await?;
+        let entries = scan_all(&*self.log, session).await?;
         let frontier = entries
             .last()
             .map(|entry| entry.log_id)
