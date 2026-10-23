@@ -1253,3 +1253,140 @@ async fn the_gate_is_consulted_before_every_step() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(provider.requests().len(), 1);
 }
+
+// --- hook call sites on the recovery path ----------------------------------
+
+struct CountPre(Arc<AtomicUsize>);
+
+impl Middleware<PreExecuteEvent> for CountPre {
+    fn handle<'a>(
+        &'a self,
+        event: PreExecuteEvent,
+        next: Next<'a, PreExecuteEvent>,
+    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        next.run(event)
+    }
+}
+
+struct CountPost(Arc<Mutex<Vec<ToolResultStatus>>>);
+
+impl Middleware<PostExecuteEvent> for CountPost {
+    fn handle<'a>(
+        &'a self,
+        event: PostExecuteEvent,
+        next: Next<'a, PostExecuteEvent>,
+    ) -> BoxFuture<'a, Result<PostExecuteEvent, PostExecuteError>> {
+        self.0.lock().unwrap().push(event.status);
+        next.run(event)
+    }
+}
+
+struct CountGate(Arc<AtomicUsize>);
+
+impl Middleware<PreStepGateEvent> for CountGate {
+    fn handle<'a>(
+        &'a self,
+        event: PreStepGateEvent,
+        next: Next<'a, PreStepGateEvent>,
+    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        next.run(event)
+    }
+}
+
+/// Recovery of an open step: the recorded unsafe intent gets a framework
+/// `Interrupted` that skips both tool hooks; only the fresh call runs them, and
+/// the step gate is consulted before new steps only.
+#[tokio::test]
+async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
+    let turn = TurnId::from_bytes([2; 16]);
+    let step = asterpath_core::StepId::from_bytes([3; 16]);
+    let recorded = ToolCallId::from_bytes([4; 16]);
+    let danger = ToolDescriptor {
+        replay: ReplaySafety::Unsafe,
+        ..descriptor("danger")
+    };
+    let log = new_log(config(vec![descriptor("echo"), danger.clone()])).await;
+    append(&log, SessionEvent::TurnStarted { turn_id: turn }).await;
+    append(
+        &log,
+        SessionEvent::StepStarted {
+            turn_id: turn,
+            step_id: step,
+        },
+    )
+    .await;
+    append(
+        &log,
+        SessionEvent::AssistantMessage {
+            turn_id: turn,
+            step_id: step,
+            items: vec![
+                tool_call("provider-a", "danger", "{}"),
+                tool_call("provider-b", "echo", "{}"),
+            ],
+            raw: None,
+            model: config(Vec::new()).model,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        },
+    )
+    .await;
+    append(
+        &log,
+        SessionEvent::ToolCallRequested {
+            turn_id: turn,
+            step_id: step,
+            tool_call_id: recorded,
+            provider_call_id: "provider-a".to_owned(),
+            name: ToolName::new("danger"),
+            raw_args: JsonString::new("{}"),
+            replay: ReplaySafety::Unsafe,
+            provenance: Provenance::InProcess,
+        },
+    )
+    .await;
+
+    let (echo, _) = TestTool::echo(descriptor("echo"));
+    let (danger_tool, danger_calls) = TestTool::echo(danger);
+    let registry = TestRegistry::with(vec![echo, danger_tool]);
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        assistant_text("done"),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let pre = Arc::new(AtomicUsize::new(0));
+    let post = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(AtomicUsize::new(0));
+    let (pre_c, post_c, gate_c) = (Arc::clone(&pre), Arc::clone(&post), Arc::clone(&gate));
+    let hooks = hooks_with(move |ctx| {
+        ctx.intercept(CountPre(Arc::clone(&pre_c)));
+        ctx.intercept(CountPost(Arc::clone(&post_c)));
+        ctx.intercept(CountGate(Arc::clone(&gate_c)));
+    })
+    .await;
+    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    drive(&agent).await;
+
+    let events = decoded(&log).await;
+    assert!(
+        results(&events)
+            .iter()
+            .any(|(call, status, _)| *call == recorded
+                && *status == ToolResultStatus::Interrupted),
+        "the recorded unsafe intent is interrupted by the framework"
+    );
+    assert!(danger_calls.lock().unwrap().is_empty());
+    assert_eq!(pre.load(Ordering::SeqCst), 1, "only the fresh call");
+    assert_eq!(
+        *post.lock().unwrap(),
+        [ToolResultStatus::Completed],
+        "the framework-written Interrupted skips post-execute"
+    );
+    assert_eq!(
+        gate.load(Ordering::SeqCst),
+        1,
+        "the recovered open step is not gated; the next step is"
+    );
+}
