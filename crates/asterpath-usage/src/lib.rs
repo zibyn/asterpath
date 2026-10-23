@@ -10,12 +10,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use asterpath_core::{
-    DedupKey, EventLog, LifecycleError, LogEntry, LogQuery, Module, ModuleCtx, ServiceId,
-    SessionCatalog, SessionId, StepId, StorageError, TurnId,
+    DedupKey, EventLog, LogEntry, LogQuery, SessionCatalog, SessionId, StepId, StorageError, TurnId,
 };
 use asterpath_protocol::{
-    USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery,
-    UsageRecord, UsageReport, UsageScope, UsageTotals, decode_entry, usage_of,
+    Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery, UsageRecord, UsageReport,
+    UsageScope, UsageTotals, decode_entry, usage_of,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -328,43 +327,5 @@ fn storage_error(session: SessionId, error: StorageError) -> UsageError {
     match error {
         StorageError::Corrupt { detail, .. } => UsageError::Corrupt { session, detail },
         other => UsageError::Backend(other.to_string()),
-    }
-}
-
-/// Provides [`USAGE_QUERY_SERVICE`]; the composition root injects the log and
-/// the session tree.
-pub struct UsageModule {
-    service: Arc<UsageService>,
-}
-
-impl UsageModule {
-    pub fn new(log: Arc<dyn EventLog>, catalog: Arc<dyn SessionCatalog>) -> Self {
-        Self {
-            service: Arc::new(UsageService::new(log, catalog)),
-        }
-    }
-
-    pub fn query(&self) -> Arc<dyn UsageQuery> {
-        self.service.clone()
-    }
-}
-
-const PROVIDED: [ServiceId; 1] = [USAGE_QUERY_SERVICE.id()];
-
-impl Module for UsageModule {
-    fn name(&self) -> &'static str {
-        "usage"
-    }
-
-    fn provides(&self) -> &[ServiceId] {
-        &PROVIDED
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        Box::pin(async move {
-            let query: Arc<dyn UsageQuery> = self.service.clone();
-            ctx.provide(USAGE_QUERY_SERVICE, query)?;
-            Ok(())
-        })
     }
 }

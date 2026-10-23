@@ -9,8 +9,8 @@ use asterpath_core::{
     ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
 };
 use asterpath_protocol::{
-    AgentRunner, ApprovalPolicy, Compactor, DefaultApprovalPolicy, ModelAlias, ModelSpec, Provider,
-    Tool, ToolConfig,
+    AgentRunner, ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec,
+    Provider, Tool, ToolConfig,
 };
 
 use crate::error::AsterError;
@@ -39,6 +39,8 @@ pub struct AsterpathConfig {
     /// Process-wide cap on live child sessions across all parents.
     pub max_live_children: NonZeroUsize,
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
+    /// Extension hooks, called in this order (ADR-0025).
+    pub hooks: Vec<Arc<dyn Hooks>>,
 }
 
 impl Default for AsterpathConfig {
@@ -60,6 +62,7 @@ impl Default for AsterpathConfig {
             gate,
             max_live_children: NonZeroUsize::new(32).expect("non-zero"),
             model_aliases: BTreeMap::new(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -113,6 +116,13 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn agent(mut self, agent: Arc<dyn AgentRunner>) -> Self {
         self.config.agent = Some(agent);
+        self
+    }
+
+    /// Register one hook; may be called repeatedly. Hooks run in this order.
+    #[must_use]
+    pub fn hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
+        self.config.hooks.push(hooks);
         self
     }
 

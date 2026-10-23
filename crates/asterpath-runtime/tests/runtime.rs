@@ -3,15 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use asterpath_core::{
-    AwaitSignal, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, LifecycleError, LogQuery,
-    Module, ModuleCtx, ModuleHost, ServiceId, SessionId, SignalDelivery, SignalId, SignalName,
-    ToolCallId, WakeCause,
+    AwaitSignal, DurableExecutor, EventLog, LogQuery, SessionId, SignalDelivery, SignalId,
+    SignalName, ToolCallId, WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry};
-use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
+use asterpath_runtime::RuntimeExecutor;
 use asterpath_testing::InMemoryEventLog;
 use futures_util::StreamExt;
 
@@ -142,56 +139,22 @@ async fn duplicate_delivery_and_repeat_waits_collapse() {
 }
 
 #[tokio::test]
-async fn module_provides_the_executor_through_the_host() {
+async fn a_delivered_signal_satisfies_a_later_wake_wait() {
     let fixture = fixture();
-    let seen = Arc::new(AtomicBool::new(false));
-
-    struct Probe(Arc<AtomicBool>);
-
-    impl Module for Probe {
-        fn name(&self) -> &'static str {
-            "probe"
-        }
-
-        fn dependencies(&self) -> &[ServiceId] {
-            static IDS: [ServiceId; 1] = [DURABLE_EXECUTOR_SERVICE.id()];
-            &IDS
-        }
-
-        fn init<'a>(
-            &'a self,
-            ctx: &'a ModuleCtx,
-        ) -> futures_core::future::BoxFuture<'a, Result<(), LifecycleError>> {
-            let seen = Arc::clone(&self.0);
-            Box::pin(async move {
-                let executor = ctx.require(DURABLE_EXECUTOR_SERVICE)?;
-                // The service is the real durable executor.
-                let signal = SignalId::from_bytes([5; 16]);
-                executor
-                    .deliver_signal(SignalDelivery {
-                        session: SESSION,
-                        signal,
-                        name: SignalName::new("tool.approval.05"),
-                        payload: serde_json::json!("Allow"),
-                    })
-                    .await
-                    .expect("deliver");
-                assert!(
-                    executor
-                        .await_wake(SESSION, WakeCause::Signal(signal))
-                        .await
-                        .is_ok()
-                );
-                seen.store(true, Ordering::SeqCst);
-                Ok(())
-            })
-        }
-    }
-
-    let mut host = ModuleHost::new();
-    host.register(Arc::new(RuntimeModule::new(Arc::clone(&fixture.executor))));
-    host.register(Arc::new(Probe(Arc::clone(&seen))));
-    host.init().await.expect("host init");
-    assert!(seen.load(Ordering::SeqCst));
-    host.shutdown().await;
+    let signal = SignalId::from_bytes([5; 16]);
+    fixture
+        .executor
+        .deliver_signal(SignalDelivery {
+            session: SESSION,
+            signal,
+            name: SignalName::new("tool.approval.05"),
+            payload: serde_json::json!("Allow"),
+        })
+        .await
+        .expect("deliver");
+    fixture
+        .executor
+        .await_wake(SESSION, WakeCause::Signal(signal))
+        .await
+        .expect("the recorded signal satisfies the wait");
 }

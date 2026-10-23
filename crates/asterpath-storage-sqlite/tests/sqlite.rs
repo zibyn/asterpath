@@ -8,22 +8,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use asterpath_core::{
-    DedupKey, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId, LogQuery, Module,
-    ModuleCtx, ModuleHost, NewEntry, SESSION_CATALOG_SERVICE, SESSION_RETIREMENT_SERVICE,
-    STORAGE_SERVICE, ServiceId, SessionCatalog, SessionId, StorageError, ToolCallId, TurnId,
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId,
+    StorageError, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent,
     dedup,
 };
-use asterpath_storage_sqlite::{SqliteStorageModule, open};
+use asterpath_storage_sqlite::open;
 use common::TempDir;
-use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
 
 const HELPER_MODE: &str = "ASTERPATH_STORAGE_HELPER_MODE";
@@ -425,51 +422,4 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
         .map(|result| result.expect("child"))
         .collect();
     assert_eq!(children, vec![child]);
-}
-
-// ---------------------------------------------------------------------------
-// Module wiring.
-// ---------------------------------------------------------------------------
-
-struct Probe;
-
-const PROBE_DEPS: [ServiceId; 4] = [
-    EVENT_LOG_SERVICE.id(),
-    STORAGE_SERVICE.id(),
-    SESSION_CATALOG_SERVICE.id(),
-    SESSION_RETIREMENT_SERVICE.id(),
-];
-
-impl Module for Probe {
-    fn name(&self) -> &'static str {
-        "probe"
-    }
-
-    fn dependencies(&self) -> &[ServiceId] {
-        &PROBE_DEPS
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        Box::pin(async move {
-            ctx.require(EVENT_LOG_SERVICE)?;
-            ctx.require(STORAGE_SERVICE)?;
-            ctx.require(SESSION_CATALOG_SERVICE)?;
-            ctx.require(SESSION_RETIREMENT_SERVICE)?;
-            Ok(())
-        })
-    }
-}
-
-#[test]
-fn module_provides_the_four_capabilities() {
-    let dir = TempDir::new("module");
-    let backend = open(dir.db()).expect("open");
-    let module = SqliteStorageModule::new(Arc::clone(&backend));
-    assert_eq!(module.provides(), &PROBE_DEPS);
-
-    let mut host = ModuleHost::new();
-    // Registered before the provider: topological order must fix that.
-    host.register(Arc::new(Probe));
-    host.register(Arc::new(module));
-    block_on(host.init()).expect("module host initializes");
 }

@@ -18,22 +18,20 @@ use std::time::Duration;
 
 use asterpath_core::{
     ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
-    LogQuery, ModuleCtx, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId,
-    unique_bytes,
+    LogQuery, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CancelReason, CancelRegistration, CancelToken,
     CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
-    Compactor, ConfigSnapshot, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents, Parallelism,
-    PostExecuteError, PostExecuteEvent, PreExecuteError, PreExecuteEvent, PreStepGateDecision,
-    PreStepGateEvent, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
-    ProviderErrorKind, RecordAppended, ReplaySafety, ResumeReason, RunRequest, SessionEvent,
-    SessionState, StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor,
-    ToolError, ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus,
-    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageRecorded, approval_signal_id,
-    approval_signal_name, decode_entry, dedup, usage_of,
+    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT,
+    OpenIntents, Parallelism, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
+    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState, StepCtx,
+    StopReason, StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
+    ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolRegistry,
+    ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageQuery,
+    approval_signal_id, approval_signal_name, decode_entry, dedup,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -53,7 +51,10 @@ pub struct Agent {
     gate: Arc<ApprovalGate>,
     executor: Arc<dyn DurableExecutor>,
     clock: Arc<dyn Clock>,
-    hooks: Option<ModuleCtx>,
+    /// Host hooks, called in registration order (ADR-0025).
+    hooks: Vec<Arc<dyn Hooks>>,
+    /// Backs `StepCtx::usage` / `ToolCallCtx::usage`.
+    usage: Option<Arc<dyn UsageQuery>>,
     compactor: Option<Arc<dyn Compactor>>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
     cancellations: Arc<CancellationRegistry>,
@@ -72,7 +73,6 @@ impl Agent {
         gate: Arc<ApprovalGate>,
         executor: Arc<dyn DurableExecutor>,
         clock: Arc<dyn Clock>,
-        hooks: Option<ModuleCtx>,
     ) -> Self {
         Self {
             log,
@@ -83,7 +83,8 @@ impl Agent {
             gate,
             executor,
             clock,
-            hooks,
+            hooks: Vec::new(),
+            usage: None,
             compactor: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             cancellations: Arc::new(CancellationRegistry::new()),
@@ -95,6 +96,18 @@ impl Agent {
     #[must_use]
     pub fn with_compactor(mut self, compactor: Option<Arc<dyn Compactor>>) -> Self {
         self.compactor = compactor;
+        self
+    }
+
+    /// Register host hooks; `usage` backs their `usage()` lookups.
+    #[must_use]
+    pub fn with_hooks(
+        mut self,
+        hooks: Vec<Arc<dyn Hooks>>,
+        usage: Option<Arc<dyn UsageQuery>>,
+    ) -> Self {
+        self.hooks = hooks;
+        self.usage = usage;
         self
     }
 
@@ -138,65 +151,13 @@ impl Agent {
         event: SessionEvent,
         key: Option<DedupKey>,
     ) -> Result<LogId, AgentError> {
-        let entry =
-            asterpath_protocol::encode_entry(session, key.clone(), &event).map_err(|error| {
-                AgentError::Corrupt {
-                    session,
-                    detail: error.to_string(),
-                }
-            })?;
-        let log_id = self.log.append(entry).await?;
-        // The loop is the unique writer of every usage terminal, so it is the
-        // only emitter. Awaiting keeps the event ordered before the next gate.
-        if let Some(hooks) = &self.hooks {
-            let compaction_turn = match &event {
-                SessionEvent::CompactionApplied { .. } => {
-                    self.compaction_turn(session, key.as_ref()).await?
-                }
-                _ => None,
-            };
-            let recorded = usage_of(&event, compaction_turn).map(|entry| UsageRecorded {
-                session,
-                turn: entry.turn,
-                step: entry.step,
-                model: entry.model,
-                bucket: entry.bucket,
-                usage: entry.usage,
-                log: log_id,
-            });
-            if let Some(recorded) = recorded {
-                hooks.emit(recorded).await;
-            }
-        }
-        // Observers see the record once it is visible; never part of recovery.
-        if let Some(bus) = &self.hooks {
-            bus.emit(RecordAppended { session }).await;
-        }
-        Ok(log_id)
-    }
-
-    /// The turn recorded on the `CompactionStarted` with this dedup key.
-    async fn compaction_turn(
-        &self,
-        session: SessionId,
-        key: Option<&DedupKey>,
-    ) -> Result<Option<TurnId>, AgentError> {
-        let Some(key) = key else {
-            return Ok(None);
-        };
-        for entry in self.scan(session).await? {
-            if entry.dedup_key.as_ref() != Some(key) {
-                continue;
-            }
-            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
+        let entry = asterpath_protocol::encode_entry(session, key, &event).map_err(|error| {
+            AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
-            })?;
-            if let SessionEvent::CompactionStarted { turn, .. } = event {
-                return Ok(turn);
             }
-        }
-        Ok(None)
+        })?;
+        Ok(self.log.append(entry).await?)
     }
 
     async fn execute(&self, session: SessionId, cancel: &CancelToken, events: &EventSink) {
@@ -506,6 +467,12 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let mut pending = existing_step;
         let mut steps_started = 0u32;
+        // Steps of this turn already in the log; only read when hooks need it.
+        let prior_steps = if self.hooks.is_empty() {
+            0
+        } else {
+            self.steps_in_turn(session, turn).await?
+        };
         let mut auto_compactions = 0u32;
 
         loop {
@@ -562,7 +529,10 @@ impl Agent {
                             }
                         }
                     }
-                    match self.pre_step_gate(session, turn).await {
+                    match self
+                        .before_step(session, turn, prior_steps + steps_started)
+                        .await
+                    {
                         GateOutcome::Continue => {}
                         GateOutcome::Stop(reason) => {
                             return self
@@ -631,20 +601,38 @@ impl Agent {
         }
     }
 
-    /// Run the host's typed pre-step waterfall; no hooks means `Continue`.
-    async fn pre_step_gate(&self, session: SessionId, turn: TurnId) -> GateOutcome {
-        let Some(hooks) = &self.hooks else {
-            return GateOutcome::Continue;
-        };
-        match hooks.waterfall(PreStepGateEvent::new(session, turn)).await {
-            Ok(event) => match event.decision {
-                PreStepGateDecision::Continue => GateOutcome::Continue,
-                PreStepGateDecision::EndTurn { reason } => GateOutcome::Stop(reason),
-                // Forward-compatible decisions do not stop the turn.
-                _ => GateOutcome::Continue,
-            },
-            Err(_) => GateOutcome::Failed,
+    /// Steps of `turn` already recorded.
+    async fn steps_in_turn(&self, session: SessionId, turn: TurnId) -> Result<u32, AgentError> {
+        let mut count = 0;
+        for entry in self.scan(session).await? {
+            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
+                session,
+                detail: error.to_string(),
+            })?;
+            if matches!(event, SessionEvent::StepStarted { turn_id, .. } if turn_id == turn) {
+                count += 1;
+            }
         }
+        Ok(count)
+    }
+
+    /// Host `before_step` hooks in order; the first `EndTurn` wins and an
+    /// error or panic fails the turn.
+    async fn before_step(&self, session: SessionId, turn: TurnId, step_index: u32) -> GateOutcome {
+        if self.hooks.is_empty() {
+            return GateOutcome::Continue;
+        }
+        let ctx = StepCtx::new(session, turn, step_index, self.usage.clone());
+        for hook in &self.hooks {
+            match caught(|| hook.before_step(&ctx)).await {
+                Ok(Gate::Continue) => {}
+                Ok(Gate::EndTurn { reason }) => return GateOutcome::Stop(reason),
+                // Forward-compatible decisions do not stop the turn.
+                Ok(_) => {}
+                Err(_) => return GateOutcome::Failed,
+            }
+        }
+        GateOutcome::Continue
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1067,6 +1055,7 @@ impl Agent {
                                         tool,
                                         descriptor,
                                         tool_call_id: intent.tool_call_id,
+                                        provider_call_id: call.provider_call_id.clone(),
                                         name: intent.name.clone(),
                                         args: intent.args.clone(),
                                     });
@@ -1090,27 +1079,27 @@ impl Agent {
                 continue;
             }
 
-            // No recorded intent: pre-execute runs for this call only.
+            // No recorded intent: `before_tool` runs for this call only.
             let tool_call_id = ToolCallId::from_bytes(self.fresh_id());
             let mut args = call.raw_args;
-            let failure = self
-                .pre_execute(
-                    session,
-                    turn,
-                    step,
-                    tool_call_id,
-                    &call.provider_call_id,
-                    &call.name,
-                    &mut args,
-                )
-                .await?;
-
             let tool = self.tools.get(&call.name);
             let descriptor = tool.as_ref().map(|tool| tool.descriptor().clone());
             let (replay, provenance) = match &descriptor {
                 Some(descriptor) => (descriptor.replay, descriptor.provenance),
                 None => (ReplaySafety::Unsafe, Provenance::Unknown),
             };
+            let ctx = ToolCallCtx::new(
+                session,
+                turn,
+                step,
+                tool_call_id,
+                call.provider_call_id.clone(),
+                call.name.clone(),
+                provenance,
+                replay,
+                self.usage.clone(),
+            );
+            let failure = self.before_tool(&ctx, &mut args).await;
             self.append(
                 session,
                 SessionEvent::ToolCallRequested {
@@ -1192,6 +1181,7 @@ impl Agent {
                                     tool,
                                     descriptor,
                                     tool_call_id,
+                                    provider_call_id: ctx.provider_call_id.clone(),
                                     name: call.name,
                                     args,
                                 });
@@ -1484,40 +1474,45 @@ impl Agent {
                 truncated = was_truncated;
             }
 
-            if let Some(hooks) = &self.hooks {
-                let event = PostExecuteEvent::new(
+            if !self.hooks.is_empty() {
+                let ctx = ToolCallCtx::new(
                     session,
                     turn,
                     step,
                     item.tool_call_id,
+                    item.provider_call_id.clone(),
                     item.name.clone(),
+                    item.descriptor.provenance,
+                    item.descriptor.replay,
+                    self.usage.clone(),
+                );
+                let mut view = ToolResultView::new(
                     status,
                     output.clone().unwrap_or_default(),
                     error.clone(),
                     truncated,
                 );
-                match hooks.waterfall(event).await {
-                    Ok(event) => {
-                        // Status is not a post-execute concern; only content and
+                match self.after_tool(&ctx, &mut view).await {
+                    Ok(()) => {
+                        // Status is not an after_tool concern; only content and
                         // the model-visible error message are rewritable.
                         if status == ToolResultStatus::Completed {
-                            output = Some(event.output);
-                            truncated = event.truncated;
+                            output = Some(view.output);
+                            truncated = view.truncated;
                         }
                         if status == ToolResultStatus::Failed {
-                            error = event.error;
+                            error = view.error;
                         }
                     }
-                    Err(PostExecuteError::Internal { message }) => {
+                    Err(failure) => {
                         status = ToolResultStatus::Failed;
                         output = None;
                         error = Some(ToolErrorInfo {
                             kind: ToolErrorKind::Internal,
-                            message,
+                            message: failure.message,
                         });
                         truncated = false;
                     }
-                    Err(_) => {}
                 }
             }
 
@@ -1535,40 +1530,33 @@ impl Agent {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn pre_execute(
-        &self,
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        tool_call_id: ToolCallId,
-        provider_call_id: &str,
-        name: &ToolName,
-        args: &mut ToolArgs,
-    ) -> Result<Option<PreFailure>, AgentError> {
-        let Some(hooks) = &self.hooks else {
-            return Ok(None);
-        };
-        let event = PreExecuteEvent::new(
-            session,
-            turn,
-            step,
-            tool_call_id,
-            provider_call_id.to_owned(),
-            name.clone(),
-            args.clone(),
-        );
-        match hooks.waterfall(event).await {
-            Ok(event) => {
-                *args = event.args;
-                Ok(None)
+    /// Host `before_tool` hooks in order: rewrites pass along, the first
+    /// `Deny` short-circuits, and an error or panic fails the call.
+    async fn before_tool(&self, ctx: &ToolCallCtx, args: &mut ToolArgs) -> Option<PreFailure> {
+        for hook in &self.hooks {
+            match caught(|| hook.before_tool(ctx, args)).await {
+                Ok(ToolGate::Deny { reason }) => {
+                    return Some(PreFailure::Denied(
+                        reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => return Some(PreFailure::Internal(error.message)),
             }
-            Err(PreExecuteError::Denied { reason }) => Ok(Some(PreFailure::Denied(
-                reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
-            ))),
-            Err(PreExecuteError::Internal { message }) => Ok(Some(PreFailure::Internal(message))),
-            Err(_) => Ok(Some(PreFailure::Internal("pre-execute failed".to_owned()))),
         }
+        None
+    }
+
+    /// Host `after_tool` hooks in order; the first error or panic wins.
+    async fn after_tool(
+        &self,
+        ctx: &ToolCallCtx,
+        view: &mut ToolResultView,
+    ) -> Result<(), HookError> {
+        for hook in &self.hooks {
+            caught(|| hook.after_tool(ctx, view)).await?;
+        }
+        Ok(())
     }
 
     /// A recorded approval signal wins over the current policy and is never
@@ -2142,6 +2130,7 @@ struct ExistingStep {
 }
 
 struct Runnable {
+    provider_call_id: String,
     tool: Arc<dyn Tool>,
     descriptor: ToolDescriptor,
     tool_call_id: ToolCallId,
@@ -2305,6 +2294,21 @@ impl Stream for DriveStream<'_> {
                 }
             }
         }
+    }
+}
+
+/// Run one hook call; a panic, while building or polling its future, counts
+/// as that hook's error.
+async fn caught<'a, T>(
+    call: impl FnOnce() -> BoxFuture<'a, Result<T, HookError>>,
+) -> Result<T, HookError> {
+    let panicked = || HookError::new("hook panicked");
+    match std::panic::catch_unwind(AssertUnwindSafe(call)) {
+        Ok(hook) => AssertUnwindSafe(hook)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(panicked())),
+        Err(_) => Err(panicked()),
     }
 }
 

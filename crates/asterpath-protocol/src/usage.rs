@@ -1,8 +1,7 @@
 //! Token usage in the exclusive normalization, plus the native usage-query
-//! contract: buckets, scopes, records, rollup totals and the live
-//! `UsageRecorded` notification.
+//! contract: buckets, scopes, records and rollup totals.
 
-use asterpath_core::{Event, LogId, ServiceKey, SessionId, StepId, TurnId, service_key};
+use asterpath_core::{LogId, SessionId, StepId, TurnId};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -194,21 +193,3 @@ pub enum UsageError {
     #[error("usage backend error: {0}")]
     Backend(String),
 }
-
-/// Live notification emitted by the unique writer after a usage terminal lands.
-///
-/// Not a log event and not persisted; history is rebuilt with [`UsageQuery`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct UsageRecorded {
-    pub session: SessionId,
-    pub turn: Option<TurnId>,
-    pub step: Option<StepId>,
-    pub model: ModelSpec,
-    pub bucket: UsageBucket,
-    pub usage: Usage,
-    pub log: LogId,
-}
-
-impl Event for UsageRecorded {}
-
-pub const USAGE_QUERY_SERVICE: ServiceKey<dyn UsageQuery> = service_key("UsageQuery");

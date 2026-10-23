@@ -5,7 +5,7 @@
 //! `plan` returns `Summarize` and writes the terminal event from `compact`'s
 //! result, so there is exactly one writer and one commit point.
 
-use asterpath_core::{LogId, LogIdRange, ServiceKey, service_key};
+use asterpath_core::{LogId, LogIdRange};
 use futures_core::future::BoxFuture;
 
 use crate::agent::{CompactionError, CompactionOutcome};
@@ -89,5 +89,3 @@ pub trait Compactor: Send + Sync {
         job: CompactionJob,
     ) -> BoxFuture<'a, Result<CompactSummary, CompactionError>>;
 }
-
-pub const COMPACTOR_SERVICE: ServiceKey<dyn Compactor> = service_key("Compactor");

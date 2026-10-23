@@ -11,14 +11,8 @@
 
 use std::time::Duration;
 
-use asterpath_core::{
-    Clock, ExecutionError, LogId, Module, ModuleCtx, ServiceId, ServiceKey, SessionId, SystemClock,
-    service_key,
-};
-use asterpath_protocol::{
-    CancellationRegistry, ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part,
-    TOOL_REGISTRY_SERVICE, ToolName,
-};
+use asterpath_core::{ExecutionError, LogId, SessionId};
+use asterpath_protocol::{ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part, ToolName};
 use futures_core::future::BoxFuture;
 
 mod scheduler;
@@ -92,89 +86,4 @@ pub enum WaitError {
     Timeout,
     #[error(transparent)]
     Execution(#[from] ExecutionError),
-}
-
-pub const SUBAGENT_SPAWNER_SERVICE: ServiceKey<dyn SubagentSpawner> =
-    service_key("SubagentSpawner");
-
-/// Provides the spawner service and registers the `spawn_agent` tool.
-pub struct SchedulerModule {
-    scheduler: std::sync::Arc<Scheduler>,
-}
-
-impl SchedulerModule {
-    pub fn new(
-        log: std::sync::Arc<dyn asterpath_core::EventLog>,
-        catalog: std::sync::Arc<dyn asterpath_core::SessionCatalog>,
-        executor: std::sync::Arc<dyn asterpath_core::DurableExecutor>,
-        model_aliases: std::collections::BTreeMap<ModelAlias, asterpath_protocol::ModelSpec>,
-    ) -> Self {
-        Self::with_runtime(
-            log,
-            catalog,
-            executor,
-            model_aliases,
-            std::sync::Arc::new(SystemClock),
-            crate::scheduler::DEFAULT_MAX_LIVE_CHILDREN,
-            std::sync::Arc::new(CancellationRegistry::new()),
-        )
-    }
-
-    /// Full wiring, used by the facade: injected clock, global live-child cap
-    /// and the registry the agent shares.
-    pub fn with_runtime(
-        log: std::sync::Arc<dyn asterpath_core::EventLog>,
-        catalog: std::sync::Arc<dyn asterpath_core::SessionCatalog>,
-        executor: std::sync::Arc<dyn asterpath_core::DurableExecutor>,
-        model_aliases: std::collections::BTreeMap<ModelAlias, asterpath_protocol::ModelSpec>,
-        clock: std::sync::Arc<dyn Clock>,
-        max_live_children: std::num::NonZeroUsize,
-        cancellations: std::sync::Arc<CancellationRegistry>,
-    ) -> Self {
-        Self {
-            scheduler: std::sync::Arc::new(Scheduler::with_runtime(
-                log,
-                catalog,
-                executor,
-                model_aliases,
-                clock,
-                max_live_children,
-                cancellations,
-            )),
-        }
-    }
-
-    pub fn scheduler(&self) -> std::sync::Arc<Scheduler> {
-        std::sync::Arc::clone(&self.scheduler)
-    }
-}
-
-impl Module for SchedulerModule {
-    fn name(&self) -> &'static str {
-        "scheduler"
-    }
-
-    fn dependencies(&self) -> &[ServiceId] {
-        static IDS: [ServiceId; 1] = [TOOL_REGISTRY_SERVICE.id()];
-        &IDS
-    }
-
-    fn provides(&self) -> &[ServiceId] {
-        static IDS: [ServiceId; 1] = [SUBAGENT_SPAWNER_SERVICE.id()];
-        &IDS
-    }
-
-    fn init<'a>(
-        &'a self,
-        ctx: &'a ModuleCtx,
-    ) -> BoxFuture<'a, Result<(), asterpath_core::LifecycleError>> {
-        Box::pin(async move {
-            let registry = ctx.require(TOOL_REGISTRY_SERVICE)?;
-            self.scheduler.set_event_bus(ctx.clone());
-            let spawner: std::sync::Arc<dyn SubagentSpawner> = self.scheduler.clone();
-            ctx.provide(SUBAGENT_SPAWNER_SERVICE, spawner)?;
-            registry.register(std::sync::Arc::new(SpawnTool::new(self.scheduler.clone())));
-            Ok(())
-        })
-    }
 }

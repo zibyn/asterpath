@@ -13,10 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_core::{
-    Clock, DedupKey, EVENT_LOG_SERVICE, EventLog, LifecycleError, LogEntry, LogId, LogQuery,
-    Module, ModuleCtx, NewEntry, RetirementError, SESSION_CATALOG_SERVICE,
-    SESSION_RETIREMENT_SERVICE, STORAGE_SERVICE, ServiceId, SessionCatalog, SessionId,
-    SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
+    Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError,
+    SessionCatalog, SessionId, SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{OpenIntent, OpenIntents, SessionEvent, decode_payload};
 use futures_core::future::BoxFuture;
@@ -452,48 +450,6 @@ impl SessionCatalog for SqliteStorage {
 
     fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
         stream::iter(self.children_sync(session)).boxed()
-    }
-}
-
-/// Module wrapper so the composition root can provide the three capabilities.
-pub struct SqliteStorageModule {
-    backend: Arc<SqliteStorage>,
-}
-
-impl SqliteStorageModule {
-    pub fn new(backend: Arc<SqliteStorage>) -> Self {
-        Self { backend }
-    }
-}
-
-const PROVIDED: [ServiceId; 4] = [
-    EVENT_LOG_SERVICE.id(),
-    STORAGE_SERVICE.id(),
-    SESSION_CATALOG_SERVICE.id(),
-    SESSION_RETIREMENT_SERVICE.id(),
-];
-
-impl Module for SqliteStorageModule {
-    fn name(&self) -> &'static str {
-        "asterpath-storage-sqlite"
-    }
-
-    fn provides(&self) -> &[ServiceId] {
-        &PROVIDED
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        Box::pin(async move {
-            let log: Arc<dyn EventLog> = self.backend.clone();
-            ctx.provide(EVENT_LOG_SERVICE, log)?;
-            let storage: Arc<dyn Storage> = self.backend.clone();
-            ctx.provide(STORAGE_SERVICE, storage)?;
-            let catalog: Arc<dyn SessionCatalog> = self.backend.clone();
-            ctx.provide(SESSION_CATALOG_SERVICE, catalog)?;
-            let retirement: Arc<dyn SessionRetirement> = self.backend.clone();
-            ctx.provide(SESSION_RETIREMENT_SERVICE, retirement)?;
-            Ok(())
-        })
     }
 }
 

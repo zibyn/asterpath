@@ -46,7 +46,7 @@ allow = ["asterpath-core", "asterpath-protocol"]
 [[package]]
 name = "asterpath-tools"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-storage-sqlite"

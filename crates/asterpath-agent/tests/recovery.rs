@@ -10,17 +10,17 @@ use std::time::Duration;
 
 use asterpath_core::{
     ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
-    LifecycleError, LogEntry, LogId, LogQuery, Middleware, Module, ModuleCtx, Next, SessionId,
-    SignalDelivery, SignalPayload, StepId, ToolCallId, TurnId, WakeCause,
+    LogEntry, LogId, LogQuery, SessionId, SignalDelivery, SignalPayload, StepId, ToolCallId,
+    TurnId, WakeCause,
 };
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot,
-    ContextPolicy, DefaultApprovalPolicy, Item, JsonString, ModelId, ModelSpec, Parallelism,
-    ParentRef, Part, PreExecuteError, PreExecuteEvent, Provenance, Provider, ProviderCatalog,
-    ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent,
-    SideEffect, StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
+    ContextPolicy, DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ModelId, ModelSpec,
+    Parallelism, ParentRef, Part, Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety,
+    RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason,
+    SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
+    ToolError, ToolGate, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
     TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
     encode_entry,
 };
@@ -219,31 +219,6 @@ impl ApprovalPolicy for AlwaysAsk {
     }
 }
 
-struct InitModule(Arc<dyn Fn(&ModuleCtx) + Send + Sync>);
-
-impl Module for InitModule {
-    fn name(&self) -> &'static str {
-        "recovery-test-hooks"
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        (self.0)(ctx);
-        Box::pin(async { Ok(()) })
-    }
-}
-
-async fn hooks_with(init: impl Fn(&ModuleCtx) + Send + Sync + 'static) -> ModuleCtx {
-    let slot: Arc<Mutex<Option<ModuleCtx>>> = Arc::new(Mutex::new(None));
-    let capture = Arc::clone(&slot);
-    let mut host = asterpath_core::ModuleHost::new();
-    host.register(Arc::new(InitModule(Arc::new(move |ctx: &ModuleCtx| {
-        *capture.lock().unwrap() = Some(ctx.clone());
-        init(ctx);
-    }))));
-    host.init().await.expect("module init");
-    slot.lock().unwrap().clone().expect("ctx captured")
-}
-
 struct Harness {
     agent: Box<dyn AgentRunner>,
 }
@@ -254,13 +229,12 @@ struct Registry {
 }
 
 impl ToolRegistry for Registry {
-    fn register(&self, tool: Arc<dyn Tool>) -> asterpath_core::Effect {
+    fn register(&self, tool: Arc<dyn Tool>) {
         self.tools
             .lock()
             .unwrap()
             .entry(tool.descriptor().name.clone())
             .or_insert(tool);
-        asterpath_core::Effect
     }
 
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
@@ -281,7 +255,7 @@ fn agent_with<L: EventLog + 'static>(
     gate: Arc<ApprovalGate>,
     executor: Arc<dyn DurableExecutor>,
     clock: Arc<ManualClock>,
-    hooks: Option<ModuleCtx>,
+    hooks: Option<Arc<dyn Hooks>>,
 ) -> Box<dyn AgentRunner> {
     let log: Arc<dyn EventLog> = log;
     let registry = Arc::new(Registry::default());
@@ -289,17 +263,19 @@ fn agent_with<L: EventLog + 'static>(
         registry.register(tool);
     }
     let provider: Arc<dyn Provider> = provider;
-    Box::new(asterpath_agent::Agent::new(
-        log,
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        registry,
-        ToolConfig::default(),
-        approval,
-        gate,
-        executor,
-        clock,
-        hooks,
-    ))
+    Box::new(
+        asterpath_agent::Agent::new(
+            log,
+            Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
+            registry,
+            ToolConfig::default(),
+            approval,
+            gate,
+            executor,
+            clock,
+        )
+        .with_hooks(hooks.into_iter().collect(), None),
+    )
 }
 
 fn harness(
@@ -1065,15 +1041,15 @@ struct RewriteAndCount {
     count: Arc<AtomicUsize>,
 }
 
-impl Middleware<PreExecuteEvent> for RewriteAndCount {
-    fn handle<'a>(
+impl Hooks for RewriteAndCount {
+    fn before_tool<'a>(
         &'a self,
-        mut event: PreExecuteEvent,
-        next: Next<'a, PreExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        _ctx: &'a ToolCallCtx,
+        args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
         let hit = self.count.fetch_add(1, Ordering::SeqCst);
-        event.args = JsonString::new(format!(r#"{{"pre":{hit}}}"#));
-        next.run(event)
+        *args = JsonString::new(format!(r#"{{"pre":{hit}}}"#));
+        Box::pin(async { Ok(ToolGate::Allow) })
     }
 }
 
@@ -1121,12 +1097,9 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
 
     let count = Arc::new(AtomicUsize::new(0));
     let middleware_count = Arc::clone(&count);
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(RewriteAndCount {
-            count: Arc::clone(&middleware_count),
-        });
-    })
-    .await;
+    let hooks: Arc<dyn Hooks> = Arc::new(RewriteAndCount {
+        count: Arc::clone(&middleware_count),
+    });
 
     let gate = Arc::new(ApprovalGate::new());
     let clock = Arc::new(ManualClock::new());

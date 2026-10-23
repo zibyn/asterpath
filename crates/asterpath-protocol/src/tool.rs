@@ -1,4 +1,4 @@
-//! Tool contract, pipeline waterfall events and approval policy.
+//! Tool contract and approval policy.
 //!
 //! The pipeline itself lives in the agent module; this crate owns the frozen
 //! shapes it hands to tools, hosts and extensions.
@@ -10,16 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use asterpath_core::{
-    ApprovalGate, Effect, Event, ServiceKey, SessionId, SignalId, SignalName, StepId, ToolCallId,
-    TurnId, WaterfallEvent, service_key,
-};
+use asterpath_core::{ApprovalGate, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::ApprovalRequest;
 use crate::config::{Provenance, ToolDescriptor};
-use crate::event::{ToolErrorInfo, ToolErrorKind, ToolResultStatus};
+use crate::event::ToolErrorKind;
 use crate::ids::{ToolArgs, ToolName};
 use crate::item::Part;
 
@@ -36,12 +33,10 @@ pub trait Tool: Send + Sync + 'static {
 /// Live registry of tools, ordered by name. Duplicate names keep the first
 /// registration; the name is the tool's identity within one process.
 pub trait ToolRegistry: Send + Sync {
-    fn register(&self, tool: Arc<dyn Tool>) -> Effect;
+    fn register(&self, tool: Arc<dyn Tool>);
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>>;
     fn list(&self) -> Vec<Arc<dyn Tool>>;
 }
-
-pub const TOOL_REGISTRY_SERVICE: ServiceKey<dyn ToolRegistry> = service_key("ToolRegistry");
 
 /// A single tool call's view of the world. Timeouts are enforced by the
 /// pipeline; tools only observe `cancel`.
@@ -242,112 +237,6 @@ impl Future for Cancelled {
         wakers.push(cx.waker().clone());
         Poll::Pending
     }
-}
-
-/// Pre-execute waterfall event. Middleware may rewrite `args` and pass the
-/// event on, or short-circuit with [`PreExecuteError::Denied`].
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PreExecuteEvent {
-    pub session: SessionId,
-    pub turn: TurnId,
-    pub step: StepId,
-    pub tool_call_id: ToolCallId,
-    pub provider_call_id: String,
-    pub tool: ToolName,
-    pub args: ToolArgs,
-}
-
-impl PreExecuteEvent {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        tool_call_id: ToolCallId,
-        provider_call_id: String,
-        tool: ToolName,
-        args: ToolArgs,
-    ) -> Self {
-        Self {
-            session,
-            turn,
-            step,
-            tool_call_id,
-            provider_call_id,
-            tool,
-            args,
-        }
-    }
-}
-
-impl Event for PreExecuteEvent {}
-impl WaterfallEvent for PreExecuteEvent {
-    type Error = PreExecuteError;
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PreExecuteError {
-    #[error("tool call denied: {}", reason.as_deref().unwrap_or(""))]
-    Denied { reason: Option<String> },
-    #[error("pre-execute failed: {message}")]
-    Internal { message: String },
-}
-
-/// Post-execute waterfall event, run after truncation and before the result is
-/// appended. Middleware may rewrite `output` and `error.message`.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PostExecuteEvent {
-    pub session: SessionId,
-    pub turn: TurnId,
-    pub step: StepId,
-    pub tool_call_id: ToolCallId,
-    pub tool: ToolName,
-    pub status: ToolResultStatus,
-    pub output: Vec<Part>,
-    pub error: Option<ToolErrorInfo>,
-    pub truncated: bool,
-}
-
-impl PostExecuteEvent {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        tool_call_id: ToolCallId,
-        tool: ToolName,
-        status: ToolResultStatus,
-        output: Vec<Part>,
-        error: Option<ToolErrorInfo>,
-        truncated: bool,
-    ) -> Self {
-        Self {
-            session,
-            turn,
-            step,
-            tool_call_id,
-            tool,
-            status,
-            output,
-            error,
-            truncated,
-        }
-    }
-}
-
-impl Event for PostExecuteEvent {}
-impl WaterfallEvent for PostExecuteEvent {
-    type Error = PostExecuteError;
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PostExecuteError {
-    #[error("post-execute failed: {message}")]
-    Internal { message: String },
 }
 
 /// Host policy for one tool call. `Ask` is only meaningful when an approval

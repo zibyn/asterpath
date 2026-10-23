@@ -1,6 +1,6 @@
 //! Facade error sum. Each layer keeps its own enum; this only adds them up.
 
-use asterpath_core::{ExecutionError, LifecycleError, StorageError};
+use asterpath_core::{ExecutionError, StorageError};
 use asterpath_protocol::{AgentError, ProviderError, ToolError};
 
 #[non_exhaustive]
@@ -10,8 +10,6 @@ pub enum AsterError {
     Config { message: String },
     #[error(transparent)]
     Agent(#[from] AgentError),
-    #[error(transparent)]
-    Lifecycle(#[from] LifecycleError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]

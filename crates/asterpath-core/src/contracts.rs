@@ -7,7 +7,6 @@ use futures_core::stream::BoxStream;
 
 use crate::error::{ExecutionError, RetirementError, StorageError};
 use crate::ids::{LogId, SessionId, SignalId};
-use crate::service::{ServiceKey, service_key};
 use crate::time::Timestamp;
 
 /// Key used to make a log append idempotent within one session stream.
@@ -114,15 +113,6 @@ pub trait SessionRetirement: Send + Sync {
         expected_frontier: LogId,
     ) -> BoxFuture<'_, Result<(), RetirementError>>;
 }
-
-/// Canonical service keys shared by backends and the composition root.
-pub const EVENT_LOG_SERVICE: ServiceKey<dyn EventLog> = service_key("EventLog");
-pub const STORAGE_SERVICE: ServiceKey<dyn Storage> = service_key("Storage");
-pub const SESSION_CATALOG_SERVICE: ServiceKey<dyn SessionCatalog> = service_key("SessionCatalog");
-pub const SESSION_RETIREMENT_SERVICE: ServiceKey<dyn SessionRetirement> =
-    service_key("SessionRetirement");
-pub const DURABLE_EXECUTOR_SERVICE: ServiceKey<dyn DurableExecutor> =
-    service_key("DurableExecutor");
 
 pub type SignalPayload = serde_json::Value;
 

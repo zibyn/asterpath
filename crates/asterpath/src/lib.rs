@@ -1,14 +1,22 @@
 //! Asterpath facade: the composition root and the stable session API.
 //!
-//! Real modules are assembled through `ModuleHost`; the SQLite backend is the
-//! only default module in this walking skeleton. There is no background driver:
-//! the host calls [`SessionHandle::drive`].
+//! The facade constructs the engine components directly; hosts extend it only
+//! through adapter traits and [`protocol::Hooks`] (ADR-0025). There is no
+//! background driver: the host calls [`SessionHandle::drive`].
 
 // The public error enum is fixed by packaging.md §3.5.
 #![allow(clippy::result_large_err)]
 
+mod commit;
 pub mod config;
 pub mod error;
+
+/// Core id types, so embedders need only this crate.
+pub use asterpath_core::{
+    InputId, LogId, SessionId, SignalId, StepId, Timestamp, ToolCallId, TurnId,
+};
+/// The contract crate: adapter traits, hooks and value types.
+pub use asterpath_protocol as protocol;
 
 /// Re-export of the Anthropic adapter when the `anthropic` feature is enabled.
 /// Providers stay host-injected: the facade never assembles one itself.
@@ -19,21 +27,20 @@ use std::sync::Arc;
 
 use asterpath_agent::Agent;
 use asterpath_core::{
-    ApprovalGate, Clock, DurableExecutor, EventLog, InputId, LogQuery, ModuleCtx, ModuleHost,
-    SessionCatalog, SessionId, SessionRetirement, SignalDelivery, Storage, ToolCallId,
-    unique_bytes,
+    ApprovalGate, Clock, DurableExecutor, EventLog, LogQuery, SessionCatalog, SessionRetirement,
+    SignalDelivery, Storage, unique_bytes,
 };
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
-    OpenIntents, ProviderCatalog, RecordAppended, RunRequest, RunTrigger, SessionEvent,
-    SessionSpec, SessionState, ToolRegistry, ToolSelection, TraceQuery, TraceTap, UsageQuery,
-    UserInput, approval_signal_id, approval_signal_name, dedup,
+    OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
+    ToolRegistry, ToolSelection, TraceQuery, TraceTap, UsageQuery, UserInput, approval_signal_id,
+    approval_signal_name, dedup,
 };
-use asterpath_runtime::{RuntimeExecutor, RuntimeModule};
-use asterpath_scheduler::SchedulerModule;
-use asterpath_tools::ToolsModule;
-use asterpath_tracing::TracingModule;
-use asterpath_usage::UsageModule;
+use asterpath_runtime::RuntimeExecutor;
+use asterpath_scheduler::{Scheduler, SpawnTool};
+use asterpath_tools::InMemoryToolRegistry;
+use asterpath_tracing::{TracingQuery, TracingTap};
+use asterpath_usage::UsageService;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
@@ -42,9 +49,6 @@ pub use error::AsterError;
 
 #[cfg(feature = "openai")]
 pub use asterpath_provider_openai as openai;
-
-#[cfg(feature = "sqlite")]
-use asterpath_storage_sqlite::SqliteStorageModule;
 
 /// The assembled framework.
 pub struct Asterpath {
@@ -62,8 +66,7 @@ pub struct Asterpath {
     clock: Arc<dyn Clock>,
     trace: Arc<dyn TraceQuery>,
     trace_tap: Arc<dyn TraceTap>,
-    bus: Option<ModuleCtx>,
-    host: ModuleHost,
+    scheduler: Arc<Scheduler>,
 }
 
 impl std::fmt::Debug for Asterpath {
@@ -119,10 +122,6 @@ impl Asterpath {
         let session_catalog;
         let session_retirement;
 
-        let mut module_host = ModuleHost::new();
-        let tools_module = Arc::new(ToolsModule::new());
-        module_host.register(tools_module.clone());
-
         match (config.event_log, config.storage) {
             (Some(log), Some(store)) => {
                 event_log = log;
@@ -142,7 +141,6 @@ impl Asterpath {
                         });
                     }
                     let backend = asterpath_storage_sqlite::open(&config.database)?;
-                    module_host.register(Arc::new(SqliteStorageModule::new(backend.clone())));
                     event_log = backend.clone();
                     storage = backend.clone();
                     session_retirement = Some(Arc::clone(&backend) as Arc<dyn SessionRetirement>);
@@ -164,17 +162,27 @@ impl Asterpath {
             }
         }
 
-        let runtime = Arc::new(RuntimeExecutor::new(Arc::clone(&event_log)));
-        module_host.register(Arc::new(RuntimeModule::new(Arc::clone(&runtime))));
-        let executor: Arc<dyn DurableExecutor> = runtime;
+        // Projections read the backend; every write goes through the one
+        // append entry so hooks and the trace tap see it.
+        let trace_tap = Arc::new(TracingTap::new(Arc::clone(&event_log)));
+        let trace: Arc<dyn TraceQuery> = Arc::new(TracingQuery::new(Arc::clone(&event_log)));
+        let usage: Arc<dyn UsageQuery> = Arc::new(UsageService::new(
+            Arc::clone(&event_log),
+            Arc::clone(&session_catalog),
+        ));
+        let event_log: Arc<dyn EventLog> = Arc::new(commit::CommitLog::new(
+            event_log,
+            config.hooks.clone(),
+            Arc::clone(&trace_tap),
+        ));
 
+        let executor: Arc<dyn DurableExecutor> =
+            Arc::new(RuntimeExecutor::new(Arc::clone(&event_log)));
         let cancellations = Arc::new(CancellationRegistry::new());
-        let tracing_module = Arc::new(TracingModule::new(Arc::clone(&event_log)));
-        module_host.register(tracing_module.clone());
 
-        // The scheduler is assembled before the agent; the runner is bound
+        // The scheduler is built before the agent; the runner is bound
         // afterwards so the two never form an ownership cycle.
-        let scheduler_module = Arc::new(SchedulerModule::with_runtime(
+        let scheduler = Arc::new(Scheduler::with_runtime(
             Arc::clone(&event_log),
             Arc::clone(&session_catalog),
             Arc::clone(&executor),
@@ -183,22 +191,11 @@ impl Asterpath {
             config.max_live_children,
             Arc::clone(&cancellations),
         ));
-        module_host.register(scheduler_module.clone());
-
-        let usage_module = Arc::new(UsageModule::new(
-            Arc::clone(&event_log),
-            Arc::clone(&session_catalog),
-        ));
-        module_host.register(usage_module.clone());
-
-        module_host.init().await?;
-        let usage = usage_module.query();
-        let tools = tools_module.registry();
+        let tools: Arc<dyn ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        tools.register(Arc::new(SpawnTool::new(Arc::clone(&scheduler))));
         for tool in config.tools {
             tools.register(tool);
         }
-        let hooks = tools_module.context();
-        let bus = hooks.clone();
 
         let gate = Arc::clone(&config.gate);
         let approval = Arc::clone(&config.approval);
@@ -215,13 +212,13 @@ impl Asterpath {
                     Arc::clone(&gate),
                     Arc::clone(&executor),
                     Arc::clone(&config.clock),
-                    hooks,
                 )
+                .with_hooks(config.hooks, Some(Arc::clone(&usage)))
                 .with_compactor(config.compactor.clone())
                 .with_cancellations(Arc::clone(&cancellations)),
             )
         });
-        scheduler_module.scheduler().set_runner(Arc::clone(&agent));
+        scheduler.set_runner(Arc::clone(&agent));
 
         Ok(Self {
             event_log,
@@ -236,10 +233,9 @@ impl Asterpath {
             gate,
             cancellations,
             clock,
-            trace: tracing_module.query(),
-            trace_tap: tracing_module.tap(),
-            bus,
-            host: module_host,
+            trace,
+            trace_tap,
+            scheduler,
         })
     }
 
@@ -296,7 +292,6 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.event_log.append(entry).await?;
-        self.notify(session).await;
 
         Ok(SessionHandle {
             session,
@@ -304,7 +299,6 @@ impl Asterpath {
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
-            bus: self.bus.clone(),
         })
     }
 
@@ -320,12 +314,15 @@ impl Asterpath {
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
-            bus: self.bus.clone(),
         })
     }
 
-    pub async fn shutdown(mut self) -> Result<(), AsterError> {
-        self.host.shutdown().await;
+    /// Release the engine in a fixed order: the scheduler (and with it the
+    /// spawn tool's hold on child sessions) first, then everything else.
+    /// Nothing runs in the background, so there is nothing to await.
+    pub async fn shutdown(self) -> Result<(), AsterError> {
+        let Self { scheduler, .. } = self;
+        drop(scheduler);
         Ok(())
     }
 
@@ -361,15 +358,9 @@ impl Asterpath {
         Arc::clone(&self.trace)
     }
 
-    /// Real-time span lifecycle driven by the typed event bus.
+    /// Real-time span lifecycle driven by the append entry.
     pub fn trace_tap(&self) -> Arc<dyn TraceTap> {
         Arc::clone(&self.trace_tap)
-    }
-
-    async fn notify(&self, session: SessionId) {
-        if let Some(bus) = &self.bus {
-            bus.emit(RecordAppended { session }).await;
-        }
     }
 }
 
@@ -381,7 +372,6 @@ pub struct SessionHandle {
     agent: Arc<dyn AgentRunner>,
     executor: Arc<dyn DurableExecutor>,
     cancellations: Arc<CancellationRegistry>,
-    bus: Option<ModuleCtx>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -409,12 +399,6 @@ impl SessionHandle {
             message: error.to_string(),
         })?;
         self.event_log.append(entry).await?;
-        if let Some(bus) = &self.bus {
-            bus.emit(RecordAppended {
-                session: self.session,
-            })
-            .await;
-        }
         Ok(input.id)
     }
 

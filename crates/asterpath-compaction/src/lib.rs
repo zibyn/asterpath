@@ -1,4 +1,4 @@
-//! Default compaction capability module.
+//! Default compaction capability.
 //!
 //! `plan` is pure: it cuts only at committed step boundaries, keeps at least
 //! the latest complete step and targets a fraction of the usable window.
@@ -13,12 +13,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath_core::{LifecycleError, LogId, LogIdRange, Module, ModuleCtx, ServiceId};
+use asterpath_core::{LogId, LogIdRange};
 use asterpath_protocol::{
-    COMPACTOR_SERVICE, CompactPlan, CompactSummary, CompactionConfig, CompactionError,
-    CompactionInput, CompactionJob, CompactionOutcome, Compactor, Item, ModelRequest, ModelSpec,
-    Part, ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorKind, Role, StreamEvent,
-    ToolChoice, TurnConfig, Usage,
+    CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionInput, CompactionJob,
+    CompactionOutcome, Compactor, Item, ModelRequest, ModelSpec, Part, ProjectedOrigin,
+    ProviderCatalog, ProviderError, ProviderErrorKind, Role, StreamEvent, ToolChoice, TurnConfig,
+    Usage,
 };
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -396,39 +396,4 @@ fn backoff(config: &TurnConfig, attempt: u32) -> Duration {
         .initial_backoff
         .saturating_mul(1u32 << exponent)
         .min(config.max_backoff)
-}
-
-/// Module wrapper: provides the default compactor as a service.
-pub struct CompactionModule {
-    compactor: Arc<dyn Compactor>,
-}
-
-impl CompactionModule {
-    pub fn new(providers: Arc<ProviderCatalog>) -> Self {
-        Self {
-            compactor: Arc::new(DefaultCompactor::new(providers)),
-        }
-    }
-
-    pub fn compactor(&self) -> Arc<dyn Compactor> {
-        Arc::clone(&self.compactor)
-    }
-}
-
-impl Module for CompactionModule {
-    fn name(&self) -> &'static str {
-        "compaction"
-    }
-
-    fn provides(&self) -> &[ServiceId] {
-        static IDS: [ServiceId; 1] = [COMPACTOR_SERVICE.id()];
-        &IDS
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        Box::pin(async move {
-            ctx.provide(COMPACTOR_SERVICE, Arc::clone(&self.compactor))?;
-            Ok(())
-        })
-    }
 }

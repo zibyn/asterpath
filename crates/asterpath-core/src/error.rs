@@ -1,23 +1,5 @@
 use crate::ids::{LogId, SessionId};
 
-/// Failures of module host startup and shutdown.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum LifecycleError {
-    #[error("module dependency cycle: {path:?}")]
-    Cycle { path: Vec<String> },
-    #[error("module `{module}` requires missing service `{service}`")]
-    MissingDependency { module: String, service: String },
-    #[error("service `{service}` is already provided")]
-    DuplicateProvider { service: String },
-    #[error("module `{module}` failed to initialize: {source}")]
-    InitFailed {
-        module: String,
-        #[source]
-        source: Box<LifecycleError>,
-    },
-}
-
 /// Failures of the event log / storage backends.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

@@ -6,18 +6,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath_core::{
-    ApprovalGate, AwaitSignal, DurableExecutor, Effect, EventLog, ExecutionError, LifecycleError,
-    LogQuery, Middleware, Module, ModuleCtx, Next, SessionId, SignalDelivery, SignalPayload,
-    ToolCallId, TurnId, WakeCause,
+    ApprovalGate, AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogQuery, SessionId,
+    SignalDelivery, SignalPayload, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Item,
-    JsonString, ModelId, ModelSpec, Parallelism, Part, PostExecuteError, PostExecuteEvent,
-    PreExecuteError, PreExecuteEvent, PreStepGateDecision, PreStepGateError, PreStepGateEvent,
-    Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role,
-    RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason, SubagentConfig, Tool, ToolArgs,
-    ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry,
-    ToolResultStatus, TurnConfig, TurnEndReason, Usage, decode_entry, encode_entry,
+    AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Gate,
+    HookError, Hooks, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
+    Provider, ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest,
+    RunTrigger, SessionEvent, SideEffect, StepCtx, StopReason, SubagentConfig, Tool, ToolArgs,
+    ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName,
+    ToolOutput, ToolRegistry, ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage,
+    decode_entry, encode_entry,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -27,47 +26,20 @@ const SESSION: SessionId = SessionId::from_bytes([9; 16]);
 
 // --- host hooks -----------------------------------------------------------
 
-struct InitModule(Arc<dyn Fn(&ModuleCtx) + Send + Sync>);
-
-impl Module for InitModule {
-    fn name(&self) -> &'static str {
-        "test-hooks"
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        (self.0)(ctx);
-        Box::pin(async { Ok(()) })
-    }
-}
-
-/// Run `init` on a real module bus and return that bus's context for runtime
-/// waterfall dispatch.
-async fn hooks_with(init: impl Fn(&ModuleCtx) + Send + Sync + 'static) -> ModuleCtx {
-    let slot: Arc<Mutex<Option<ModuleCtx>>> = Arc::new(Mutex::new(None));
-    let capture = Arc::clone(&slot);
-    let mut host = asterpath_core::ModuleHost::new();
-    host.register(Arc::new(InitModule(Arc::new(move |ctx: &ModuleCtx| {
-        *capture.lock().unwrap() = Some(ctx.clone());
-        init(ctx);
-    }))));
-    host.init().await.expect("module init");
-    slot.lock().unwrap().clone().expect("ctx captured")
-}
-
 struct RewriteArgs {
     args: JsonString,
     count: Arc<AtomicUsize>,
 }
 
-impl Middleware<PreExecuteEvent> for RewriteArgs {
-    fn handle<'a>(
+impl Hooks for RewriteArgs {
+    fn before_tool<'a>(
         &'a self,
-        mut event: PreExecuteEvent,
-        next: Next<'a, PreExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        _ctx: &'a ToolCallCtx,
+        args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
         self.count.fetch_add(1, Ordering::SeqCst);
-        event.args = self.args.clone();
-        next.run(event)
+        *args = self.args.clone();
+        Box::pin(async { Ok(ToolGate::Allow) })
     }
 }
 
@@ -75,15 +47,15 @@ struct DenyPreExecute {
     reason: String,
 }
 
-impl Middleware<PreExecuteEvent> for DenyPreExecute {
-    fn handle<'a>(
+impl Hooks for DenyPreExecute {
+    fn before_tool<'a>(
         &'a self,
-        _event: PreExecuteEvent,
-        _next: Next<'a, PreExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        _ctx: &'a ToolCallCtx,
+        _args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
         let reason = self.reason.clone();
         Box::pin(async move {
-            Err(PreExecuteError::Denied {
+            Ok(ToolGate::Deny {
                 reason: Some(reason),
             })
         })
@@ -92,18 +64,18 @@ impl Middleware<PreExecuteEvent> for DenyPreExecute {
 
 struct RedactOutput;
 
-impl Middleware<PostExecuteEvent> for RedactOutput {
-    fn handle<'a>(
+impl Hooks for RedactOutput {
+    fn after_tool<'a>(
         &'a self,
-        mut event: PostExecuteEvent,
-        next: Next<'a, PostExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PostExecuteEvent, PostExecuteError>> {
-        for part in &mut event.output {
+        _ctx: &'a ToolCallCtx,
+        result: &'a mut ToolResultView,
+    ) -> BoxFuture<'a, Result<(), HookError>> {
+        for part in &mut result.output {
             if let Part::Text { text } = part {
                 *text = "[redacted]".to_owned();
             }
         }
-        next.run(event)
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -189,12 +161,11 @@ impl TestRegistry {
 }
 
 impl ToolRegistry for TestRegistry {
-    fn register(&self, tool: Arc<dyn Tool>) -> Effect {
+    fn register(&self, tool: Arc<dyn Tool>) {
         self.tools
             .lock()
             .unwrap()
             .insert(tool.descriptor().name.clone(), tool);
-        Effect
     }
 
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
@@ -313,7 +284,7 @@ fn agent(
     provider: Arc<ScriptedProvider>,
     registry: Arc<dyn ToolRegistry>,
     tool_config: ToolConfig,
-    hooks: Option<ModuleCtx>,
+    hooks: Vec<Arc<dyn Hooks>>,
 ) -> impl AgentRunner {
     let provider: Arc<dyn Provider> = provider;
     let gate = Arc::new(ApprovalGate::new());
@@ -326,8 +297,8 @@ fn agent(
         gate,
         Arc::new(NoopExecutor),
         Arc::new(asterpath_testing::ManualClock::new()),
-        hooks,
     )
+    .with_hooks(hooks, None)
 }
 
 /// Pipeline tests never wait: approval is `Allow` for their in-process tools.
@@ -462,14 +433,11 @@ async fn pre_execute_rewrites_args_before_the_intent_is_recorded() {
     );
     let count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&count);
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(RewriteArgs {
-            args: JsonString::new(r#"{"n":2}"#),
-            count: Arc::clone(&counter),
-        });
-    })
-    .await;
-    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(RewriteArgs {
+        args: JsonString::new(r#"{"n":2}"#),
+        count: Arc::clone(&counter),
+    }) as Arc<dyn Hooks>];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
     drive(&agent).await;
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -501,13 +469,10 @@ async fn pre_execute_deny_records_a_failed_intent_without_executing() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let hooks = hooks_with(|ctx| {
-        ctx.intercept(DenyPreExecute {
-            reason: "blocked by policy".to_owned(),
-        });
-    })
-    .await;
-    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(DenyPreExecute {
+        reason: "blocked by policy".to_owned(),
+    }) as Arc<dyn Hooks>];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
     let live = drive(&agent).await;
 
     assert!(
@@ -531,6 +496,42 @@ async fn pre_execute_deny_records_a_failed_intent_without_executing() {
     );
 }
 
+struct PanicBeforeTool;
+
+impl Hooks for PanicBeforeTool {
+    fn before_tool<'a>(
+        &'a self,
+        _ctx: &'a ToolCallCtx,
+        _args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
+        panic!("hook bug");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_before_tool_hook_fails_the_call_as_internal() {
+    let (tool, calls) = TestTool::echo(descriptor("echo"));
+    let registry = TestRegistry::with(vec![tool]);
+    let log = new_log(config(vec![descriptor("echo")])).await;
+    let provider = provider(
+        vec![tool_call("call-1", "echo", "{}")],
+        StopReason::ToolUse,
+        assistant_text("done"),
+    );
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(PanicBeforeTool)];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
+    drive(&agent).await;
+
+    assert!(calls.lock().unwrap().is_empty());
+    let events = decoded(&log).await;
+    let intent = intents(&events);
+    assert_eq!(
+        error_kind(&events, intent[0].0),
+        Some(asterpath_protocol::ToolErrorKind::Internal)
+    );
+    assert_eq!(events.last().map(SessionEvent::kind), Some("TurnCommitted"));
+}
+
 // --- T7: panic ------------------------------------------------------------
 
 #[tokio::test]
@@ -551,7 +552,7 @@ async fn a_panicking_tool_fails_alone_and_the_step_commits() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let agent = agent(log.clone(), provider, registry, tool_config(), None);
+    let agent = agent(log.clone(), provider, registry, tool_config(), Vec::new());
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -601,7 +602,7 @@ async fn oversized_output_is_truncated_at_a_utf8_boundary() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let agent = agent(log.clone(), provider, registry, tool_config(), None);
+    let agent = agent(log.clone(), provider, registry, tool_config(), Vec::new());
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -648,7 +649,7 @@ async fn the_step_cap_truncates_later_completions() {
         max_output_bytes_per_step: 150,
         ..tool_config()
     };
-    let agent = agent(log.clone(), provider, registry, config, None);
+    let agent = agent(log.clone(), provider, registry, config, Vec::new());
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -679,11 +680,8 @@ async fn post_execute_can_rewrite_content_before_the_result_is_logged() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let hooks = hooks_with(|ctx| {
-        ctx.intercept(RedactOutput);
-    })
-    .await;
-    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(RedactOutput) as Arc<dyn Hooks>];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -704,14 +702,11 @@ async fn an_unknown_tool_records_intent_and_not_found_without_execution() {
     );
     let count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&count);
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(RewriteArgs {
-            args: JsonString::new("{}"),
-            count: Arc::clone(&counter),
-        });
-    })
-    .await;
-    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(RewriteArgs {
+        args: JsonString::new("{}"),
+        count: Arc::clone(&counter),
+    }) as Arc<dyn Hooks>];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
     let live = drive(&agent).await;
 
     assert_eq!(count.load(Ordering::SeqCst), 1, "pre-execute still runs");
@@ -755,7 +750,13 @@ async fn same_name_and_args_parallel_calls_get_distinct_identities() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let agent = agent(log.clone(), provider.clone(), registry, tool_config(), None);
+    let agent = agent(
+        log.clone(),
+        provider.clone(),
+        registry,
+        tool_config(),
+        Vec::new(),
+    );
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -857,7 +858,7 @@ async fn an_exclusive_call_excludes_parallel_siblings_for_the_step() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let agent = agent(log, provider, registry, tool_config(), None);
+    let agent = agent(log, provider, registry, tool_config(), Vec::new());
     drive(&agent).await;
 
     assert!(!probe.write_saw_others.load(Ordering::SeqCst));
@@ -926,7 +927,7 @@ async fn max_parallel_calls_queues_excess_tools() {
         max_parallel_calls: std::num::NonZeroUsize::new(2).expect("non-zero"),
         ..tool_config()
     };
-    let agent = agent(log, provider, registry, config, None);
+    let agent = agent(log, provider, registry, config, Vec::new());
     drive(&agent).await;
 
     assert_eq!(probe.started.load(Ordering::SeqCst), 3);
@@ -951,7 +952,7 @@ async fn a_tool_that_ignores_the_deadline_fails_timeout() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let agent = agent(log.clone(), provider, registry, tool_config(), None);
+    let agent = agent(log.clone(), provider, registry, tool_config(), Vec::new());
     drive(&agent).await;
 
     let events = decoded(&log).await;
@@ -1021,19 +1022,16 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
     ));
     let count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&count);
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(RewriteArgs {
-            args: JsonString::new(r#"{"n":99}"#),
-            count: Arc::clone(&counter),
-        });
-    })
-    .await;
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(RewriteArgs {
+        args: JsonString::new(r#"{"n":99}"#),
+        count: Arc::clone(&counter),
+    }) as Arc<dyn Hooks>];
     let agent = agent(
         log.clone(),
         provider.clone(),
         registry,
         tool_config(),
-        Some(hooks),
+        hooks,
     );
     drive(&agent).await;
 
@@ -1076,16 +1074,10 @@ struct StopGate {
     reason: String,
 }
 
-impl Middleware<PreStepGateEvent> for StopGate {
-    fn handle<'a>(
-        &'a self,
-        mut event: PreStepGateEvent,
-        next: Next<'a, PreStepGateEvent>,
-    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
-        event.decision = PreStepGateDecision::EndTurn {
-            reason: self.reason.clone(),
-        };
-        next.run(event)
+impl Hooks for StopGate {
+    fn before_step<'a>(&'a self, _ctx: &'a StepCtx) -> BoxFuture<'a, Result<Gate, HookError>> {
+        let reason = self.reason.clone();
+        Box::pin(async move { Ok(Gate::EndTurn { reason }) })
     }
 }
 
@@ -1095,34 +1087,29 @@ struct StopAfter {
     reason: String,
 }
 
-impl Middleware<PreStepGateEvent> for StopAfter {
-    fn handle<'a>(
-        &'a self,
-        mut event: PreStepGateEvent,
-        next: Next<'a, PreStepGateEvent>,
-    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.skip {
-            event.decision = PreStepGateDecision::EndTurn {
+impl Hooks for StopAfter {
+    fn before_step<'a>(&'a self, ctx: &'a StepCtx) -> BoxFuture<'a, Result<Gate, HookError>> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            ctx.step_index as usize, index,
+            "step_index counts the turn's steps"
+        );
+        let gate = if index >= self.skip {
+            Gate::EndTurn {
                 reason: self.reason.clone(),
-            };
-        }
-        next.run(event)
+            }
+        } else {
+            Gate::Continue
+        };
+        Box::pin(async move { Ok(gate) })
     }
 }
 
 struct FailGate;
 
-impl Middleware<PreStepGateEvent> for FailGate {
-    fn handle<'a>(
-        &'a self,
-        _event: PreStepGateEvent,
-        _next: Next<'a, PreStepGateEvent>,
-    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
-        Box::pin(async {
-            Err(PreStepGateError::Internal {
-                message: "gate boom".to_owned(),
-            })
-        })
+impl Hooks for FailGate {
+    fn before_step<'a>(&'a self, _ctx: &'a StepCtx) -> BoxFuture<'a, Result<Gate, HookError>> {
+        Box::pin(async { Err(HookError::new("gate boom")) })
     }
 }
 
@@ -1131,18 +1118,15 @@ async fn a_gate_stop_before_the_first_step_ends_a_zero_step_turn() {
     let log = new_log(config(Vec::new())).await;
     let provider = Arc::new(ScriptedProvider::new("p"));
     let registry = TestRegistry::with(Vec::new());
-    let hooks = hooks_with(|ctx| {
-        ctx.intercept(StopGate {
-            reason: "budget".to_owned(),
-        });
-    })
-    .await;
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(StopGate {
+        reason: "budget".to_owned(),
+    }) as Arc<dyn Hooks>];
     let agent = agent(
         log.clone(),
         provider.clone(),
         registry,
         tool_config(),
-        Some(hooks),
+        hooks,
     );
 
     let events = drive(&agent).await;
@@ -1177,16 +1161,13 @@ async fn a_gate_error_ends_the_turn_failed_with_no_step() {
     let log = new_log(config(Vec::new())).await;
     let provider = Arc::new(ScriptedProvider::new("p"));
     let registry = TestRegistry::with(Vec::new());
-    let hooks = hooks_with(|ctx| {
-        ctx.intercept(FailGate);
-    })
-    .await;
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(FailGate) as Arc<dyn Hooks>];
     let agent = agent(
         log.clone(),
         provider.clone(),
         registry,
         tool_config(),
-        Some(hooks),
+        hooks,
     );
 
     let events = drive(&agent).await;
@@ -1217,20 +1198,17 @@ async fn the_gate_is_consulted_before_every_step() {
     let registry = TestRegistry::with(Vec::new());
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&calls);
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(StopAfter {
-            calls: Arc::clone(&counter),
-            skip: 1,
-            reason: "enough".to_owned(),
-        });
-    })
-    .await;
+    let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(StopAfter {
+        calls: Arc::clone(&counter),
+        skip: 1,
+        reason: "enough".to_owned(),
+    }) as Arc<dyn Hooks>];
     let agent = agent(
         log.clone(),
         provider.clone(),
         registry,
         tool_config(),
-        Some(hooks),
+        hooks,
     );
 
     let events = drive(&agent).await;
@@ -1258,40 +1236,36 @@ async fn the_gate_is_consulted_before_every_step() {
 
 struct CountPre(Arc<AtomicUsize>);
 
-impl Middleware<PreExecuteEvent> for CountPre {
-    fn handle<'a>(
+impl Hooks for CountPre {
+    fn before_tool<'a>(
         &'a self,
-        event: PreExecuteEvent,
-        next: Next<'a, PreExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PreExecuteEvent, PreExecuteError>> {
+        _ctx: &'a ToolCallCtx,
+        _args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        next.run(event)
+        Box::pin(async { Ok(ToolGate::Allow) })
     }
 }
 
 struct CountPost(Arc<Mutex<Vec<ToolResultStatus>>>);
 
-impl Middleware<PostExecuteEvent> for CountPost {
-    fn handle<'a>(
+impl Hooks for CountPost {
+    fn after_tool<'a>(
         &'a self,
-        event: PostExecuteEvent,
-        next: Next<'a, PostExecuteEvent>,
-    ) -> BoxFuture<'a, Result<PostExecuteEvent, PostExecuteError>> {
-        self.0.lock().unwrap().push(event.status);
-        next.run(event)
+        _ctx: &'a ToolCallCtx,
+        result: &'a mut ToolResultView,
+    ) -> BoxFuture<'a, Result<(), HookError>> {
+        self.0.lock().unwrap().push(result.status());
+        Box::pin(async { Ok(()) })
     }
 }
 
 struct CountGate(Arc<AtomicUsize>);
 
-impl Middleware<PreStepGateEvent> for CountGate {
-    fn handle<'a>(
-        &'a self,
-        event: PreStepGateEvent,
-        next: Next<'a, PreStepGateEvent>,
-    ) -> BoxFuture<'a, Result<PreStepGateEvent, PreStepGateError>> {
+impl Hooks for CountGate {
+    fn before_step<'a>(&'a self, _ctx: &'a StepCtx) -> BoxFuture<'a, Result<Gate, HookError>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        next.run(event)
+        Box::pin(async { Ok(Gate::Continue) })
     }
 }
 
@@ -1360,21 +1334,19 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
     let post = Arc::new(Mutex::new(Vec::new()));
     let gate = Arc::new(AtomicUsize::new(0));
     let (pre_c, post_c, gate_c) = (Arc::clone(&pre), Arc::clone(&post), Arc::clone(&gate));
-    let hooks = hooks_with(move |ctx| {
-        ctx.intercept(CountPre(Arc::clone(&pre_c)));
-        ctx.intercept(CountPost(Arc::clone(&post_c)));
-        ctx.intercept(CountGate(Arc::clone(&gate_c)));
-    })
-    .await;
-    let agent = agent(log.clone(), provider, registry, tool_config(), Some(hooks));
+    let hooks: Vec<Arc<dyn Hooks>> = vec![
+        Arc::new(CountPre(Arc::clone(&pre_c))) as Arc<dyn Hooks>,
+        Arc::new(CountPost(Arc::clone(&post_c))) as Arc<dyn Hooks>,
+        Arc::new(CountGate(Arc::clone(&gate_c))) as Arc<dyn Hooks>,
+    ];
+    let agent = agent(log.clone(), provider, registry, tool_config(), hooks);
     drive(&agent).await;
 
     let events = decoded(&log).await;
     assert!(
         results(&events)
             .iter()
-            .any(|(call, status, _)| *call == recorded
-                && *status == ToolResultStatus::Interrupted),
+            .any(|(call, status, _)| *call == recorded && *status == ToolResultStatus::Interrupted),
         "the recorded unsafe intent is interrupted by the framework"
     );
     assert!(danger_calls.lock().unwrap().is_empty());

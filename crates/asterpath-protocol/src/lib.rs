@@ -11,6 +11,7 @@ pub mod decode;
 pub mod dedup;
 pub mod encode;
 pub mod event;
+pub mod hooks;
 pub mod ids;
 pub mod intents;
 pub mod item;
@@ -23,13 +24,12 @@ pub mod usage;
 
 pub use agent::{
     AgentError, AgentEvent, AgentRunner, ApprovalRequest, CancelRegistration, CancellationRegistry,
-    CompactResult, CompactionError, CompactionOutcome, PreStepGateDecision, PreStepGateError,
-    PreStepGateEvent, RunRequest, RunTrigger, SessionSpec, ToolSelection, UserInput,
+    CompactResult, CompactionError, CompactionOutcome, RunRequest, RunTrigger, SessionSpec,
+    ToolSelection, UserInput,
 };
 
 pub use compactor::{
-    COMPACTOR_SERVICE, CompactPlan, CompactSummary, CompactionInput, CompactionJob, Compactor,
-    UsageAnchor,
+    CompactPlan, CompactSummary, CompactionInput, CompactionJob, Compactor, UsageAnchor,
 };
 pub use config::{
     CompactionConfig, ConfigSnapshot, ContextPolicy, ModelSpec, Parallelism, Provenance,
@@ -40,8 +40,11 @@ pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payloa
 pub use encode::encode_entry;
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,
-    ParentRef, RecordAppended, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo,
-    ToolErrorKind, ToolResultStatus, TurnEndReason,
+    ParentRef, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo, ToolErrorKind,
+    ToolResultStatus, TurnEndReason,
+};
+pub use hooks::{
+    CommittedRecord, Gate, HookError, Hooks, StepCtx, ToolCallCtx, ToolGate, ToolResultView,
 };
 pub use ids::{
     JsonSchema, JsonString, JsonValue, ModelAlias, ModelId, ProviderId, ToolArgs, ToolName,
@@ -59,9 +62,8 @@ pub use provider::{
 };
 pub use tool::{
     APPROVAL_SIGNAL_PREFIX, ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken,
-    DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, PostExecuteError, PostExecuteEvent,
-    PreExecuteError, PreExecuteEvent, TOOL_REGISTRY_SERVICE, Tool, ToolContext, ToolError,
-    ToolOutput, ToolRegistry, approval_signal_id, approval_signal_name,
+    DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, Tool, ToolContext, ToolError, ToolOutput,
+    ToolRegistry, approval_signal_id, approval_signal_name,
 };
 pub use tracing::{
     AttemptEvent, CompactionAttrs, ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, Span,
@@ -69,7 +71,6 @@ pub use tracing::{
     ToolCallAttrs, TraceError, TraceId, TraceQuery, TraceTap, TurnAttrs, WaitAttrs, WaitKind,
 };
 pub use usage::{
-    InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageEntry, UsageError,
-    UsageFilter, UsageQuery, UsageRecord, UsageRecorded, UsageReport, UsageScope, UsageTotals,
-    usage_of,
+    InputTokens, OutputTokens, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery,
+    UsageRecord, UsageReport, UsageScope, UsageTotals, usage_of,
 };

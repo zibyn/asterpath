@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use asterpath_core::{
-    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, ModuleCtx,
-    SessionCatalog, SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
+    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
+    SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, RecordAppended,
-    Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason,
-    decode_entry, dedup, encode_entry,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
+    RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
+    encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -41,7 +41,6 @@ pub struct Scheduler {
     /// reaches the module bus and this scheduler, so an Arc here would leak the
     /// whole composition root.
     runner: OnceLock<Weak<dyn AgentRunner>>,
-    bus: Mutex<Option<ModuleCtx>>,
     /// Admission state is memory only; `recovered` marks parents whose open
     /// spawns have been rebuilt from the log.
     admission: Mutex<Admission>,
@@ -101,14 +100,9 @@ impl Scheduler {
             max_live_children,
             cancellations,
             runner: OnceLock::new(),
-            bus: Mutex::new(None),
             admission: Mutex::new(Admission::default()),
             notify: tokio::sync::Notify::new(),
         }
-    }
-
-    pub(crate) fn set_event_bus(&self, ctx: ModuleCtx) {
-        *self.bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
     }
 
     async fn append(
@@ -118,16 +112,7 @@ impl Scheduler {
         key: Option<asterpath_core::DedupKey>,
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, &event).map_err(backend)?;
-        let log_id = self.log.append(entry).await.map_err(backend)?;
-        let bus = self
-            .bus
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(bus) = bus {
-            bus.emit(RecordAppended { session }).await;
-        }
-        Ok(log_id)
+        self.log.append(entry).await.map_err(backend)
     }
 
     /// Late-bind the runner so the scheduler and the agent never own each other.

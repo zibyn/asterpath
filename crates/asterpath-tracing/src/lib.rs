@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
-    EventLog, Fnv, LifecycleError, LogEntry, LogId, LogIdRange, LogQuery, Module, ModuleCtx,
-    SessionId, SignalId, StepId, StorageError, Timestamp, ToolCallId, TurnId,
+    EventLog, Fnv, LogEntry, LogId, LogIdRange, LogQuery, SessionId, SignalId, StepId,
+    StorageError, Timestamp, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
-    ErrorType, ModelCallAttrs, RecordAppended, ResumeEvent, SessionAttrs, SessionEvent, SideEffect,
-    Span, SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
+    ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span,
+    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
     ToolCallAttrs, ToolErrorKind, ToolResultStatus, TraceError, TraceId, TraceQuery, TraceTap,
     TurnAttrs, TurnEndReason, WaitAttrs, WaitKind, decode_entry,
 };
@@ -913,7 +913,7 @@ impl TracingTap {
         }
     }
 
-    /// Called from the event bus after a record becomes visible.
+    /// Called by the facade's append entry after a record becomes visible.
     pub async fn record_appended(&self, session: SessionId) {
         let spans = match fold_session(self.log.as_ref(), session).await {
             Ok(spans) => spans,
@@ -989,53 +989,4 @@ fn span_updates(previous: &[Span], current: &[Span]) -> Vec<SpanUpdate> {
         }
     }
     updates
-}
-
-/// Module wrapper: registers the tap handler and exposes both seams.
-pub struct TracingModule {
-    query: Arc<TracingQuery>,
-    tap: Arc<TracingTap>,
-}
-
-impl TracingModule {
-    pub fn new(log: Arc<dyn EventLog>) -> Self {
-        Self {
-            query: Arc::new(TracingQuery::new(Arc::clone(&log))),
-            tap: Arc::new(TracingTap::new(log)),
-        }
-    }
-
-    pub fn query(&self) -> Arc<dyn TraceQuery> {
-        Arc::clone(&self.query) as Arc<dyn TraceQuery>
-    }
-
-    pub fn tap(&self) -> Arc<dyn TraceTap> {
-        Arc::clone(&self.tap) as Arc<dyn TraceTap>
-    }
-}
-
-impl Module for TracingModule {
-    fn name(&self) -> &'static str {
-        "tracing"
-    }
-
-    fn init<'a>(
-        &'a self,
-        ctx: &'a ModuleCtx,
-    ) -> futures_core::future::BoxFuture<'a, Result<(), LifecycleError>> {
-        Box::pin(async move {
-            ctx.on(TapHandler(Arc::clone(&self.tap)));
-            Ok(())
-        })
-    }
-}
-
-struct TapHandler(Arc<TracingTap>);
-
-impl asterpath_core::Handler<RecordAppended> for TapHandler {
-    fn handle<'a>(&'a self, event: &'a RecordAppended) -> futures_core::future::BoxFuture<'a, ()> {
-        let tap = Arc::clone(&self.0);
-        let session = event.session;
-        Box::pin(async move { tap.record_appended(session).await })
-    }
 }

@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
-    Event, ExecutionError, InputId, LifecycleError, LogIdRange, SessionId, StepId, StorageError,
-    ToolCallId, TurnId, WaterfallEvent,
+    ExecutionError, InputId, LogIdRange, SessionId, StepId, StorageError, ToolCallId, TurnId,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -148,8 +147,6 @@ pub enum AgentError {
     #[error(transparent)]
     Execution(#[from] ExecutionError),
     #[error(transparent)]
-    Lifecycle(#[from] LifecycleError),
-    #[error(transparent)]
     Compaction(#[from] CompactionError),
 }
 
@@ -252,49 +249,6 @@ impl Drop for CancelRegistration {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.session);
     }
-}
-
-/// Host policy consulted before every step. `Continue` runs the step; the
-/// middleware sets `EndTurn` to stop the turn with `TurnEndReason::Stopped`.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum PreStepGateDecision {
-    #[default]
-    Continue,
-    EndTurn {
-        reason: String,
-    },
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreStepGateEvent {
-    pub session: SessionId,
-    pub turn: TurnId,
-    pub decision: PreStepGateDecision,
-}
-
-impl PreStepGateEvent {
-    pub fn new(session: SessionId, turn: TurnId) -> Self {
-        Self {
-            session,
-            turn,
-            decision: PreStepGateDecision::Continue,
-        }
-    }
-}
-
-impl Event for PreStepGateEvent {}
-impl WaterfallEvent for PreStepGateEvent {
-    type Error = PreStepGateError;
-}
-
-/// A gate error ends the turn with `TurnEndReason::Failed`.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PreStepGateError {
-    #[error("pre-step gate failed: {message}")]
-    Internal { message: String },
 }
 
 impl SessionSpec {

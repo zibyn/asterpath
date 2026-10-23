@@ -10,11 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_core::{
-    AwaitSignal, DURABLE_EXECUTOR_SERVICE, DurableExecutor, EventLog, ExecutionError,
-    LifecycleError, LogId, LogQuery, Module, ModuleCtx, ServiceId, SessionId, SignalDelivery,
-    SignalId, SignalPayload, WakeCause,
+    AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogId, LogQuery, SessionId,
+    SignalDelivery, SignalId, SignalPayload, WakeCause,
 };
-use asterpath_protocol::{RecordAppended, SessionEvent, decode_entry, dedup, encode_entry};
+use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -58,8 +57,6 @@ impl Waiters {
 pub struct RuntimeExecutor {
     log: Arc<dyn EventLog>,
     waiters: Waiters,
-    /// Set by the module wrapper so committed waits reach the trace tap.
-    bus: Mutex<Option<ModuleCtx>>,
 }
 
 impl RuntimeExecutor {
@@ -67,12 +64,7 @@ impl RuntimeExecutor {
         Self {
             log,
             waiters: Waiters::default(),
-            bus: Mutex::new(None),
         }
-    }
-
-    pub fn set_event_bus(&self, ctx: ModuleCtx) {
-        *self.bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
     }
 
     async fn append(
@@ -82,16 +74,7 @@ impl RuntimeExecutor {
         key: Option<asterpath_core::DedupKey>,
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, event).map_err(backend)?;
-        let log_id = self.log.append(entry).await.map_err(backend)?;
-        let bus = self
-            .bus
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(bus) = bus {
-            bus.emit(RecordAppended { session }).await;
-        }
-        Ok(log_id)
+        self.log.append(entry).await.map_err(backend)
     }
 
     async fn scan(&self, session: SessionId) -> Result<Vec<SessionEvent>, ExecutionError> {
@@ -211,35 +194,6 @@ impl DurableExecutor for RuntimeExecutor {
             WakeCause::ChildCompleted(child) => WaitKey::Child(child),
         };
         self.waiters.wake(key);
-    }
-}
-
-/// Module wrapper so the composition root can provide the executor service.
-pub struct RuntimeModule {
-    executor: Arc<RuntimeExecutor>,
-}
-
-impl RuntimeModule {
-    pub fn new(executor: Arc<RuntimeExecutor>) -> Self {
-        Self { executor }
-    }
-}
-
-impl Module for RuntimeModule {
-    fn name(&self) -> &'static str {
-        "runtime"
-    }
-
-    fn provides(&self) -> &[ServiceId] {
-        static IDS: [ServiceId; 1] = [DURABLE_EXECUTOR_SERVICE.id()];
-        &IDS
-    }
-
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>> {
-        let executor: Arc<dyn DurableExecutor> = self.executor.clone();
-        self.executor.set_event_bus(ctx.clone());
-        let result = ctx.provide(DURABLE_EXECUTOR_SERVICE, executor);
-        Box::pin(async move { result.map(|_| ()) })
     }
 }
 
