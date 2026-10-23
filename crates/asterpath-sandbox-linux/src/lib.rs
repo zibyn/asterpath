@@ -13,7 +13,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use asterpath_sandbox::{
+use asterpath_protocol::{
     ConfinedSpawn, Enforcement, SandboxError, SandboxPolicy, SandboxProvider, SpawnRequest,
 };
 
@@ -63,29 +63,9 @@ impl LinuxSandbox {
 
 impl SandboxProvider for LinuxSandbox {
     fn confine(&self, request: &SpawnRequest<'_>) -> Result<ConfinedSpawn, SandboxError> {
+        request.policy.validate()?;
         if matches!(request.policy, SandboxPolicy::FullAccess) {
-            return Ok(ConfinedSpawn::new(
-                request.program.to_os_string(),
-                request.args.to_vec(),
-                request.cwd.map(Path::to_path_buf),
-                request.env.clone(),
-                Enforcement::Full,
-            ));
-        }
-
-        if let SandboxPolicy::WorkspaceWrite { writable_roots } = request.policy {
-            // An empty or relative root set is a configuration error: fail
-            // closed instead of degrading to read-only or binding relative paths.
-            if writable_roots.is_empty() {
-                return Err(SandboxError::Unsupported {
-                    reason: "workspace-write requires at least one writable root".to_owned(),
-                });
-            }
-            if let Some(root) = writable_roots.iter().find(|root| !root.is_absolute()) {
-                return Err(SandboxError::Unsupported {
-                    reason: format!("writable root must be absolute: {}", root.display()),
-                });
-            }
+            return Ok(ConfinedSpawn::unconfined(request));
         }
 
         let program = resolve_bwrap(&self.bwrap).ok_or_else(|| SandboxError::Setup {

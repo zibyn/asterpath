@@ -161,6 +161,7 @@ project(entries):
 ### 恢复
 
 - `CompactionStarted` 无 `CompactionApplied` / `CompactionAborted` 是未闭合意图：恢复后重做摘要并补写终态；失败写 `CompactionAborted` 后按本文件 §6 收尾。
+- 重做 `ProviderError` 触发的压缩时，输入与实时相同：按开放 step 的水位线（`seq < StepStarted.seq`）投影，step 内记录的 steering 输入不进摘要；阈值 / 手动压缩仍看整个日志。之后是否重试同一 step 由尝试策略决定（[agent-loop.md](agent-loop.md) §7.1）。
 - 崩溃在摘要调用中 → 重新进入 pre-step，重新压缩；崩溃在 append 后 → 事件已提交，投影与下一次请求一致。
 - 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 
@@ -217,7 +218,7 @@ pub struct CompactionConfig {
 | C2 | 只有最近一个 step | `NothingToDo`；仍超窗则 `TurnCommitted(ContextExhausted)`，无事件 |
 | C3 | 摘要调用中 `kill -9` | 有 `CompactionStarted`、无终态；恢复后重做；成功 → 最终恰一条 `CompactionApplied`；再次失败 → `CompactionAborted`，无 open `CompactionStarted` |
 | C4 | append 后 `kill -9` | 事件保留；恢复不再压缩；投影包含 summary |
-| C5 | provider 错误 `context_exceeded`（无 `AssistantMessage`） | 同一 `StepStarted` 内强制压缩一次并重试（事件序列无第二个 `StepStarted`）；重试投影含压缩结果；成功则回合继续；同一 step 第二次超限 → `ContextExhausted` |
+| C5 | provider 错误 `context_exceeded`（无 `AssistantMessage`） | 同一 `StepStarted` 内强制压缩一次并重试（事件序列无第二个 `StepStarted`）；重试投影含压缩结果；成功则回合继续；同一 step 第二次超限 → `ContextExhausted`；C5 重试不占 `max_attempts` 预算、每 step 至多一次（[agent-loop.md](agent-loop.md) §7.1） |
 | C6 | `stop_reason` 超限（已有 `AssistantMessage`） | 不写 `CompactionApplied`；`TurnCommitted(ContextExhausted)` |
 | C7 | 手动压缩：Idle / TurnOpen | Idle 写 `CompactionStarted` + `CompactionApplied` 两条事件、无回合记录；TurnOpen 返回 `AgentError::Busy`、日志不变 |
 | C8 | 连续两次压缩 | 投影只含最新 summary + 保留内容；旧 summary 被覆盖；原始记录仍在 |

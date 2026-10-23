@@ -1,4 +1,5 @@
 mod compaction_turn;
+mod crash_points;
 mod pipeline;
 mod recovery;
 mod support;

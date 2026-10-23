@@ -5,4 +5,4 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-asterpath-sandbox = { path = "../asterpath-sandbox" }
+asterpath-protocol = { path = "../asterpath-protocol" }

@@ -97,9 +97,8 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "asterpath",
- "asterpath-plugin-host",
+ "asterpath-mcp",
  "asterpath-protocol",
- "asterpath-sandbox",
  "asterpath-sandbox-linux",
  "asterpath-skills",
  "asterpath-storage-sqlite",
@@ -118,7 +117,9 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "asterpath",
+ "asterpath-mcp",
  "asterpath-protocol",
+ "asterpath-sandbox-linux",
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
@@ -140,26 +141,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "asterpath-mcp-fixture"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-plugin-host"
+name = "asterpath-mcp"
 version = "0.1.0"
 dependencies = [
  "asterpath-http",
  "asterpath-protocol",
- "asterpath-sandbox",
  "asterpath-testing",
  "libc",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-mcp-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
  "tokio",
 ]
 
@@ -206,14 +206,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "asterpath-sandbox"
-version = "0.1.0"
-
-[[package]]
 name = "asterpath-sandbox-linux"
 version = "0.1.0"
 dependencies = [
- "asterpath-sandbox",
+ "asterpath-protocol",
 ]
 
 [[package]]
@@ -248,7 +244,6 @@ name = "asterpath-testing"
 version = "0.1.0"
 dependencies = [
  "asterpath-protocol",
- "asterpath-sandbox",
  "futures",
  "futures-core",
  "futures-util",
