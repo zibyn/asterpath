@@ -11,13 +11,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
     Part, Role, SessionState, Span, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope,
     UsageTotals, UserInput, decode_entry, history,
 };
 use asterpath_protocol::{
-    Clock, EventLog, InputId, LogEntry, LogQuery, SessionId, SystemClock, unique_bytes,
+    Clock, EventLog, InputId, LogEntry, SessionId, SystemClock, unique_bytes,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
@@ -644,16 +645,9 @@ async fn bare(settings: &config::Settings) -> CliResult<Asterpath> {
 }
 
 async fn scan(event_log: Arc<dyn EventLog>, session: SessionId) -> Result<Vec<LogEntry>, String> {
-    let mut stream = event_log.scan(LogQuery {
-        session,
-        after: None,
-        limit: None,
-    });
-    let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        entries.push(entry.map_err(|error| error.to_string())?);
-    }
-    Ok(entries)
+    scan_all(&*event_log, session)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Fold the log once; the deltas tell the summary which intents are still open.

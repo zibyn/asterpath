@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder};
 use asterpath_plugin_host::{PluginHost, PluginManifest, PluginStatus};
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
     ModelSpec, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
@@ -21,7 +22,7 @@ use asterpath_protocol::{
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig, TurnEndReason,
     UserInput, decode_entry,
 };
-use asterpath_protocol::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
+use asterpath_protocol::{Clock, EventLog, InputId, SessionCatalog, SessionId, Storage};
 use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
@@ -430,16 +431,9 @@ async fn scan(
     log: Arc<dyn EventLog>,
     session: SessionId,
 ) -> Result<Vec<asterpath_protocol::LogEntry>, String> {
-    let mut stream = log.scan(LogQuery {
-        session,
-        after: None,
-        limit: None,
-    });
-    let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        entries.push(entry.map_err(|error| error.to_string())?);
-    }
-    Ok(entries)
+    scan_all(&*log, session)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn assemble(

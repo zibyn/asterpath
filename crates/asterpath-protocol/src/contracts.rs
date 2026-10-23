@@ -89,6 +89,24 @@ pub trait EventLog: Send + Sync {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 }
 
+/// Every committed record of `session`, in `seq` order: the one whole-session
+/// read shared by the engine and its hosts.
+pub async fn scan_all(
+    log: &dyn EventLog,
+    session: SessionId,
+) -> Result<Vec<LogEntry>, StorageError> {
+    let mut stream = log.scan(LogQuery {
+        session,
+        after: None,
+        limit: None,
+    });
+    let mut entries = Vec::new();
+    while let Some(entry) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        entries.push(entry?);
+    }
+    Ok(entries)
+}
+
 /// Wake discovery contract: read-only, no queue and no lease.
 pub trait Storage: Send + Sync {
     /// Sessions that need to be driven: non-compaction open intents or

@@ -39,6 +39,7 @@ use crate::tools::ToolTable;
 use crate::views::trace::TracingQuery;
 use crate::views::usage::UsageService;
 use crate::waits::Waits;
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, OpenIntents,
     ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, Span,
@@ -46,8 +47,8 @@ use asterpath_protocol::{
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, Clock, EventLog, LogQuery, SessionCatalog, SessionRetirement, SignalDelivery,
-    Storage, unique_bytes,
+    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, SignalDelivery, Storage,
+    unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -458,15 +459,7 @@ impl SessionHandle {
 
     /// State is the log-derived classification, not driver memory.
     pub async fn state(&self) -> Result<SessionState, AsterError> {
-        let mut stream = self.event_log.scan(LogQuery {
-            session: self.session,
-            after: None,
-            limit: None,
-        });
-        let mut entries = Vec::new();
-        while let Some(entry) = stream.next().await {
-            entries.push(entry?);
-        }
+        let entries = scan_all(&*self.event_log, self.session).await?;
         let intents = OpenIntents::fold(&entries).map_err(|error| {
             AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
                 session: self.session,

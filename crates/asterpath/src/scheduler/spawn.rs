@@ -5,14 +5,15 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
     ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
     SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    Clock, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog, SessionId,
-    Timestamp, ToolCallId, WakeCause, unique_bytes,
+    Clock, EventLog, ExecutionError, LogEntry, LogId, SessionCatalog, SessionId, Timestamp,
+    ToolCallId, WakeCause, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -1087,14 +1088,8 @@ async fn scan(
     log: &dyn EventLog,
     session: SessionId,
 ) -> Result<Vec<(LogEntry, SessionEvent)>, ExecutionError> {
-    let mut stream = log.scan(LogQuery {
-        session,
-        after: None,
-        limit: None,
-    });
     let mut events = Vec::new();
-    while let Some(entry) = stream.next().await {
-        let entry = entry.map_err(backend)?;
+    for entry in scan_all(log, session).await.map_err(backend)? {
         let event = decode_entry(&entry).map_err(backend)?;
         events.push((entry, event));
     }

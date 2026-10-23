@@ -42,7 +42,7 @@ pub use config::{
 pub use contracts::{
     ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, EventLog, LogEntry, LogQuery, NewEntry,
     SessionCatalog, SessionRetirement, SignalDelivery, SignalName, SignalPayload, Storage,
-    WakeCause,
+    WakeCause, scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;

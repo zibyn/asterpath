@@ -9,14 +9,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AwaitSignal, EventLog, ExecutionError, LogId, LogQuery, SessionId, SignalDelivery, SignalId,
+    AwaitSignal, EventLog, ExecutionError, LogId, SessionId, SignalDelivery, SignalId,
     SignalPayload, WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
-use futures_util::StreamExt;
 use tokio::sync::Notify;
 
 /// Process-local wait identities. Not persisted.
@@ -78,16 +77,8 @@ impl Waits {
     }
 
     async fn scan(&self, session: SessionId) -> Result<Vec<SessionEvent>, ExecutionError> {
-        let stream: BoxStream<
-            '_,
-            Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
-        > = self.log.scan(LogQuery {
-            session,
-            after: None,
-            limit: None,
-        });
         let mut events = Vec::new();
-        for entry in collect(stream).await? {
+        for entry in scan_all(&*self.log, session).await.map_err(backend)? {
             events.push(decode_entry(&entry).map_err(backend)?);
         }
         Ok(events)
@@ -197,19 +188,6 @@ impl Waits {
         };
         self.waiters.wake(key);
     }
-}
-
-async fn collect<S>(mut stream: S) -> Result<Vec<asterpath_protocol::LogEntry>, ExecutionError>
-where
-    S: futures_core::Stream<
-            Item = Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
-        > + Unpin,
-{
-    let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        entries.push(entry.map_err(backend)?);
-    }
-    Ok(entries)
 }
 
 fn backend(error: impl std::fmt::Display) -> ExecutionError {

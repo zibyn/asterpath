@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
     ApprovalVerdict, CancelReason, CancelRegistration, CancelToken, CancellationRegistry,
@@ -148,16 +149,7 @@ impl Agent {
     }
 
     async fn scan(&self, session: SessionId) -> Result<Vec<LogEntry>, AgentError> {
-        let mut stream = self.log.scan(LogQuery {
-            session,
-            after: None,
-            limit: None,
-        });
-        let mut entries = Vec::new();
-        while let Some(entry) = stream.next().await {
-            entries.push(entry?);
-        }
-        Ok(entries)
+        Ok(scan_all(&*self.log, session).await?)
     }
 
     async fn append(

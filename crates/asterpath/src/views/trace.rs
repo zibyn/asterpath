@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
     ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span,
@@ -16,8 +17,8 @@ use asterpath_protocol::{
     WaitKind, decode_entry,
 };
 use asterpath_protocol::{
-    EventLog, Fnv, LogEntry, LogId, LogIdRange, LogQuery, SessionId, SignalId, StepId,
-    StorageError, Timestamp, ToolCallId, TurnId,
+    EventLog, Fnv, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, StorageError,
+    Timestamp, ToolCallId, TurnId,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -102,21 +103,10 @@ async fn fold_session(log: &dyn EventLog, session: SessionId) -> Result<Vec<Span
 }
 
 async fn scan(log: &dyn EventLog, session: SessionId) -> Result<Vec<LogEntry>, TraceError> {
-    let mut stream = log.scan(LogQuery {
-        session,
-        after: None,
-        limit: None,
-    });
-    let mut entries = Vec::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(entry) => entries.push(entry),
-            Err(StorageError::Corrupt { detail, .. }) => {
-                return Err(TraceError::Corrupt { session, detail });
-            }
-            Err(error) => return Err(TraceError::Backend(error.to_string())),
-        }
-    }
+    let entries = scan_all(log, session).await.map_err(|error| match error {
+        StorageError::Corrupt { detail, .. } => TraceError::Corrupt { session, detail },
+        error => TraceError::Backend(error.to_string()),
+    })?;
     if entries.is_empty() {
         return Err(TraceError::NotFound { session });
     }

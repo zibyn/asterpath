@@ -2,7 +2,7 @@
 
 use asterpath_protocol::{
     ConfigSnapshot, EventLog, ModelId, ModelSpec, ParentRef, ProviderId, SessionCatalog,
-    SessionEvent, SessionId, ToolCallId, TurnId, encode_entry,
+    SessionEvent, SessionId, ToolCallId, TurnId, encode_entry, scan_all,
 };
 use asterpath_testing::{InMemoryEventLog, MemoryBackend, event_log_contract, storage_contract};
 use futures_util::StreamExt;
@@ -69,4 +69,33 @@ async fn in_memory_log_is_a_session_catalog_over_session_created_parents() {
         "ordered by session id, like SQLite"
     );
     assert!(log.children(first).next().await.is_none());
+}
+
+#[tokio::test]
+async fn scan_all_reads_one_whole_session_in_seq_order() {
+    let root = SessionId::from_bytes([1; 16]);
+    let other = SessionId::from_bytes([2; 16]);
+    let log = InMemoryEventLog::new();
+    let first = log
+        .append(encode_entry(root, None, &created(None)).unwrap())
+        .await
+        .unwrap();
+    log.append(encode_entry(other, None, &created(Some(root))).unwrap())
+        .await
+        .unwrap();
+    let input = SessionEvent::InputRecorded { input: vec![] };
+    let second = log
+        .append(encode_entry(root, None, &input).unwrap())
+        .await
+        .unwrap();
+
+    let entries = scan_all(&log, root).await.unwrap();
+    let ids: Vec<_> = entries.iter().map(|entry| entry.log_id).collect();
+    assert_eq!(ids, vec![first, second]);
+    assert!(
+        scan_all(&log, SessionId::from_bytes([9; 16]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
