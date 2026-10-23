@@ -166,6 +166,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterpath-mcp-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-sandbox",
+]
+
+[[package]]
 name = "asterpath-protocol"
 version = "0.1.0"
 dependencies = [
@@ -217,6 +234,17 @@ dependencies = [
  "futures-util",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "asterpath-sandbox"
+version = "0.1.0"
+
+[[package]]
+name = "asterpath-sandbox-linux"
+version = "0.1.0"
+dependencies = [
+ "asterpath-sandbox",
 ]
 
 [[package]]
