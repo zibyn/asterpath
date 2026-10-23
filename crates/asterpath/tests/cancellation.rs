@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath::{Asterpath, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AbortKind, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, PartDelta, Provider,
     ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, ReplaySafety,
@@ -17,7 +16,8 @@ use asterpath_protocol::{
     SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
     ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
-use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::{Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -73,7 +73,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
         parallelism: Parallelism::Parallel,
         replay: ReplaySafety::Safe,
         side_effect: SideEffect::ReadOnly,
-        provenance: asterpath_protocol::Provenance::InProcess,
+        provenance: asterpath::protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
     }
@@ -181,7 +181,7 @@ impl Provider for BlockingProvider {
 
     fn stream(
         &self,
-        _request: asterpath_protocol::ModelRequest,
+        _request: asterpath::protocol::ModelRequest,
     ) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
@@ -370,7 +370,7 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
     assert_eq!(provider.calls(), 1);
     assert!(matches!(
         handle.state().await.unwrap(),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
 
     // The session still accepts input and starts a new turn.
@@ -450,7 +450,7 @@ async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
     );
     assert!(matches!(
         handle.state().await.unwrap(),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
 
     asterpath.shutdown().await.unwrap();
@@ -540,7 +540,7 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
     assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Cancelled]);
     assert!(matches!(
         handle.state().await.unwrap(),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
 
     asterpath.shutdown().await.unwrap();

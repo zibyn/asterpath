@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asterpath::DefaultCompactor;
-use asterpath::{Asterpath, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AgentError, AgentEvent, CompactionAbortReason, CompactionConfig, CompactionTrigger, Compactor,
     InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism, Part, Provider,
     ProviderCatalog, ProviderError, ProviderErrorKind, ProviderId, ReplaySafety, RequestConfig,
@@ -17,7 +16,8 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
     TurnEndReason, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore};
+use asterpath::{Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -85,7 +85,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
         parallelism: Parallelism::Parallel,
         replay: ReplaySafety::Safe,
         side_effect: SideEffect::ReadOnly,
-        provenance: asterpath_protocol::Provenance::InProcess,
+        provenance: asterpath::protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
     }
@@ -235,13 +235,13 @@ fn image_and_reasoning() -> Vec<Item> {
     vec![
         Item::Reasoning {
             summary: vec![text("hidden reasoning")],
-            binding: asterpath_protocol::ReasoningBinding {
+            binding: asterpath::protocol::ReasoningBinding {
                 provider: ProviderId::new("p"),
                 model: ModelId::new("model-1"),
                 prefix_epoch: 0,
                 tools_hash: String::new(),
             },
-            raw: asterpath_protocol::RawProviderData {
+            raw: asterpath::protocol::RawProviderData {
                 provider: ProviderId::new("p"),
                 model: None,
                 kind: "raw".to_owned(),
@@ -254,7 +254,7 @@ fn image_and_reasoning() -> Vec<Item> {
                 text("step one"),
                 Part::Image {
                     media_type: "image/png".to_owned(),
-                    source: asterpath_protocol::ImageSource::Url {
+                    source: asterpath::protocol::ImageSource::Url {
                         url: "https://example.invalid/p.png".to_owned(),
                     },
                 },
@@ -268,7 +268,7 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
     let db = temp_db("c1");
     let provider = Arc::new(
         ScriptedProvider::new("p")
-            .with_capabilities(asterpath_protocol::ProviderCapabilities {
+            .with_capabilities(asterpath::protocol::ProviderCapabilities {
                 image_input: true,
                 ..Default::default()
             })
@@ -328,7 +328,7 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
     assert!(summary_request.tools.is_empty());
     assert_eq!(
         summary_request.tool_choice,
-        asterpath_protocol::ToolChoice::None
+        asterpath::protocol::ToolChoice::None
     );
     assert!(summary_request.reasoning.is_none());
     assert!(summary_request.sampling.is_none());
@@ -566,7 +566,7 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
     let result = handle.compact_now().await.expect("compact_now");
     assert!(matches!(
         result,
-        asterpath_protocol::CompactResult::Applied(_)
+        asterpath::protocol::CompactResult::Applied(_)
     ));
     let after = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&after, "CompactionStarted"), 1);
@@ -583,7 +583,7 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
         session,
         None,
         &SessionEvent::TurnStarted {
-            turn_id: asterpath_protocol::TurnId::from_bytes([9; 16]),
+            turn_id: asterpath::protocol::TurnId::from_bytes([9; 16]),
         },
     )
     .expect("encode");
@@ -675,7 +675,7 @@ async fn c13_missing_window_disables_every_path() {
     )));
 
     let result = handle.compact_now().await.expect("manual");
-    assert_eq!(result, asterpath_protocol::CompactResult::NotConfigured);
+    assert_eq!(result, asterpath::protocol::CompactResult::NotConfigured);
     let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
@@ -815,7 +815,7 @@ async fn c16_without_a_compactor_nothing_is_written() {
         }
     )));
     let result = handle.compact_now().await.expect("manual");
-    assert_eq!(result, asterpath_protocol::CompactResult::NotConfigured);
+    assert_eq!(result, asterpath::protocol::CompactResult::NotConfigured);
     let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
@@ -874,7 +874,7 @@ async fn c3_open_compaction_is_redone_on_recovery() {
     assert_eq!(count(&entries, "CompactionAborted"), 0);
     assert!(matches!(
         handle.state().await.expect("state"),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
     cleanup(&db);
 }
@@ -907,7 +907,7 @@ async fn c3_failed_redo_closes_with_an_abort() {
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     assert!(matches!(
         handle.state().await.expect("state"),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
     cleanup(&db);
 }
@@ -935,7 +935,7 @@ async fn c3_without_a_compactor_the_intent_stays_open_and_idle() {
     assert_eq!(count(&entries, "CompactionAborted"), 0);
     assert!(matches!(
         handle.state().await.expect("state"),
-        asterpath_protocol::SessionState::Idle
+        asterpath::protocol::SessionState::Idle
     ));
     cleanup(&db);
 }
@@ -1058,7 +1058,7 @@ async fn manual_states_are_results_not_errors() {
         .expect("session");
     assert_eq!(
         handle.compact_now().await.expect("nothing to do"),
-        asterpath_protocol::CompactResult::NotConfigured
+        asterpath::protocol::CompactResult::NotConfigured
     );
     cleanup(&db);
 }

@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AgentEvent, CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part,
     Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
     StopReason, SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
     ToolOutput, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -51,7 +51,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
         parallelism: Parallelism::Parallel,
         replay: ReplaySafety::Safe,
         side_effect: SideEffect::ReadOnly,
-        provenance: asterpath_protocol::Provenance::InProcess,
+        provenance: asterpath::protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
     }

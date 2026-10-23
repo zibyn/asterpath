@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath::{Asterpath, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider,
     ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
@@ -17,7 +16,8 @@ use asterpath_protocol::{
     ToolName, ToolOutput, ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id,
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
+use asterpath::protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
+use asterpath::{Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -54,7 +54,7 @@ fn descriptor(name: &str, timeout: Option<Duration>) -> ToolDescriptor {
         parallelism: Parallelism::Parallel,
         replay: ReplaySafety::Safe,
         side_effect: SideEffect::ReadOnly,
-        provenance: asterpath_protocol::Provenance::InProcess,
+        provenance: asterpath::protocol::Provenance::InProcess,
         timeout,
         max_output_bytes: None,
     }
@@ -133,8 +133,8 @@ impl TestTool {
     }
 
     fn external(mut self) -> Self {
-        self.descriptor.provenance = asterpath_protocol::Provenance::External {
-            transport: asterpath_protocol::TransportKind::Stdio,
+        self.descriptor.provenance = asterpath::protocol::Provenance::External {
+            transport: asterpath::protocol::TransportKind::Stdio,
         };
         self
     }
@@ -183,7 +183,7 @@ fn kind_count(entries: &[LogEntry], kind: &str) -> usize {
 
 fn tool_results(
     entries: &[LogEntry],
-) -> Vec<(asterpath_protocol::ToolResultStatus, Option<String>)> {
+) -> Vec<(asterpath::protocol::ToolResultStatus, Option<String>)> {
     entries
         .iter()
         .filter_map(|entry| match decode_entry(entry).expect("decodes") {
@@ -197,7 +197,7 @@ fn tool_results(
 
 fn text_input(id: u8) -> UserInput {
     UserInput {
-        id: asterpath_protocol::InputId::from_bytes([id; 16]),
+        id: asterpath::protocol::InputId::from_bytes([id; 16]),
         parts: vec![text("go")],
     }
 }
@@ -275,7 +275,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].0,
-        asterpath_protocol::ToolResultStatus::Completed
+        asterpath::protocol::ToolResultStatus::Completed
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
     assert_eq!(kind_count(&entries, "SignalReceived"), 1);
@@ -340,7 +340,7 @@ async fn ask_with_open_gate_deny_records_denied_with_reason() {
     let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
+    assert_eq!(results[0].0, asterpath::protocol::ToolResultStatus::Failed);
     assert_eq!(results[0].1.as_deref(), Some("not now"));
     assert!(calls.lock().unwrap().is_empty());
 
@@ -380,7 +380,7 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
     let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
+    assert_eq!(results[0].0, asterpath::protocol::ToolResultStatus::Failed);
     assert!(
         results[0]
             .1
@@ -417,8 +417,8 @@ async fn recorded_decision_is_reused_without_reprompting() {
     let handle = asterpath.create_session(spec()).await.unwrap();
     let session = handle.id();
 
-    let turn = asterpath_protocol::TurnId::from_bytes([1; 16]);
-    let step = asterpath_protocol::StepId::from_bytes([2; 16]);
+    let turn = asterpath::protocol::TurnId::from_bytes([1; 16]);
+    let step = asterpath::protocol::StepId::from_bytes([2; 16]);
     let call = ToolCallId::from_bytes([3; 16]);
     let log = asterpath.store();
     append(
@@ -464,7 +464,7 @@ async fn recorded_decision_is_reused_without_reprompting() {
             name: ToolName::new("echo"),
             raw_args: JsonString::new(r#"{"q":"hi"}"#),
             replay: ReplaySafety::Safe,
-            provenance: asterpath_protocol::Provenance::InProcess,
+            provenance: asterpath::protocol::Provenance::InProcess,
         },
         Some(dedup::tool_call(call)),
     )
@@ -493,7 +493,7 @@ async fn recorded_decision_is_reused_without_reprompting() {
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].0,
-        asterpath_protocol::ToolResultStatus::Completed
+        asterpath::protocol::ToolResultStatus::Completed
     );
 
     asterpath.shutdown().await.unwrap();
@@ -524,8 +524,8 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
     let handle = asterpath.create_session(spec()).await.unwrap();
     let session = handle.id();
 
-    let turn = asterpath_protocol::TurnId::from_bytes([1; 16]);
-    let step = asterpath_protocol::StepId::from_bytes([2; 16]);
+    let turn = asterpath::protocol::TurnId::from_bytes([1; 16]);
+    let step = asterpath::protocol::StepId::from_bytes([2; 16]);
     let first = ToolCallId::from_bytes([3; 16]);
     let second = ToolCallId::from_bytes([4; 16]);
     let call = |id: &str| Item::ToolCall {
@@ -580,7 +580,7 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
                 name: ToolName::new("echo"),
                 raw_args: JsonString::new(r#"{"q":"hi"}"#),
                 replay: ReplaySafety::Safe,
-                provenance: asterpath_protocol::Provenance::InProcess,
+                provenance: asterpath::protocol::Provenance::InProcess,
             },
             Some(dedup::tool_call(id)),
         )
@@ -665,7 +665,7 @@ async fn cancel_before_deadline_wins_over_timeout() {
     assert_eq!(results.len(), 1, "exactly one terminal record");
     assert_eq!(
         results[0].0,
-        asterpath_protocol::ToolResultStatus::Interrupted,
+        asterpath::protocol::ToolResultStatus::Interrupted,
         "cancel takes the terminal; no Failed{{Timeout}}"
     );
     assert_eq!(kind_count(&entries, "ToolResult"), 1);
@@ -715,7 +715,7 @@ async fn real_result_within_grace_beats_cancellation() {
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].0,
-        asterpath_protocol::ToolResultStatus::Completed
+        asterpath::protocol::ToolResultStatus::Completed
     );
 
     asterpath.shutdown().await.unwrap();
@@ -772,7 +772,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
     );
     let entries = scan(asterpath.store(), denied.id()).await;
     let results = tool_results(&entries);
-    assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
+    assert_eq!(results[0].0, asterpath::protocol::ToolResultStatus::Failed);
     assert!(calls.lock().unwrap().is_empty());
 
     // With an endpoint the same tool asks and, once allowed, executes.
@@ -801,7 +801,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
     let results = tool_results(&entries);
     assert_eq!(
         results[0].0,
-        asterpath_protocol::ToolResultStatus::Completed
+        asterpath::protocol::ToolResultStatus::Completed
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
 

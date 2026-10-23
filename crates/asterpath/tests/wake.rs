@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use asterpath::Asterpath;
-use asterpath_protocol::{
+use asterpath::protocol::{
     CompactionConfig, CompactionTrigger, LogId, ModelId, ModelSpec, ParentRef, Part, ProviderId,
     RequestConfig, SessionEvent, SessionId, SessionSpec, StepId, SubagentConfig, ToolCallId,
     ToolSelection, TurnConfig, TurnEndReason, TurnId, UserInput, dedup, encode_entry,
@@ -38,7 +38,7 @@ async fn append_keyed(
     asterpath: &Asterpath,
     session: SessionId,
     event: SessionEvent,
-    key: Option<asterpath_protocol::DedupKey>,
+    key: Option<asterpath::protocol::DedupKey>,
 ) {
     let entry = encode_entry(session, key, &event).expect("encode");
     asterpath.store().append(entry).await.expect("append");
@@ -118,7 +118,7 @@ async fn seed(asterpath: &Asterpath) -> (Vec<SessionId>, Vec<SessionId>) {
         .await
         .expect("open")
         .submit_input(UserInput {
-            id: asterpath_protocol::InputId::from_bytes([9; 16]),
+            id: asterpath::protocol::InputId::from_bytes([9; 16]),
             parts: vec![Part::Text {
                 text: "also this".to_owned(),
             }],

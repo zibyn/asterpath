@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, ChildFailure,
     ChildOutcome, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId, ModelRequest,
     ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCapabilities, ProviderError,
@@ -19,9 +18,10 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolErrorKind, ToolName, ToolOutput, ToolResultStatus,
     ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
-use asterpath_protocol::{
+use asterpath::protocol::{
     ApprovalGate, InputId, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId,
 };
+use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -357,7 +357,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     assert_eq!(
         completion(&parent_entries),
         Some(ChildOutcome::Completed {
-            summary: asterpath_protocol::Summary {
+            summary: asterpath::protocol::Summary {
                 items: vec![text("child summary")]
             }
         })
@@ -451,7 +451,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
         completion(&parent_entries),
         Some(ChildOutcome::Failed {
             reason: ChildFailure::MaxStepsExceeded,
-            summary: asterpath_protocol::Summary {
+            summary: asterpath::protocol::Summary {
                 items: vec![text("still working")]
             }
         })
@@ -1102,7 +1102,7 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Cancelled {
-            reason: asterpath_protocol::CancelReason::Parent
+            reason: asterpath::protocol::CancelReason::Parent
         }]
     );
     let results = all_tool_results(&entries);
@@ -1199,7 +1199,7 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Cancelled {
-            reason: asterpath_protocol::CancelReason::Parent
+            reason: asterpath::protocol::CancelReason::Parent
         }],
         "the dropped spawn future still closes the child wait"
     );
@@ -1211,13 +1211,13 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
         vec![ToolResultStatus::Interrupted]
     );
     assert_eq!(handle.state().await.unwrap(), SessionState::Idle);
-    let intents = asterpath_protocol::SessionFacts::fold(&entries).expect("folds");
+    let intents = asterpath::protocol::SessionFacts::fold(&entries).expect("folds");
     assert!(intents.is_idle(), "no waiting intent survives cancellation");
     assert!(
         !matches!(
             handle.compact_now().await,
             Err(asterpath::AsterError::Agent(
-                asterpath_protocol::AgentError::Busy { .. }
+                asterpath::protocol::AgentError::Busy { .. }
             ))
         ),
         "an idle session is not stuck behind the closed wait"
@@ -1281,7 +1281,7 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Cancelled {
-            reason: asterpath_protocol::CancelReason::Timeout
+            reason: asterpath::protocol::CancelReason::Timeout
         }]
     );
     let (status, _, error) = all_tool_results(&entries)
@@ -1340,7 +1340,7 @@ async fn a_child_completing_before_its_deadline_wins() {
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Completed {
-            summary: asterpath_protocol::Summary {
+            summary: asterpath::protocol::Summary {
                 items: vec![text("child done")]
             }
         }]

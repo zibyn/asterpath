@@ -4,7 +4,7 @@
 #![cfg(feature = "anthropic")]
 
 use asterpath::anthropic::AnthropicProvider;
-use asterpath_protocol::Provider;
+use asterpath::protocol::Provider;
 
 #[test]
 fn anthropic_adapter_is_reexported_under_the_feature_flag() {

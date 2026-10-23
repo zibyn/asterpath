@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asterpath::{Asterpath, SessionHandle};
-use asterpath_protocol::SessionId;
-use asterpath_protocol::{
+use asterpath::protocol::SessionId;
+use asterpath::protocol::{
     AgentEvent, CompactionConfig, InputTokens, ModelId, ModelSpec, OutputTokens, Part, ProviderId,
     RequestConfig, SessionSpec, StopReason, SubagentConfig, ToolSelection, TurnConfig, Usage,
     UsageError, UsageScope, UserInput,
 };
+use asterpath::{Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 
@@ -39,9 +39,9 @@ fn text(value: &str) -> Part {
     }
 }
 
-fn assistant(value: &str) -> asterpath_protocol::Item {
-    asterpath_protocol::Item::Message {
-        role: asterpath_protocol::Role::Assistant,
+fn assistant(value: &str) -> asterpath::protocol::Item {
+    asterpath::protocol::Item::Message {
+        role: asterpath::protocol::Role::Assistant,
         parts: vec![text(value)],
     }
 }
@@ -110,7 +110,7 @@ async fn facade_usage_query_folds_live_turns() {
 
     session
         .submit_input(UserInput {
-            id: asterpath_protocol::InputId::from_bytes([1; 16]),
+            id: asterpath::protocol::InputId::from_bytes([1; 16]),
             parts: vec![text("first")],
         })
         .await
@@ -118,7 +118,7 @@ async fn facade_usage_query_folds_live_turns() {
     drive(&session).await;
     session
         .submit_input(UserInput {
-            id: asterpath_protocol::InputId::from_bytes([2; 16]),
+            id: asterpath::protocol::InputId::from_bytes([2; 16]),
             parts: vec![text("second")],
         })
         .await

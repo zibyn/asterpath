@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asterpath::Asterpath;
-use asterpath_protocol::{
+use asterpath::protocol::{
     CompactionConfig, Item, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, Role,
     SessionSpec, SpanKind, SpanStatus, StopReason, SubagentConfig, ToolSelection, TraceError,
     TurnConfig, Usage, UserInput,
 };
-use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 

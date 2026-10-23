@@ -8,15 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AbortKind, AgentError, AgentEvent, CompactionConfig, InputTokens, Item, ModelId, ModelSpec,
     OutputTokens, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind,
     ProviderId, RequestConfig, Role, SamplingParams, SessionEvent, SessionSpec, SessionState,
     StopReason, SubagentConfig, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath_protocol::{Clock, InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{Clock, InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 

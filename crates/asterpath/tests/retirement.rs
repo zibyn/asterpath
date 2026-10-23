@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asterpath::{AsterError, Asterpath};
-use asterpath_protocol::{
+use asterpath::protocol::{
     AgentError, CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, ToolSelection, TurnConfig,
 };
-use asterpath_protocol::{LogId, RetirementError, SessionStore};
-use asterpath_protocol::{LogQuery, SessionId};
+use asterpath::protocol::{LogId, RetirementError, SessionStore};
+use asterpath::protocol::{LogQuery, SessionId};
+use asterpath::{AsterError, Asterpath};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 
@@ -138,8 +138,8 @@ struct NoRetirement(asterpath_testing::InMemoryEventLog);
 impl SessionStore for NoRetirement {
     fn append(
         &self,
-        entry: asterpath_protocol::NewEntry,
-    ) -> futures_core::future::BoxFuture<'_, Result<LogId, asterpath_protocol::StorageError>> {
+        entry: asterpath::protocol::NewEntry,
+    ) -> futures_core::future::BoxFuture<'_, Result<LogId, asterpath::protocol::StorageError>> {
         self.0.append(entry)
     }
 
@@ -148,7 +148,7 @@ impl SessionStore for NoRetirement {
         query: LogQuery,
     ) -> futures_core::stream::BoxStream<
         '_,
-        Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
+        Result<asterpath::protocol::LogEntry, asterpath::protocol::StorageError>,
     > {
         self.0.scan(query)
     }
@@ -156,15 +156,17 @@ impl SessionStore for NoRetirement {
     fn frontier(
         &self,
         session: SessionId,
-    ) -> futures_core::future::BoxFuture<'_, Result<Option<LogId>, asterpath_protocol::StorageError>>
+    ) -> futures_core::future::BoxFuture<'_, Result<Option<LogId>, asterpath::protocol::StorageError>>
     {
         self.0.frontier(session)
     }
 
     fn sessions(
         &self,
-    ) -> futures_core::future::BoxFuture<'_, Result<Vec<SessionId>, asterpath_protocol::StorageError>>
-    {
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Vec<SessionId>, asterpath::protocol::StorageError>,
+    > {
         self.0.sessions()
     }
 
@@ -173,7 +175,7 @@ impl SessionStore for NoRetirement {
         session: SessionId,
     ) -> futures_core::future::BoxFuture<
         '_,
-        Result<Option<SessionId>, asterpath_protocol::StorageError>,
+        Result<Option<SessionId>, asterpath::protocol::StorageError>,
     > {
         self.0.parent(session)
     }
@@ -181,7 +183,7 @@ impl SessionStore for NoRetirement {
     fn children(
         &self,
         session: SessionId,
-    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath_protocol::StorageError>>
+    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath::protocol::StorageError>>
     {
         self.0.children(session)
     }
