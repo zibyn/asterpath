@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asterpath::Asterpath;
-use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     CompactionConfig, Item, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, Role,
     SessionSpec, Span, SpanFilter, SpanKind, SpanStatus, SpanUpdate, StopReason, SubagentConfig,
     ToolSelection, TraceError, TurnConfig, Usage, UserInput,
 };
+use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 

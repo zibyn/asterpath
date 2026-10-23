@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asterpath_core::{EventLog, LogQuery, SessionId};
+use asterpath_protocol::{EventLog, LogQuery, SessionId};
 use asterpath_protocol::{
     JsonString, Parallelism, Part, Provenance, Provider, ReplaySafety, SessionEvent, SideEffect,
     Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
@@ -131,9 +131,9 @@ impl Tool for CounterTool {
 fn context() -> ToolContext {
     ToolContext::new(
         SESSION,
-        asterpath_core::TurnId::from_bytes([2; 16]),
-        asterpath_core::StepId::from_bytes([3; 16]),
-        asterpath_core::ToolCallId::from_bytes([4; 16]),
+        asterpath_protocol::TurnId::from_bytes([2; 16]),
+        asterpath_protocol::StepId::from_bytes([3; 16]),
+        asterpath_protocol::ToolCallId::from_bytes([4; 16]),
         asterpath_protocol::CancelToken::new(),
     )
 }
@@ -234,7 +234,7 @@ fn fixture_parses_and_replays_after_a_committed_prefix() {
     assert_eq!(provider.requests().len(), 1);
 }
 
-async fn scan(log: &Arc<InMemoryEventLog>) -> Vec<asterpath_core::LogEntry> {
+async fn scan(log: &Arc<InMemoryEventLog>) -> Vec<asterpath_protocol::LogEntry> {
     let mut stream = log.scan(LogQuery {
         session: SESSION,
         after: None,

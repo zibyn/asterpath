@@ -5,12 +5,12 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath_core::{
-    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
-};
 use asterpath_protocol::{
     AgentRunner, ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec,
     Provider, Tool, ToolConfig,
+};
+use asterpath_protocol::{
+    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
 };
 
 use crate::error::AsterError;

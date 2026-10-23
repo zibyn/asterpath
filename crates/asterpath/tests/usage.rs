@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::SessionId;
+use asterpath_protocol::SessionId;
 use asterpath_protocol::{
     AgentEvent, CompactionConfig, InputTokens, ModelId, ModelSpec, OutputTokens, Part, ProviderId,
     RequestConfig, SessionSpec, StopReason, SubagentConfig, ToolSelection, TurnConfig, Usage,
@@ -122,7 +122,7 @@ async fn facade_usage_query_folds_live_turns() {
 
     session
         .submit_input(UserInput {
-            id: asterpath_core::InputId::from_bytes([1; 16]),
+            id: asterpath_protocol::InputId::from_bytes([1; 16]),
             parts: vec![text("first")],
         })
         .await
@@ -130,7 +130,7 @@ async fn facade_usage_query_folds_live_turns() {
     drive(&session).await;
     session
         .submit_input(UserInput {
-            id: asterpath_core::InputId::from_bytes([2; 16]),
+            id: asterpath_protocol::InputId::from_bytes([2; 16]),
             parts: vec![text("second")],
         })
         .await

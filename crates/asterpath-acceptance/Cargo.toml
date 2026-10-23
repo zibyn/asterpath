@@ -10,7 +10,6 @@ path = "src/bin/testdrive.rs"
 
 [dependencies]
 asterpath = { path = "../asterpath" }
-asterpath-core = { path = "../asterpath-core" }
 asterpath-plugin-host = { path = "../asterpath-plugin-host" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-sandbox = { path = "../asterpath-sandbox" }

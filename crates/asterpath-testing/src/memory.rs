@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_core::{
+use asterpath_protocol::{
     Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, Storage, StorageError,
     SystemClock, Timestamp,
 };

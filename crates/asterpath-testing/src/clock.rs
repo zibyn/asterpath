@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use asterpath_core::{Clock, Timestamp};
+use asterpath_protocol::{Clock, Timestamp};
 
 /// Starts at a fixed epoch and only moves when `advance` is called.
 #[derive(Debug)]

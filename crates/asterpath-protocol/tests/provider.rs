@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use asterpath_core::{DedupKey, SessionId};
+use asterpath_protocol::{DedupKey, SessionId};
 use asterpath_protocol::{
     Provider, ProviderCapabilities, ProviderCatalog, ProviderError, ProviderErrorKind, ProviderId,
     SessionEvent, StopReason, StreamEvent, decode_entry, encode_entry,
@@ -71,15 +71,15 @@ fn error_classification_defaults_and_context_overflow() {
 fn encode_entry_produces_a_decodable_envelope() {
     let session = SessionId::from_bytes([7; 16]);
     let event = SessionEvent::TurnStarted {
-        turn_id: asterpath_core::TurnId::from_bytes([9; 16]),
+        turn_id: asterpath_protocol::TurnId::from_bytes([9; 16]),
     };
     let entry = encode_entry(session, Some(DedupKey::new("k")), &event).unwrap();
 
     assert_eq!(entry.session, session);
     assert_eq!(entry.schema_version, asterpath_protocol::LOG_SCHEMA_VERSION);
     assert_eq!(entry.dedup_key.as_ref().unwrap().as_str(), "k");
-    let decoded = decode_entry(&asterpath_core::LogEntry {
-        log_id: asterpath_core::LogId::from_i64(1),
+    let decoded = decode_entry(&asterpath_protocol::LogEntry {
+        log_id: asterpath_protocol::LogId::from_i64(1),
         session,
         seq: 1,
         recorded_at: 0,

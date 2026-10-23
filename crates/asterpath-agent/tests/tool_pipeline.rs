@@ -5,10 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath_core::{
-    ApprovalGate, AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogQuery, SessionId,
-    SignalDelivery, SignalPayload, ToolCallId, TurnId, WakeCause,
-};
 use asterpath_protocol::{
     AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Gate,
     HookError, Hooks, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
@@ -17,6 +13,10 @@ use asterpath_protocol::{
     ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName,
     ToolOutput, ToolRegistry, ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage,
     decode_entry, encode_entry,
+};
+use asterpath_protocol::{
+    ApprovalGate, AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogQuery, SessionId,
+    SignalDelivery, SignalPayload, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -968,7 +968,7 @@ async fn a_tool_that_ignores_the_deadline_fails_timeout() {
 #[tokio::test]
 async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
     let turn = TurnId::from_bytes([2; 16]);
-    let step = asterpath_core::StepId::from_bytes([3; 16]);
+    let step = asterpath_protocol::StepId::from_bytes([3; 16]);
     let recorded = ToolCallId::from_bytes([4; 16]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     append(&log, SessionEvent::TurnStarted { turn_id: turn }).await;
@@ -1275,7 +1275,7 @@ impl Hooks for CountGate {
 #[tokio::test]
 async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
     let turn = TurnId::from_bytes([2; 16]);
-    let step = asterpath_core::StepId::from_bytes([3; 16]);
+    let step = asterpath_protocol::StepId::from_bytes([3; 16]);
     let recorded = ToolCallId::from_bytes([4; 16]);
     let danger = ToolDescriptor {
         replay: ReplaySafety::Unsafe,

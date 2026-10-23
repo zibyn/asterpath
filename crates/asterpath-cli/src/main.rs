@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_core::{
-    Clock, EventLog, InputId, LogEntry, LogQuery, SessionId, SystemClock, unique_bytes,
-};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
     Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason,
     UsageFilter, UsageScope, UsageTotals, UserInput, decode_entry, history,
+};
+use asterpath_protocol::{
+    Clock, EventLog, InputId, LogEntry, LogQuery, SessionId, SystemClock, unique_bytes,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
@@ -750,7 +750,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use asterpath_core::ToolCallId;
+    use asterpath_protocol::ToolCallId;
     use asterpath_protocol::{
         ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, JsonString, ModelId,
         ModelSpec, Parallelism, Provenance, Provider, ProviderId, ReplaySafety, RequestConfig,
@@ -764,8 +764,8 @@ mod tests {
     fn request() -> ApprovalRequest {
         ApprovalRequest::new(
             SessionId::from_bytes([1; 16]),
-            asterpath_core::TurnId::from_bytes([2; 16]),
-            asterpath_core::StepId::from_bytes([3; 16]),
+            asterpath_protocol::TurnId::from_bytes([2; 16]),
+            asterpath_protocol::StepId::from_bytes([3; 16]),
             ToolCallId::from_bytes([4; 16]),
             ToolName::new("echo"),
             JsonString::new(r#"{"q":"hi"}"#),

@@ -4,7 +4,7 @@ mod common;
 
 use std::sync::Arc;
 
-use asterpath_core::{EventLog, Storage};
+use asterpath_protocol::{EventLog, Storage};
 use asterpath_storage_sqlite::{SqliteStorage, open};
 use asterpath_testing::{BackendFactory, BackendHandle, event_log_contract, storage_contract};
 use common::TempDir;

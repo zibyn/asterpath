@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath_core::{
+use asterpath_protocol::{
     AwaitSignal, DurableExecutor, EventLog, LogQuery, SessionId, SignalDelivery, SignalId,
     SignalName, ToolCallId, WakeCause,
 };

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_core::{
+use asterpath_protocol::{
     AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogId, LogQuery, SessionId,
     SignalDelivery, SignalId, SignalPayload, WakeCause,
 };
@@ -71,19 +71,21 @@ impl RuntimeExecutor {
         &self,
         session: SessionId,
         event: &SessionEvent,
-        key: Option<asterpath_core::DedupKey>,
+        key: Option<asterpath_protocol::DedupKey>,
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, event).map_err(backend)?;
         self.log.append(entry).await.map_err(backend)
     }
 
     async fn scan(&self, session: SessionId) -> Result<Vec<SessionEvent>, ExecutionError> {
-        let stream: BoxStream<'_, Result<asterpath_core::LogEntry, asterpath_core::StorageError>> =
-            self.log.scan(LogQuery {
-                session,
-                after: None,
-                limit: None,
-            });
+        let stream: BoxStream<
+            '_,
+            Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
+        > = self.log.scan(LogQuery {
+            session,
+            after: None,
+            limit: None,
+        });
         let mut events = Vec::new();
         for entry in collect(stream).await? {
             events.push(decode_entry(&entry).map_err(backend)?);
@@ -197,10 +199,11 @@ impl DurableExecutor for RuntimeExecutor {
     }
 }
 
-async fn collect<S>(mut stream: S) -> Result<Vec<asterpath_core::LogEntry>, ExecutionError>
+async fn collect<S>(mut stream: S) -> Result<Vec<asterpath_protocol::LogEntry>, ExecutionError>
 where
-    S: futures_core::Stream<Item = Result<asterpath_core::LogEntry, asterpath_core::StorageError>>
-        + Unpin,
+    S: futures_core::Stream<
+            Item = Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
+        > + Unpin,
 {
     let mut entries = Vec::new();
     while let Some(entry) = stream.next().await {

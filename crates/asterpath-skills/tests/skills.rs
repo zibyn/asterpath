@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use asterpath_core::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_protocol::{CancelToken, Part, Tool, ToolArgs, ToolContext, ToolError};
+use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, Discovery, LoadSkillTool, SkillDiagnosticKind, SkillRoot, SkillRootLabel,
     discover, render_index,

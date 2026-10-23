@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath_core::ExecutionError;
+use asterpath_protocol::ExecutionError;
 use asterpath_protocol::{
     ChildOutcome, ModelAlias, Parallelism, ParentRef, Part, Provenance, ReplaySafety, SideEffect,
     Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,

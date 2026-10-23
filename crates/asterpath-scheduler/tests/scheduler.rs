@@ -7,17 +7,17 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath_core::{
-    AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId,
-    LogQuery, SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, SystemClock,
-    Timestamp, ToolCallId, TurnId, WakeCause,
-};
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, CancelReason, ChildFailure, ChildOutcome,
     CompactionConfig, ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelId, ModelSpec,
     Parallelism, Part, Provenance, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest,
     SessionEvent, SideEffect, StopReason, SubagentConfig, Summary, ToolDescriptor, ToolName,
     ToolResultStatus, TurnConfig, TurnEndReason, Usage, dedup, encode_entry,
+};
+use asterpath_protocol::{
+    AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId,
+    LogQuery, SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, SystemClock,
+    Timestamp, ToolCallId, TurnId, WakeCause,
 };
 use asterpath_protocol::{
     CancelToken, CancellationRegistry, Tool, ToolArgs, ToolContext, ToolError,
@@ -88,7 +88,7 @@ fn encoded(
     session: SessionId,
     event: &SessionEvent,
     key: Option<DedupKey>,
-) -> asterpath_core::NewEntry {
+) -> asterpath_protocol::NewEntry {
     encode_entry(session, key, event).expect("encodes")
 }
 
@@ -226,7 +226,7 @@ async fn seed_parent(
         parent,
         SessionEvent::ToolCallRequested {
             turn_id: reference.turn,
-            step_id: asterpath_core::StepId::from_bytes([4; 16]),
+            step_id: asterpath_protocol::StepId::from_bytes([4; 16]),
             tool_call_id: reference.tool_call,
             provider_call_id: "call-1".to_owned(),
             name: ToolName::new("spawn_agent"),
@@ -250,7 +250,7 @@ async fn completed_child(
         child,
         SessionEvent::AssistantMessage {
             turn_id: TurnId::from_bytes([5; 16]),
-            step_id: asterpath_core::StepId::from_bytes([6; 16]),
+            step_id: asterpath_protocol::StepId::from_bytes([6; 16]),
             items: vec![
                 Item::Reasoning {
                     summary: vec![text("hidden reasoning")],
@@ -905,7 +905,7 @@ fn tool_context(parent: &asterpath_protocol::ParentRef) -> ToolContext {
     ToolContext::new(
         parent.session,
         parent.turn,
-        asterpath_core::StepId::from_bytes([4; 16]),
+        asterpath_protocol::StepId::from_bytes([4; 16]),
         parent.tool_call,
         CancelToken::new(),
     )
@@ -992,7 +992,7 @@ struct PoisonLog {
 impl EventLog for PoisonLog {
     fn append(
         &self,
-        entry: asterpath_core::NewEntry,
+        entry: asterpath_protocol::NewEntry,
     ) -> BoxFuture<'_, Result<LogId, StorageError>> {
         self.inner.append(entry)
     }
@@ -1027,7 +1027,7 @@ impl AgentRunner for StubRunner {
         *self.runs.lock().unwrap() += 1;
         let log = self.log.clone();
         let turn = TurnId::from_bytes([7; 16]);
-        let step = asterpath_core::StepId::from_bytes([8; 16]);
+        let step = asterpath_protocol::StepId::from_bytes([8; 16]);
         stream::once(async move {
             let events = [
                 SessionEvent::TurnStarted { turn_id: turn },
@@ -1083,8 +1083,8 @@ const CALL_A: ToolCallId = ToolCallId::from_bytes([0x21; 16]);
 const CALL_SIBLING: ToolCallId = ToolCallId::from_bytes([0x22; 16]);
 const CALL_SPAWN: ToolCallId = ToolCallId::from_bytes([3; 16]);
 const FORK_TURN: TurnId = TurnId::from_bytes([2; 16]);
-const STEP_1: asterpath_core::StepId = asterpath_core::StepId::from_bytes([0x11; 16]);
-const STEP_2: asterpath_core::StepId = asterpath_core::StepId::from_bytes([0x12; 16]);
+const STEP_1: asterpath_protocol::StepId = asterpath_protocol::StepId::from_bytes([0x11; 16]);
+const STEP_2: asterpath_protocol::StepId = asterpath_protocol::StepId::from_bytes([0x12; 16]);
 
 fn raw(provider: &str, kind: &str) -> asterpath_protocol::RawProviderData {
     asterpath_protocol::RawProviderData {
@@ -1108,7 +1108,7 @@ fn reasoning(provider: &str) -> Item {
     }
 }
 
-fn assistant_at(step: asterpath_core::StepId, items: Vec<Item>) -> SessionEvent {
+fn assistant_at(step: asterpath_protocol::StepId, items: Vec<Item>) -> SessionEvent {
     SessionEvent::AssistantMessage {
         turn_id: FORK_TURN,
         step_id: step,
@@ -1502,7 +1502,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
         SessionEvent::CompactionApplied {
             first_kept: at,
             summary: vec![text("summary")],
-            replaces: asterpath_core::LogIdRange {
+            replaces: asterpath_protocol::LogIdRange {
                 first: turn,
                 last: old_answer,
             },
@@ -1579,7 +1579,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
         SessionEvent::CompactionApplied {
             first_kept: later,
             summary: vec![text("later summary")],
-            replaces: asterpath_core::LogIdRange {
+            replaces: asterpath_protocol::LogIdRange {
                 first: turn,
                 last: later,
             },
@@ -1739,7 +1739,7 @@ async fn seed_parent_with(
                 parent,
                 SessionEvent::ToolCallRequested {
                     turn_id: reference.turn,
-                    step_id: asterpath_core::StepId::from_bytes([4; 16]),
+                    step_id: asterpath_protocol::StepId::from_bytes([4; 16]),
                     tool_call_id: *call,
                     provider_call_id: format!("call-{index}"),
                     name: ToolName::new("spawn_agent"),

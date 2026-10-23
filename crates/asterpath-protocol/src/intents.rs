@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use asterpath_core::{DedupKey, LogEntry, LogId, SessionId, StepId, ToolCallId, TurnId};
+use crate::{DedupKey, LogEntry, LogId, SessionId, StepId, ToolCallId, TurnId};
 
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::dedup::compaction_frontier;

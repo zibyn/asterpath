@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use asterpath_core::{LogEntry, LogId, LogIdRange, ToolCallId};
+use crate::{LogEntry, LogId, LogIdRange, ToolCallId};
 
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::event::{SessionEvent, ToolResultStatus};

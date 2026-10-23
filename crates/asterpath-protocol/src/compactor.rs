@@ -5,7 +5,7 @@
 //! `plan` returns `Summarize` and writes the terminal event from `compact`'s
 //! result, so there is exactly one writer and one commit point.
 
-use asterpath_core::{LogId, LogIdRange};
+use crate::{LogId, LogIdRange};
 use futures_core::future::BoxFuture;
 
 use crate::agent::{CompactionError, CompactionOutcome};

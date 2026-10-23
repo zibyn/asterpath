@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{EventLog, InputId, LogQuery, SessionId};
 use asterpath_protocol::{
     AgentEvent, ConfigSnapshot, Item, JsonString, ModelId, ModelSpec, Part, Provider, ProviderId,
     RequestConfig, Role, SessionEvent, SessionSpec, SideEffect, StopReason, SubagentConfig,
     ToolErrorKind, ToolName, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage,
     UserInput,
 };
+use asterpath_protocol::{EventLog, InputId, LogQuery, SessionId};
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillRoot, SkillRootLabel, SkillSummary, discover,
     render_index,

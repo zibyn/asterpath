@@ -1,7 +1,7 @@
 //! Token usage in the exclusive normalization, plus the native usage-query
 //! contract: buckets, scopes, records and rollup totals.
 
-use asterpath_core::{LogId, SessionId, StepId, TurnId};
+use crate::{LogId, SessionId, StepId, TurnId};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -133,9 +133,9 @@ pub struct UsageFilter {
     pub bucket: Option<UsageBucket>,
     pub model: Option<ModelId>,
     /// Inclusive; read from the log envelope's `recorded_at`.
-    pub since: Option<asterpath_core::Timestamp>,
+    pub since: Option<crate::Timestamp>,
     /// Exclusive; read from the log envelope's `recorded_at`.
-    pub until: Option<asterpath_core::Timestamp>,
+    pub until: Option<crate::Timestamp>,
     /// Only applies to `records()`; `totals()` ignores it.
     pub limit: Option<usize>,
 }
@@ -150,7 +150,7 @@ pub struct UsageRecord {
     pub bucket: UsageBucket,
     pub usage: Usage,
     pub log: LogId,
-    pub recorded_at: asterpath_core::Timestamp,
+    pub recorded_at: crate::Timestamp,
 }
 
 /// Per-bucket sums. `partial` never contributes to [`Self::total`].

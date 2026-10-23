@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{DedupKey, EventLog, LogEntry, LogQuery, SessionId, ToolCallId};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider,
@@ -18,6 +17,7 @@ use asterpath_protocol::{
     ToolName, ToolOutput, ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id,
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
+use asterpath_protocol::{DedupKey, EventLog, LogEntry, LogQuery, SessionId, ToolCallId};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -197,7 +197,7 @@ fn tool_results(
 
 fn text_input(id: u8) -> UserInput {
     UserInput {
-        id: asterpath_core::InputId::from_bytes([id; 16]),
+        id: asterpath_protocol::InputId::from_bytes([id; 16]),
         parts: vec![text("go")],
     }
 }
@@ -417,8 +417,8 @@ async fn recorded_decision_is_reused_without_reprompting() {
     let handle = asterpath.create_session(spec()).await.unwrap();
     let session = handle.id();
 
-    let turn = asterpath_core::TurnId::from_bytes([1; 16]);
-    let step = asterpath_core::StepId::from_bytes([2; 16]);
+    let turn = asterpath_protocol::TurnId::from_bytes([1; 16]);
+    let step = asterpath_protocol::StepId::from_bytes([2; 16]);
     let call = ToolCallId::from_bytes([3; 16]);
     let log = asterpath.event_log();
     append(

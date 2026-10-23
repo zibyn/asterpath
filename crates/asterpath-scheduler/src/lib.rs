@@ -11,8 +11,8 @@
 
 use std::time::Duration;
 
-use asterpath_core::{ExecutionError, LogId, SessionId};
 use asterpath_protocol::{ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part, ToolName};
+use asterpath_protocol::{ExecutionError, LogId, SessionId};
 use futures_core::future::BoxFuture;
 
 mod scheduler;

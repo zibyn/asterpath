@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder};
-use asterpath_core::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
 use asterpath_plugin_host::{PluginHost, PluginManifest, PluginStatus};
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
@@ -22,6 +21,7 @@ use asterpath_protocol::{
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolSelection, TurnConfig,
     TurnEndReason, UserInput, decode_entry,
 };
+use asterpath_protocol::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
 use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
@@ -430,7 +430,7 @@ fn now(clock: &ManualClock) -> i64 {
 async fn scan(
     log: Arc<dyn EventLog>,
     session: SessionId,
-) -> Result<Vec<asterpath_core::LogEntry>, String> {
+) -> Result<Vec<asterpath_protocol::LogEntry>, String> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,

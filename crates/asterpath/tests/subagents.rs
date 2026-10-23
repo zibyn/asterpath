@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, SessionHandle};
-use asterpath_core::{ApprovalGate, EventLog, InputId, LogEntry, LogQuery, SessionId, ToolCallId};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, ChildFailure,
     ChildOutcome, CompactionConfig, ConfigSnapshot, Item, JsonString, ModelId, ModelRequest,
@@ -19,6 +18,9 @@ use asterpath_protocol::{
     SessionState, SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolConfig,
     ToolContext, ToolDescriptor, ToolError, ToolErrorKind, ToolName, ToolOutput, ToolResultStatus,
     ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
+};
+use asterpath_protocol::{
+    ApprovalGate, EventLog, InputId, LogEntry, LogQuery, SessionId, ToolCallId,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;

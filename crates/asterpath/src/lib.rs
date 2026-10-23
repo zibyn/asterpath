@@ -11,12 +11,12 @@ mod commit;
 pub mod config;
 pub mod error;
 
-/// Core id types, so embedders need only this crate.
-pub use asterpath_core::{
-    InputId, LogId, SessionId, SignalId, StepId, Timestamp, ToolCallId, TurnId,
-};
 /// The contract crate: adapter traits, hooks and value types.
 pub use asterpath_protocol as protocol;
+/// Core id types, so embedders need only this crate.
+pub use asterpath_protocol::{
+    InputId, LogId, SessionId, SignalId, StepId, Timestamp, ToolCallId, TurnId,
+};
 
 /// Re-export of the Anthropic adapter when the `anthropic` feature is enabled.
 /// Providers stay host-injected: the facade never assembles one itself.
@@ -26,15 +26,15 @@ pub use asterpath_provider_anthropic as anthropic;
 use std::sync::Arc;
 
 use asterpath_agent::Agent;
-use asterpath_core::{
-    ApprovalGate, Clock, DurableExecutor, EventLog, LogQuery, SessionCatalog, SessionRetirement,
-    SignalDelivery, Storage, unique_bytes,
-};
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
     OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
     ToolRegistry, ToolSelection, TraceQuery, TraceTap, UsageQuery, UserInput, approval_signal_id,
     approval_signal_name, dedup,
+};
+use asterpath_protocol::{
+    ApprovalGate, Clock, DurableExecutor, EventLog, LogQuery, SessionCatalog, SessionRetirement,
+    SignalDelivery, Storage, unique_bytes,
 };
 use asterpath_runtime::RuntimeExecutor;
 use asterpath_scheduler::{Scheduler, SpawnTool};

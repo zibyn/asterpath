@@ -11,7 +11,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asterpath_core::{EventLog, LogEntry, LogId, LogQuery, NewEntry, StorageError};
+use asterpath_protocol::{EventLog, LogEntry, LogId, LogQuery, NewEntry, StorageError};
 use asterpath_protocol::{Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -162,7 +162,7 @@ impl EventLog for FailpointEventLog {
 
     fn frontier(
         &self,
-        session: asterpath_core::SessionId,
+        session: asterpath_protocol::SessionId,
     ) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
     }

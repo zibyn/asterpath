@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asterpath::{AsterError, Asterpath, SessionHandle};
-use asterpath_core::{Clock, EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, CompactionConfig, InputTokens, Item, ModelId, ModelSpec,
     OutputTokens, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind,
@@ -17,6 +16,7 @@ use asterpath_protocol::{
     StopReason, SubagentConfig, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
+use asterpath_protocol::{Clock, EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 

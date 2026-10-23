@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use asterpath_core::{
+use asterpath_protocol::{
     DedupKey, EventLog, LogEntry, LogQuery, SessionCatalog, SessionId, StepId, StorageError, TurnId,
 };
 use asterpath_protocol::{
@@ -74,7 +74,7 @@ impl UsageService {
     async fn next_entry(
         &self,
         session: SessionId,
-        after: Option<asterpath_core::LogId>,
+        after: Option<asterpath_protocol::LogId>,
     ) -> Result<Option<LogEntry>, UsageError> {
         let mut entries = self.log.scan(LogQuery {
             session,
@@ -205,7 +205,7 @@ struct Records {
 
 struct SessionScan {
     session: SessionId,
-    after: Option<asterpath_core::LogId>,
+    after: Option<asterpath_protocol::LogId>,
     /// `CompactionStarted` dedup key -> the turn it recorded.
     started: HashMap<DedupKey, Option<TurnId>>,
 }

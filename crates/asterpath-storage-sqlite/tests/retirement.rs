@@ -5,13 +5,13 @@ mod common;
 
 use std::sync::Arc;
 
-use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId,
-    SessionRetirement, Storage, StorageError, TurnId,
-};
 use asterpath_protocol::{
     CompactionTrigger, ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef,
     ProviderId, SessionEvent, dedup,
+};
+use asterpath_protocol::{
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId,
+    SessionRetirement, Storage, StorageError, TurnId,
 };
 use asterpath_storage_sqlite::open;
 use common::TempDir;
@@ -47,7 +47,7 @@ fn session_created(parent: Option<SessionId>) -> SessionEvent {
         parent: parent.map(|session| ParentRef {
             session,
             turn: TurnId::from_bytes([1; 16]),
-            tool_call: asterpath_core::ToolCallId::from_bytes([1; 16]),
+            tool_call: asterpath_protocol::ToolCallId::from_bytes([1; 16]),
         }),
     }
 }

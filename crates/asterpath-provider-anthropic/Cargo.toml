@@ -5,7 +5,6 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-asterpath-core = { path = "../asterpath-core" }
 asterpath-http = { path = "../asterpath-http" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 bytes = "1"

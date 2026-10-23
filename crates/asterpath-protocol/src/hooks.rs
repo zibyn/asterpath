@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use asterpath_core::{LogId, SessionId, StepId, Timestamp, ToolCallId, TurnId};
+use crate::{LogId, SessionId, StepId, Timestamp, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 
 use crate::config::{Provenance, ReplaySafety};

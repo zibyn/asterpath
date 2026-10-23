@@ -1,16 +1,18 @@
-//! Canonical protocol value model, event log decoding and folds.
-//!
-//! The core crate owns the opaque log envelope; this crate owns its typed view:
-//! items, events, configuration snapshots, read-time upcasting, dedup-key
-//! construction, open-intent folding and projection.
+//! The contract crate: ids, the opaque log envelope and storage contracts,
+//! clock, errors, adapter traits, hooks, and the typed protocol view of the
+//! log (items, events, configuration snapshots, read-time upcasting, dedup-key
+//! construction, open-intent folding and projection). ADR-0026.
 
 pub mod agent;
 pub mod compactor;
 pub mod config;
+pub mod contracts;
 pub mod decode;
 pub mod dedup;
 pub mod encode;
+pub mod error;
 pub mod event;
+pub mod hash;
 pub mod hooks;
 pub mod ids;
 pub mod intents;
@@ -18,6 +20,7 @@ pub mod item;
 pub mod names;
 pub mod projection;
 pub mod provider;
+pub mod time;
 pub mod tool;
 pub mod tracing;
 pub mod usage;
@@ -36,18 +39,26 @@ pub use config::{
     ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig, SamplingParams, SideEffect,
     SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
+pub use contracts::{
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, LogEntry,
+    LogQuery, NewEntry, SessionCatalog, SessionRetirement, SignalDelivery, SignalName,
+    SignalPayload, Storage, WakeCause,
+};
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
+pub use error::{ExecutionError, RetirementError, StorageError};
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,
     ParentRef, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo, ToolErrorKind,
     ToolResultStatus, TurnEndReason,
 };
+pub use hash::Fnv;
 pub use hooks::{
     CommittedRecord, Gate, HookError, Hooks, StepCtx, ToolCallCtx, ToolGate, ToolResultView,
 };
 pub use ids::{
-    JsonSchema, JsonString, JsonValue, ModelAlias, ModelId, ProviderId, ToolArgs, ToolName,
+    InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
+    SessionId, SignalId, StepId, ToolArgs, ToolCallId, ToolName, TurnId,
 };
 pub use intents::{IntentDelta, OpenIntent, OpenIntents, SessionState, StepState};
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
@@ -60,6 +71,7 @@ pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
     ProviderError, ProviderErrorKind, StreamEvent,
 };
+pub use time::{Clock, SystemClock, Timestamp, unique_bytes};
 pub use tool::{
     APPROVAL_SIGNAL_PREFIX, ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken,
     DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, Tool, ToolContext, ToolError, ToolOutput,

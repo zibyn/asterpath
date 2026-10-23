@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asterpath::{AsterError, Asterpath};
-use asterpath_core::{LogQuery, SessionCatalog, SessionId, StorageError};
 use asterpath_protocol::{
     AgentError, CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, ToolSelection, TurnConfig,
 };
+use asterpath_protocol::{LogQuery, SessionCatalog, SessionId, StorageError};
 use asterpath_testing::{InMemoryEventLog, InMemoryStorage, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;

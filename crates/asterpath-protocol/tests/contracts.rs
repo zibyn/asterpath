@@ -1,4 +1,4 @@
-use asterpath_core::{
+use asterpath_protocol::{
     ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError,
     LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionCatalog, SessionId,
     SessionRetirement, SignalDelivery, SignalId, SignalName, SignalPayload, Storage, StorageError,

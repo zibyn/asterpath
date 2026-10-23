@@ -5,7 +5,7 @@
 //! on demand; `TraceTap` pushes the same lifecycle from the engine append entry.
 //! Content never enters a span: only `Span.log_range` references the log.
 
-use asterpath_core::{LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId};
+use crate::{LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId};
 use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_core::{
+use crate::{
     ExecutionError, InputId, LogIdRange, SessionId, StepId, StorageError, ToolCallId, TurnId,
 };
 use futures_core::future::BoxFuture;
@@ -170,7 +170,7 @@ pub enum CompactResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionOutcome {
-    pub first_kept: asterpath_core::LogId,
+    pub first_kept: crate::LogId,
     pub summary: Vec<Part>,
     pub replaces: LogIdRange,
     pub model: ModelSpec,

@@ -1,7 +1,7 @@
 //! Facade error sum. Each layer keeps its own enum; this only adds them up.
 
-use asterpath_core::{ExecutionError, StorageError};
 use asterpath_protocol::{AgentError, ProviderError, ToolError};
+use asterpath_protocol::{ExecutionError, StorageError};
 
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]

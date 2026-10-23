@@ -532,8 +532,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use asterpath_core::{SessionId, StepId, ToolCallId, TurnId};
     use asterpath_protocol::{CancelToken, ToolContext};
+    use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
     use asterpath_sandbox::{ConfinedSpawn, Enforcement};
     use serde_json::json;
 

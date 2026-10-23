@@ -3,7 +3,7 @@
 //! Upcasting happens only while reading: the payload is walked up the version
 //! chain in memory and then deserialized once. The log is never rewritten.
 
-use asterpath_core::LogEntry;
+use crate::LogEntry;
 use serde_json::Value;
 
 use crate::event::SessionEvent;

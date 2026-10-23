@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use asterpath_core::{
+use asterpath_protocol::{
     Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError,
     SessionCatalog, SessionId, SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
 };

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_core::{EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, StorageError};
 use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
+use asterpath_protocol::{EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, StorageError};
 use asterpath_tracing::TracingTap;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;

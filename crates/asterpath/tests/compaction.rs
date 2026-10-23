@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_compaction::DefaultCompactor;
-use asterpath_core::{EventLog, InputId, LogEntry, LogId, LogQuery, SessionId};
 use asterpath_protocol::{
     AgentError, AgentEvent, CompactionAbortReason, CompactionConfig, CompactionTrigger, Compactor,
     InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism, Part, Provider,
@@ -18,6 +17,7 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
     TurnEndReason, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
+use asterpath_protocol::{EventLog, InputId, LogEntry, LogId, LogQuery, SessionId};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -583,7 +583,7 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
         session,
         None,
         &SessionEvent::TurnStarted {
-            turn_id: asterpath_core::TurnId::from_bytes([9; 16]),
+            turn_id: asterpath_protocol::TurnId::from_bytes([9; 16]),
         },
     )
     .expect("encode");

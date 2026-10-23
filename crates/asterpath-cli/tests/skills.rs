@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use asterpath::Asterpath;
-use asterpath_core::{EventLog, InputId, LogQuery};
 use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, Tool, ToolSelection, TurnConfig, UserInput,
 };
+use asterpath_protocol::{EventLog, InputId, LogQuery};
 use asterpath_skills::{LoadSkillTool, SkillRoot, SkillRootLabel};
 use asterpath_testing::ScriptedProvider;
 use common::{MockServer, bin};
@@ -329,7 +329,10 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
     );
 }
 
-async fn app_log(db: &Path, session: asterpath_core::SessionId) -> Vec<(String, Option<String>)> {
+async fn app_log(
+    db: &Path,
+    session: asterpath_protocol::SessionId,
+) -> Vec<(String, Option<String>)> {
     let backend = asterpath_storage_sqlite::open(db).expect("open");
     let mut stream = backend.scan(LogQuery {
         session,

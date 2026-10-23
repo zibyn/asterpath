@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CompactResult, CompactionConfig, Item, JsonString, ModelId,
@@ -19,6 +18,7 @@ use asterpath_protocol::{
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig,
     TurnEndReason, Usage, UserInput, decode_entry,
 };
+use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;

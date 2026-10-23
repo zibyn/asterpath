@@ -6,20 +6,15 @@
 #   - every normal dependency on another workspace member is in that member's `allow`
 #     list ("*" = any workspace member);
 #   - module crates have no normal dependency on another module crate;
-#   - contract crates (`asterpath-core`, `asterpath-protocol`) declare no features.
+#   - contract crates (`asterpath-protocol`) declare no features.
 #
 # Only normal dependencies are checked. Dev-dependencies are intentionally exempt
 # (module crates may dev-depend on `asterpath-testing` for contract suites).
 
 [[package]]
-name = "asterpath-core"
-role = "contract"
-allow = []
-
-[[package]]
 name = "asterpath-protocol"
 role = "contract"
-allow = ["asterpath-core"]
+allow = []
 
 # Shared adapter library (SseDecoder; ADR-0026 re-audit candidate 5 revision). Listed as
 # a contract so adapter modules may depend on it; it is not part of the stable surface.
@@ -41,7 +36,7 @@ allow = ["asterpath-sandbox"]
 [[package]]
 name = "asterpath-agent"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-tools"
@@ -51,47 +46,47 @@ allow = ["asterpath-protocol"]
 [[package]]
 name = "asterpath-storage-sqlite"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-runtime"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-scheduler"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-compaction"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-provider-anthropic"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol", "asterpath-http"]
+allow = ["asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-provider-openai"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol", "asterpath-http"]
+allow = ["asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-tracing"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-usage"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-plugin-host"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox", "asterpath-http"]
+allow = ["asterpath-protocol", "asterpath-sandbox", "asterpath-http"]
 
 [[package]]
 name = "asterpath-skills"
@@ -106,7 +101,7 @@ allow = []
 [[package]]
 name = "asterpath-testing"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox"]
+allow = ["asterpath-protocol", "asterpath-sandbox"]
 
 [[package]]
 name = "asterpath"

@@ -7,7 +7,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asterpath_core::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_plugin_host::{
     PluginCapability, PluginHost, PluginId, PluginLoadStage, PluginManifest, PluginProtocol,
     PluginStatus, PluginTimeouts, PluginTransport,
@@ -16,6 +15,7 @@ use asterpath_protocol::{
     CancelToken, JsonString, Part, Provenance, SessionEvent, ToolContext, ToolErrorKind, ToolName,
     ToolRegistry, ToolResultStatus, TransportKind, TurnEndReason,
 };
+use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_sandbox::SandboxPolicy;
 use asterpath_tools::InMemoryToolRegistry;
 use serde_json::{Value, json};

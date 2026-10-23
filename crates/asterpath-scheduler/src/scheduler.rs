@@ -5,15 +5,15 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
-use asterpath_core::{
-    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
-    SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
-};
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
     ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
     RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
     encode_entry,
+};
+use asterpath_protocol::{
+    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
+    SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -109,7 +109,7 @@ impl Scheduler {
         &self,
         session: SessionId,
         event: SessionEvent,
-        key: Option<asterpath_core::DedupKey>,
+        key: Option<asterpath_protocol::DedupKey>,
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, &event).map_err(backend)?;
         self.log.append(entry).await.map_err(backend)

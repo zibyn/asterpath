@@ -8,16 +8,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_core::{
-    EventLog, Fnv, LogEntry, LogId, LogIdRange, LogQuery, SessionId, SignalId, StepId,
-    StorageError, Timestamp, ToolCallId, TurnId,
-};
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
     ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span,
     SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
     ToolCallAttrs, ToolErrorKind, ToolResultStatus, TraceError, TraceId, TraceQuery, TraceTap,
     TurnAttrs, TurnEndReason, WaitAttrs, WaitKind, decode_entry,
+};
+use asterpath_protocol::{
+    EventLog, Fnv, LogEntry, LogId, LogIdRange, LogQuery, SessionId, SignalId, StepId,
+    StorageError, Timestamp, ToolCallId, TurnId,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};

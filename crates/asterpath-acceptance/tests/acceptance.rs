@@ -9,23 +9,23 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use asterpath::AsterpathBuilder;
-use asterpath_core::{SessionId, ToolCallId};
 use asterpath_protocol::{
     ChildOutcome, InputTokens, Item, OutputTokens, Part, Role, SessionEvent, Span, SpanAttributes,
     SpanFilter, SpanKind, ToolResultStatus, TraceId, TurnEndReason, Usage, UsageFilter, UsageScope,
 };
+use asterpath_protocol::{SessionId, ToolCallId};
 use common::{Scenario, Testdrive, markers, scan, session_id};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 async fn session_entries(
     db: &Path,
-    session: asterpath_core::SessionId,
-) -> Vec<asterpath_core::LogEntry> {
+    session: asterpath_protocol::SessionId,
+) -> Vec<asterpath_protocol::LogEntry> {
     scan(db, session).await
 }
 
-fn assistant_per_step(events: &[SessionEvent]) -> Vec<(asterpath_core::StepId, usize)> {
+fn assistant_per_step(events: &[SessionEvent]) -> Vec<(asterpath_protocol::StepId, usize)> {
     let mut counts = std::collections::BTreeMap::new();
     for event in events {
         if let SessionEvent::AssistantMessage { step_id, .. } = event {
@@ -35,7 +35,7 @@ fn assistant_per_step(events: &[SessionEvent]) -> Vec<(asterpath_core::StepId, u
     counts.into_iter().collect()
 }
 
-fn commits_per_step(events: &[SessionEvent]) -> Vec<(asterpath_core::StepId, usize)> {
+fn commits_per_step(events: &[SessionEvent]) -> Vec<(asterpath_protocol::StepId, usize)> {
     let mut counts = std::collections::BTreeMap::new();
     for event in events {
         if let SessionEvent::StepCommitted { step_id, .. } = event {
@@ -45,7 +45,7 @@ fn commits_per_step(events: &[SessionEvent]) -> Vec<(asterpath_core::StepId, usi
     counts.into_iter().collect()
 }
 
-fn started_steps(events: &[SessionEvent]) -> Vec<asterpath_core::StepId> {
+fn started_steps(events: &[SessionEvent]) -> Vec<asterpath_protocol::StepId> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -614,10 +614,10 @@ fn task_text(parts: &[Part]) -> String {
 /// The facade holds the writer lock, so scenario (c) reads through its log
 /// instead of opening a second connection.
 async fn committed(
-    log: &dyn asterpath_core::EventLog,
+    log: &dyn asterpath_protocol::EventLog,
     session: SessionId,
-) -> Vec<asterpath_core::LogEntry> {
-    let mut stream = log.scan(asterpath_core::LogQuery {
+) -> Vec<asterpath_protocol::LogEntry> {
+    let mut stream = log.scan(asterpath_protocol::LogQuery {
         session,
         after: None,
         limit: None,

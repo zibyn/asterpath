@@ -1,9 +1,9 @@
 //! Behaviour of the canonical model, log decoding and folds.
 
-use asterpath_core::{
+use asterpath_protocol::*;
+use asterpath_protocol::{
     DedupKey, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId,
 };
-use asterpath_protocol::*;
 use serde_json::{Value, json};
 
 fn entry(seq: u64, schema_version: u16, payload: Value) -> LogEntry {

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use asterpath_core::{ApprovalGate, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
+use crate::{ApprovalGate, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 

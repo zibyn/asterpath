@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath_compaction::DefaultCompactor;
-use asterpath_core::{LogId, LogIdRange};
 use asterpath_protocol::{
     CompactSummary, CompactionConfig, CompactionJob, Compactor, InputTokens, Item, ModelId,
     ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderError, ProviderErrorKind,
     ProviderId, Role, StopReason, ToolChoice, TurnConfig, Usage,
 };
+use asterpath_protocol::{LogId, LogIdRange};
 use asterpath_testing::ScriptedProvider;
 
 fn text(value: &str) -> Part {

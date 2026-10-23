@@ -1,7 +1,7 @@
 //! `usage_of` is the single bucket decision for one log record.
 
-use asterpath_core::{LogId, LogIdRange, StepId, TurnId};
 use asterpath_protocol::*;
+use asterpath_protocol::{LogId, LogIdRange, StepId, TurnId};
 
 fn turn(byte: u8) -> TurnId {
     TurnId::from_bytes([byte; 16])

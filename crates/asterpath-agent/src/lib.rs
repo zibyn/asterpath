@@ -16,10 +16,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use asterpath_core::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
-    LogQuery, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
-};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CancelReason, CancelRegistration, CancelToken,
@@ -32,6 +28,10 @@ use asterpath_protocol::{
     ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolRegistry,
     ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageQuery,
     approval_signal_id, approval_signal_name, decode_entry, dedup,
+};
+use asterpath_protocol::{
+    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
+    LogQuery, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;

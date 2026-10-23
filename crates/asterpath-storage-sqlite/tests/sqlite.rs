@@ -11,13 +11,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId,
-    StorageError, ToolCallId, TurnId,
-};
 use asterpath_protocol::{
     ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent,
     dedup,
+};
+use asterpath_protocol::{
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId,
+    StorageError, ToolCallId, TurnId,
 };
 use asterpath_storage_sqlite::open;
 use common::TempDir;

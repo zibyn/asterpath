@@ -12,7 +12,6 @@ sqlite = ["dep:asterpath-storage-sqlite"]
 
 [dependencies]
 asterpath-agent = { path = "../asterpath-agent" }
-asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-provider-anthropic = { path = "../asterpath-provider-anthropic", optional = true }
 asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }

@@ -5,14 +5,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, PoisonError};
 
-use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, StepId,
-    StorageError, Timestamp, TurnId,
-};
 use asterpath_protocol::{
     CompactionTrigger, InputTokens, Item, ModelId, ModelSpec, OutputTokens, Part, ProviderId, Role,
     SessionEvent, StopReason, Usage, UsageBucket, UsageError, UsageFilter, UsageQuery, UsageScope,
     dedup, encode_entry,
+};
+use asterpath_protocol::{
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, StepId,
+    StorageError, Timestamp, TurnId,
 };
 use asterpath_usage::UsageService;
 use futures_core::future::BoxFuture;
@@ -469,7 +469,7 @@ fn push_compaction(
         &SessionEvent::CompactionApplied {
             first_kept: caused_by,
             summary: vec![text("sum")],
-            replaces: asterpath_core::LogIdRange {
+            replaces: asterpath_protocol::LogIdRange {
                 first: caused_by,
                 last: caused_by,
             },

@@ -1,8 +1,6 @@
 //! The complete session event enum and the value enums its payloads carry.
 
-use asterpath_core::{
-    LogId, LogIdRange, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId,
-};
+use crate::{LogId, LogIdRange, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigSnapshot, ContextPolicy, ModelSpec, Provenance, ReplaySafety};
@@ -113,7 +111,7 @@ pub enum SessionEvent {
         caused_by: LogId,
         /// Absolute spawn-timeout deadline, written with the spawn record.
         #[serde(default)]
-        deadline: Option<asterpath_core::Timestamp>,
+        deadline: Option<crate::Timestamp>,
     },
     ChildSessionCompleted {
         child: SessionId,

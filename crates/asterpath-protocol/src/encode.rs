@@ -2,7 +2,7 @@
 //!
 //! Protocol owns both directions so core and storage stay payload-agnostic.
 
-use asterpath_core::{DedupKey, NewEntry, SessionId};
+use crate::{DedupKey, NewEntry, SessionId};
 
 use crate::decode::LOG_SCHEMA_VERSION;
 use crate::event::SessionEvent;

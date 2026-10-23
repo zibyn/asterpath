@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use asterpath::{Asterpath, anthropic::AnthropicProvider};
-use asterpath_core::{InputId, TurnId};
 use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionEvent,
     SessionSpec, SubagentConfig, ToolSelection, TurnConfig, UserInput, encode_entry,
 };
+use asterpath_protocol::{InputId, TurnId};
 use common::{MockServer, bin};
 
 struct TestDir {

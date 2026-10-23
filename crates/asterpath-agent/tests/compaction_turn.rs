@@ -6,16 +6,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use asterpath_core::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LogId,
-    SessionId, SignalDelivery, SignalPayload, StepId, TurnId, WakeCause,
-};
 use asterpath_protocol::{
     AgentEvent, AgentRunner, CompactPlan, CompactSummary, CompactionConfig, CompactionError,
     CompactionJob, CompactionOutcome, ConfigSnapshot, DefaultApprovalPolicy, InputTokens, Item,
     ModelId, ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderId, RequestConfig,
     Role, RunRequest, RunTrigger, SessionEvent, StopReason, SubagentConfig, Tool, ToolConfig,
     ToolDescriptor, ToolName, ToolRegistry, TurnConfig, Usage, decode_entry, dedup, encode_entry,
+};
+use asterpath_protocol::{
+    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LogId,
+    SessionId, SignalDelivery, SignalPayload, StepId, TurnId, WakeCause,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -144,7 +144,7 @@ impl asterpath_protocol::Compactor for AlwaysCompact {
                 .first()
                 .copied()
                 .unwrap_or(LogId::from_i64(0)),
-            replaces: asterpath_core::LogIdRange {
+            replaces: asterpath_protocol::LogIdRange {
                 first: LogId::from_i64(0),
                 last: LogId::from_i64(0),
             },
@@ -217,7 +217,7 @@ async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {
 }
 
 async fn submit_input(log: &Arc<InMemoryEventLog>) {
-    let input = asterpath_core::InputId::from_bytes([4; 16]);
+    let input = asterpath_protocol::InputId::from_bytes([4; 16]);
     append(
         log,
         SessionEvent::InputRecorded {
@@ -310,7 +310,7 @@ async fn idle_compaction_intent_records_no_turn() {
 
 /// `turn` of every `CompactionStarted`, in log order.
 async fn started_turns(log: &Arc<InMemoryEventLog>) -> Vec<Option<TurnId>> {
-    let mut entries = log.scan(asterpath_core::LogQuery {
+    let mut entries = log.scan(asterpath_protocol::LogQuery {
         session: SESSION,
         after: None,
         limit: None,
@@ -345,7 +345,7 @@ async fn threshold_compaction_intent_records_its_turn() {
 
     drive(agent.as_ref()).await;
 
-    let mut entries = log.scan(asterpath_core::LogQuery {
+    let mut entries = log.scan(asterpath_protocol::LogQuery {
         session: SESSION,
         after: None,
         limit: None,

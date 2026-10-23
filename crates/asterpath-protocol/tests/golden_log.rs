@@ -1,7 +1,7 @@
 //! Compatibility gate for the golden v1 log fixture: every historical version
 //! must keep decoding and projecting to its canonical expected result.
 
-use asterpath_core::{DedupKey, LogEntry, LogId, SessionId};
+use asterpath_protocol::{DedupKey, LogEntry, LogId, SessionId};
 use asterpath_protocol::{LOG_SCHEMA_VERSION, decode_entry, history};
 use serde_json::Value;
 

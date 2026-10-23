@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use asterpath_core::LogId;
+use crate::LogId;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{JsonSchema, ModelId, ProviderId, ToolName};

@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use asterpath_compaction::{DefaultCompactor, usable_window};
-use asterpath_core::{LogId, LogIdRange};
 use asterpath_protocol::{
     CompactPlan, CompactionConfig, CompactionInput, CompactionTrigger, Compactor, Item, ModelId,
     ModelSpec, Part, ProjectedEntry, ProjectedOrigin, ProviderCatalog, ProviderId, Role,
     TurnConfig, Usage, UsageAnchor,
 };
+use asterpath_protocol::{LogId, LogIdRange};
 
 fn text(value: &str) -> Part {
     Part::Text {

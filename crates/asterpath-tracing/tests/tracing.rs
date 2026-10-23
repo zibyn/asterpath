@@ -5,9 +5,6 @@
 
 use std::sync::Arc;
 
-use asterpath_core::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, ToolCallId, TurnId,
-};
 use asterpath_protocol::{
     AbortKind, ApprovalDecision, ChildOutcome, CompactionTrigger, ConfigSnapshot, ContextPolicy,
     ErrorType, InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism,
@@ -16,6 +13,9 @@ use asterpath_protocol::{
     StopReason, SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolName,
     ToolResultStatus, TraceError, TraceQuery, TraceTap, TurnConfig, TurnEndReason, Usage, WaitKind,
     approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
+};
+use asterpath_protocol::{
+    DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::InMemoryEventLog;
 use asterpath_tracing::{TracingQuery, TracingTap};
@@ -167,7 +167,7 @@ fn compaction_applied(from: LogId, to: LogId) -> SessionEvent {
     SessionEvent::CompactionApplied {
         first_kept: to,
         summary: vec![text("summary")],
-        replaces: asterpath_core::LogIdRange {
+        replaces: asterpath_protocol::LogIdRange {
             first: from,
             last: to,
         },
@@ -1551,21 +1551,21 @@ async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
     for (compaction, (trigger, expected_replaces)) in compactions.iter().zip([
         (
             CompactionTrigger::ProviderError,
-            asterpath_core::LogIdRange {
+            asterpath_protocol::LogIdRange {
                 first: step_start,
                 last: step_start,
             },
         ),
         (
             CompactionTrigger::Threshold,
-            asterpath_core::LogIdRange {
+            asterpath_protocol::LogIdRange {
                 first: step_start,
                 last: committed,
             },
         ),
         (
             CompactionTrigger::Manual,
-            asterpath_core::LogIdRange {
+            asterpath_protocol::LogIdRange {
                 first: step_start,
                 last: committed,
             },

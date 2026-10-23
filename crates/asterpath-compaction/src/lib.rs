@@ -13,13 +13,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath_core::{LogId, LogIdRange};
 use asterpath_protocol::{
     CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionInput, CompactionJob,
     CompactionOutcome, Compactor, Item, ModelRequest, ModelSpec, Part, ProjectedOrigin,
     ProviderCatalog, ProviderError, ProviderErrorKind, Role, StreamEvent, ToolChoice, TurnConfig,
     Usage,
 };
+use asterpath_protocol::{LogId, LogIdRange};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
 

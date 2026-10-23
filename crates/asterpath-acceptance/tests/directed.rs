@@ -10,10 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_core::{
-    Clock, DedupKey, EventLog, InputId, LogEntry, LogQuery, SessionId, StepId, SystemClock,
-    ToolCallId, TurnId,
-};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
@@ -21,6 +17,10 @@ use asterpath_protocol::{
     StopReason, SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
     ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UserInput, approval_signal_id,
     approval_signal_name, decode_entry, dedup, encode_entry,
+};
+use asterpath_protocol::{
+    Clock, DedupKey, EventLog, InputId, LogEntry, LogQuery, SessionId, StepId, SystemClock,
+    ToolCallId, TurnId,
 };
 use asterpath_testing::ScriptedProvider;
 use common::{Scenario, Testdrive, markers, scan, session_id};

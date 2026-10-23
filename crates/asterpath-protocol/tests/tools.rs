@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use asterpath_core::{ApprovalGate, LogEntry, LogId, SessionId, ToolCallId};
+use asterpath_protocol::{ApprovalGate, LogEntry, LogId, SessionId, ToolCallId};
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, DefaultApprovalPolicy, Item, JsonString,
     Part, Provenance, ReplaySafety, SessionEvent, SideEffect, ToolName, ToolResultStatus,
@@ -32,8 +32,8 @@ fn entry(seq: u64, event: SessionEvent) -> LogEntry {
 fn request(provenance: Provenance) -> ApprovalRequest {
     ApprovalRequest::new(
         session(),
-        asterpath_core::TurnId::from_bytes([2; 16]),
-        asterpath_core::StepId::from_bytes([3; 16]),
+        asterpath_protocol::TurnId::from_bytes([2; 16]),
+        asterpath_protocol::StepId::from_bytes([3; 16]),
         ToolCallId::from_bytes([4; 16]),
         ToolName::new("tool"),
         JsonString::new("{}"),
@@ -76,8 +76,8 @@ fn default_policy_allows_in_process_and_fails_external_calls_closed() {
 #[test]
 fn tool_results_project_in_intent_order_not_completion_order() {
     let assistant = SessionEvent::AssistantMessage {
-        turn_id: asterpath_core::TurnId::from_bytes([2; 16]),
-        step_id: asterpath_core::StepId::from_bytes([3; 16]),
+        turn_id: asterpath_protocol::TurnId::from_bytes([2; 16]),
+        step_id: asterpath_protocol::StepId::from_bytes([3; 16]),
         items: vec![
             Item::ToolCall {
                 call_id: "provider-a".to_owned(),
@@ -107,8 +107,8 @@ fn tool_results_project_in_intent_order_not_completion_order() {
         stop_reason: asterpath_protocol::StopReason::ToolUse,
     };
     let intent_a = SessionEvent::ToolCallRequested {
-        turn_id: asterpath_core::TurnId::from_bytes([2; 16]),
-        step_id: asterpath_core::StepId::from_bytes([3; 16]),
+        turn_id: asterpath_protocol::TurnId::from_bytes([2; 16]),
+        step_id: asterpath_protocol::StepId::from_bytes([3; 16]),
         tool_call_id: ToolCallId::from_bytes([10; 16]),
         provider_call_id: "provider-a".to_owned(),
         name: ToolName::new("echo"),
@@ -117,8 +117,8 @@ fn tool_results_project_in_intent_order_not_completion_order() {
         provenance: Provenance::InProcess,
     };
     let intent_b = SessionEvent::ToolCallRequested {
-        turn_id: asterpath_core::TurnId::from_bytes([2; 16]),
-        step_id: asterpath_core::StepId::from_bytes([3; 16]),
+        turn_id: asterpath_protocol::TurnId::from_bytes([2; 16]),
+        step_id: asterpath_protocol::StepId::from_bytes([3; 16]),
         tool_call_id: ToolCallId::from_bytes([11; 16]),
         provider_call_id: "provider-b".to_owned(),
         name: ToolName::new("echo"),

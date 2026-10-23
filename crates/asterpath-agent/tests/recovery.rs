@@ -8,11 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath_core::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
-    LogEntry, LogId, LogQuery, SessionId, SignalDelivery, SignalPayload, StepId, ToolCallId,
-    TurnId, WakeCause,
-};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
     ApprovalRequest, ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot,
@@ -23,6 +18,11 @@ use asterpath_protocol::{
     ToolError, ToolGate, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
     TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
     encode_entry,
+};
+use asterpath_protocol::{
+    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
+    LogEntry, LogId, LogQuery, SessionId, SignalDelivery, SignalPayload, StepId, ToolCallId,
+    TurnId, WakeCause,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -330,7 +330,7 @@ impl DurableExecutor for NoopExecutor {
 /// wakes the waiter. The open tool call is the only wait record.
 #[derive(Default)]
 struct TestExecutor {
-    signals: Mutex<HashMap<asterpath_core::SignalId, SignalPayload>>,
+    signals: Mutex<HashMap<asterpath_protocol::SignalId, SignalPayload>>,
     wake: tokio::sync::Notify,
 }
 
@@ -749,7 +749,7 @@ async fn recovered_forced_compaction_retries_the_same_step() {
         SessionEvent::CompactionApplied {
             first_kept: LogId::from_i64(2),
             summary: vec![text("compacted")],
-            replaces: asterpath_core::LogIdRange {
+            replaces: asterpath_protocol::LogIdRange {
                 first: LogId::from_i64(1),
                 last: LogId::from_i64(2),
             },
@@ -1897,15 +1897,16 @@ struct CorruptParentLog {
 impl EventLog for CorruptParentLog {
     fn append(
         &self,
-        entry: asterpath_core::NewEntry,
-    ) -> BoxFuture<'_, Result<LogId, asterpath_core::StorageError>> {
+        entry: asterpath_protocol::NewEntry,
+    ) -> BoxFuture<'_, Result<LogId, asterpath_protocol::StorageError>> {
         self.inner.append(entry)
     }
 
     fn scan(
         &self,
         query: LogQuery,
-    ) -> futures_core::stream::BoxStream<'_, Result<LogEntry, asterpath_core::StorageError>> {
+    ) -> futures_core::stream::BoxStream<'_, Result<LogEntry, asterpath_protocol::StorageError>>
+    {
         if query.session == PARENT {
             return futures_util::stream::once(async move { Ok(self.corrupt.clone()) }).boxed();
         }
@@ -1915,7 +1916,7 @@ impl EventLog for CorruptParentLog {
     fn frontier(
         &self,
         session: SessionId,
-    ) -> BoxFuture<'_, Result<Option<LogId>, asterpath_core::StorageError>> {
+    ) -> BoxFuture<'_, Result<Option<LogId>, asterpath_protocol::StorageError>> {
         self.inner.frontier(session)
     }
 }
