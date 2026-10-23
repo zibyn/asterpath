@@ -2,21 +2,20 @@
 //! compaction records none. Live usage observation is `Hooks::on_record`
 //! (ADR-0025), covered by the facade tests.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent::Agent;
+use crate::tools::ToolTable;
+use crate::waits::Waits;
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, CompactPlan, CompactSummary, CompactionConfig, CompactionError,
-    CompactionJob, CompactionOutcome, ConfigSnapshot, DefaultApprovalPolicy, InputTokens, Item,
-    ModelId, ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderId, RequestConfig,
-    Role, RunRequest, RunTrigger, SessionEvent, StopReason, SubagentConfig, Tool, ToolConfig,
-    ToolDescriptor, ToolName, ToolRegistry, TurnConfig, Usage, decode_entry, dedup, encode_entry,
+    AgentEvent, CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionJob,
+    CompactionOutcome, ConfigSnapshot, DefaultApprovalPolicy, InputTokens, Item, ModelId,
+    ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderId, RequestConfig, Role,
+    RunRequest, RunTrigger, SessionEvent, StopReason, SubagentConfig, Tool, ToolConfig,
+    ToolDescriptor, TurnConfig, Usage, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, LogId,
-    SessionId, SignalDelivery, SignalPayload, StepId, TurnId, WakeCause,
-};
+use asterpath_protocol::{ApprovalGate, DedupKey, EventLog, LogId, SessionId, StepId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -78,60 +77,12 @@ fn assistant(text_value: &str) -> Item {
 
 // --- tools and executor ---------------------------------------------------
 
-struct Registry(Mutex<HashMap<ToolName, Arc<dyn Tool>>>);
-
-impl ToolRegistry for Registry {
-    fn register(&self, tool: Arc<dyn Tool>) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(tool.descriptor().name.clone(), tool);
+fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
+    let table = Arc::new(ToolTable::new());
+    for tool in tools {
+        table.register(tool);
     }
-
-    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .cloned()
-    }
-
-    fn list(&self) -> Vec<Arc<dyn Tool>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
-    }
-}
-
-struct NoopExecutor;
-
-impl DurableExecutor for NoopExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
+    table
 }
 
 struct AlwaysCompact;
@@ -181,26 +132,22 @@ fn agent(
     provider: Arc<ScriptedProvider>,
     tools: Vec<Arc<dyn Tool>>,
     compactor: Option<Arc<dyn asterpath_protocol::Compactor>>,
-) -> Box<dyn AgentRunner> {
-    let registry = Arc::new(Registry(Mutex::new(HashMap::new())));
-    for tool in tools {
-        registry.register(tool);
-    }
+) -> Agent {
+    let registry = tool_table(tools);
+    let waits = Arc::new(Waits::new(log.clone()));
     let gate = Arc::new(ApprovalGate::new());
     let provider: Arc<dyn Provider> = provider;
-    Box::new(
-        crate::agent::Agent::new(
-            log,
-            Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-            registry,
-            ToolConfig::default(),
-            Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
-            gate,
-            Arc::new(NoopExecutor),
-            Arc::new(ManualClock::new()),
-        )
-        .with_compactor(compactor),
+    Agent::new(
+        log,
+        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
+        registry,
+        ToolConfig::default(),
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        waits,
+        Arc::new(ManualClock::new()),
     )
+    .with_compactor(compactor)
 }
 
 async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {
@@ -233,7 +180,7 @@ async fn append(log: &Arc<InMemoryEventLog>, event: SessionEvent, key: Option<De
     log.append(entry).await.expect("append")
 }
 
-async fn drive(agent: &dyn AgentRunner) -> Vec<AgentEvent> {
+async fn drive(agent: &Agent) -> Vec<AgentEvent> {
     let mut stream = agent.run(RunRequest {
         session: SESSION,
         trigger: RunTrigger::Resume,
@@ -343,7 +290,7 @@ async fn threshold_compaction_intent_records_its_turn() {
         Some(Arc::new(AlwaysCompact)),
     );
 
-    drive(agent.as_ref()).await;
+    drive(&agent).await;
 
     let mut entries = log.scan(asterpath_protocol::LogQuery {
         session: SESSION,

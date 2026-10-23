@@ -1,23 +1,22 @@
-//! Tool pipeline behaviour through the public `AgentRunner` seam.
+//! Tool pipeline behaviour through the agent's `run`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::agent::Agent;
+use crate::tools::ToolTable;
+use crate::waits::Waits;
 use asterpath_protocol::{
-    AgentEvent, AgentRunner, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Gate,
-    HookError, Hooks, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
-    Provider, ProviderCatalog, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest,
-    RunTrigger, SessionEvent, SideEffect, StepCtx, StopReason, SubagentConfig, Tool, ToolArgs,
-    ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName,
-    ToolOutput, ToolRegistry, ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage,
-    decode_entry, encode_entry,
+    AgentEvent, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Gate, HookError, Hooks,
+    Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCatalog,
+    ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent,
+    SideEffect, StepCtx, StopReason, SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolConfig,
+    ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName, ToolOutput, ToolResultStatus,
+    ToolResultView, TurnConfig, TurnEndReason, Usage, decode_entry, encode_entry,
 };
-use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogQuery, SessionId,
-    SignalDelivery, SignalPayload, ToolCallId, TurnId, WakeCause,
-};
+use asterpath_protocol::{ApprovalGate, EventLog, LogQuery, SessionId, ToolCallId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -145,38 +144,12 @@ impl Tool for TestTool {
     }
 }
 
-#[derive(Default)]
-struct TestRegistry {
-    tools: Mutex<HashMap<ToolName, Arc<dyn Tool>>>,
-}
-
-impl TestRegistry {
-    fn with(tools: Vec<Arc<dyn Tool>>) -> Arc<Self> {
-        let registry = Arc::new(Self::default());
-        for tool in tools {
-            registry.register(tool);
-        }
-        registry
+fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
+    let table = Arc::new(ToolTable::new());
+    for tool in tools {
+        table.register(tool);
     }
-}
-
-impl ToolRegistry for TestRegistry {
-    fn register(&self, tool: Arc<dyn Tool>) {
-        self.tools
-            .lock()
-            .unwrap()
-            .insert(tool.descriptor().name.clone(), tool);
-    }
-
-    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
-        self.tools.lock().unwrap().get(name).cloned()
-    }
-
-    fn list(&self) -> Vec<Arc<dyn Tool>> {
-        let mut tools: Vec<_> = self.tools.lock().unwrap().values().cloned().collect();
-        tools.sort_by(|a, b| a.descriptor().name.cmp(&b.descriptor().name));
-        tools
-    }
+    table
 }
 
 // --- fixtures -------------------------------------------------------------
@@ -282,55 +255,27 @@ fn provider(first: Vec<Item>, stop: StopReason, second: Vec<Item>) -> Arc<Script
 fn agent(
     log: Arc<InMemoryEventLog>,
     provider: Arc<ScriptedProvider>,
-    registry: Arc<dyn ToolRegistry>,
+    registry: Arc<ToolTable>,
     tool_config: ToolConfig,
     hooks: Vec<Arc<dyn Hooks>>,
-) -> impl AgentRunner {
+) -> Agent {
     let provider: Arc<dyn Provider> = provider;
     let gate = Arc::new(ApprovalGate::new());
-    crate::agent::Agent::new(
+    let waits = Arc::new(Waits::new(log.clone()));
+    Agent::new(
         log,
         Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
         registry,
         tool_config,
         Arc::new(DefaultApprovalPolicy::new(gate.clone())),
         gate,
-        Arc::new(NoopExecutor),
+        waits,
         Arc::new(asterpath_testing::ManualClock::new()),
     )
     .with_hooks(hooks, None)
 }
 
-/// Pipeline tests never wait: approval is `Allow` for their in-process tools.
-struct NoopExecutor;
-
-impl DurableExecutor for NoopExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
-}
-
-async fn drive(agent: &impl AgentRunner) -> Vec<AgentEvent> {
+async fn drive(agent: &Agent) -> Vec<AgentEvent> {
     let mut stream = agent.run(RunRequest {
         session: SESSION,
         trigger: RunTrigger::Resume,
@@ -424,7 +369,7 @@ fn result_output(events: &[SessionEvent], call: ToolCallId) -> Option<Vec<Part>>
 #[tokio::test]
 async fn pre_execute_rewrites_args_before_the_intent_is_recorded() {
     let (tool, calls) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     let provider = provider(
         vec![tool_call("call-1", "echo", r#"{"n":1}"#)],
@@ -462,7 +407,7 @@ async fn pre_execute_rewrites_args_before_the_intent_is_recorded() {
 #[tokio::test]
 async fn pre_execute_deny_records_a_failed_intent_without_executing() {
     let (tool, calls) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     let provider = provider(
         vec![tool_call("call-1", "echo", "{}")],
@@ -511,7 +456,7 @@ impl Hooks for PanicBeforeTool {
 #[tokio::test]
 async fn a_panicking_before_tool_hook_fails_the_call_as_internal() {
     let (tool, calls) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     let provider = provider(
         vec![tool_call("call-1", "echo", "{}")],
@@ -542,7 +487,7 @@ async fn a_panicking_tool_fails_alone_and_the_step_commits() {
         |_args, _ctx| Box::pin(async { panic!("boom") }),
     );
     let (ok, _) = TestTool::echo(descriptor("ok"));
-    let registry = TestRegistry::with(vec![boom, ok]);
+    let registry = tool_table(vec![boom, ok]);
     let log = new_log(config(vec![descriptor("boom"), descriptor("ok")])).await;
     let provider = provider(
         vec![
@@ -595,7 +540,7 @@ async fn oversized_output_is_truncated_at_a_utf8_boundary() {
     let mut descriptor = descriptor("long");
     descriptor.max_output_bytes = Some(10);
     let tool = TestTool::text(descriptor.clone(), &long);
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor])).await;
     let provider = provider(
         vec![tool_call("call-1", "long", "{}")],
@@ -634,7 +579,7 @@ async fn oversized_output_is_truncated_at_a_utf8_boundary() {
 #[tokio::test]
 async fn the_step_cap_truncates_later_completions() {
     let tool = TestTool::text(descriptor("fixed"), &"a".repeat(100));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("fixed")])).await;
     let provider = provider(
         vec![
@@ -673,7 +618,7 @@ async fn the_step_cap_truncates_later_completions() {
 #[tokio::test]
 async fn post_execute_can_rewrite_content_before_the_result_is_logged() {
     let (tool, _) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     let provider = provider(
         vec![tool_call("call-1", "echo", r#"{"secret":1}"#)],
@@ -693,7 +638,7 @@ async fn post_execute_can_rewrite_content_before_the_result_is_logged() {
 
 #[tokio::test]
 async fn an_unknown_tool_records_intent_and_not_found_without_execution() {
-    let registry = TestRegistry::with(Vec::new());
+    let registry = tool_table(Vec::new());
     let log = new_log(config(Vec::new())).await;
     let provider = provider(
         vec![tool_call("call-1", "ghost", "{}")],
@@ -740,7 +685,7 @@ async fn an_unknown_tool_records_intent_and_not_found_without_execution() {
 #[tokio::test]
 async fn same_name_and_args_parallel_calls_get_distinct_identities() {
     let (tool, _) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("echo")])).await;
     let provider = provider(
         vec![
@@ -841,7 +786,7 @@ async fn an_exclusive_call_excludes_parallel_siblings_for_the_step() {
             })
         },
     );
-    let registry = TestRegistry::with(vec![read, write]);
+    let registry = tool_table(vec![read, write]);
     let log = new_log(config(vec![
         descriptor("read"),
         ToolDescriptor {
@@ -907,7 +852,7 @@ async fn max_parallel_calls_queues_excess_tools() {
             },
         ));
     }
-    let registry = TestRegistry::with(tools);
+    let registry = tool_table(tools);
     let log = new_log(config(vec![
         descriptor("p1"),
         descriptor("p2"),
@@ -945,7 +890,7 @@ async fn a_tool_that_ignores_the_deadline_fails_timeout() {
         Arc::new(Mutex::new(Vec::new())),
         |_args, _ctx| Box::pin(std::future::pending()),
     );
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor])).await;
     let provider = provider(
         vec![tool_call("call-1", "slow", "{}")],
@@ -1012,7 +957,7 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
     .await;
 
     let (tool, calls) = TestTool::echo(descriptor("echo"));
-    let registry = TestRegistry::with(vec![tool]);
+    let registry = tool_table(vec![tool]);
     // Only the next step's model response is scripted: the open step must not
     // call the model again.
     let provider = Arc::new(ScriptedProvider::new("p").respond(
@@ -1117,7 +1062,7 @@ impl Hooks for FailGate {
 async fn a_gate_stop_before_the_first_step_ends_a_zero_step_turn() {
     let log = new_log(config(Vec::new())).await;
     let provider = Arc::new(ScriptedProvider::new("p"));
-    let registry = TestRegistry::with(Vec::new());
+    let registry = tool_table(Vec::new());
     let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(StopGate {
         reason: "budget".to_owned(),
     }) as Arc<dyn Hooks>];
@@ -1160,7 +1105,7 @@ async fn a_gate_stop_before_the_first_step_ends_a_zero_step_turn() {
 async fn a_gate_error_ends_the_turn_failed_with_no_step() {
     let log = new_log(config(Vec::new())).await;
     let provider = Arc::new(ScriptedProvider::new("p"));
-    let registry = TestRegistry::with(Vec::new());
+    let registry = tool_table(Vec::new());
     let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(FailGate) as Arc<dyn Hooks>];
     let agent = agent(
         log.clone(),
@@ -1195,7 +1140,7 @@ async fn the_gate_is_consulted_before_every_step() {
         StopReason::PauseTurn,
         assistant_text("two"),
     );
-    let registry = TestRegistry::with(Vec::new());
+    let registry = tool_table(Vec::new());
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&calls);
     let hooks: Vec<Arc<dyn Hooks>> = vec![Arc::new(StopAfter {
@@ -1324,7 +1269,7 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
 
     let (echo, _) = TestTool::echo(descriptor("echo"));
     let (danger_tool, danger_calls) = TestTool::echo(danger);
-    let registry = TestRegistry::with(vec![echo, danger_tool]);
+    let registry = tool_table(vec![echo, danger_tool]);
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         assistant_text("done"),
         StopReason::EndTurn,

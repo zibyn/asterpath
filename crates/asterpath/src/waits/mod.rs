@@ -1,4 +1,4 @@
-//! Durable executor: approval signals and child-completion wakes expressed
+//! Durable waits: approval signals and child-completion wakes expressed
 //! through the event log.
 //!
 //! An approval wait is recorded by its open `ToolCallRequested`; delivery
@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    AwaitSignal, DurableExecutor, EventLog, ExecutionError, LogId, LogQuery, SessionId,
-    SignalDelivery, SignalId, SignalPayload, WakeCause,
+    AwaitSignal, EventLog, ExecutionError, LogId, LogQuery, SessionId, SignalDelivery, SignalId,
+    SignalPayload, WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
 use futures_core::future::BoxFuture;
@@ -53,14 +53,14 @@ impl Waiters {
     }
 }
 
-/// `DurableExecutor` backed by an event log.
-pub struct RuntimeExecutor {
+/// Approval and child-completion waits backed by the event log.
+pub(crate) struct Waits {
     log: Arc<dyn EventLog>,
     waiters: Waiters,
 }
 
-impl RuntimeExecutor {
-    pub fn new(log: Arc<dyn EventLog>) -> Self {
+impl Waits {
+    pub(crate) fn new(log: Arc<dyn EventLog>) -> Self {
         Self {
             log,
             waiters: Waiters::default(),
@@ -111,8 +111,8 @@ impl RuntimeExecutor {
     }
 }
 
-impl DurableExecutor for RuntimeExecutor {
-    fn await_signal(
+impl Waits {
+    pub(crate) fn await_signal(
         &self,
         req: AwaitSignal,
     ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
@@ -131,7 +131,7 @@ impl DurableExecutor for RuntimeExecutor {
         })
     }
 
-    fn deliver_signal(
+    pub(crate) fn deliver_signal(
         &self,
         delivery: SignalDelivery,
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
@@ -152,7 +152,7 @@ impl DurableExecutor for RuntimeExecutor {
         })
     }
 
-    fn await_wake(
+    pub(crate) fn await_wake(
         &self,
         session: SessionId,
         cause: WakeCause,
@@ -190,7 +190,7 @@ impl DurableExecutor for RuntimeExecutor {
         })
     }
 
-    fn wake(&self, _session: SessionId, cause: WakeCause) {
+    pub(crate) fn wake(&self, _session: SessionId, cause: WakeCause) {
         let key = match cause {
             WakeCause::Signal(signal) => WaitKey::Signal(signal),
             WakeCause::ChildCompleted(child) => WaitKey::Child(child),

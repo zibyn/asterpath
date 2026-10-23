@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::ApprovalRequest;
 use crate::config::{Provenance, ToolDescriptor};
 use crate::event::ToolErrorKind;
-use crate::ids::{ToolArgs, ToolName};
+use crate::ids::ToolArgs;
 use crate::item::Part;
 
 /// One executable tool. `descriptor` is immutable for the tool's lifetime.
@@ -28,14 +28,6 @@ pub trait Tool: Send + Sync + 'static {
         args: ToolArgs,
         ctx: ToolContext,
     ) -> BoxFuture<'_, Result<ToolOutput, ToolError>>;
-}
-
-/// Live registry of tools, ordered by name. Duplicate names keep the first
-/// registration; the name is the tool's identity within one process.
-pub trait ToolRegistry: Send + Sync {
-    fn register(&self, tool: Arc<dyn Tool>);
-    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>>;
-    fn list(&self) -> Vec<Arc<dyn Tool>>;
 }
 
 /// A single tool call's view of the world. Timeouts are enforced by the

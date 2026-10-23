@@ -10,11 +10,9 @@ use asterpath_protocol::{
     AgentError, CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, ToolSelection, TurnConfig,
 };
-use asterpath_protocol::{LogQuery, SessionCatalog, SessionId, StorageError};
+use asterpath_protocol::{LogQuery, SessionId};
 use asterpath_testing::{InMemoryEventLog, InMemoryStorage, ScriptedProvider};
-use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
@@ -135,30 +133,15 @@ async fn open_session_reports_unknown_sessions_as_not_found() {
     cleanup(&db);
 }
 
-struct DummyCatalog;
-
-impl SessionCatalog for DummyCatalog {
-    fn parent(
-        &self,
-        _session: SessionId,
-    ) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn children(&self, _session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        stream::empty().boxed()
-    }
-}
-
 #[tokio::test]
 async fn injected_backend_without_retirement_returns_none() {
     let log = Arc::new(InMemoryEventLog::new());
     let storage = Arc::new(InMemoryStorage::new(Arc::clone(&log)));
     let asterpath = Asterpath::builder()
         .providers(vec![Arc::new(ScriptedProvider::new("p"))])
-        .event_log(log)
+        .event_log(Arc::clone(&log) as Arc<dyn asterpath_protocol::EventLog>)
         .storage(storage)
-        .session_catalog(Arc::new(DummyCatalog))
+        .session_catalog(log)
         .build()
         .await
         .expect("facade builds with injected storage");

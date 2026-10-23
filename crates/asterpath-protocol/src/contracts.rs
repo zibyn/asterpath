@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 
-use crate::error::{ExecutionError, RetirementError, StorageError};
+use crate::error::{RetirementError, StorageError};
 use crate::ids::{LogId, SessionId, SignalId};
 use crate::time::Timestamp;
 
@@ -135,28 +135,6 @@ pub struct AwaitSignal {
 pub enum WakeCause {
     Signal(SignalId),
     ChildCompleted(SessionId),
-}
-
-/// Durable wait seam: approval signals and wake notifications. An approval
-/// wait is recorded by its open `ToolCallRequested`; nothing else is written
-/// until `SignalReceived`.
-pub trait DurableExecutor: Send + Sync {
-    fn await_signal(
-        &self,
-        req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>>;
-
-    fn deliver_signal(&self, delivery: SignalDelivery)
-    -> BoxFuture<'_, Result<(), ExecutionError>>;
-
-    fn await_wake(
-        &self,
-        session: SessionId,
-        cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>>;
-
-    /// In-memory wake only; terminal writers append first, then wake.
-    fn wake(&self, session: SessionId, cause: WakeCause);
 }
 
 /// Liveness declaration for approval responders: the kernel mechanism only

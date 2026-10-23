@@ -2,15 +2,16 @@
 //!
 //! **This backend does not satisfy G1.** There is no persistence, no fsync and
 //! no crash prefix guarantee; everything is lost with the process. It exists to
-//! run the backend-neutral contract suites. It also does not implement
+//! run the backend-neutral contract suites. The log is also its own
+//! `SessionCatalog` (parents come from `SessionCreated`). It does not implement
 //! `SessionRetirement`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, Storage, StorageError,
-    SystemClock, Timestamp,
+    Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, Storage,
+    StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{OpenIntents, SessionEvent, decode_entry, decode_payload};
 use futures_core::future::BoxFuture;
@@ -126,6 +127,54 @@ impl EventLog for InMemoryEventLog {
             .max_by_key(|entry| entry.seq)
             .map(|entry| entry.log_id);
         Box::pin(async move { Ok(frontier) })
+    }
+}
+
+impl InMemoryEventLog {
+    /// The parent recorded in `session`'s `SessionCreated`, if any.
+    fn parent_of(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
+        let Some(first) = self
+            .snapshot()
+            .into_iter()
+            .filter(|entry| entry.session == session)
+            .min_by_key(|entry| entry.seq)
+        else {
+            return Ok(None);
+        };
+        match decode_entry(&first).map_err(|error| StorageError::Corrupt {
+            session: Some(session),
+            detail: error.to_string(),
+        })? {
+            SessionEvent::SessionCreated { parent, .. } => Ok(parent.map(|parent| parent.session)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Like SQLite's `sessions.parent_id`: the tree comes from `SessionCreated`.
+impl SessionCatalog for InMemoryEventLog {
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        let parent = self.parent_of(session);
+        Box::pin(async move { parent })
+    }
+
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
+        let mut sessions: Vec<SessionId> = self
+            .snapshot()
+            .into_iter()
+            .map(|entry| entry.session)
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        let children: Vec<Result<SessionId, StorageError>> = sessions
+            .into_iter()
+            .filter_map(|candidate| match self.parent_of(candidate) {
+                Ok(Some(parent)) if parent == session => Some(Ok(candidate)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect();
+        stream::iter(children).boxed()
     }
 }
 

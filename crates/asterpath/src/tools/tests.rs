@@ -1,11 +1,11 @@
-//! Registry contract tests for the in-process tool registry.
+//! The tool table: unique names, name-ordered listing.
 
 use std::sync::Arc;
 
-use crate::tools::InMemoryToolRegistry;
+use crate::tools::ToolTable;
 use asterpath_protocol::{
     Parallelism, Provenance, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor,
-    ToolError, ToolName, ToolOutput, ToolRegistry,
+    ToolError, ToolName, ToolOutput,
 };
 use futures_core::future::BoxFuture;
 
@@ -47,7 +47,7 @@ impl Tool for StubTool {
 
 #[test]
 fn names_are_unique_and_listing_is_name_ordered() {
-    let registry = InMemoryToolRegistry::new();
+    let registry = ToolTable::new();
     let first = StubTool::tool("echo");
     let duplicate = StubTool::tool("echo");
     let other = StubTool::tool("alpha");

@@ -1,12 +1,12 @@
-//! Approval signal and wake behaviour through the public `DurableExecutor` seam.
+//! Approval signal and wake behaviour through the engine's durable waits.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::waits::RuntimeExecutor;
+use crate::waits::Waits;
 use asterpath_protocol::{
-    AwaitSignal, DurableExecutor, EventLog, LogQuery, SessionId, SignalDelivery, SignalId,
-    SignalName, ToolCallId, WakeCause,
+    AwaitSignal, EventLog, LogQuery, SessionId, SignalDelivery, SignalId, SignalName, ToolCallId,
+    WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry};
 use asterpath_testing::InMemoryEventLog;
@@ -16,12 +16,12 @@ const SESSION: SessionId = SessionId::from_bytes([7; 16]);
 
 struct Fixture {
     log: Arc<InMemoryEventLog>,
-    executor: Arc<RuntimeExecutor>,
+    executor: Arc<Waits>,
 }
 
 fn fixture() -> Fixture {
     let log = Arc::new(InMemoryEventLog::new());
-    let executor = Arc::new(RuntimeExecutor::new(log.clone()));
+    let executor = Arc::new(Waits::new(log.clone()));
     Fixture { log, executor }
 }
 

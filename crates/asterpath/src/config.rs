@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use asterpath_protocol::{
-    AgentRunner, ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec,
-    Provider, Tool, ToolConfig,
+    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
 };
 use asterpath_protocol::{
-    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
+    ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec, Provider, Tool,
+    ToolConfig,
 };
 
 use crate::error::AsterError;
@@ -21,7 +21,6 @@ pub struct AsterpathConfig {
     pub providers: Vec<Arc<dyn Provider>>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub tool: ToolConfig,
-    pub agent: Option<Arc<dyn AgentRunner>>,
     /// Optional compaction capability. `None` (the M0 default) makes every
     /// compaction path report `NotConfigured`.
     pub compactor: Option<Arc<dyn Compactor>>,
@@ -51,7 +50,6 @@ impl Default for AsterpathConfig {
             providers: Vec::new(),
             tools: Vec::new(),
             tool: ToolConfig::default(),
-            agent: None,
             compactor: None,
             event_log: None,
             storage: None,
@@ -110,12 +108,6 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn tool(mut self, tool: ToolConfig) -> Self {
         self.config.tool = tool;
-        self
-    }
-
-    #[must_use]
-    pub fn agent(mut self, agent: Arc<dyn AgentRunner>) -> Self {
-        self.config.agent = Some(agent);
         self
     }
 

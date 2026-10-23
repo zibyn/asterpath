@@ -1,19 +1,19 @@
 //! Native execution tracing: a deterministic projection of the event log.
 //!
-//! There is no trace sink and no trace table. [`TracingQuery`] folds the
-//! injected [`EventLog`] on demand; [`TracingTap`] pushes the same lifecycle off
-//! the facade append entry. `recorded_at` only feeds timings and statuses here, never
-//! recovery or projection.
+//! There is no trace sink, no trace table and no push channel: [`TracingQuery`]
+//! folds the injected [`EventLog`] on demand. Live export is the host's own
+//! incremental fold over `Hooks::on_record`. `recorded_at` only feeds timings
+//! and statuses here, never recovery or projection.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use asterpath_protocol::{
     APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
     ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span,
-    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
-    ToolCallAttrs, ToolErrorKind, ToolResultStatus, TraceError, TraceId, TraceQuery, TraceTap,
-    TurnAttrs, TurnEndReason, WaitAttrs, WaitKind, decode_entry,
+    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs,
+    ToolErrorKind, ToolResultStatus, TraceError, TraceId, TurnAttrs, TurnEndReason, WaitAttrs,
+    WaitKind, decode_entry,
 };
 use asterpath_protocol::{
     EventLog, Fnv, LogEntry, LogId, LogIdRange, LogQuery, SessionId, SignalId, StepId,
@@ -21,21 +21,20 @@ use asterpath_protocol::{
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
-use tokio::sync::broadcast;
 
 /// Pull seam: folds one session's log per request.
-pub struct TracingQuery {
+pub(crate) struct TracingQuery {
     log: Arc<dyn EventLog>,
 }
 
 impl TracingQuery {
-    pub fn new(log: Arc<dyn EventLog>) -> Self {
+    pub(crate) fn new(log: Arc<dyn EventLog>) -> Self {
         Self { log }
     }
 }
 
-impl TraceQuery for TracingQuery {
-    fn spans(&self, filter: SpanFilter) -> BoxStream<'_, Result<Span, TraceError>> {
+impl TracingQuery {
+    pub(crate) fn spans(&self, filter: SpanFilter) -> BoxStream<'_, Result<Span, TraceError>> {
         let log = Arc::clone(&self.log);
         Box::pin(
             stream::once(async move {
@@ -894,99 +893,4 @@ fn span_id(session: SessionId, log_id: LogId, kind: SpanKind) -> SpanId {
     hash.write(&log_id.as_i64().to_be_bytes());
     hash.write(&[kind_tag(kind)]);
     SpanId::from_bytes(hash.finish_64().to_be_bytes())
-}
-
-/// Real-time seam: diffs the projection after each committed record.
-pub struct TracingTap {
-    log: Arc<dyn EventLog>,
-    updates: broadcast::Sender<Result<SpanUpdate, TraceError>>,
-    state: Mutex<HashMap<SessionId, (u64, Vec<Span>)>>,
-}
-
-impl TracingTap {
-    pub fn new(log: Arc<dyn EventLog>) -> Self {
-        let (updates, _) = broadcast::channel(1024);
-        Self {
-            log,
-            updates,
-            state: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Called by the facade's append entry after a record becomes visible.
-    pub async fn record_appended(&self, session: SessionId) {
-        let spans = match fold_session(self.log.as_ref(), session).await {
-            Ok(spans) => spans,
-            Err(TraceError::NotFound { .. }) => return,
-            Err(error) => {
-                let _ = self.updates.send(Err(error));
-                return;
-            }
-        };
-        let sequence = spans
-            .iter()
-            .map(|span| span.log_range.last.as_i64() as u64)
-            .max()
-            .unwrap_or(0);
-
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state
-            .get(&session)
-            .is_some_and(|(known, _)| *known > sequence)
-        {
-            // An out-of-order fold from a concurrent append; the newer one won.
-            return;
-        }
-        let previous = state.get(&session).map(|(_, spans)| spans.clone());
-        state.insert(session, (sequence, spans.clone()));
-        drop(state);
-
-        let notifications = match &previous {
-            None => spans
-                .iter()
-                .cloned()
-                .map(SpanUpdate::Started)
-                .collect::<Vec<_>>(),
-            Some(previous) => span_updates(previous, &spans),
-        };
-        for update in notifications {
-            let _ = self.updates.send(Ok(update));
-        }
-    }
-}
-
-impl TraceTap for TracingTap {
-    fn subscribe(&self) -> BoxStream<'_, Result<SpanUpdate, TraceError>> {
-        let receiver = self.updates.subscribe();
-        Box::pin(stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(update) => return Some((update, receiver)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        }))
-    }
-}
-
-fn span_updates(previous: &[Span], current: &[Span]) -> Vec<SpanUpdate> {
-    let mut updates = Vec::new();
-    for span in current {
-        match previous.iter().find(|known| known.span == span.span) {
-            None => {
-                updates.push(SpanUpdate::Started(span.clone()));
-                // A wait materialized only when its decision was recorded can
-                // already be terminal in the same fold.
-                if span.ended_at.is_some() {
-                    updates.push(SpanUpdate::Ended(span.clone()));
-                }
-            }
-            Some(known) if known.ended_at.is_none() && span.ended_at.is_some() => {
-                updates.push(SpanUpdate::Ended(span.clone()));
-            }
-            _ => {}
-        }
-    }
-    updates
 }

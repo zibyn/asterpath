@@ -1,4 +1,4 @@
-//! Driver-facing contracts: session spec, `AgentRunner`, live `AgentEvent`
+//! Driver-facing values: session spec, run request, live `AgentEvent`
 //! stream and the summed `AgentError`.
 
 use std::collections::HashMap;
@@ -7,8 +7,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::{
     ExecutionError, InputId, LogIdRange, SessionId, StepId, StorageError, ToolCallId, TurnId,
 };
-use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 
 use crate::config::{
     CompactionConfig, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety, RequestConfig,
@@ -178,17 +176,10 @@ pub struct CompactionOutcome {
     pub raw: Option<RawProviderData>,
 }
 
-/// Turn / step driver. The composition root injects one implementation.
-pub trait AgentRunner: Send + Sync {
-    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>>;
-    fn compact_now(&self, session: SessionId) -> BoxFuture<'_, Result<CompactResult, AgentError>>;
-}
-
 /// Process-local map from a driven session to its active turn token.
 ///
-/// The facade and the default runner share one registry, so `SessionHandle`
-/// cancellation reaches the active drive without widening `AgentRunner`.
-/// Custom runners that do not register degrade to a no-op cancel.
+/// The facade and the agent share one registry, so `SessionHandle`
+/// cancellation reaches the active drive.
 #[derive(Default)]
 pub struct CancellationRegistry {
     active: Mutex<HashMap<SessionId, CancelToken>>,

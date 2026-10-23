@@ -1,36 +1,34 @@
-//! Scheduler behaviour at its public seam: spawn/materialization, recorded
+//! Scheduler behaviour: spawn/materialization, recorded
 //! outcomes, depth, outcome mapping, lost children and cancel.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::scheduler::{
-    ChildRef, Scheduler, SpawnError, SpawnRequest, SpawnTool, SubagentSpawner, WaitError,
+use crate::agent::Agent;
+use crate::scheduler::{ChildRef, Scheduler, SpawnError, SpawnRequest, WaitError};
+use crate::tools::ToolTable;
+use crate::waits::Waits;
+use asterpath_protocol::{
+    CancelReason, ChildFailure, ChildOutcome, CompactionConfig, ConfigSnapshot, ContextPolicy,
+    Item, ModelAlias, ModelId, ModelSpec, Parallelism, Part, Provenance, ProviderId, ReplaySafety,
+    RequestConfig, Role, SessionEvent, SideEffect, StopReason, SubagentConfig, Summary,
+    ToolDescriptor, ToolName, ToolResultStatus, TurnConfig, TurnEndReason, Usage, dedup,
+    encode_entry,
 };
 use asterpath_protocol::{
-    AgentError, AgentEvent, AgentRunner, CancelReason, ChildFailure, ChildOutcome,
-    CompactionConfig, ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelId, ModelSpec,
-    Parallelism, Part, Provenance, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest,
-    SessionEvent, SideEffect, StopReason, SubagentConfig, Summary, ToolDescriptor, ToolName,
-    ToolResultStatus, TurnConfig, TurnEndReason, Usage, dedup, encode_entry,
+    CancelToken, DefaultApprovalPolicy, Provider, ProviderCatalog, ToolArgs, ToolConfig,
+    ToolContext, ToolError,
 };
 use asterpath_protocol::{
-    AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId,
-    LogQuery, SessionCatalog, SessionId, SignalDelivery, SignalPayload, StorageError, SystemClock,
-    Timestamp, ToolCallId, TurnId, WakeCause,
+    Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionCatalog, SessionId, StorageError,
+    SystemClock, Timestamp, ToolCallId, TurnId,
 };
-use asterpath_protocol::{
-    CancelToken, CancellationRegistry, Tool, ToolArgs, ToolContext, ToolError,
-};
-use asterpath_testing::{InMemoryEventLog, ManualClock};
+use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
-
-type Log = Arc<InMemoryEventLog>;
 
 fn text(value: &str) -> Part {
     Part::Text {
@@ -114,94 +112,65 @@ async fn events(log: &dyn EventLog, session: SessionId) -> Vec<SessionEvent> {
     events
 }
 
-/// `None` for the root; every other session has one parent edge.
-#[derive(Default)]
-struct FakeCatalog {
-    parents: Mutex<HashMap<SessionId, SessionId>>,
-}
-
-impl FakeCatalog {
-    fn with_chain(depth: usize, leaf: SessionId) -> Arc<Self> {
-        let catalog = Arc::new(Self::default());
-        let mut child = leaf;
-        for index in 0..depth {
-            let parent = SessionId::from_bytes([0x10 + index as u8; 16]);
-            catalog.parents.lock().unwrap().insert(child, parent);
-            child = parent;
-        }
-        catalog
-    }
-}
-
-impl SessionCatalog for FakeCatalog {
-    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
-        let parent = self.parents.lock().unwrap().get(&session).copied();
-        Box::pin(async move { Ok(parent) })
-    }
-
-    fn children(&self, _session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        stream::empty().boxed()
-    }
-}
-
-/// The scheduler never needs a real wait in these directed tests; the recorded
-/// outcome path returns before `await_wake`.
-struct NoopExecutor;
-
-impl DurableExecutor for NoopExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(std::future::pending())
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
-}
-
-fn new_scheduler(
-    log: Arc<dyn EventLog>,
-    catalog: Arc<dyn SessionCatalog>,
+/// The scheduler and a real agent over `log`, which is also the session
+/// catalog. The agent's provider has no script; tests that drive a child
+/// build their own with [`agent_for`].
+fn new_scheduler<L: EventLog + SessionCatalog + 'static>(
+    log: Arc<L>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
-) -> Arc<Scheduler> {
-    Arc::new(Scheduler::new(
-        log,
+) -> (Arc<Scheduler>, Agent) {
+    let catalog: Arc<dyn SessionCatalog> = log.clone();
+    let log: Arc<dyn EventLog> = log;
+    let scheduler = Arc::new(Scheduler::new(
+        Arc::clone(&log),
         catalog,
-        Arc::new(NoopExecutor),
+        Arc::new(Waits::new(Arc::clone(&log))),
         aliases,
-    ))
+    ));
+    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
+    (scheduler, agent)
 }
 
-fn new_scheduler_with(
-    log: Arc<dyn EventLog>,
-    catalog: Arc<dyn SessionCatalog>,
-    executor: Arc<dyn DurableExecutor>,
+fn new_scheduler_with<L: EventLog + SessionCatalog + 'static>(
+    log: Arc<L>,
     clock: Arc<dyn Clock>,
-) -> Arc<Scheduler> {
-    Arc::new(Scheduler::with_runtime(
-        log,
+) -> (Arc<Scheduler>, Agent) {
+    let catalog: Arc<dyn SessionCatalog> = log.clone();
+    let log: Arc<dyn EventLog> = log;
+    let scheduler = Arc::new(Scheduler::with_runtime(
+        Arc::clone(&log),
         catalog,
-        executor,
+        Arc::new(Waits::new(Arc::clone(&log))),
         BTreeMap::new(),
         clock,
         NonZeroUsize::new(32).expect("non-zero"),
-        Arc::new(CancellationRegistry::new()),
-    ))
+        Default::default(),
+    ));
+    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
+    (scheduler, agent)
+}
+
+/// The real agent that drives children of `scheduler`, sharing its
+/// cancellation registry.
+fn agent_for(
+    log: Arc<dyn EventLog>,
+    scheduler: &Arc<Scheduler>,
+    provider: Arc<ScriptedProvider>,
+) -> Agent {
+    let provider: Arc<dyn Provider> = provider;
+    let gate = Arc::new(asterpath_protocol::ApprovalGate::new());
+    Agent::new(
+        Arc::clone(&log),
+        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
+        Arc::new(ToolTable::new()),
+        ToolConfig::default(),
+        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        gate,
+        Arc::new(Waits::new(log)),
+        Arc::new(SystemClock),
+    )
+    .with_cancellations(scheduler.cancellations())
+    .with_scheduler(Arc::clone(scheduler))
 }
 
 /// Seeds a root parent with its `SessionCreated` and the spawn
@@ -210,16 +179,32 @@ async fn seed_parent(
     log: &InMemoryEventLog,
     max_depth: u8,
 ) -> (SessionId, asterpath_protocol::ParentRef, LogId) {
+    seed_parent_at_depth(log, max_depth, 0).await
+}
+
+/// Like [`seed_parent`], with `depth` ancestor sessions above the parent.
+async fn seed_parent_at_depth(
+    log: &InMemoryEventLog,
+    max_depth: u8,
+    depth: usize,
+) -> (SessionId, asterpath_protocol::ParentRef, LogId) {
     let parent = SessionId::from_bytes([1; 16]);
-    append(
-        log,
-        parent,
-        SessionEvent::SessionCreated {
-            config: config(max_depth),
-            parent: None,
-        },
-    )
-    .await;
+    let mut session = parent;
+    for index in 0..=depth {
+        let ancestor = (index < depth).then(|| SessionId::from_bytes([0x10 + index as u8; 16]));
+        append(
+            log,
+            session,
+            SessionEvent::SessionCreated {
+                config: config(max_depth),
+                parent: ancestor.map(parent_ref),
+            },
+        )
+        .await;
+        if let Some(ancestor) = ancestor {
+            session = ancestor;
+        }
+    }
     let reference = parent_ref(parent);
     let caused_by = append(
         log,
@@ -299,11 +284,7 @@ async fn completed_child(
 async fn spawn_materializes_once_and_reuses_the_child_on_replay() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
 
     let mut request = SpawnRequest::new(reference.clone(), caused_by, vec![text("do it")]);
     request.tool_allowlist = Some(vec![ToolName::new("echo")]);
@@ -404,7 +385,7 @@ async fn spawn_honours_model_alias_and_rejects_invalid_narrowing() {
             context_window: None,
         },
     );
-    let scheduler = new_scheduler(log.clone(), Arc::new(FakeCatalog::default()), aliases);
+    let (scheduler, _agent) = new_scheduler(log.clone(), aliases);
 
     // Each case uses its own tool call so R1 does not mask the validation.
     let mut call = 0u8;
@@ -482,10 +463,9 @@ async fn spawn_honours_model_alias_and_rejects_invalid_narrowing() {
 #[tokio::test]
 async fn depth_exceeded_creates_no_child() {
     let log = Arc::new(InMemoryEventLog::new());
-    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     // Parent already sits at depth 3; a child would be depth 4.
-    let catalog = FakeCatalog::with_chain(3, parent);
-    let scheduler = new_scheduler(log.clone(), catalog, BTreeMap::new());
+    let (parent, reference, caused_by) = seed_parent_at_depth(&log, 3, 3).await;
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
 
     let result = scheduler
         .spawn(SpawnRequest::new(
@@ -546,14 +526,17 @@ async fn recorded_outcome_wins_without_reading_the_child() {
         inner: inner.clone(),
         parent,
     });
-    let scheduler = new_scheduler(log, Arc::new(FakeCatalog::default()), BTreeMap::new());
+    let (scheduler, agent) = new_scheduler(log, BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
 
     assert_eq!(
-        scheduler.await_completion(&child_ref).await.expect("R3"),
+        scheduler
+            .await_completion(&child_ref, &agent)
+            .await
+            .expect("R3"),
         outcome
     );
 }
@@ -579,17 +562,13 @@ async fn child_terminal_becomes_one_parent_completion() {
     .await;
     completed_child(&log, child, "the answer", TurnEndReason::Completed).await;
 
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
     let outcome = scheduler
-        .await_completion(&child_ref)
+        .await_completion(&child_ref, &agent)
         .await
         .expect("outcome");
     let ChildOutcome::Completed { summary } = &outcome else {
@@ -608,7 +587,10 @@ async fn child_terminal_becomes_one_parent_completion() {
 
     // R3: the second call reads the record, never the child.
     assert_eq!(
-        scheduler.await_completion(&child_ref).await.expect("R3"),
+        scheduler
+            .await_completion(&child_ref, &agent)
+            .await
+            .expect("R3"),
         outcome
     );
     assert_eq!(
@@ -658,12 +640,15 @@ async fn child_failure_reasons_map_to_child_failure() {
         .await;
         completed_child(&log, child, "partial", reason.clone()).await;
 
-        let scheduler = new_scheduler(log, Arc::new(FakeCatalog::default()), BTreeMap::new());
+        let (scheduler, agent) = new_scheduler(log, BTreeMap::new());
         let outcome = scheduler
-            .await_completion(&ChildRef {
-                parent: reference,
-                child,
-            })
+            .await_completion(
+                &ChildRef {
+                    parent: reference,
+                    child,
+                },
+                &agent,
+            )
             .await
             .expect("outcome");
         assert!(
@@ -699,13 +684,16 @@ async fn child_failure_reasons_map_to_child_failure() {
         },
     )
     .await;
-    let scheduler = new_scheduler(log, Arc::new(FakeCatalog::default()), BTreeMap::new());
+    let (scheduler, agent) = new_scheduler(log, BTreeMap::new());
     assert!(matches!(
         scheduler
-            .await_completion(&ChildRef {
-                parent: reference,
-                child,
-            })
+            .await_completion(
+                &ChildRef {
+                    parent: reference,
+                    child,
+                },
+                &agent
+            )
             .await,
         Ok(ChildOutcome::Completed { .. })
     ));
@@ -734,13 +722,16 @@ async fn unreadable_child_records_lost_and_unblocks_replay() {
         inner: inner.clone(),
         parent,
     });
-    let scheduler = new_scheduler(log, Arc::new(FakeCatalog::default()), BTreeMap::new());
+    let (scheduler, agent) = new_scheduler(log, BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
 
-    let error = scheduler.await_completion(&child_ref).await.unwrap_err();
+    let error = scheduler
+        .await_completion(&child_ref, &agent)
+        .await
+        .unwrap_err();
     assert!(matches!(error, WaitError::Execution(_)));
     assert!(matches!(
         events(&*inner, parent)
@@ -773,19 +764,18 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
         },
     )
     .await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
 
-    scheduler.cancel(&child_ref).await.expect("cancel");
     scheduler
-        .cancel(&child_ref)
+        .cancel_wait(child_ref.clone(), &agent)
+        .await
+        .expect("cancel");
+    scheduler
+        .cancel_wait(child_ref.clone(), &agent)
         .await
         .expect("idempotent cancel");
     let completions: Vec<_> = events(&*log, parent)
@@ -822,21 +812,17 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
     )
     .await;
     completed_child(&log, child, "done", TurnEndReason::Completed).await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
     scheduler
-        .await_completion(&child_ref)
+        .await_completion(&child_ref, &agent)
         .await
         .expect("record");
     scheduler
-        .cancel(&child_ref)
+        .cancel_wait(child_ref.clone(), &agent)
         .await
         .expect("cancel after record");
     assert!(matches!(
@@ -855,16 +841,16 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
 async fn driving_a_fresh_child_opens_exactly_one_turn() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
-    let stub = Arc::new(StubRunner {
-        log: log.clone(),
-        runs: Mutex::new(0),
-    });
-    scheduler.set_runner(stub.clone());
+    let (scheduler, _) = new_scheduler(log.clone(), BTreeMap::new());
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![Item::Message {
+            role: Role::Assistant,
+            parts: vec![text("child answer")],
+        }],
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let agent = agent_for(log.clone(), &scheduler, Arc::clone(&provider));
 
     let child = scheduler
         .spawn(SpawnRequest::new(
@@ -874,7 +860,10 @@ async fn driving_a_fresh_child_opens_exactly_one_turn() {
         ))
         .await
         .expect("spawn");
-    let outcome = scheduler.await_completion(&child).await.expect("outcome");
+    let outcome = scheduler
+        .await_completion(&child, &agent)
+        .await
+        .expect("outcome");
     assert!(matches!(outcome, ChildOutcome::Completed { .. }));
 
     let child_kinds = kinds(&*log, child.child).await;
@@ -884,13 +873,14 @@ async fn driving_a_fresh_child_opens_exactly_one_turn() {
             "SessionCreated",
             "InputRecorded",
             "TurnStarted",
+            "StepStarted",
             "AssistantMessage",
             "StepCommitted",
             "TurnCommitted",
         ],
         "the first drive starts the turn; no StreamResumed is prepended"
     );
-    assert_eq!(*stub.runs.lock().unwrap(), 1);
+    assert_eq!(provider.requests().len(), 1, "the child is driven once");
     assert_eq!(
         events(&*log, parent)
             .await
@@ -914,14 +904,14 @@ fn tool_context(parent: &asterpath_protocol::ParentRef) -> ToolContext {
 #[tokio::test]
 async fn spawn_tool_maps_depth_to_invalid_args_and_rejects_overrides() {
     let log = Arc::new(InMemoryEventLog::new());
-    let (parent, reference, _) = seed_parent(&log, 3).await;
-    let catalog = FakeCatalog::with_chain(3, parent);
-    let scheduler = new_scheduler(log.clone(), catalog, BTreeMap::new());
-    let tool = SpawnTool::new(scheduler);
+    let (parent, reference, _) = seed_parent_at_depth(&log, 3, 3).await;
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
 
     let args = ToolArgs::new(r#"{"task":"too deep"}"#);
     assert!(matches!(
-        tool.invoke(args, tool_context(&reference)).await,
+        scheduler
+            .run_spawn_tool(&agent, args, tool_context(&reference))
+            .await,
         Err(ToolError::InvalidArgs { .. })
     ));
     assert!(
@@ -934,7 +924,9 @@ async fn spawn_tool_maps_depth_to_invalid_args_and_rejects_overrides() {
     // A system/approval override cannot be expressed by the model.
     let args = ToolArgs::new(r#"{"task":"x","system":"override"}"#);
     assert!(matches!(
-        tool.invoke(args, tool_context(&reference)).await,
+        scheduler
+            .run_spawn_tool(&agent, args, tool_context(&reference))
+            .await,
         Err(ToolError::InvalidArgs { .. })
     ));
 }
@@ -970,15 +962,12 @@ async fn spawn_tool_maps_a_recorded_lost_outcome_to_internal() {
     )
     .await;
 
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
-    let tool = SpawnTool::new(scheduler);
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
     let args = ToolArgs::new(r#"{"task":"retry"}"#);
     assert!(matches!(
-        tool.invoke(args, tool_context(&reference)).await,
+        scheduler
+            .run_spawn_tool(&agent, args, tool_context(&reference))
+            .await,
         Err(ToolError::Internal { .. })
     ));
 }
@@ -1016,63 +1005,13 @@ impl EventLog for PoisonLog {
     }
 }
 
-/// Minimal runner: opens the turn and commits a completed turn.
-struct StubRunner {
-    log: Log,
-    runs: Mutex<u32>,
-}
-
-impl AgentRunner for StubRunner {
-    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
-        *self.runs.lock().unwrap() += 1;
-        let log = self.log.clone();
-        let turn = TurnId::from_bytes([7; 16]);
-        let step = asterpath_protocol::StepId::from_bytes([8; 16]);
-        stream::once(async move {
-            let events = [
-                SessionEvent::TurnStarted { turn_id: turn },
-                SessionEvent::AssistantMessage {
-                    turn_id: turn,
-                    step_id: step,
-                    items: vec![Item::Message {
-                        role: Role::Assistant,
-                        parts: vec![text("child answer")],
-                    }],
-                    raw: None,
-                    model: config(3).model,
-                    usage: Usage::default(),
-                    stop_reason: StopReason::EndTurn,
-                },
-                SessionEvent::StepCommitted {
-                    turn_id: turn,
-                    step_id: step,
-                },
-                SessionEvent::TurnCommitted {
-                    turn_id: turn,
-                    reason: TurnEndReason::Completed,
-                },
-            ];
-            for event in events {
-                let entry = encode_entry(req.session, None, &event).expect("encodes");
-                log.append(entry).await.map_err(AgentError::Storage)?;
-            }
-            Ok(AgentEvent::TurnCommitted {
-                turn,
-                reason: TurnEndReason::Completed,
-            })
-        })
-        .boxed()
+impl SessionCatalog for PoisonLog {
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        self.inner.parent(session)
     }
 
-    fn compact_now(
-        &self,
-        _session: SessionId,
-    ) -> BoxFuture<'_, Result<asterpath_protocol::CompactResult, AgentError>> {
-        Box::pin(async {
-            Err(AgentError::NotFound {
-                session: SessionId::from_bytes([0; 16]),
-            })
-        })
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
+        self.inner.children(session)
     }
 }
 
@@ -1342,11 +1281,7 @@ fn fork_event(events: &[SessionEvent]) -> &SessionEvent {
 async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
     let log = Arc::new(InMemoryEventLog::new());
     let (caused_by, at) = seed_fork_parent(&*log, &SubagentConfig::default()).await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
 
     let child = scheduler
         .spawn(fork_request(caused_by, at))
@@ -1544,11 +1479,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
     )
     .await;
 
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
     let request = fork_request(caused_by, at);
     let child = scheduler.spawn(request.clone()).await.expect("fork spawn");
 
@@ -1625,11 +1556,7 @@ async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
     )
     .await;
 
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
     let request = fork_request(caused_by, at);
 
     // Window: ChildSessionSpawned committed, child stream still empty.
@@ -1788,12 +1715,7 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
     ];
     let subagents = limit(1);
     let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        Arc::new(SystemClock),
-    );
+    let (scheduler, agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
 
     // The first call takes the only slot.
     let first = scheduler
@@ -1825,7 +1747,10 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
     );
 
     // Releasing the slot admits the lower seq next, not the earlier arrival.
-    scheduler.cancel(&first).await.expect("release slot");
+    scheduler
+        .cancel_wait(first.clone(), &agent)
+        .await
+        .expect("release slot");
     let second = tokio::time::timeout(Duration::from_secs(5), queued_low)
         .await
         .expect("admitted")
@@ -1837,7 +1762,10 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
         vec![calls[0], calls[1]]
     );
 
-    scheduler.cancel(&second).await.expect("release slot");
+    scheduler
+        .cancel_wait(second.clone(), &agent)
+        .await
+        .expect("release slot");
     let third = tokio::time::timeout(Duration::from_secs(5), queued_high)
         .await
         .expect("admitted")
@@ -1874,12 +1802,7 @@ async fn a_spawn_cancelled_before_admission_does_not_block_a_later_spawn() {
     )
     .await;
 
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        Arc::new(SystemClock),
-    );
+    let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
     let child = tokio::time::timeout(
         Duration::from_secs(5),
         scheduler.spawn(request_for(&reference, calls[1], caused_by[1])),
@@ -1922,12 +1845,7 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
     .await;
 
     // A new process: empty in-memory admission state over the same log.
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        Arc::new(SystemClock),
-    );
+    let (scheduler, agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
 
     // R1: replay reuses the admitted child and writes no second record.
     let admitted = scheduler
@@ -1954,14 +1872,20 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
         "the admitted child counts as Running and open spawns wait"
     );
 
-    scheduler.cancel(&admitted).await.expect("release slot");
+    scheduler
+        .cancel_wait(admitted.clone(), &agent)
+        .await
+        .expect("release slot");
     let b = tokio::time::timeout(Duration::from_secs(5), queued_b)
         .await
         .expect("admitted")
         .expect("task")
         .expect("spawn");
     assert_eq!(b.parent.tool_call, calls[1]);
-    scheduler.cancel(&b).await.expect("release slot");
+    scheduler
+        .cancel_wait(b.clone(), &agent)
+        .await
+        .expect("release slot");
     let c = tokio::time::timeout(Duration::from_secs(5), queued_c)
         .await
         .expect("admitted")
@@ -1999,16 +1923,15 @@ async fn cancel_after_a_child_terminal_still_records_cancelled_parent() {
     // outcome before entering cancelling.
     completed_child(&log, child, "finished", TurnEndReason::Completed).await;
 
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
     let child_ref = ChildRef {
         parent: reference,
         child,
     };
-    scheduler.cancel(&child_ref).await.expect("cancel");
+    scheduler
+        .cancel_wait(child_ref.clone(), &agent)
+        .await
+        .expect("cancel");
 
     assert_eq!(
         events(&*log, parent)
@@ -2029,12 +1952,7 @@ async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     // The spawn tool leaves the request at its `Fresh` default.
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        Arc::new(SystemClock),
-    );
+    let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
     let child = scheduler
         .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
         .await
@@ -2069,12 +1987,7 @@ async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
         ..SubagentConfig::default()
     };
     let (caused_by, at) = seed_fork_parent(&*log, &subagents).await;
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        Arc::new(SystemClock),
-    );
+    let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
     // Same request the spawn tool builds: `Fresh` unless the snapshot says otherwise.
     let child = scheduler
         .spawn(SpawnRequest::new(
@@ -2102,40 +2015,54 @@ async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
     assert_eq!(*source_log, at, "the snapshot is taken at the spawn step");
 }
 
-/// Appends the child's terminal when driven, as a real agent would when it
-/// finishes inside the cancellation grace window.
-struct CompletingRunner {
-    log: Arc<InMemoryEventLog>,
+/// A child whose turn completes in the cancellation grace window: the
+/// drained child's `TurnCommitted{Cancelled}` lands as `Completed`, as when
+/// its own commit beats the cancel.
+struct CompletesInGrace {
+    inner: Arc<InMemoryEventLog>,
+    child: SessionId,
 }
 
-impl AgentRunner for CompletingRunner {
-    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
-        let log = Arc::clone(&self.log);
-        let session = req.session;
-        let turn = TurnId::from_bytes([5; 16]);
-        stream::once(async move {
-            append(
-                &*log,
-                session,
-                SessionEvent::TurnCommitted {
-                    turn_id: turn,
+impl EventLog for CompletesInGrace {
+    fn append(
+        &self,
+        entry: asterpath_protocol::NewEntry,
+    ) -> BoxFuture<'_, Result<LogId, StorageError>> {
+        let event = asterpath_protocol::decode_payload(&entry.payload, entry.schema_version)
+            .expect("decodes");
+        let entry = match event {
+            SessionEvent::TurnCommitted {
+                turn_id,
+                reason: TurnEndReason::Cancelled,
+            } if entry.session == self.child => encoded(
+                entry.session,
+                &SessionEvent::TurnCommitted {
+                    turn_id,
                     reason: TurnEndReason::Completed,
                 },
-            )
-            .await;
-            Ok(AgentEvent::TurnCommitted {
-                turn,
-                reason: TurnEndReason::Completed,
-            })
-        })
-        .boxed()
+                entry.dedup_key,
+            ),
+            _ => entry,
+        };
+        self.inner.append(entry)
     }
 
-    fn compact_now(
-        &self,
-        session: SessionId,
-    ) -> BoxFuture<'_, Result<asterpath_protocol::CompactResult, AgentError>> {
-        Box::pin(async move { Err(AgentError::NotFound { session }) })
+    fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
+        self.inner.scan(query)
+    }
+
+    fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
+        self.inner.frontier(session)
+    }
+}
+
+impl SessionCatalog for CompletesInGrace {
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        self.inner.parent(session)
+    }
+
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
+        self.inner.children(session)
     }
 }
 
@@ -2163,27 +2090,22 @@ async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
         },
     )
     .await;
-
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        clock,
-    );
-    let runner: Arc<dyn AgentRunner> = Arc::new(CompletingRunner {
-        log: Arc::clone(&log),
-    });
-    scheduler.set_runner(Arc::clone(&runner));
+    // The drain's cancel loses the race: the child's own completion commits.
+    let log = Arc::new(CompletesInGrace { inner: log, child });
+    let (scheduler, agent) = new_scheduler_with(log.clone(), clock);
     let outcome = scheduler
-        .await_completion(&ChildRef {
-            parent: reference,
-            child,
-        })
+        .await_completion(
+            &ChildRef {
+                parent: reference,
+                child,
+            },
+            &agent,
+        )
         .await
         .expect("the terminal written during grace wins over the timeout");
     assert!(matches!(outcome, ChildOutcome::Completed { .. }));
     assert_eq!(
-        events(&*log, parent)
+        events(&*log.inner, parent)
             .await
             .into_iter()
             .filter_map(|event| match event {
@@ -2212,17 +2134,15 @@ async fn a_committed_child_terminal_wins_over_an_expired_spawn_deadline() {
     // The child finished before the parent noticed the deadline.
     completed_child(&log, child, "finished", TurnEndReason::Completed).await;
 
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        clock,
-    );
+    let (scheduler, agent) = new_scheduler_with(log.clone(), clock);
     let outcome = scheduler
-        .await_completion(&ChildRef {
-            parent: reference,
-            child,
-        })
+        .await_completion(
+            &ChildRef {
+                parent: reference,
+                child,
+            },
+            &agent,
+        )
         .await
         .expect("terminal wins");
     assert!(matches!(outcome, ChildOutcome::Completed { .. }));
@@ -2263,20 +2183,18 @@ async fn completions(log: &dyn EventLog, parent: SessionId) -> Vec<ChildOutcome>
         .collect()
 }
 
-/// A child that never reaches a terminal, however long it is driven.
-struct HangingRunner;
-
-impl AgentRunner for HangingRunner {
-    fn run(&self, _req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
-        stream::pending().boxed()
-    }
-
-    fn compact_now(
-        &self,
-        session: SessionId,
-    ) -> BoxFuture<'_, Result<asterpath_protocol::CompactResult, AgentError>> {
-        Box::pin(async move { Err(AgentError::NotFound { session }) })
-    }
+/// An agent whose child never reaches a terminal, however long it is driven:
+/// the model stream opens and never ends.
+fn hanging_agent(log: Arc<dyn EventLog>, scheduler: &Arc<Scheduler>) -> Agent {
+    agent_for(
+        log,
+        scheduler,
+        Arc::new(
+            ScriptedProvider::new("p")
+                .respond(Vec::new(), StopReason::EndTurn, Usage::default())
+                .stream_open_on_first_attempt(),
+        ),
+    )
 }
 
 #[tokio::test]
@@ -2284,12 +2202,7 @@ async fn spawn_records_the_timeout_as_a_deadline_on_the_spawn_record() {
     let log = Arc::new(InMemoryEventLog::new());
     let clock = Arc::new(ManualClock::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        clock.clone(),
-    );
+    let (scheduler, _agent) = new_scheduler_with(log.clone(), clock.clone());
     let mut request = SpawnRequest::new(reference, caused_by, vec![text("task")]);
     request.timeout = Some(Duration::from_secs(5));
     scheduler.spawn(request.clone()).await.expect("spawn");
@@ -2317,11 +2230,7 @@ async fn spawn_records_the_timeout_as_a_deadline_on_the_spawn_record() {
 async fn a_spawn_without_a_timeout_has_no_deadline() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
     scheduler
         .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
         .await
@@ -2357,17 +2266,11 @@ async fn a_spawn_deadline_that_expired_while_stopped_times_out_exactly_once_afte
     };
 
     for _restart in 0..2 {
-        let scheduler = new_scheduler_with(
-            log.clone(),
-            Arc::new(FakeCatalog::default()),
-            Arc::new(NoopExecutor),
-            clock.clone(),
-        );
-        let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
-        scheduler.set_runner(Arc::clone(&runner));
+        let (scheduler, _) = new_scheduler_with(log.clone(), clock.clone());
+        let agent = hanging_agent(log.clone(), &scheduler);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            scheduler.await_completion(&child_ref),
+            scheduler.await_completion(&child_ref, &agent),
         )
         .await
         .expect("an expired deadline never waits");
@@ -2394,20 +2297,17 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
         spawn_with_deadline(child, reference.tool_call, caused_by, clock.now() + 50),
     )
     .await;
-    let scheduler = new_scheduler_with(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        Arc::new(NoopExecutor),
-        clock,
-    );
-    let runner: Arc<dyn AgentRunner> = Arc::new(HangingRunner);
-    scheduler.set_runner(Arc::clone(&runner));
+    let (scheduler, _) = new_scheduler_with(log.clone(), clock);
+    let agent = hanging_agent(log.clone(), &scheduler);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        scheduler.await_completion(&ChildRef {
-            parent: reference,
-            child,
-        }),
+        scheduler.await_completion(
+            &ChildRef {
+                parent: reference,
+                child,
+            },
+            &agent,
+        ),
     )
     .await
     .expect("the wait ends at the deadline");

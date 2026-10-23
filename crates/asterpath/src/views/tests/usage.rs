@@ -8,8 +8,8 @@ use std::sync::{Mutex, PoisonError};
 use crate::views::usage::UsageService;
 use asterpath_protocol::{
     CompactionTrigger, InputTokens, Item, ModelId, ModelSpec, OutputTokens, Part, ProviderId, Role,
-    SessionEvent, StopReason, Usage, UsageBucket, UsageError, UsageFilter, UsageQuery, UsageScope,
-    dedup, encode_entry,
+    SessionEvent, StopReason, Usage, UsageBucket, UsageError, UsageFilter, UsageScope, dedup,
+    encode_entry,
 };
 use asterpath_protocol::{
     DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, StepId,

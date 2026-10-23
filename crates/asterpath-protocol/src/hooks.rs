@@ -13,7 +13,7 @@ use crate::config::{Provenance, ReplaySafety};
 use crate::event::{SessionEvent, ToolErrorInfo, ToolResultStatus};
 use crate::ids::{ToolArgs, ToolName};
 use crate::item::Part;
-use crate::usage::{UsageError, UsageFilter, UsageQuery, UsageReport, UsageScope};
+use crate::usage::{UsageError, UsageReport};
 
 /// Lifecycle hooks. Every method has a pass-through default.
 pub trait Hooks: Send + Sync {
@@ -93,27 +93,22 @@ impl From<UsageError> for HookError {
     }
 }
 
+/// Engine-supplied fold behind `usage()`: a session's own and subtree usage.
+pub type UsageLookup =
+    Arc<dyn Fn(SessionId) -> BoxFuture<'static, Result<UsageReport, UsageError>> + Send + Sync>;
+
 /// Usage of a session and its subtree, shared by both contexts.
 #[derive(Clone, Default)]
-struct UsageSource(Option<Arc<dyn UsageQuery>>);
+struct UsageSource(Option<UsageLookup>);
 
 impl UsageSource {
     async fn report(&self, session: SessionId) -> Result<UsageReport, UsageError> {
-        let Some(query) = &self.0 else {
+        let Some(lookup) = &self.0 else {
             return Err(UsageError::Backend(
                 "usage accounting is not configured".to_owned(),
             ));
         };
-        query
-            .totals(UsageFilter {
-                scope: UsageScope::SessionSubtree(session),
-                bucket: None,
-                model: None,
-                since: None,
-                until: None,
-                limit: None,
-            })
-            .await
+        lookup(session).await
     }
 }
 
@@ -139,7 +134,7 @@ impl StepCtx {
         session: SessionId,
         turn: TurnId,
         step_index: u32,
-        usage: Option<Arc<dyn UsageQuery>>,
+        usage: Option<UsageLookup>,
     ) -> Self {
         Self {
             session,
@@ -182,7 +177,7 @@ impl ToolCallCtx {
         tool: ToolName,
         provenance: Provenance,
         replay: ReplaySafety,
-        usage: Option<Arc<dyn UsageQuery>>,
+        usage: Option<UsageLookup>,
     ) -> Self {
         Self {
             session,

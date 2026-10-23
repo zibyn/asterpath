@@ -10,13 +10,12 @@ use std::time::Duration;
 
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
-    ApprovalRequest, ApprovalVerdict, CompactResult, CompactionConfig, Item, JsonString, ModelId,
-    ModelSpec, Parallelism, Part, PartDelta, Provider, ProviderCapabilities, ProviderError,
-    ProviderErrorKind, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, SessionEvent,
-    SessionSpec, SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig,
-    TurnEndReason, Usage, UserInput, decode_entry,
+    AbortKind, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
+    CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, PartDelta, Provider,
+    ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, ReplaySafety,
+    RequestConfig, Role, SessionEvent, SessionSpec, SideEffect, StopReason, StreamEvent,
+    SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_testing::ScriptedProvider;
@@ -906,47 +905,6 @@ async fn cancel_interrupts_the_retry_backoff_sleep() {
     );
     assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Cancelled]);
     assert_eq!(provider.requests().len(), 1, "the next attempt never runs");
-
-    asterpath.shutdown().await.unwrap();
-    cleanup(&db);
-}
-
-struct StubRunner;
-
-impl AgentRunner for StubRunner {
-    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
-        stream::once(async move {
-            Ok(AgentEvent::Idle {
-                session: req.session,
-            })
-        })
-        .boxed()
-    }
-
-    fn compact_now(&self, _session: SessionId) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
-        Box::pin(async { Ok(CompactResult::NotConfigured) })
-    }
-}
-
-#[tokio::test]
-async fn a_custom_runner_degrades_cancel_to_a_no_op() {
-    let db = temp_db("custom-runner");
-    let provider = Arc::new(ScriptedProvider::new("p"));
-    let asterpath = Asterpath::builder()
-        .database(&db)
-        .providers(vec![provider as Arc<dyn Provider>])
-        .agent(Arc::new(StubRunner))
-        .build()
-        .await
-        .expect("build");
-    let handle = asterpath
-        .create_session(spec(TurnConfig::default()))
-        .await
-        .unwrap();
-
-    handle.cancel().await.unwrap();
-    let events = drive_all(&handle).await;
-    assert!(matches!(events.as_slice(), [AgentEvent::Idle { .. }]));
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);

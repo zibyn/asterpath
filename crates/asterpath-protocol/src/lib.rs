@@ -26,7 +26,7 @@ pub mod tracing;
 pub mod usage;
 
 pub use agent::{
-    AgentError, AgentEvent, AgentRunner, ApprovalRequest, CancelRegistration, CancellationRegistry,
+    AgentError, AgentEvent, ApprovalRequest, CancelRegistration, CancellationRegistry,
     CompactResult, CompactionError, CompactionOutcome, RunRequest, RunTrigger, SessionSpec,
     ToolSelection, UserInput,
 };
@@ -40,9 +40,9 @@ pub use config::{
     SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, LogEntry,
-    LogQuery, NewEntry, SessionCatalog, SessionRetirement, SignalDelivery, SignalName,
-    SignalPayload, Storage, WakeCause,
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, EventLog, LogEntry, LogQuery, NewEntry,
+    SessionCatalog, SessionRetirement, SignalDelivery, SignalName, SignalPayload, Storage,
+    WakeCause,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
@@ -55,6 +55,7 @@ pub use event::{
 pub use hash::Fnv;
 pub use hooks::{
     CommittedRecord, Gate, HookError, Hooks, StepCtx, ToolCallCtx, ToolGate, ToolResultView,
+    UsageLookup,
 };
 pub use ids::{
     InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
@@ -75,14 +76,14 @@ pub use time::{Clock, SystemClock, Timestamp, unique_bytes};
 pub use tool::{
     APPROVAL_SIGNAL_PREFIX, ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken,
     DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, Tool, ToolContext, ToolError, ToolOutput,
-    ToolRegistry, approval_signal_id, approval_signal_name,
+    approval_signal_id, approval_signal_name,
 };
 pub use tracing::{
     AttemptEvent, CompactionAttrs, ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, Span,
-    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SpanUpdate, SubagentAttrs,
-    ToolCallAttrs, TraceError, TraceId, TraceQuery, TraceTap, TurnAttrs, WaitAttrs, WaitKind,
+    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs,
+    TraceError, TraceId, TurnAttrs, WaitAttrs, WaitKind,
 };
 pub use usage::{
-    InputTokens, OutputTokens, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery,
+    InputTokens, OutputTokens, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter,
     UsageRecord, UsageReport, UsageScope, UsageTotals, usage_of,
 };

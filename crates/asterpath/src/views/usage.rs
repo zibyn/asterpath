@@ -13,22 +13,20 @@ use asterpath_protocol::{
     DedupKey, EventLog, LogEntry, LogQuery, SessionCatalog, SessionId, StepId, StorageError, TurnId,
 };
 use asterpath_protocol::{
-    Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery, UsageRecord, UsageReport,
-    UsageScope, UsageTotals, decode_entry, usage_of,
+    Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageRecord, UsageReport, UsageScope,
+    UsageTotals, decode_entry, usage_of,
 };
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
-use futures_util::stream;
 
 /// Read-side implementation over one `EventLog` and the session tree.
-pub struct UsageService {
+pub(crate) struct UsageService {
     log: Arc<dyn EventLog>,
     catalog: Arc<dyn SessionCatalog>,
 }
 
 impl UsageService {
-    pub fn new(log: Arc<dyn EventLog>, catalog: Arc<dyn SessionCatalog>) -> Self {
+    pub(crate) fn new(log: Arc<dyn EventLog>, catalog: Arc<dyn SessionCatalog>) -> Self {
         Self { log, catalog }
     }
 
@@ -88,6 +86,7 @@ impl UsageService {
         }
     }
 
+    #[cfg(test)]
     async fn next_record(
         &self,
         scan: &mut SessionScan,
@@ -105,8 +104,14 @@ impl UsageService {
     }
 }
 
-impl UsageQuery for UsageService {
-    fn records(&self, filter: UsageFilter) -> BoxStream<'_, Result<UsageRecord, UsageError>> {
+// The per-record view of the same fold. The facade reports totals only; the
+// U-suite pins the fold record by record through it.
+#[cfg(test)]
+impl UsageService {
+    pub(crate) fn records(
+        &self,
+        filter: UsageFilter,
+    ) -> futures_core::stream::BoxStream<'_, Result<UsageRecord, UsageError>> {
         let state = Records {
             filter,
             phase: Phase::Start,
@@ -114,7 +119,7 @@ impl UsageQuery for UsageService {
             scan: None,
             emitted: 0,
         };
-        stream::unfold(state, move |mut state| async move {
+        futures_util::stream::unfold(state, move |mut state| async move {
             loop {
                 match state.phase {
                     Phase::Start => match self.sessions_for(&state.filter.scope).await {
@@ -162,8 +167,13 @@ impl UsageQuery for UsageService {
         })
         .boxed()
     }
+}
 
-    fn totals(&self, filter: UsageFilter) -> BoxFuture<'_, Result<UsageReport, UsageError>> {
+impl UsageService {
+    pub(crate) fn totals(
+        &self,
+        filter: UsageFilter,
+    ) -> BoxFuture<'_, Result<UsageReport, UsageError>> {
         Box::pin(async move {
             let sessions = self.sessions_for(&filter.scope).await?;
             let mut report = UsageReport::default();
@@ -189,12 +199,14 @@ impl UsageQuery for UsageService {
     }
 }
 
+#[cfg(test)]
 enum Phase {
     Start,
     Scan,
     Done,
 }
 
+#[cfg(test)]
 struct Records {
     filter: UsageFilter,
     phase: Phase,

@@ -1,13 +1,11 @@
 //! The single append entry (ADR-0025). Every engine writer (agent, runtime,
 //! scheduler, facade) appends through this log: after a successful append it
-//! shows each new record to the hosts' `on_record` hooks, in session order,
-//! then drives the trace tap.
+//! shows each new record to the hosts' `on_record` hooks, in session order.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::views::trace::TracingTap;
 use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
 use asterpath_protocol::{EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, StorageError};
 use futures_core::future::BoxFuture;
@@ -21,22 +19,16 @@ type Cursor = Arc<AsyncMutex<Option<Option<LogId>>>>;
 pub(crate) struct CommitLog {
     inner: Arc<dyn EventLog>,
     hooks: Vec<Arc<dyn Hooks>>,
-    tap: Arc<TracingTap>,
     // shortcut: one cursor per session touched by this process, never evicted;
     // evict on retirement if long-lived hosts touch very many sessions.
     cursors: Mutex<HashMap<SessionId, Cursor>>,
 }
 
 impl CommitLog {
-    pub(crate) fn new(
-        inner: Arc<dyn EventLog>,
-        hooks: Vec<Arc<dyn Hooks>>,
-        tap: Arc<TracingTap>,
-    ) -> Self {
+    pub(crate) fn new(inner: Arc<dyn EventLog>, hooks: Vec<Arc<dyn Hooks>>) -> Self {
         Self {
             inner,
             hooks,
-            tap,
             cursors: Mutex::new(HashMap::new()),
         }
     }
@@ -116,17 +108,11 @@ impl CommitLog {
 
 impl EventLog for CommitLog {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
-        Box::pin(async move {
-            let session = entry.session;
-            // No hooks, no observation work (#74).
-            let log_id = if self.hooks.is_empty() {
-                self.inner.append(entry).await?
-            } else {
-                self.append_observed(entry).await?
-            };
-            self.tap.record_appended(session).await;
-            Ok(log_id)
-        })
+        // No hooks, no observation work (#74).
+        if self.hooks.is_empty() {
+            return self.inner.append(entry);
+        }
+        Box::pin(self.append_observed(entry))
     }
 
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {

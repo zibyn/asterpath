@@ -11,7 +11,7 @@ use std::path::Path;
 use asterpath::AsterpathBuilder;
 use asterpath_protocol::{
     ChildOutcome, InputTokens, Item, OutputTokens, Part, Role, SessionEvent, Span, SpanAttributes,
-    SpanFilter, SpanKind, ToolResultStatus, TraceId, TurnEndReason, Usage, UsageFilter, UsageScope,
+    SpanKind, ToolResultStatus, TraceId, TurnEndReason, Usage, UsageScope,
 };
 use asterpath_protocol::{SessionId, ToolCallId};
 use common::{Scenario, Testdrive, markers, scan, session_id};
@@ -571,17 +571,6 @@ fn usage(uncached: u64, output: u64) -> Usage {
     }
 }
 
-fn usage_filter(scope: UsageScope) -> UsageFilter {
-    UsageFilter {
-        scope,
-        bucket: None,
-        model: None,
-        since: None,
-        until: None,
-        limit: None,
-    }
-}
-
 /// The child log minus the crash bookkeeping the loop itself writes on
 /// recovery; anything else unexpected remains visible to the assertion.
 fn lifecycle(events: &[SessionEvent]) -> Vec<&'static str> {
@@ -627,18 +616,6 @@ async fn committed(
         entries.push(entry.expect("log entry"));
     }
     entries
-}
-
-async fn trace_spans(trace: &dyn asterpath_protocol::TraceQuery, session: SessionId) -> Vec<Span> {
-    let mut stream = trace.spans(SpanFilter {
-        session: Some(session),
-        ..SpanFilter::default()
-    });
-    let mut spans = Vec::new();
-    while let Some(span) = stream.next().await {
-        spans.push(span.expect("trace span"));
-    }
-    spans
 }
 
 #[tokio::test]
@@ -887,9 +864,8 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
 
     // --- usage attribution -------------------------------------------------
 
-    let usage_query = asterpath.usage();
-    let own = usage_query
-        .totals(usage_filter(UsageScope::Session(parent)))
+    let own = asterpath
+        .usage(UsageScope::Session(parent))
         .await
         .expect("parent usage");
     assert_eq!(
@@ -898,20 +874,20 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
         "parent Session own is only the parent's own calls"
     );
     assert_eq!(own.descendants.model_calls, Usage::default());
-    let child_a_usage = usage_query
-        .totals(usage_filter(UsageScope::Session(child_a)))
+    let child_a_usage = asterpath
+        .usage(UsageScope::Session(child_a))
         .await
         .expect("child A usage")
         .own;
-    let child_b_usage = usage_query
-        .totals(usage_filter(UsageScope::Session(child_b)))
+    let child_b_usage = asterpath
+        .usage(UsageScope::Session(child_b))
         .await
         .expect("child B usage")
         .own;
     assert_eq!(child_a_usage.model_calls, usage(11, 3));
     assert_eq!(child_b_usage.model_calls, usage(12, 4));
-    let subtree = usage_query
-        .totals(usage_filter(UsageScope::SessionSubtree(parent)))
+    let subtree = asterpath
+        .usage(UsageScope::SessionSubtree(parent))
         .await
         .expect("subtree usage");
     assert_eq!(subtree.own.model_calls, usage(40, 12));
@@ -928,8 +904,7 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
 
     // --- trace attribution -------------------------------------------------
 
-    let trace = asterpath.trace();
-    let parent_spans = trace_spans(trace.as_ref(), parent).await;
+    let parent_spans = asterpath.trace(parent).await.expect("parent trace");
     let subagents: Vec<&Span> = parent_spans
         .iter()
         .filter(|span| span.kind == SpanKind::Subagent)
@@ -1011,7 +986,7 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
     );
 
     for child in &spawned_children {
-        let spans = trace_spans(trace.as_ref(), *child).await;
+        let spans = asterpath.trace(*child).await.expect("child trace");
         let roots: Vec<&Span> = spans
             .iter()
             .filter(|span| span.kind == SpanKind::Session)

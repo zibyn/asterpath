@@ -1,28 +1,28 @@
 //! Recovery from a committed prefix: open intents only, no full replay.
 //!
 //! Each test fabricates the exact log a `SIGKILL` would leave behind, opens a
-//! fresh runner over that log and asserts the terminal records it appends.
+//! fresh agent over that log and asserts the terminal records it appends.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::agent::Agent;
+use crate::tools::ToolTable;
+use crate::waits::Waits;
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
-    ApprovalRequest, ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot,
-    ContextPolicy, DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ModelId, ModelSpec,
-    Parallelism, ParentRef, Part, Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety,
+    AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
+    ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot, ContextPolicy,
+    DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ModelId, ModelSpec, Parallelism,
+    ParentRef, Part, Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety,
     RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason,
     SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
-    ToolError, ToolGate, ToolName, ToolOutput, ToolRegistry, ToolResultStatus, TurnConfig,
-    TurnEndReason, Usage, approval_signal_id, approval_signal_name, decode_entry, dedup,
-    encode_entry,
+    ToolError, ToolGate, ToolName, ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
+    approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, DedupKey, DurableExecutor, EventLog, ExecutionError, InputId,
-    LogEntry, LogId, LogQuery, SessionId, SignalDelivery, SignalPayload, StepId, ToolCallId,
-    TurnId, WakeCause,
+    ApprovalGate, DedupKey, EventLog, InputId, LogEntry, LogId, LogQuery, SessionId,
+    SignalDelivery, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -219,31 +219,16 @@ impl ApprovalPolicy for AlwaysAsk {
     }
 }
 
+fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
+    let table = Arc::new(ToolTable::new());
+    for tool in tools {
+        table.register(tool);
+    }
+    table
+}
+
 struct Harness {
-    agent: Box<dyn AgentRunner>,
-}
-
-#[derive(Default)]
-struct Registry {
-    tools: Mutex<HashMap<ToolName, Arc<dyn Tool>>>,
-}
-
-impl ToolRegistry for Registry {
-    fn register(&self, tool: Arc<dyn Tool>) {
-        self.tools
-            .lock()
-            .unwrap()
-            .entry(tool.descriptor().name.clone())
-            .or_insert(tool);
-    }
-
-    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
-        self.tools.lock().unwrap().get(name).cloned()
-    }
-
-    fn list(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.lock().unwrap().values().cloned().collect()
-    }
+    agent: Agent,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,29 +238,25 @@ fn agent_with<L: EventLog + 'static>(
     tools: Vec<Arc<dyn Tool>>,
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
-    executor: Arc<dyn DurableExecutor>,
+    executor: Option<Arc<Waits>>,
     clock: Arc<ManualClock>,
     hooks: Option<Arc<dyn Hooks>>,
-) -> Box<dyn AgentRunner> {
+) -> Agent {
     let log: Arc<dyn EventLog> = log;
-    let registry = Arc::new(Registry::default());
-    for tool in tools {
-        registry.register(tool);
-    }
+    let registry = tool_table(tools);
+    let executor = executor.unwrap_or_else(|| Arc::new(Waits::new(Arc::clone(&log))));
     let provider: Arc<dyn Provider> = provider;
-    Box::new(
-        crate::agent::Agent::new(
-            log,
-            Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-            registry,
-            ToolConfig::default(),
-            approval,
-            gate,
-            executor,
-            clock,
-        )
-        .with_hooks(hooks.into_iter().collect(), None),
+    Agent::new(
+        log,
+        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
+        registry,
+        ToolConfig::default(),
+        approval,
+        gate,
+        executor,
+        clock,
     )
+    .with_hooks(hooks.into_iter().collect(), None)
 }
 
 fn harness(
@@ -291,97 +272,14 @@ fn harness(
         tools,
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
-        Arc::new(NoopExecutor),
+        None,
         clock,
         None,
     );
     Harness { agent }
 }
 
-struct NoopExecutor;
-
-impl DurableExecutor for NoopExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
-}
-
-/// In-process executor for approval waits: records delivered decisions and
-/// wakes the waiter. The open tool call is the only wait record.
-#[derive(Default)]
-struct TestExecutor {
-    signals: Mutex<HashMap<asterpath_protocol::SignalId, SignalPayload>>,
-    wake: tokio::sync::Notify,
-}
-
-impl DurableExecutor for TestExecutor {
-    fn await_signal(
-        &self,
-        req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async move {
-            loop {
-                if let Some(payload) = self.signals.lock().unwrap().get(&req.signal).cloned() {
-                    return Ok(payload);
-                }
-                let notified = self.wake.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if let Some(payload) = self.signals.lock().unwrap().get(&req.signal).cloned() {
-                    return Ok(payload);
-                }
-                notified.await;
-            }
-        })
-    }
-
-    fn deliver_signal(
-        &self,
-        delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async move {
-            self.signals
-                .lock()
-                .unwrap()
-                .insert(delivery.signal, delivery.payload);
-            self.wake.notify_waiters();
-            Ok(())
-        })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
-}
-
-#[allow(clippy::borrowed_box)]
-async fn drive(agent: &Box<dyn AgentRunner>) -> Vec<AgentEvent> {
+async fn drive(agent: &Agent) -> Vec<AgentEvent> {
     let mut stream = agent.run(RunRequest {
         session: SESSION,
         trigger: RunTrigger::Resume,
@@ -932,7 +830,7 @@ async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
         Vec::new(),
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
-        Arc::new(NoopExecutor),
+        None,
         clock,
         None,
     );
@@ -1114,7 +1012,7 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
         vec![alpha, beta],
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
-        Arc::new(NoopExecutor),
+        None,
         clock,
         Some(hooks),
     );
@@ -1193,7 +1091,7 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
         vec![tool],
         Arc::new(AlwaysAsk),
         gate,
-        Arc::new(NoopExecutor),
+        None,
         clock,
         None,
     );
@@ -1245,7 +1143,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register();
     let clock = Arc::new(ManualClock::new());
-    let executor = Arc::new(TestExecutor::default());
+    let executor = Arc::new(Waits::new(log.clone()));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -1257,7 +1155,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
         vec![tool],
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
-        executor.clone(),
+        Some(executor.clone()),
         clock,
         None,
     );
@@ -1332,7 +1230,7 @@ async fn undecided_ask_with_a_closed_gate_denies() {
         vec![tool],
         Arc::new(AlwaysAsk),
         gate,
-        Arc::new(NoopExecutor),
+        None,
         clock,
         None,
     );
@@ -1620,14 +1518,13 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
 
     let provider = Arc::new(ScriptedProvider::new("p"));
     let gate = Arc::new(ApprovalGate::new());
-    let executor = Arc::new(UnusedExecutor);
     let agent = agent_with(
         Arc::clone(&log),
         Arc::clone(&provider),
         Vec::new(),
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
-        executor,
+        None,
         Arc::new(ManualClock::new()),
         None,
     );
@@ -1836,7 +1733,7 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
         Vec::new(),
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
-        Arc::new(NoopExecutor),
+        None,
         Arc::new(ManualClock::new()),
         None,
     );
@@ -1857,35 +1754,6 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
     let entries = scan_session(&inner, SESSION).await;
     assert_eq!(count(&entries, "TurnStarted"), 0);
     assert_eq!(count(&entries, "StreamResumed"), 0);
-}
-
-/// Orphan closing never waits, so every wait fails loudly.
-struct UnusedExecutor;
-
-impl DurableExecutor for UnusedExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Err(ExecutionError::Backend("unused".to_owned())) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
 }
 
 /// Delegating event log with one undecodable record on the parent stream.

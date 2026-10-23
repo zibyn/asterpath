@@ -11,24 +11,14 @@
 
 use std::time::Duration;
 
-use asterpath_protocol::{ChildOutcome, ContextPolicy, ModelAlias, ParentRef, Part, ToolName};
+use asterpath_protocol::{ContextPolicy, ModelAlias, ParentRef, Part, ToolName};
 use asterpath_protocol::{ExecutionError, LogId, SessionId};
-use futures_core::future::BoxFuture;
 
 mod spawn;
 mod tool;
 
-pub use spawn::Scheduler;
-pub use tool::{SPAWN_TOOL_NAME, SpawnTool};
-
-/// Process capability implemented by this module; hosts may use it directly.
-pub trait SubagentSpawner: Send + Sync {
-    fn spawn(&self, req: SpawnRequest) -> BoxFuture<'_, Result<ChildRef, SpawnError>>;
-
-    fn await_completion(&self, child: &ChildRef) -> BoxFuture<'_, Result<ChildOutcome, WaitError>>;
-
-    fn cancel(&self, child: &ChildRef) -> BoxFuture<'_, Result<(), WaitError>>;
-}
+pub(crate) use spawn::Scheduler;
+pub(crate) use tool::{SPAWN_TOOL_NAME, SpawnTool};
 
 /// One spawn request. `caused_by` is the parent `ToolCallRequested` log id.
 #[non_exhaustive]

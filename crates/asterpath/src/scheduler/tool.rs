@@ -1,6 +1,5 @@
 //! The model-visible `spawn_agent` tool: a thin wrapper over spawn + wait.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath_protocol::ExecutionError;
@@ -10,9 +9,10 @@ use asterpath_protocol::{
 };
 use futures_core::future::BoxFuture;
 
-use super::{Scheduler, SpawnError, SpawnRequest, SubagentSpawner, WaitError};
+use super::{Scheduler, SpawnError, SpawnRequest, WaitError};
+use crate::agent::Agent;
 
-pub const SPAWN_TOOL_NAME: &str = "spawn_agent";
+pub(crate) const SPAWN_TOOL_NAME: &str = "spawn_agent";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,15 +27,16 @@ struct SpawnArgs {
     timeout_ms: Option<u64>,
 }
 
-pub struct SpawnTool {
-    scheduler: Arc<Scheduler>,
+/// `spawn_agent` in the tool table. Its calls never reach [`Tool::invoke`]:
+/// the agent routes them to [`Scheduler::run_spawn_tool`] with itself as the
+/// child driver.
+pub(crate) struct SpawnTool {
     descriptor: ToolDescriptor,
 }
 
 impl SpawnTool {
-    pub fn new(scheduler: Arc<Scheduler>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            scheduler,
             descriptor: descriptor(),
         }
     }
@@ -48,9 +49,25 @@ impl Tool for SpawnTool {
 
     fn invoke(
         &self,
+        _args: ToolArgs,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        Box::pin(async {
+            Err(ToolError::Internal {
+                message: "spawn_agent runs only inside the agent".to_owned(),
+            })
+        })
+    }
+}
+
+impl Scheduler {
+    /// One `spawn_agent` call: spawn + wait, with `agent` driving the child.
+    pub(crate) fn run_spawn_tool<'a>(
+        &'a self,
+        agent: &'a Agent,
         args: ToolArgs,
         ctx: ToolContext,
-    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
             let args: SpawnArgs =
                 serde_json::from_str(args.as_str()).map_err(|error| ToolError::InvalidArgs {
@@ -68,7 +85,6 @@ impl Tool for SpawnTool {
             }
 
             let caused_by = self
-                .scheduler
                 .caused_by(ctx.session, ctx.tool_call_id)
                 .await
                 .map_err(infra)?
@@ -94,18 +110,17 @@ impl Tool for SpawnTool {
             // queued entry is dropped (no child); an admitted child is
             // cancelled and closed, then the future parks until the pipeline's
             // grace writes `Interrupted`.
-            let mut spawning = self.scheduler.spawn(request.clone());
+            let mut spawning = self.spawn(request.clone());
             let child = tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => {
                     drop(spawning);
                     if let Some(child) = self
-                        .scheduler
                         .spawned_child(request.parent.clone())
                         .await
                         .map_err(infra)?
                     {
-                        self.scheduler.cancel_wait(child).await.map_err(wait_error)?;
+                        self.cancel_wait(child, agent).await.map_err(wait_error)?;
                     }
                     return std::future::pending().await;
                 }
@@ -124,12 +139,12 @@ impl Tool for SpawnTool {
                 },
             };
 
-            let mut waiting = self.scheduler.await_completion(&child);
+            let mut waiting = self.await_completion(&child, agent);
             let result = tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => {
                     drop(waiting);
-                    self.scheduler.cancel_wait(child).await.map_err(wait_error)?;
+                    self.cancel_wait(child, agent).await.map_err(wait_error)?;
                     return std::future::pending().await;
                 }
                 result = &mut waiting => result,

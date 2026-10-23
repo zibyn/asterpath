@@ -1,8 +1,7 @@
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, ExecutionError,
-    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionCatalog, SessionId,
-    SessionRetirement, SignalDelivery, SignalId, SignalName, SignalPayload, Storage, StorageError,
-    SystemClock, Timestamp, WakeCause,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry,
+    RetirementError, SessionCatalog, SessionId, SessionRetirement, SignalId, SignalName, Storage,
+    StorageError, SystemClock, Timestamp,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -60,41 +59,12 @@ impl SessionRetirement for DummyRetirement {
     }
 }
 
-struct DummyExecutor;
-
-impl DurableExecutor for DummyExecutor {
-    fn await_signal(
-        &self,
-        _req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async { Ok(serde_json::Value::Null) })
-    }
-
-    fn deliver_signal(
-        &self,
-        _delivery: SignalDelivery,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn await_wake(
-        &self,
-        _session: SessionId,
-        _cause: WakeCause,
-    ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn wake(&self, _session: SessionId, _cause: WakeCause) {}
-}
-
 #[test]
 fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
     let _: &dyn EventLog = &DummyLog;
     let _: &dyn Storage = &DummyStorage;
     let _: &dyn SessionCatalog = &DummyCatalog;
     let _: &dyn SessionRetirement = &DummyRetirement;
-    let _: &dyn DurableExecutor = &DummyExecutor;
 
     let session = SessionId::from_bytes([7; 16]);
     let _new = NewEntry {

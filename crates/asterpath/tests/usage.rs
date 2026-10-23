@@ -1,5 +1,4 @@
-//! Facade assembly: `Asterpath::usage()` folds the assembled log, exposed as
-//! the stable `UsageQuery` contract.
+//! Facade assembly: `Asterpath::usage(scope)` folds the assembled log.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ use asterpath_protocol::SessionId;
 use asterpath_protocol::{
     AgentEvent, CompactionConfig, InputTokens, ModelId, ModelSpec, OutputTokens, Part, ProviderId,
     RequestConfig, SessionSpec, StopReason, SubagentConfig, ToolSelection, TurnConfig, Usage,
-    UsageError, UsageFilter, UsageScope, UserInput,
+    UsageError, UsageScope, UserInput,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
@@ -77,17 +76,6 @@ fn spec() -> SessionSpec {
     }
 }
 
-fn filter(scope: UsageScope) -> UsageFilter {
-    UsageFilter {
-        scope,
-        bucket: None,
-        model: None,
-        since: None,
-        until: None,
-        limit: None,
-    }
-}
-
 async fn drive(session: &SessionHandle) {
     let mut stream = session.drive();
     while let Some(event) = stream.next().await {
@@ -137,24 +125,16 @@ async fn facade_usage_query_folds_live_turns() {
         .expect("input");
     drive(&session).await;
 
-    let query = asterpath.usage();
-    let report = query
-        .totals(filter(UsageScope::Session(session.id())))
+    let report = asterpath
+        .usage(UsageScope::Session(session.id()))
         .await
         .expect("totals");
     assert_eq!(report.own.model_calls, usage(30, 5));
     assert_eq!(report.own.total(), 35);
     assert_eq!(report.descendants, Default::default());
 
-    let records: Vec<_> = query
-        .records(filter(UsageScope::Session(session.id())))
-        .collect()
-        .await;
-    assert_eq!(records.len(), 2);
-    assert!(records.iter().all(|record| record.is_ok()));
-
     let missing = SessionId::from_bytes([200; 16]);
-    match query.totals(filter(UsageScope::Session(missing))).await {
+    match asterpath.usage(UsageScope::Session(missing)).await {
         Err(UsageError::NotFound { session }) => assert_eq!(session, missing),
         other => panic!("expected NotFound, got {other:?}"),
     }

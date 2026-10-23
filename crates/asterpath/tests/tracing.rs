@@ -1,17 +1,16 @@
-//! Real-time tracing through the facade: `TraceTap` pairs Started/Ended off the
-//! engine append entry and never writes to the log (T14).
+//! Tracing through the facade: `Asterpath::trace(session)` folds the session's
+//! log on demand and never writes to it. There is no push channel (ADR-0026).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use asterpath::Asterpath;
 use asterpath_protocol::{
     CompactionConfig, Item, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, Role,
-    SessionSpec, Span, SpanFilter, SpanKind, SpanStatus, SpanUpdate, StopReason, SubagentConfig,
-    ToolSelection, TraceError, TurnConfig, Usage, UserInput,
+    SessionSpec, SpanKind, SpanStatus, StopReason, SubagentConfig, ToolSelection, TraceError,
+    TurnConfig, Usage, UserInput,
 };
 use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
 use asterpath_testing::ScriptedProvider;
@@ -75,22 +74,9 @@ async fn scan(log: &Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
     .await
 }
 
-async fn query_spans(framework: &Asterpath, session: SessionId) -> Vec<Span> {
-    let query = framework.trace();
-    let mut stream = query.spans(SpanFilter {
-        session: Some(session),
-        ..SpanFilter::default()
-    });
-    let mut spans = Vec::new();
-    while let Some(span) = stream.next().await {
-        spans.push(span.expect("span"));
-    }
-    spans
-}
-
 #[tokio::test]
-async fn t14_tap_pairs_started_and_ended_without_touching_the_log() {
-    let db = temp_db("tap");
+async fn trace_folds_the_session_without_touching_the_log() {
+    let db = temp_db("pull");
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         response(),
         StopReason::EndTurn,
@@ -102,9 +88,6 @@ async fn t14_tap_pairs_started_and_ended_without_touching_the_log() {
         .build()
         .await
         .expect("facade builds");
-
-    let tap = framework.trace_tap();
-    let mut updates = tap.subscribe();
 
     let handle = framework.create_session(spec()).await.expect("session");
     let session = handle.id();
@@ -123,86 +106,25 @@ async fn t14_tap_pairs_started_and_ended_without_touching_the_log() {
 
     let log = framework.event_log();
     let before = scan(&log, session).await;
-    let expected = query_spans(&framework, session).await;
-    assert!(expected.len() >= 4, "session, turn, step and model call");
-
-    let closed = expected
-        .iter()
-        .filter(|span| span.kind != SpanKind::Session)
-        .count();
-    let needed = expected.len() + closed;
-
-    let mut received: Vec<SpanUpdate> = Vec::new();
-    let collected = tokio::time::timeout(Duration::from_secs(2), async {
-        while received.len() < needed {
-            match updates.next().await {
-                Some(update) => received.push(update.expect("update")),
-                None => break,
-            }
-        }
-        received
-    })
-    .await
-    .expect("tap settles without wall-clock races");
-
-    let after = scan(&log, session).await;
-    assert_eq!(before, after, "tracing never changes the log");
-
-    let started: Vec<&Span> = collected
-        .iter()
-        .filter_map(|update| match update {
-            SpanUpdate::Started(span) => Some(span),
-            _ => None,
-        })
-        .collect();
-    let ended: Vec<&Span> = collected
-        .iter()
-        .filter_map(|update| match update {
-            SpanUpdate::Ended(span) => Some(span),
-            _ => None,
-        })
-        .collect();
-
-    let session_span = expected
-        .iter()
-        .find(|span| span.kind == SpanKind::Session)
-        .expect("session span");
-    let session_starts = started
-        .iter()
-        .filter(|span| span.span == session_span.span)
-        .count();
-    assert_eq!(session_starts, 1, "session span starts exactly once");
-    assert!(
-        ended.iter().all(|span| span.span != session_span.span),
-        "session spans never end"
+    let spans = framework.trace(session).await.expect("trace");
+    assert_eq!(
+        before,
+        scan(&log, session).await,
+        "tracing never changes the log"
     );
 
-    for span in &expected {
-        if span.kind == SpanKind::Session {
-            continue;
-        }
-        let starts = started.iter().filter(|seen| seen.span == span.span).count();
-        let ends = ended.iter().filter(|seen| seen.span == span.span).count();
-        assert_eq!(starts, 1, "one Started for {:?}", span.kind);
-        assert_eq!(ends, 1, "one Ended for {:?}", span.kind);
-        let start_index = collected
+    assert!(spans.len() >= 4, "session, turn, step and model call");
+    assert_eq!(
+        spans
             .iter()
-            .position(
-                |update| matches!(update, SpanUpdate::Started(seen) if seen.span == span.span),
-            )
-            .unwrap();
-        let end_index = collected
-            .iter()
-            .position(|update| matches!(update, SpanUpdate::Ended(seen) if seen.span == span.span))
-            .unwrap();
-        assert!(start_index < end_index, "Started precedes Ended");
+            .filter(|span| span.kind == SpanKind::Session)
+            .count(),
+        1
+    );
+    for span in spans.iter().filter(|span| span.kind != SpanKind::Session) {
+        assert!(span.ended_at.is_some(), "{:?} is closed", span.kind);
         assert_eq!(span.status, SpanStatus::Ok);
     }
-
-    // Started order follows the log-derived span order.
-    let started_ids: Vec<_> = started.iter().map(|span| span.span).collect();
-    let expected_ids: Vec<_> = expected.iter().map(|span| span.span).collect();
-    assert_eq!(started_ids, expected_ids);
 
     framework.shutdown().await.expect("shutdown");
     cleanup(&db);
@@ -247,16 +169,7 @@ async fn retired_sessions_disappear_from_the_trace() {
         .await
         .expect("retire");
 
-    let query = framework.trace();
-    let mut stream = query.spans(SpanFilter {
-        session: Some(session),
-        ..SpanFilter::default()
-    });
-    let error = stream
-        .next()
-        .await
-        .expect("one error")
-        .expect_err("retired");
+    let error = framework.trace(session).await.expect_err("retired");
     assert!(matches!(error, TraceError::NotFound { session: s } if s == session));
 
     framework.shutdown().await.expect("shutdown");

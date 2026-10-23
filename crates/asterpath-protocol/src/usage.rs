@@ -2,8 +2,6 @@
 //! contract: buckets, scopes, records and rollup totals.
 
 use crate::{LogId, SessionId, StepId, TurnId};
-use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ModelSpec;
@@ -174,13 +172,6 @@ impl UsageTotals {
 pub struct UsageReport {
     pub own: UsageTotals,
     pub descendants: UsageTotals,
-}
-
-/// Read-side capability: a pure fold over the event log.
-pub trait UsageQuery: Send + Sync {
-    fn records(&self, filter: UsageFilter) -> BoxStream<'_, Result<UsageRecord, UsageError>>;
-
-    fn totals(&self, filter: UsageFilter) -> BoxFuture<'_, Result<UsageReport, UsageError>>;
 }
 
 #[derive(Debug, thiserror::Error)]

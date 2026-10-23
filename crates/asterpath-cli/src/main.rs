@@ -13,8 +13,8 @@ use std::sync::Arc;
 use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
-    Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason,
-    UsageFilter, UsageScope, UsageTotals, UserInput, decode_entry, history,
+    Part, Role, SessionState, Span, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope,
+    UsageTotals, UserInput, decode_entry, history,
 };
 use asterpath_protocol::{
     Clock, EventLog, InputId, LogEntry, LogQuery, SessionId, SystemClock, unique_bytes,
@@ -333,21 +333,13 @@ async fn trace(args: SessionArgs) -> CliResult<()> {
     }
     let asterpath = bare(&settings).await?;
 
-    let trace = asterpath.trace();
-    let mut spans = Vec::new();
-    let mut stream = trace.spans(SpanFilter {
-        session: Some(session),
-        ..SpanFilter::default()
-    });
-    while let Some(span) = stream.next().await {
-        match span {
-            Ok(span) => spans.push(span),
-            Err(error) => {
-                let _ = asterpath.shutdown().await;
-                return Err(CliError::run(error.to_string()));
-            }
+    let spans = match asterpath.trace(session).await {
+        Ok(spans) => spans,
+        Err(error) => {
+            let _ = asterpath.shutdown().await;
+            return Err(CliError::run(error.to_string()));
         }
-    }
+    };
     asterpath.shutdown().await.map_err(aster_error)?;
 
     if args.common.json {
@@ -368,17 +360,7 @@ async fn usage(args: SessionArgs) -> CliResult<()> {
     }
     let asterpath = bare(&settings).await?;
 
-    let report = asterpath
-        .usage()
-        .totals(UsageFilter {
-            scope: UsageScope::SessionSubtree(session),
-            bucket: None,
-            model: None,
-            since: None,
-            until: None,
-            limit: None,
-        })
-        .await;
+    let report = asterpath.usage(UsageScope::SessionSubtree(session)).await;
     let report = match report {
         Ok(report) => report,
         Err(error) => {

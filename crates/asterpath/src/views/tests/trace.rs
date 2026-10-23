@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use crate::views::trace::{TracingQuery, TracingTap};
+use crate::views::trace::TracingQuery;
 use asterpath_protocol::{
     AbortKind, ApprovalDecision, ChildOutcome, CompactionTrigger, ConfigSnapshot, ContextPolicy,
     ErrorType, InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism,
     ParentRef, Part, Provenance, ProviderId, ReplaySafety, RequestConfig, ResumeReason, Role,
-    SessionEvent, SideEffect, Span, SpanAttributes, SpanFilter, SpanKind, SpanStatus, SpanUpdate,
-    StopReason, SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolName,
-    ToolResultStatus, TraceError, TraceQuery, TraceTap, TurnConfig, TurnEndReason, Usage, WaitKind,
-    approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
+    SessionEvent, SideEffect, Span, SpanAttributes, SpanFilter, SpanKind, SpanStatus, StopReason,
+    SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolName, ToolResultStatus,
+    TraceError, TurnConfig, TurnEndReason, Usage, WaitKind, approval_signal_id,
+    approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
     DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, ToolCallId, TurnId,
@@ -185,18 +185,6 @@ async fn append(
 ) -> LogId {
     let entry = encode_entry(session, key, event).expect("encode");
     log.append(entry).await.expect("append")
-}
-
-async fn append_notify(
-    log: &dyn EventLog,
-    tap: &TracingTap,
-    session: SessionId,
-    event: &SessionEvent,
-    key: Option<DedupKey>,
-) -> LogId {
-    let id = append(log, session, event, key).await;
-    tap.record_appended(session).await;
-    id
 }
 
 async fn entries(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
@@ -1843,134 +1831,4 @@ async fn forced_compaction_retry_keeps_the_model_call_ok() {
         span_of(&spans, SpanKind::Compaction).parent_span,
         Some(span_of(&spans, SpanKind::Step).span)
     );
-}
-
-#[tokio::test]
-async fn tap_pairs_a_wait_span_that_only_becomes_visible_with_its_decision() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
-    let session = sid(17);
-    let t = turn();
-    let s = step(0x11);
-    let c = call(0x12);
-    let tap = TracingTap::new(Arc::clone(&log));
-    let mut updates = tap.subscribe();
-
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &created(session),
-        Some(dedup::session_created(session)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &SessionEvent::TurnStarted { turn_id: t },
-        None,
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &SessionEvent::StepStarted {
-            turn_id: t,
-            step_id: s,
-        },
-        None,
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &assistant(t, s, vec![text("call")]),
-        Some(dedup::assistant_message(t, s)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &tool_requested(t, s, c, "echo"),
-        Some(dedup::tool_call(c)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &SessionEvent::SignalReceived {
-            signal_id: approval_signal_id(c),
-            name: approval_signal_name(c),
-            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
-        },
-        Some(dedup::tool_call(c)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &tool_result(c, ToolResultStatus::Completed),
-        Some(dedup::tool_result(c)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &SessionEvent::StepCommitted {
-            turn_id: t,
-            step_id: s,
-        },
-        Some(dedup::step_committed(s)),
-    )
-    .await;
-    append_notify(
-        &*log,
-        &tap,
-        session,
-        &SessionEvent::TurnCommitted {
-            turn_id: t,
-            reason: TurnEndReason::Completed,
-        },
-        Some(dedup::turn_committed(t)),
-    )
-    .await;
-
-    let spans = fold(&log, session).await;
-    let closed = spans
-        .iter()
-        .filter(|span| span.kind != SpanKind::Session)
-        .count();
-    let needed = spans.len() + closed;
-
-    let collected: Vec<SpanUpdate> =
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            let mut collected = Vec::new();
-            while collected.len() < needed {
-                match updates.next().await {
-                    Some(update) => collected.push(update.expect("update")),
-                    None => break,
-                }
-            }
-            collected
-        })
-        .await
-        .expect("tap settles");
-
-    let wait = span_of(&spans, SpanKind::Wait);
-    let starts = collected
-        .iter()
-        .filter(|update| matches!(update, SpanUpdate::Started(seen) if seen.span == wait.span))
-        .count();
-    let ends = collected
-        .iter()
-        .filter(|update| matches!(update, SpanUpdate::Ended(seen) if seen.span == wait.span))
-        .count();
-    assert_eq!(starts, 1, "the approval wait still gets Started");
-    assert_eq!(ends, 1, "and its Ended even when both appear in one fold");
 }

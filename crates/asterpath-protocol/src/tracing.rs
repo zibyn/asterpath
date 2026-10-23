@@ -6,7 +6,6 @@
 //! Content never enters a span: only `Span.log_range` references the log.
 
 use crate::{LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId};
-use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ModelSpec, Provenance, ReplaySafety, SideEffect};
@@ -230,15 +229,6 @@ pub struct ResumeEvent {
     pub at: Timestamp,
 }
 
-/// Push lifecycle notification. Every opening record yields `Started`; only a
-/// terminal record yields `Ended`. Session spans only ever emit `Started`.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum SpanUpdate {
-    Started(Span),
-    Ended(Span),
-}
-
 /// All fields are `Option` and combine with AND. `session` selects the trace.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpanFilter {
@@ -250,16 +240,6 @@ pub struct SpanFilter {
     pub status: Option<SpanStatus>,
     pub open_only: bool,
     pub limit: Option<usize>,
-}
-
-/// On-demand fold over the injected event log.
-pub trait TraceQuery: Send + Sync {
-    fn spans(&self, filter: SpanFilter) -> BoxStream<'_, Result<Span, TraceError>>;
-}
-
-/// Real-time span lifecycle, driven by the engine append entry.
-pub trait TraceTap: Send + Sync {
-    fn subscribe(&self) -> BoxStream<'_, Result<SpanUpdate, TraceError>>;
 }
 
 #[non_exhaustive]

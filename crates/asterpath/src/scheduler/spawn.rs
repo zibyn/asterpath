@@ -2,27 +2,29 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath_protocol::{
-    AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
-    RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
-    encode_entry,
+    AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
+    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
+    SessionEvent, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    Clock, DurableExecutor, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog,
-    SessionId, SystemClock, Timestamp, ToolCallId, WakeCause, unique_bytes,
+    Clock, EventLog, ExecutionError, LogEntry, LogId, LogQuery, SessionCatalog, SessionId,
+    Timestamp, ToolCallId, WakeCause, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
 use super::tool::SPAWN_TOOL_NAME;
-use super::{ChildRef, SpawnError, SpawnRequest, SubagentSpawner, WaitError};
+use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
+use crate::agent::Agent;
+use crate::waits::Waits;
 
-pub(crate) const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
+#[cfg(test)]
+const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
 
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
@@ -30,17 +32,13 @@ const MAX_PARENT_CHAIN: u8 = 64;
 pub struct Scheduler {
     log: Arc<dyn EventLog>,
     catalog: Arc<dyn SessionCatalog>,
-    executor: Arc<dyn DurableExecutor>,
+    executor: Arc<Waits>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
     /// Process-wide cap on live children across all parents.
     max_live_children: NonZeroUsize,
-    /// Shared with the agent runner so child drives see cancellation.
+    /// Shared with the agent so child drives see cancellation.
     cancellations: Arc<CancellationRegistry>,
-    /// Set by the composition root after the agent is built. Weak: the agent
-    /// reaches this scheduler through the spawn tool, so an Arc here would leak the
-    /// whole composition root.
-    runner: OnceLock<Weak<dyn AgentRunner>>,
     /// Admission state is memory only; `recovered` marks parents whose open
     /// spawns have been rebuilt from the log.
     admission: Mutex<Admission>,
@@ -63,10 +61,11 @@ struct ParentAdmission {
 }
 
 impl Scheduler {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         log: Arc<dyn EventLog>,
         catalog: Arc<dyn SessionCatalog>,
-        executor: Arc<dyn DurableExecutor>,
+        executor: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
     ) -> Self {
         Self::with_runtime(
@@ -74,7 +73,7 @@ impl Scheduler {
             catalog,
             executor,
             aliases,
-            Arc::new(SystemClock),
+            Arc::new(asterpath_protocol::SystemClock),
             DEFAULT_MAX_LIVE_CHILDREN,
             Arc::new(CancellationRegistry::new()),
         )
@@ -82,10 +81,10 @@ impl Scheduler {
 
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
-    pub fn with_runtime(
+    pub(crate) fn with_runtime(
         log: Arc<dyn EventLog>,
         catalog: Arc<dyn SessionCatalog>,
-        executor: Arc<dyn DurableExecutor>,
+        executor: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
         max_live_children: NonZeroUsize,
@@ -99,10 +98,15 @@ impl Scheduler {
             clock,
             max_live_children,
             cancellations,
-            runner: OnceLock::new(),
             admission: Mutex::new(Admission::default()),
             notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The registry child drives must share to see cancellation.
+    #[cfg(test)]
+    pub(crate) fn cancellations(&self) -> Arc<CancellationRegistry> {
+        Arc::clone(&self.cancellations)
     }
 
     async fn append(
@@ -113,11 +117,6 @@ impl Scheduler {
     ) -> Result<LogId, ExecutionError> {
         let entry = encode_entry(session, key, &event).map_err(backend)?;
         self.log.append(entry).await.map_err(backend)
-    }
-
-    /// Late-bind the runner so the scheduler and the agent never own each other.
-    pub fn set_runner(&self, runner: Arc<dyn AgentRunner>) {
-        let _ = self.runner.set(Arc::downgrade(&runner));
     }
 
     /// The parent `ToolCallRequested` log id for a spawn tool call.
@@ -153,8 +152,8 @@ impl Scheduler {
     }
 }
 
-impl SubagentSpawner for Scheduler {
-    fn spawn(&self, req: SpawnRequest) -> BoxFuture<'_, Result<ChildRef, SpawnError>> {
+impl Scheduler {
+    pub(crate) fn spawn(&self, req: SpawnRequest) -> BoxFuture<'_, Result<ChildRef, SpawnError>> {
         Box::pin(async move {
             let parent_events = scan(&*self.log, req.parent.session)
                 .await
@@ -298,7 +297,12 @@ impl SubagentSpawner for Scheduler {
         })
     }
 
-    fn await_completion(&self, child: &ChildRef) -> BoxFuture<'_, Result<ChildOutcome, WaitError>> {
+    /// R3 + the durable wait; `agent` drives the child while it is open.
+    pub(crate) fn await_completion<'a>(
+        &'a self,
+        child: &ChildRef,
+        agent: &'a Agent,
+    ) -> BoxFuture<'a, Result<ChildOutcome, WaitError>> {
         let child = child.clone();
         Box::pin(async move {
             let mut parent_events = scan(&*self.log, child.parent.session)
@@ -345,12 +349,6 @@ impl SubagentSpawner for Scheduler {
                 return wait_outcome(&outcome);
             }
 
-            let Some(runner) = self.runner.get().and_then(Weak::upgrade) else {
-                return Err(WaitError::Execution(backend(
-                    "agent runner is not configured on the scheduler",
-                )));
-            };
-
             loop {
                 parent_events = scan(&*self.log, child.parent.session)
                     .await
@@ -372,10 +370,10 @@ impl SubagentSpawner for Scheduler {
 
                 let remaining = record.deadline.map(|deadline| deadline - self.clock.now());
                 if remaining.is_some_and(|remaining| remaining <= 0) {
-                    return self.timed_out(&child, &record).await;
+                    return self.timed_out(&child, &record, agent).await;
                 }
 
-                let drive = drive_child(Arc::clone(&runner), child.child);
+                let drive = drive_child(agent, child.child);
                 tokio::pin!(drive);
                 let wake = self
                     .executor
@@ -432,13 +430,6 @@ impl SubagentSpawner for Scheduler {
         })
     }
 
-    fn cancel(&self, child: &ChildRef) -> BoxFuture<'_, Result<(), WaitError>> {
-        let child = child.clone();
-        Box::pin(self.cancel_wait(child))
-    }
-}
-
-impl Scheduler {
     /// Rebuild this parent's queue and Running count from the log. A child
     /// with `ChildSessionSpawned` and no completion is Running and is never
     /// re-queued; open spawns wait in `seq` order.
@@ -611,9 +602,10 @@ impl Scheduler {
         &self,
         child: &ChildRef,
         record: &SpawnRecord,
+        agent: &Agent,
     ) -> Result<ChildOutcome, WaitError> {
         match self
-            .time_out(child, record.config.subagents.cancel_grace)
+            .time_out(child, record.config.subagents.cancel_grace, agent)
             .await?
         {
             Some(outcome) => wait_outcome(&outcome),
@@ -628,8 +620,9 @@ impl Scheduler {
         &self,
         child: &ChildRef,
         grace: Duration,
+        agent: &Agent,
     ) -> Result<Option<ChildOutcome>, WaitError> {
-        self.drain_child(child.child, grace).await;
+        self.drain_child(agent, child.child, grace).await;
         let child_events = scan(&*self.log, child.child)
             .await
             .map_err(WaitError::Execution)?;
@@ -654,7 +647,11 @@ impl Scheduler {
     /// Parent cancellation: signal the child through the shared registry, give
     /// it `cancel_grace` to close its stream, then record `Cancelled{Parent}`
     /// unless an outcome is already committed (R3/SA8).
-    pub(crate) async fn cancel_wait(&self, child: ChildRef) -> Result<(), WaitError> {
+    pub(crate) async fn cancel_wait(
+        &self,
+        child: ChildRef,
+        agent: &Agent,
+    ) -> Result<(), WaitError> {
         let parent_events = scan(&*self.log, child.parent.session)
             .await
             .map_err(WaitError::Execution)?;
@@ -666,7 +663,7 @@ impl Scheduler {
             // No spawn record violates an invariant; fall back to the default grace.
             .unwrap_or(SubagentConfig::default().cancel_grace);
 
-        self.drain_child(child.child, grace).await;
+        self.drain_child(agent, child.child, grace).await;
 
         let parent_events = scan(&*self.log, child.parent.session)
             .await
@@ -701,11 +698,8 @@ impl Scheduler {
 
     /// Drive a child after cancellation. `run` registers a fresh token, so the
     /// registry is signalled after the stream is built.
-    async fn drain_child(&self, session: SessionId, grace: Duration) {
-        let Some(runner) = self.runner.get().and_then(Weak::upgrade) else {
-            return;
-        };
-        let mut stream = runner.run(RunRequest {
+    async fn drain_child(&self, agent: &Agent, session: SessionId, grace: Duration) {
+        let mut stream = agent.run(RunRequest {
             session,
             trigger: RunTrigger::Resume,
         });
@@ -1077,9 +1071,9 @@ fn narrow_tools(
         .collect())
 }
 
-async fn drive_child(runner: Arc<dyn AgentRunner>, session: SessionId) -> Result<(), AgentError> {
+async fn drive_child(agent: &Agent, session: SessionId) -> Result<(), AgentError> {
     let mut stream: BoxStream<'_, Result<asterpath_protocol::AgentEvent, AgentError>> =
-        runner.run(RunRequest {
+        agent.run(RunRequest {
             session,
             trigger: RunTrigger::Resume,
         });

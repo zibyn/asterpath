@@ -17,23 +17,27 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, AgentRunner, ApprovalDecision, ApprovalPolicy,
-    ApprovalRequest, ApprovalVerdict, CancelReason, CancelRegistration, CancelToken,
-    CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
-    CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
-    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT,
-    OpenIntents, Parallelism, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
-    ProviderErrorKind, ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState, StepCtx,
-    StopReason, StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
-    ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolRegistry,
-    ToolResultStatus, ToolResultView, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageQuery,
-    approval_signal_id, approval_signal_name, decode_entry, dedup,
+    AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
+    ApprovalVerdict, CancelReason, CancelRegistration, CancelToken, CancellationRegistry,
+    ChildOutcome, CompactPlan, CompactResult, CompactSummary, CompactionAbortReason,
+    CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger, Compactor,
+    ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenIntents,
+    Parallelism, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorKind,
+    ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionState, StepCtx, StopReason,
+    StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor, ToolError,
+    ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
+    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, approval_signal_id,
+    approval_signal_name, decode_entry, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, DurableExecutor, EventLog, LogEntry, LogId,
-    LogQuery, SessionId, SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId,
+    SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
 };
 use futures_core::Stream;
+
+use crate::scheduler::{SPAWN_TOOL_NAME, Scheduler};
+use crate::tools::ToolTable;
+use crate::waits::Waits;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::stream::FuturesUnordered;
@@ -41,37 +45,39 @@ use futures_util::{FutureExt, StreamExt, stream};
 
 const DENIED_WITHOUT_REASON: &str = "tool call denied";
 
-/// Default turn driver.
-pub struct Agent {
+/// The turn driver.
+pub(crate) struct Agent {
     log: Arc<dyn EventLog>,
     providers: Arc<ProviderCatalog>,
-    tools: Arc<dyn ToolRegistry>,
+    tools: Arc<ToolTable>,
     tool_config: ToolConfig,
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
-    executor: Arc<dyn DurableExecutor>,
+    executor: Arc<Waits>,
     clock: Arc<dyn Clock>,
     /// Host hooks, called in registration order (ADR-0025).
     hooks: Vec<Arc<dyn Hooks>>,
     /// Backs `StepCtx::usage` / `ToolCallCtx::usage`.
-    usage: Option<Arc<dyn UsageQuery>>,
+    usage: Option<UsageLookup>,
     compactor: Option<Arc<dyn Compactor>>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
     cancellations: Arc<CancellationRegistry>,
+    /// Runs `spawn_agent` calls; children are driven by this agent.
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl Agent {
     /// The composition root supplies policy, gate and durable executor; this
     /// module never constructs them, so approval waits are real.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         log: Arc<dyn EventLog>,
         providers: Arc<ProviderCatalog>,
-        tools: Arc<dyn ToolRegistry>,
+        tools: Arc<ToolTable>,
         tool_config: ToolConfig,
         approval: Arc<dyn ApprovalPolicy>,
         gate: Arc<ApprovalGate>,
-        executor: Arc<dyn DurableExecutor>,
+        executor: Arc<Waits>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -88,23 +94,24 @@ impl Agent {
             compactor: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             cancellations: Arc::new(CancellationRegistry::new()),
+            scheduler: None,
         }
     }
 
     /// Inject the optional compaction capability. `None` means compaction is
     /// unavailable everywhere (`NotConfigured`).
     #[must_use]
-    pub fn with_compactor(mut self, compactor: Option<Arc<dyn Compactor>>) -> Self {
+    pub(crate) fn with_compactor(mut self, compactor: Option<Arc<dyn Compactor>>) -> Self {
         self.compactor = compactor;
         self
     }
 
     /// Register host hooks; `usage` backs their `usage()` lookups.
     #[must_use]
-    pub fn with_hooks(
+    pub(crate) fn with_hooks(
         mut self,
         hooks: Vec<Arc<dyn Hooks>>,
-        usage: Option<Arc<dyn UsageQuery>>,
+        usage: Option<UsageLookup>,
     ) -> Self {
         self.hooks = hooks;
         self.usage = usage;
@@ -112,10 +119,18 @@ impl Agent {
     }
 
     /// Share the facade's per-session cancellation registry. Without this the
-    /// agent keeps a private one, so direct `AgentRunner` users still work.
+    /// agent keeps a private one.
     #[must_use]
-    pub fn with_cancellations(mut self, cancellations: Arc<CancellationRegistry>) -> Self {
+    pub(crate) fn with_cancellations(mut self, cancellations: Arc<CancellationRegistry>) -> Self {
         self.cancellations = cancellations;
+        self
+    }
+
+    /// Run `spawn_agent` through this scheduler, driving children with this
+    /// agent. Without it the spawn tool is an ordinary tool.
+    #[must_use]
+    pub(crate) fn with_scheduler(mut self, scheduler: Arc<Scheduler>) -> Self {
+        self.scheduler = Some(scheduler);
         self
     }
 
@@ -1415,10 +1430,15 @@ impl Agent {
                     Provenance::External { .. } => self.tool_config.external_timeout,
                     _ => None,
                 });
+            let tool = item.tool;
+            let call = match &self.scheduler {
+                Some(scheduler) if tool.descriptor().name.as_str() == SPAWN_TOOL_NAME => {
+                    scheduler.run_spawn_tool(self, item.args, context)
+                }
+                _ => tool.invoke(item.args, context),
+            };
             let invocation = invoke_tool(
-                item.tool,
-                item.args,
-                context,
+                call,
                 cancel,
                 turn_cancel.clone(),
                 timeout,
@@ -1814,8 +1834,8 @@ impl Agent {
     }
 }
 
-impl AgentRunner for Agent {
-    fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
+impl Agent {
+    pub(crate) fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
         let session = req.session;
         if !self.acquire(session) {
             return stream::once(async move { Err(AgentError::Busy { session }) }).boxed();
@@ -1841,7 +1861,10 @@ impl AgentRunner for Agent {
         })
     }
 
-    fn compact_now(&self, session: SessionId) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
+    pub(crate) fn compact_now(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
         Box::pin(async move {
             let entries = decode_entries(self.scan(session).await?, session)?;
             let mut intents = OpenIntents::default();
@@ -2314,15 +2337,13 @@ async fn caught<'a, T>(
 
 /// Invoke one tool with pipeline-owned deadline and panic containment.
 async fn invoke_tool(
-    tool: Arc<dyn Tool>,
-    args: ToolArgs,
-    context: ToolContext,
+    call: BoxFuture<'_, Result<ToolOutput, ToolError>>,
     cancel: CancelToken,
     turn_cancel: CancelToken,
     timeout: Option<Duration>,
     kill_grace: Duration,
 ) -> Invocation {
-    let future = AssertUnwindSafe(tool.invoke(args, context)).catch_unwind();
+    let future = AssertUnwindSafe(call).catch_unwind();
     tokio::pin!(future);
 
     let Some(limit) = timeout else {
