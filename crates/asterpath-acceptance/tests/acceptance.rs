@@ -2,6 +2,7 @@
 #![cfg(unix)]
 
 mod common;
+mod m5;
 
 use std::collections::HashSet;
 use std::path::Path;

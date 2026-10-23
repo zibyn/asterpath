@@ -6,6 +6,7 @@
 pub mod mock;
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -24,6 +25,63 @@ pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(name)
+}
+
+/// The `asterpath-mcp-fixture` binary. `cargo test -p asterpath-acceptance` does
+/// not build another package's bins, so build it on demand when missing.
+pub fn mcp_fixture() -> PathBuf {
+    if let Ok(path) = std::env::var("ASTERPATH_MCP_FIXTURE") {
+        return PathBuf::from(path);
+    }
+    let bin = std::env::current_exe()
+        .expect("test binary path")
+        .parent()
+        .and_then(Path::parent)
+        .expect("target/profile directory")
+        .join("asterpath-mcp-fixture");
+    if !bin.exists() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "asterpath-mcp-fixture"])
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .status()
+            .expect("run cargo build -p asterpath-mcp-fixture");
+        assert!(
+            status.success(),
+            "cargo build -p asterpath-mcp-fixture failed"
+        );
+    }
+    assert!(
+        bin.exists(),
+        "fixture binary missing at {}; build it with `cargo build -p asterpath-mcp-fixture`",
+        bin.display()
+    );
+    bin
+}
+
+/// Proves a crashed host left no sandbox or fixture process behind. `delay` is
+/// the unique `--fault-delay-ms` value of the run under test.
+pub fn assert_no_process(fixture: &Path, delay: &str) {
+    let fixture = fixture.to_string_lossy();
+    for _ in 0..100 {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("proc") {
+            let Ok(entry) = entry else { continue };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+            if args.iter().any(|arg| *arg == fixture.as_bytes()) && args.contains(&delay.as_bytes())
+            {
+                found.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("processes still running for fixture {fixture} delay {delay}");
 }
 
 pub fn open(db: &Path) -> std::sync::Arc<SqliteStorage> {
@@ -81,10 +139,36 @@ pub struct Scenario<'a> {
     pub failpoints: Vec<String>,
 }
 
+/// M5 scenarios: the same driver plus a plugin manifest and a sandbox policy.
+pub struct PluginScenario<'a> {
+    pub run: bool,
+    pub db: &'a Path,
+    pub fixture: &'a str,
+    pub effect: &'a Path,
+    pub manifests: &'a [PathBuf],
+    pub sandbox: &'a str,
+}
+
 impl Testdrive {
     pub fn start(scenario: Scenario<'_>) -> Self {
         let name = scenario.fixture.to_owned();
         let command = Self::command(&scenario);
+        Self::spawn(command, name)
+    }
+
+    pub fn start_plugin(scenario: PluginScenario<'_>) -> Self {
+        let name = scenario.fixture.to_owned();
+        let mut command = Self::base_command(
+            scenario.run,
+            scenario.db,
+            scenario.fixture,
+            scenario.effect,
+            0,
+        );
+        for manifest in scenario.manifests {
+            command.arg("--plugin-manifest").arg(manifest);
+        }
+        command.arg("--sandbox").arg(scenario.sandbox);
         Self::spawn(command, name)
     }
 
@@ -113,20 +197,40 @@ impl Testdrive {
     }
 
     fn command(scenario: &Scenario<'_>) -> Command {
-        let mut command = Command::new(assert_cmd::cargo::cargo_bin("testdrive"));
-        command
-            .arg(if scenario.run { "run" } else { "resume" })
-            .arg("--db")
-            .arg(scenario.db)
-            .arg("--fixture")
-            .arg(fixture(scenario.fixture))
-            .env("ASTERPATH_EFFECT_FILE", scenario.effect)
-            .env("ASTERPATH_TOOL_HOLD_MS", scenario.hold_ms.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = Self::base_command(
+            scenario.run,
+            scenario.db,
+            scenario.fixture,
+            scenario.effect,
+            scenario.hold_ms,
+        );
         for failpoint in &scenario.failpoints {
             command.arg("--failpoint").arg(failpoint);
         }
+        command
+    }
+
+    fn base_command(
+        run: bool,
+        db: &Path,
+        fixture_name: &str,
+        effect: &Path,
+        hold_ms: u64,
+    ) -> Command {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin("testdrive"));
+        command
+            .arg(if run { "run" } else { "resume" })
+            .arg("--db")
+            .arg(db)
+            .arg("--fixture")
+            .arg(fixture(fixture_name))
+            .env("ASTERPATH_EFFECT_FILE", effect)
+            .env("ASTERPATH_TOOL_HOLD_MS", hold_ms.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // The crash scenarios start a bwrap + fixture tree; killing the whole
+        // group mirrors a host crash and leaves nothing behind.
+        command.process_group(0);
         command
     }
 
@@ -174,8 +278,7 @@ impl Testdrive {
                 }
                 Err(error) => {
                     // Unblock the stderr reader before collecting it.
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    kill_group(&mut self.child);
                     let stderr = self.take_stderr();
                     panic!(
                         "testdrive {} did not emit {needle:?} within {MARKER_TIMEOUT:?}: {error}\nstdout: {:#?}\nstderr: {stderr}",
@@ -188,12 +291,7 @@ impl Testdrive {
 
     /// Signal-level crash: `SIGKILL`, never `SIGTERM` or a panic.
     pub fn kill(mut self) -> Vec<String> {
-        // SAFETY: the pid belongs to the child we spawned and it has not been
-        // reaped yet.
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        kill_group(&mut self.child);
         self.drain();
         std::mem::take(&mut self.lines)
     }
@@ -229,10 +327,20 @@ impl Testdrive {
 impl Drop for Testdrive {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            kill_group(&mut self.child);
         }
     }
+}
+
+/// `process_group(0)` made the child a group leader, so a negative pid kills
+/// the driver and everything it started.
+fn kill_group(child: &mut Child) {
+    // SAFETY: the group belongs to the child we spawned and it has not been
+    // reaped yet.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 pub fn session_id(lines: &[String]) -> SessionId {

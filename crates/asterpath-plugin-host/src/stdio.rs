@@ -460,9 +460,21 @@ mod tests {
             .and_then(|deps| deps.parent())
             .expect("target/profile directory")
             .join("asterpath-mcp-fixture");
+        if !bin.exists() {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let status = std::process::Command::new(cargo)
+                .args(["build", "-p", "asterpath-mcp-fixture"])
+                .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                .status()
+                .expect("run cargo build -p asterpath-mcp-fixture");
+            assert!(
+                status.success(),
+                "cargo build -p asterpath-mcp-fixture failed"
+            );
+        }
         assert!(
             bin.exists(),
-            "fixture binary missing at {}; run `cargo test --workspace`",
+            "fixture binary missing at {}; run `cargo build -p asterpath-mcp-fixture`",
             bin.display()
         );
         bin
