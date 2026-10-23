@@ -198,7 +198,7 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 
 ### 状态
 
-`SessionState` 同时是 `SessionHandle::state()` 的返回类型（[packaging.md](packaging.md) §3.3）；它由 `OpenIntents` 折叠推导，与恢复共用同一分类器。
+`SessionState` 同时是 `SessionHandle::state()` 的返回类型（[packaging.md](packaging.md) §3.3）；它由会话事实（`SessionFacts`）折叠推导，与恢复共用同一分类器。
 
 ```rust
 pub enum SessionState {
@@ -214,7 +214,7 @@ pub enum StepState {
 
 「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`CompactionStarted` 无 `CompactionApplied` / `CompactionAborted`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
-- `OpenIntents`（protocol）是唯一的折叠实现：`apply(event)` 维护 `(kind, id)` 集合，`is_idle()` 排除 `compaction`。storage 在同一事务里把集合物化为 `open_intents` 表；恢复对日志折叠得到同一集合；两者不一致即违反 G7。
+- `SessionFacts`（protocol，会话事实）是唯一的折叠实现：`fold(&[LogEntry])` 批量解码折叠，`apply(seq, log_id, dedup_key, &event)` 逐事件折叠；`is_idle()` 排除 `compaction`。它同时回答未闭合意图的元数据（打开时 seq、所属回合/步骤、工具名、子会话的父工具调用与 `deadline`）、open step 及其起始 seq、是否有待处理输入、父会话。agent 恢复、scheduler 准入、facade `state()` / `facts()`、CLI `inspect` 与内存后端都读它，不各写折叠。`IntentDelta::of(event, dedup_key)` 是无状态的逐事件 delta（含待处理输入的设置/清除）；sqlite 目前仍用它在同一事务里物化 `open_intents` 表（#73 删除该表）；两者不一致即违反 G7。
 - 关闭事件按键精确匹配。审批的 `SignalReceived` 不关闭任何意图（工具意图由 `ToolResult` 关闭）；`InputRecorded` 不是意图。
 - `Idle` 只看非 compaction 意图：只有 `CompactionStarted` 未闭合时仍是 `Idle`（丢弃一次摘要调用是安全的，见 [retention.md](retention.md) §5）。
 

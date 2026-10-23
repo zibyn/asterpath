@@ -171,6 +171,7 @@ impl SessionHandle {
     pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>>;
     pub async fn cancel(&self) -> Result<(), AsterError>;
     pub async fn state(&self) -> Result<SessionState, AsterError>;
+    pub async fn facts(&self) -> Result<SessionFacts, AsterError>;
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
@@ -179,7 +180,7 @@ impl SessionHandle {
 ```
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
-- `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，由 `OpenIntents` 折叠推导，不依赖驱动者。
+- `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 经引擎的持久等待投递 signal（signal name = `tool.approval.<tool_call_id>`，payload = `ApprovalDecision`），落 `SignalReceived`。
