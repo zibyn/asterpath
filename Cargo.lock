@@ -283,6 +283,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-core",
  "asterpath-protocol",
+ "asterpath-sandbox",
  "futures",
  "futures-core",
  "futures-util",
