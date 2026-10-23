@@ -2,7 +2,7 @@
 //!
 //! There is no trace sink and no trace table. [`TracingQuery`] folds the
 //! injected [`EventLog`] on demand; [`TracingTap`] pushes the same lifecycle off
-//! the typed event bus. `recorded_at` only feeds timings and statuses here, never
+//! the facade append entry. `recorded_at` only feeds timings and statuses here, never
 //! recovery or projection.
 
 use std::collections::HashMap;

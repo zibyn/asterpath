@@ -17,7 +17,7 @@
 ## 阅读顺序
 
 1. [打包、公共 API 与参考 CLI](../design/packaging.md)：crate 图、稳定面、CLI、交付清单、验证协议。
-2. [模块边界、内核契约与插件宿主](../design/module-contracts.md)：模块宿主、服务注册、事件总线、生命周期。
+2. [模块边界、内核契约与插件宿主](../design/module-contracts.md)：内核契约、扩展钩子（`Hooks`）、生命周期。
 3. [事件日志与检查点恢复语义](../design/event-log-recovery.md)：日志拓扑、提交单位、恢复与等待。
 4. [Agent loop](../design/agent-loop.md)：turn/step、取消、steering、失败重试。
 5. [工具契约、执行管线与审批边界](../design/tools.md)：管线、审批、并行、超时。

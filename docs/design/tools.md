@@ -13,11 +13,13 @@
 >
 > 2026-10-22 #28 修订：`ToolCallRequested` 增加 `provider_call_id`；已有意图的调用恢复时不重跑 pre-execute；每个调用由单一 supervisor 写终态（真实结果 > 取消 > 超时）。
 >
+> 2026-10-23 #78 修订（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：pre-execute / post-execute 不再是事件总线 waterfall，而是宿主注册的 `Hooks::before_tool` / `Hooks::after_tool`。调用点与恢复语义不变；本文的 “pre-execute” / “post-execute” 即指这两个钩子。多个钩子按注册顺序调用，首个 `ToolGate::Deny` 短路，改写逐个传递；钩子错误或 panic 使该调用 `Failed{Internal}`。
+>
 > 相关 ADR：[0007 审批是框架管线，隔离与内容安全是扩展模块责任](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
-- **管线固定**：pre-execute → 意图记录 → 审批 → 执行 → 截断 → post-execute → 结果记录。只有 pre-execute 与 post-execute 可拦截；其余只能观察。
+- **管线固定**：pre-execute → 意图记录 → 审批 → 执行 → 截断 → post-execute → 结果记录。只有 pre-execute（`before_tool`）与 post-execute（`after_tool`）可拦截；其余只能经 `on_record` 观察。
 - **审批是框架管线阶段**。框架定义策略 seam、请求/决定事件与持久等待；具体审批 UI 与策略由 host 提供。
 - **审批决定复用 `SignalReceived`**，跨崩溃；审批请求是进程内 typed event，不进日志。
 - **`External` 默认 fail closed**：没有审批端时按 Deny 处理；`ReplaySafety` 默认 `Unsafe`。
@@ -98,7 +100,7 @@ impl CancelToken {
 ```text
 AssistantMessage(tool_calls)
   for each call，按并行/独占规则调度：
-    pre-execute waterfall          # allow / deny / ask / 改写参数
+    Hooks::before_tool             # allow / deny / 改写参数
     append ToolCallRequested { tool_call_id, provider_call_id, effective args }
     if tool not in registry: append ToolResult{Failed, NotFound}; done
     approval policy                # Allow / Ask / Deny
@@ -107,7 +109,7 @@ AssistantMessage(tool_calls)
     acquire Parallel / Exclusive lock
     invoke (timeout + cancel)
     truncate                       # 单次 + 本 step 累计上限
-    post-execute waterfall         # 宿主/扩展模块塑形
+    Hooks::after_tool              # 宿主塑形（脱敏、格式化）
     append ToolResult { final }
 ```
 
@@ -122,7 +124,7 @@ AssistantMessage(tool_calls)
 - deny（来自 pre-execute、策略或审批）写 `ToolResult{Failed, error.kind = Denied}`，跳过执行与 post-execute。
 - **`ToolCallRequested` 是副作用的点无回退**：写完它之后，任何执行都必须以重放安全规则收尾。
 - post-execute 在结果落盘前运行，可以改写 `content` / `error.message`（格式化、脱敏、审计改写），但**不得产生副作用、不得写日志**。
-- 除两个 waterfall 外，观察者只能通过 emit 接收通知，不能阻止或改写管线。
+- 除这两个钩子外，宿主只能经 `Hooks::on_record` 观察已提交记录，不能阻止或改写管线。框架补写的 `Interrupted` / `Denied` / `NotFound` 不经过 `after_tool`。
 
 ## 4. 审批
 
@@ -329,8 +331,8 @@ pub struct ToolConfig {
 以下能力由模块/插件实现，内核只提供接入点：
 
 - **沙箱/隔离**：`SandboxProvider` 在进程启动点变换命令；内核只带 `Provenance`。纯进程内工具没有进程边界，包装器只能在 `invoke` 前后拒绝或审计。接缝、策略与错误分类见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。
-- **内容脱敏/密钥**：host 或 `post-execute` 模块；内核不提供默认规则。`post-execute` 在落盘前运行，是唯一接入点。
-- **成本/预算**：不是工具层扩展；usage 与 pre-step gate 见 [usage.md](usage.md) / [agent-loop.md](agent-loop.md)。
+- **内容脱敏/密钥**：宿主的 `Hooks::after_tool`；内核不提供默认规则。它在落盘前运行，是唯一接入点。
+- **成本/预算**：不是工具层扩展；usage 与 `Hooks::before_step` 见 [usage.md](usage.md) / [agent-loop.md](agent-loop.md)。
 - **内置工具**：可选模块或参考 CLI，不在内核。
 
 ## 12. 留给下游

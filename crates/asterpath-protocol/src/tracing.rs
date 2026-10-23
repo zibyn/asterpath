@@ -2,7 +2,7 @@
 //! projection over one session's event log.
 //!
 //! A trace is not stored separately. `TraceQuery` folds the injected `EventLog`
-//! on demand; `TraceTap` pushes the same lifecycle off the typed event bus.
+//! on demand; `TraceTap` pushes the same lifecycle from the engine append entry.
 //! Content never enters a span: only `Span.log_range` references the log.
 
 use asterpath_core::{LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId};
@@ -257,7 +257,7 @@ pub trait TraceQuery: Send + Sync {
     fn spans(&self, filter: SpanFilter) -> BoxStream<'_, Result<Span, TraceError>>;
 }
 
-/// Real-time span lifecycle off the typed event bus.
+/// Real-time span lifecycle, driven by the engine append entry.
 pub trait TraceTap: Send + Sync {
     fn subscribe(&self) -> BoxStream<'_, Result<SpanUpdate, TraceError>>;
 }

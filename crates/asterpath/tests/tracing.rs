@@ -1,5 +1,5 @@
 //! Real-time tracing through the facade: `TraceTap` pairs Started/Ended off the
-//! typed event bus and never writes to the log (T14).
+//! engine append entry and never writes to the log (T14).
 
 use std::fs;
 use std::path::{Path, PathBuf};

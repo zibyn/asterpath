@@ -6,13 +6,14 @@
 >
 > **2026-10-22 范围调整**：不做通用工作流引擎（[ADR-0003](../adr/0003-single-session-stream-topology.md)）。模块图中的 `asterpath-workflow` 已移除，编排相关表述以本文件为准已更新；#10 出界，调度 API 原型见 #17。
 > **2026-10-22 #32 修订 / 2026-10-23 M5 范围**：`asterpath-plugin-host` 与 MCP adapter 归 M5（post-v1，进行中），不进 v1 workspace；模块契约本身不变。
+> **2026-10-23 #78 修订**（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：模块宿主、服务注册表、类型化事件总线与 `Module` trait 已删除。扩展点是 protocol 的 `Hooks`（§3.1）；facade 直接构造内部组件。下文 §3.1–§3.3、§5 已按此改写。
 
 ## 1. 决策摘要
 
-- 内核只含三样东西：模块宿主、类型化事件总线、合约 trait/值类型。任何具体实现都不在内核。
-- 模块间交互只有两种进程内形式：能力调用走 trait object，观察/拦截走类型化事件；消息只出现在跨进程与跨恢复边界。
-- 内置模块与插件共享同一套 `Module` 生命周期；插件是外部传输，不是特权层。外部能力带 `Provenance::External`，经进程内 adapter 暴露。
-- 生命周期是显式的：组装根构造、静态依赖、拓扑初始化、effect 回卷；v1 不做动态发现与热替换。
+- 内核只含合约 trait、值类型与日志信封；扩展点是 protocol 的 `Hooks`（ADR-0025）。任何具体实现都不在内核。
+- 组件间交互是进程内 trait object 调用；嵌入者的观察/拦截只经 `Hooks`；消息只出现在跨进程与跨恢复边界。
+- 插件是外部传输，不是特权层。外部能力带 `Provenance::External`，经进程内 adapter 以 `Tool` 暴露。
+- 生命周期是显式的：facade 按固定顺序构造并收尾内部组件；v1 不做动态发现与热替换。
 - 异步运行时是 tokio，不做运行时抽象；配置装载不在内核，由组装根/配置模块以显式参数提供。
 - 依赖方向固定为 `core ← protocol ← modules ← app`；模块之间零依赖，CI 用 `cargo metadata` 白名单校验。
 
@@ -40,11 +41,11 @@ modules (each crate; no module→module edges)
         ▼
 contract crates
   asterpath-protocol   canonical model, Provider/Tool/ToolRegistry/AgentRunner,
-                       Compactor, session events, Provenance
+                       Compactor, Hooks, session events, Provenance
         │
         ▼
-  asterpath-core       Module host, ServiceId/ServiceKey, EventBus,
-                       EventLog/Storage/DurableExecutor, IDs, errors
+  asterpath-core       EventLog/Storage/DurableExecutor, IDs, errors
+                       (Hooks live in asterpath-protocol)
 ```
 
 规则：
@@ -56,81 +57,36 @@ contract crates
 
 ## 3. 内核契约（`asterpath-core`）
 
-### 3.1 模块宿主
+### 3.1 钩子（`Hooks`，protocol）
+
+模块宿主、服务注册表与类型化事件总线已删除（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。嵌入者唯一的进程内扩展点是：
 
 ```rust
-pub trait Module: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn dependencies(&self) -> &[ServiceId] { &[] }
-    fn optional_dependencies(&self) -> &[ServiceId] { &[] }
-    fn init<'a>(&'a self, ctx: &'a ModuleCtx) -> BoxFuture<'a, Result<(), LifecycleError>>;
+pub trait Hooks: Send + Sync {
+    fn before_step<'a>(&'a self, ctx: &'a StepCtx) -> BoxFuture<'a, Result<Gate, HookError>>;
+    fn before_tool<'a>(&'a self, ctx: &'a ToolCallCtx, args: &'a mut ToolArgs)
+        -> BoxFuture<'a, Result<ToolGate, HookError>>;
+    fn after_tool<'a>(&'a self, ctx: &'a ToolCallCtx, result: &'a mut ToolResultView)
+        -> BoxFuture<'a, Result<(), HookError>>;
+    fn on_record(&self, record: &CommittedRecord);   // 同步、不可失败
 }
 ```
 
-- `init` 是唯一生命周期入口，没有单独的 `start`/`shutdown`。
-- 清理通过 effect 注册，宿主按 LIFO 顺序 await disposer。
-- `name` 用于诊断与环错误。
+- 每个方法都有放行 / 不改的默认实现；新增钩子点 = 给 trait 加带默认实现的方法。
+- 注册：`AsterpathBuilder::hooks(Arc<dyn Hooks>)`（可多次）或 `AsterpathConfig.hooks`。
+- 组合：按注册顺序调用；首个 `Gate::EndTurn` / `ToolGate::Deny` 短路，参数与结果改写逐个传递；没有环绕式 `next`。
+- 拦截式钩子（`before_*` / `after_tool`）的错误或 panic 按该钩子的错误处理：`before_step` → 回合 `Failed`；`before_tool` / `after_tool` → 该调用 `Failed`（`Internal`）。
+- `on_record` 在每条提交记录（所有会话，含子会话）提交后按会话内顺序调用一次；panic 被捕获、`tracing::warn!` 后继续，不影响循环。
+- 上下文只带数据：`StepCtx { session, turn, step_index }`、`ToolCallCtx { session, turn, step, tool_call_id, provider_call_id, tool, provenance, replay }`；两者的异步 `usage()` 返回本会话自身与子树的用量（`UsageReport`）。没有服务定位器。
+- 调用点：`before_step` 在每个新 step 前（恢复的未完成 step 不再调用）；`before_tool` 在写意图前，已记录意图恢复时不调用（#28）；`after_tool` 在截断后、写结果前，框架补写的 `Interrupted` / 拒绝不经过它。
 
-### 3.2 服务注册表
+### 3.2 单一 append 入口
 
-```rust
-pub struct ServiceId { /* TypeId + display name */ }
-pub struct ServiceKey<T: ?Sized + 'static> { /* ServiceId */ }
+agent、runtime、scheduler 与 facade 都经引擎内同一个 append 入口写日志：append 成功 → 依次 `on_record` → 驱动 trace tap。没有注册钩子时不做任何观察工作。
 
-pub const fn service_key<T: ?Sized + 'static>(name: &'static str) -> ServiceKey<T>;
+### 3.3 （已删除）事件总线
 
-impl ModuleCtx {
-    pub fn provide<T: ?Sized + Send + Sync + 'static>(
-        &self, key: ServiceKey<T>, value: Arc<T>,
-    ) -> Result<Effect, LifecycleError>;
-
-    pub fn require<T: ?Sized + Send + Sync + 'static>(
-        &self, key: ServiceKey<T>,
-    ) -> Result<Arc<T>, LifecycleError>;
-
-    pub fn require_optional<T: ?Sized + Send + Sync + 'static>(
-        &self, key: ServiceKey<T>,
-    ) -> Result<Option<Arc<T>>, LifecycleError>;
-}
-```
-
-- 每个 `ServiceId` 只有一个活跃提供者；重复 `provide` 是启动错误。
-- key 是合约 crate 里的 typed 常量，不做字符串查找。
-- 集合型能力（工具、provider、模型）由各自的注册表模块管理，不进宿主。
-
-### 3.3 事件总线
-
-```rust
-pub trait Event: Send + Sync + 'static {}
-pub trait WaterfallEvent: Event { type Error: Error + Send + Sync + 'static; }
-
-pub trait Handler<E: Event>: Send + Sync + 'static {
-    fn handle(&self, event: &E) -> BoxFuture<'_, ()>;
-}
-
-pub trait Middleware<E: WaterfallEvent>: Send + Sync + 'static {
-    fn handle(&self, event: E, next: Next<'_, E>)
-        -> BoxFuture<'_, Result<E, E::Error>>;
-}
-
-impl ModuleCtx {
-    pub fn emit<E: Event>(&self, event: E) -> BoxFuture<'_, ()>;
-    pub fn waterfall<E: WaterfallEvent>(&self, event: E)
-        -> BoxFuture<'_, Result<E, E::Error>>;
-    pub fn on<E: Event>(&self, handler: impl Handler<E>) -> Effect;
-    pub fn intercept<E: WaterfallEvent>(&self, middleware: impl Middleware<E>) -> Effect;
-    pub fn effect(&self, dispose: impl FnOnce() -> BoxFuture<'static, ()> + Send + 'static)
-        -> Effect;
-}
-```
-
-- `emit`：按注册顺序依次 await 处理者；处理者错误记录后继续，不传播。确定性优先于并发。
-- `waterfall`：中间件按注册顺序组成链，可改写事件、调用 `next` 或短路；错误传播给调用者。`Next<'_, E>` 是不透明的续行句柄。
-- `on` / `intercept` 只注册；执行统一走 `emit` / `waterfall`。
-- `effect`：为任意清理动作注册 `Effect`；关停时宿主按 LIFO 顺序 await 该 disposer。
-- `Effect` 是已注册句柄：`provide` / `on` / `intercept` / `effect` 都产出它，不要求调用方再交回宿主。
-- 不单独提供 `serial`/`bail`：有序中止用 waterfall 表达。
-- 跨模块事件是 core/protocol 里的普通数据结构。
+原 `emit` / `waterfall` / `Effect` / `ServiceKey` 机制见 git 历史与 ADR-0001；ADR-0025 取代。
 
 ### 3.4 事件日志、存储、持久执行器
 
@@ -203,7 +159,7 @@ pub struct ApprovalEndpoint;
 - 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
 - `Clock` 是时间来源接缝：`runtime` / `scheduler` 注入 `Arc<dyn Clock>` 取 `now`；`Storage` 仍收显式 `now`（#5）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - `Storage` 负责唤醒发现；方法集由 #5 定。
-- `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储模块 `provide`，宿主或策略模块用 `require_optional` 接入；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
+- `SessionRetirement` 是 core 的**可选**能力（整会话退役），由存储后端实现、经 facade 的 `session_retirement()` 取得；签名与语义见 [retention.md](retention.md)。导出用现有 `EventLog::frontier` + `scan`，导入不在 v1；它不并入 `EventLog` / `Storage`，也不允许扩展直接访问后端。
 - `EventLog` 负责 append/scan/frontier；事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `EventLog::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
 - `DurableExecutor` 是持久等待 seam，只剩 `await_signal` / `deliver_signal` / `wake` / `await_wake`：持久等待只有审批与子会话完成，没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。v1 没有 activity / workflow。
@@ -213,7 +169,7 @@ pub struct ApprovalEndpoint;
 
 ### 3.5 错误与 ID
 
-- 每类能力一个 `#[non_exhaustive]` 枚举：`LifecycleError`、`StorageError`、`ExecutionError` 在 core；`ProviderError`、`ToolError`、`LogDecodeError` 在 protocol。`LogDecodeError` 只在 protocol 内部消费，经 `AgentError::Corrupt` / `StorageError::Corrupt` 露出。
+- 每类能力一个 `#[non_exhaustive]` 枚举：`StorageError`、`ExecutionError`、`RetirementError` 在 core；`ProviderError`、`ToolError`、`LogDecodeError` 在 protocol。`LogDecodeError` 只在 protocol 内部消费，经 `AgentError::Corrupt` / `StorageError::Corrupt` 露出。
 - `AsterError` 在门面 crate，对上述错误求和；core 不反向依赖 protocol。
 - `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId` 是 core 里的 opaque newtype。
 - `anyhow` 只允许出现在 CLI/二进制；库契约不暴露 `Box<dyn Error>`。
@@ -222,7 +178,7 @@ pub struct ApprovalEndpoint;
 
 - tokio 是唯一支持的运行时；公共 async 签名按 tokio 生态的 `BoxFuture`/`BoxStream` 表达，不引入泛型 executor 或运行时无关抽象。
 - 可测试性所需的 clock / random / timer 用注入 seam 解决，不靠替换运行时。
-- core 本身不 spawn 任务；spawn 归宿主或执行器模块所有，并受 effect 约束。
+- core 本身不 spawn 任务；引擎也没有后台任务，驱动由宿主调用。
 - 配置装载不在内核：内核只收显式构造参数，不读文件、不读环境变量。
 
 ## 4. 协议合约（`asterpath-protocol`）
@@ -258,7 +214,7 @@ pub struct ToolDescriptor {
 }
 
 pub trait ToolRegistry: Send + Sync {
-    fn register(&self, tool: Arc<dyn Tool>) -> Effect;
+    fn register(&self, tool: Arc<dyn Tool>);
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>>;
     fn list(&self) -> Vec<Arc<dyn Tool>>;
 }
@@ -282,31 +238,29 @@ pub trait AgentRunner: Send + Sync {
 | 扩展 | 接入方式 | 内核提供的 seam |
 | --- | --- | --- |
 | 沙箱/隔离 | 进程启动点的 `SandboxProvider` 变换（独立合约 crate，v1 不建） | 内核只带 `Provenance`；见 [sandbox.md](sandbox.md) |
-| 成本/预算 | 消费 usage 的模块 + pre-step gate | `UsageRecorded` / `UsageQuery`、pre-step waterfall（#13） |
-| trace 导出/采样 | exporter 模块订阅 tracing 模块 | 原生 trace 模型/查询、事件日志 |
+| 成本/预算 | 宿主钩子 | `Hooks::before_step` + `StepCtx::usage()`，或 `on_record` + `usage_of`（#13、ADR-0025） |
+| trace 导出/采样 | 宿主钩子 | `Hooks::on_record`、原生 trace 查询、事件日志 |
 | 日志保留/归档 | storage admin 扩展 | `SessionRetirement` 可选能力（#18，见 [retention.md](retention.md)） |
-| 内容脱敏/密钥 | host 或 post-execute 模块 | `post-execute` hook |
+| 内容脱敏/密钥 | 宿主钩子 | `Hooks::after_tool` |
 | 内置工具 | 可选模块或参考 CLI | `ToolRegistry` |
 | 插件安装/分发 | 生态工具或 host | 插件清单/加载（#16） |
 
-这些扩展不是内核职责，也不出界；它们通过合约 trait/事件接入。内核不内置策略、价格表、沙箱实现或脱敏规则。
+这些扩展不是内核职责，也不出界；它们通过合约 trait 与 `Hooks` 接入。内核不内置策略、价格表、沙箱实现或脱敏规则。
 
 ## 5. 生命周期规则
 
-1. 组装根显式构造全部模块；只有它知道具体模块类型。
-2. `Module::dependencies()` 静态声明；宿主拓扑排序；成环 = `LifecycleError::Cycle`，启动失败并打印环路径。
-3. `init` 是模块向宿主注册能力/effect 的唯一时机；宿主注册表在 init 结束后关闭。能力级注册表（如 `ToolRegistry`）可在运行期自行增删，不走宿主注册表。
-4. 所有注册产生 `Effect`（`provide` / `on` / `intercept` / `effect`）；关停时 LIFO 回卷，异步 disposer 逐个 await。`init` 失败时，宿主回卷该模块已注册的 effect，再报告启动失败。
-5. 缺必需依赖 = 启动失败；缺可选依赖 = `None`。
-6. 模块不得启动不受 effect 约束的后台任务；宿主关停后不得有任务存活。
-7. v1 不做动态发现、热替换、运行期卸载；换模块 = 重启进程。
-8. 外部插件经进程内 adapter 模块接入；其能力带 `Provenance::External`。
-9. core 能力（EventLog/Storage/DurableExecutor/Provider）在 v1 没有外部接入路径，只由进程内模块提供。
-10. cross-module 只走合约 trait/事件；模块之间没有 crate 依赖。
+1. facade（组装根）显式构造全部内部组件；只有它知道具体类型。替换能力只经配置字段（provider、tools、compactor、存储后端、审批策略）与 `Hooks`。
+2. 构造顺序固定：存储 → append 入口（含钩子与 trace tap）→ 执行器 → scheduler → 工具注册表（先注册 `spawn_agent`）→ agent；scheduler 与 agent 的循环用 `Weak` 的 `set_runner` 打破。
+3. 关停按固定顺序收尾：先 scheduler（子会话），再其余组件。引擎没有后台任务，关停后不会有任务存活。
+4. 能力级注册表（如 `ToolRegistry`）可在运行期自行增删。
+5. v1 不做动态发现、热替换、运行期卸载；换组件 = 重启进程。
+6. 外部插件经进程内 adapter 接入；其能力带 `Provenance::External`。
+7. core 能力（EventLog/Storage/DurableExecutor/Provider）在 v1 没有外部接入路径，只由进程内实现提供。
+8. cross-module 只走合约 trait；模块之间没有 crate 依赖（#79 合并引擎 crate 前）。
 
 ## 6. 插件与信任
 
-- 进程内模块随宿主编译，`Module` 永远是进程内、受信的。
+- 进程内代码（含 `Hooks`）随宿主编译，永远是进程内、受信的。
 - 外部插件是子进程或 MCP server；由进程内 adapter 模块连接，并把它们的工具注册为 `Provenance::External { transport }`。
 - 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）；沙箱接缝见 [sandbox.md](sandbox.md)（#21）。
 - 动态发现、热替换不属于 v1；安装/分发是 host 责任；清单、加载与版本协商见 [plugins.md](plugins.md) §7。
@@ -342,8 +296,8 @@ pub trait AgentRunner: Send + Sync {
 | #9 上下文压缩 | 已定。`Compactor` 在 protocol，默认实现 `asterpath-compaction` 可选装配；见 [compaction.md](compaction.md) 与 [protocol.md](protocol.md) §6.1 |
 | #17 调度 API | 已定。`DurableExecutor` 在 core，`SubagentSpawner` 在 scheduler；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；不做通用 workflow |
 | #11 协议模型 | 已定。规范模型与 `Provider` 在 protocol；见 [protocol.md](protocol.md) |
-| #12 追踪 | 订阅事件；查询 API 在自己的模块 |
-| #13 token 统计 | 已定。`UsageQuery` / `UsageRecorded` 在 protocol，`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
+| #12 追踪 | append 入口直接驱动 trace tap；查询 API 在自己的模块 |
+| #13 token 统计 | 已定。`UsageQuery` / `usage_of` 在 protocol（实时观察走 `Hooks::on_record`），`SessionCatalog` 在 core；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
 | #16 插件清单 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现与分发出界 |
 | #21 沙箱 | 已定。接缝在独立合约 crate；core 零改动，protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |

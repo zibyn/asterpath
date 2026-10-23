@@ -976,8 +976,8 @@ impl Agent {
         Ok(step_outcome(&stop_reason, had_calls, pending_input))
     }
 
-    /// The fixed pipeline: pre-execute, intent, registry, approval, scheduling,
-    /// invocation, truncation, post-execute, result.
+    /// The fixed pipeline: `before_tool`, intent, registry, approval, scheduling,
+    /// invocation, truncation, `after_tool`, result.
     #[allow(clippy::too_many_arguments)]
     async fn execute_tool_calls(
         &self,

@@ -38,7 +38,7 @@ pub struct Scheduler {
     /// Shared with the agent runner so child drives see cancellation.
     cancellations: Arc<CancellationRegistry>,
     /// Set by the composition root after the agent is built. Weak: the agent
-    /// reaches the module bus and this scheduler, so an Arc here would leak the
+    /// reaches this scheduler through the spawn tool, so an Arc here would leak the
     /// whole composition root.
     runner: OnceLock<Weak<dyn AgentRunner>>,
     /// Admission state is memory only; `recovered` marks parents whose open

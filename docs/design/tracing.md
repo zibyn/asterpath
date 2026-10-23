@@ -270,7 +270,7 @@ pub enum TraceError {
 - `TraceQuery` 从注入的 `EventLog` 流式折叠，内存有界；没有 trace 表，也不需要额外索引。
 - 日志被退役后，该会话的 span 一并消失：`TraceQuery` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
-- `TraceTap` 由 `asterpath-tracing` 在事件总线之上运行，向 exporter 发 `Started` / `Ended`：每条开启记录发 `Started`，只有终态记录发 `Ended`。session span 永不发 `Ended`；frontier 上的 span 在其后续 append 关闭时才发 `Ended`。它不改变日志，也不参与恢复。
+- `TraceTap` 由引擎的单一 append 入口在每次提交后直接驱动（ADR-0025，不经钩子也不经事件总线），向 exporter 发 `Started` / `Ended`：每条开启记录发 `Started`，只有终态记录发 `Ended`。session span 永不发 `Ended`；frontier 上的 span 在其后续 append 关闭时才发 `Ended`。它不改变日志，也不参与恢复。
 - **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `EventLog` 读取权限，并自行脱敏。默认导出不含内容。
 - **采样、过滤、格式、批量、重试**：全归 exporter。内核与 tracing 模块不做 head sampling。
 - 导出格式（OTLP/JSON/其他）与 `gen_ai.*` 映射只在 exporter 中出现；核心类型不使用字符串属性名。

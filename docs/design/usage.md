@@ -6,6 +6,8 @@
 >
 > 相关 ADR：[0012 用量是事件日志的确定性投影](../adr/0012-usage-accounting.md)。
 >
+> **2026-10-23 #78 修订**（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：`UsageRecorded` 与事件总线已删除。实时观察统一走 `Hooks::on_record` + `usage_of`；预算在 `Hooks::before_step` 用 `StepCtx::usage()`。§6 已按此改写。
+>
 > 本票对已关闭票的修订（已同步到对应文件）：
 >
 > - `ProviderError` 增加 `partial_usage: Option<Usage>`（#11）。
@@ -14,13 +16,13 @@
 
 ## 1. 决策摘要
 
-- **只有 provider 返回值进账**。`Usage` 只来自协议响应；本地 tokenizer、`bytes/3` 估算与宿主猜测永不进入 `Usage`、总量或 `UsageRecorded`。`#9` 的 `estimated_input` 只活在压缩模块内部，仅用于窗口判断。
+- **只有 provider 返回值进账**。`Usage` 只来自协议响应；本地 tokenizer、`bytes/3` 估算与宿主猜测永不进入 `Usage` 或总量。`#9` 的 `estimated_input` 只活在压缩模块内部，仅用于窗口判断。
 - **归一化沿用 #11 的 exclusive 口径**：`input_total = uncached + cache_read + cache_write`；`output.total` 含推理，`reasoning` 是子集、不叠加；供应商 `total_tokens` 忽略；缺失字段按 0；原始 usage 留在 `raw`。
 - **三个桶**：`model_calls`（成功的 `AssistantMessage`）、`compaction`（成功的 `CompactionApplied`）、`partial`（失败/中断 attempt 已确认的用量，只作诊断）。`total = model_calls + compaction`；`partial` 不进总量。
 - **用量不是独立日志事件**：它是 `AssistantMessage` / `CompactionApplied` / `ModelCallAborted` 上的字段；聚合是事件日志的确定性投影，恢复与重放天然幂等。
 - **归因按会话树**：子会话 usage 只写子流，父日志不含子 usage。`own` 与 `SessionSubtree` 分开返回，`own + descendants` 结构上不会重复计数；`fork` 不继承父用量。
-- **查询纯折叠**：`UsageQuery`（pull）从 `EventLog` 流式折叠，v1 不建 usage 派生表；实时通知是 `UsageRecorded`（push），由唯一写入者在 append 成功后发出。
-- **成本/预算不在内核**：价格表、币种、告警、预算执行都在扩展模块；内核只提供用量、`UsageRecorded` 与 #6 的 pre-step gate。
+- **查询纯折叠**：`UsageQuery`（pull）从 `EventLog` 流式折叠，v1 不建 usage 派生表；实时观察是 `Hooks::on_record`（每条提交记录一次）配合 `usage_of`。
+- **成本/预算不在内核**：价格表、币种、告警、预算执行都在扩展模块；内核只提供用量、`usage_of`、`Hooks::on_record` 与 `Hooks::before_step`（#6 的 pre-step gate）。
 - **全局跨 session 聚合出界**：v1 查询面限于单会话及其子树。
 
 ## 2. 类型（`asterpath-protocol`）
@@ -155,7 +157,7 @@ pub struct UsageEntry {
 pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option<UsageEntry>;
 ```
 
-- “一条记录算哪个桶、归哪个 turn / step”只有这一份判定。`UsageQuery` 折叠、`UsageRecorded` 的发射方与成本 / 预算观察者都调用它，不各写一份。
+- “一条记录算哪个桶、归哪个 turn / step”只有这一份判定。`UsageQuery` 折叠与 `on_record` 里的成本 / 预算观察者都调用它，不各写一份。
 - 不承载用量的记录（含 `usage: None` 的 `ModelCallAborted`）返回 `None`。
 
 ### 压缩的 turn 归属
@@ -192,32 +194,19 @@ pub trait SessionCatalog: Send + Sync {
 
 ## 6. 实时事件与成本接缝
 
-### `UsageRecorded`
+### 实时观察：`Hooks::on_record`
 
-```rust
-pub struct UsageRecorded {
-    pub session: SessionId,
-    pub turn: Option<TurnId>,
-    pub step: Option<StepId>,
-    pub model: ModelSpec,
-    pub bucket: UsageBucket,
-    pub usage: Usage,
-    pub log: LogId,
-}
-```
-
-- **唯一写入者发射**：agent loop（`AssistantMessage`、`CompactionApplied`、`ModelCallAborted` 的 append 方）在 append 成功后发出，字段由 `usage_of` 得出；`CompactionApplied` 虽由压缩模块产生结果，仍由 loop 统一 append，所以只有一个发射点。
-- 载荷不含 `recorded_at`：`EventLog::append` 只返回 `LogId`，时间由存储层分配；需要时间的一方用 `UsageQuery` 查。
-- 总线 `emit` 按注册顺序 await 处理者，处理者错误只记录不传播（[module-contracts.md](module-contracts.md) §3.3）。因此成本模块在下一次 pre-step gate 前一定看到最新用量。
-- `ModelCallAborted.usage = None` 时不发事件。
-- 恢复与重放不重发：没有新 append 就没有事件；历史用量由模块用 `UsageQuery` 重建。
+- 每条提交记录（所有会话，含子会话）append 成功后，引擎的单一 append 入口按会话内顺序调用每个钩子的 `on_record(&CommittedRecord { session, log_id, seq, recorded_at, event })`。
+- 观察者对 `record.event` 调用 `usage_of` 得到桶、用量、model、turn / step；`CompactionApplied` 的 turn 取同 dedup key 的 `CompactionStarted.turn`（观察者可在看到 `CompactionStarted` 时记下）。
+- `on_record` 同步、不可失败；panic 被捕获并记录，不影响循环。
+- 恢复与重放不重发：只有新提交的记录会被看到；dedup 命中已有记录的 append 不再通知。历史用量用 `UsageQuery` 重建。
 
 ### 成本/预算扩展
 
-- 价格表、币种、告警阈值、预算策略全部在扩展模块（参考实现可叫 `asterpath-cost`），内核不提供相关类型。
-- 模块订阅 `UsageRecorded`，用 `SessionCatalog.parent` 把样本归到 root session（可缓存），自行累计；进程重启后用 `UsageQuery` 重建。
-- 执行点是 #6 的 pre-step gate：超预算返回 `Stopped { reason }`。gate 只在 step 之间运行，**最多超支一个 step**；不在模型流中间打断。这是明确接受的语义。
-- 模块可自行决定是否把 `Partial` 计入预算；也可在 gate 时调用 `UsageQuery` 做子树预算。
+- 价格表、币种、告警阈值、预算策略全部在宿主钩子，内核不提供相关类型。
+- 执行点是 `Hooks::before_step`：用 `StepCtx::usage()`（本会话 `own` 与子树 `descendants`）判定，超预算返回 `Gate::EndTurn { reason }` → `Stopped { reason }`。gate 只在 step 之间运行，**最多超支一个 step**；不在模型流中间打断。这是明确接受的语义。
+- 跨会话累计（例如按 root session）由钩子在 `on_record` 里用 `SessionCatalog.parent` 归并；进程重启后用 `UsageQuery` 重建。
+- 是否把 `Partial` 计入预算由宿主决定。
 
 ## 7. 重放与幂等
 
@@ -252,9 +241,9 @@ pub struct UsageRecorded {
 | U6 | 回合内压缩 | `Compaction` 桶；turn 的 `compaction` 计入，step 的 usage 不含它；`step = None` |
 | U7 | Idle 压缩 | `Compaction` 桶；`turn = None`；只进 session |
 | U8 | 父子归因 | 父 `Session` 的 own 不含子用量；`SessionSubtree` 的 `descendants` = 子会话之和；`own + descendants` 无重复；fork 子不继承父用量 |
-| U9 | 崩溃于 `AssistantMessage` 后、`StepCommitted` 前 | 恢复后该 step 的 usage 恰一份；无新 `UsageRecorded` |
+| U9 | 崩溃于 `AssistantMessage` 后、`StepCommitted` 前 | 恢复后该 step 的 usage 恰一份；`on_record` 不重发该记录 |
 | U10 | 崩溃于 `ResponseEnded` 后、`AssistantMessage` 前 | 恢复重调模型；最终恰一条 `ModelCall`；第一次调用的用量不可见 |
-| U11 | 实时事件顺序 | 每条 usage 终态记录 append 后恰发一条 `UsageRecorded`；下一 step 的 gate 能看到；重放不发 |
+| U11 | 实时观察顺序 | 每条提交记录恰一次送达 `on_record`、会话内有序；下一 step 的 `before_step` 经 `usage()` 能看到；重放不发 |
 | U12 | 与 trace 对账 | 同一 scope 的 `total()` = `model_call` span 的 `usage` 之和 + `compaction` span 的 `usage` 之和（`partial` 除外） |
 | U13 | session 日志损坏 | `UsageError::Corrupt`；不返回部分结果 |
 | U14 | 过滤 | `bucket` / `model` / `since` / `until` 组合只返回匹配记录；`until` 不含边界 |

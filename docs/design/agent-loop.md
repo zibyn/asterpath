@@ -20,7 +20,7 @@
 - steering 只排队，**不打断**在途模型流；输入到达即写 `InputRecorded`。
 - 取消是回合级、协作式；宽限期后 drop 在途工具并写 `Interrupted`；取消同时闭合本 step 的等待意图。
 - 模型失败在 step 内按 attempt 重试；工具失败不重试，作为模型可见结果交回模型。
-- 默认不设 step 上限；宿主通过 pre-step waterfall gate 实施自己的停止策略。
+- 默认不设 step 上限；宿主通过 `Hooks::before_step`（pre-step gate，ADR-0025）实施自己的停止策略。
 
 ## 2. 回合与步骤
 
@@ -92,7 +92,7 @@ run_turn(session):
             Ok(NotNeeded | NothingToDo | NotConfigured | Applied) -> {}
             Ok(Insufficient) -> append(TurnCommitted(ContextExhausted)); return
             Err(_)           -> append(TurnCommitted(CompactionFailed)); return
-        match pre_step_gate(session):                     # waterfall
+        match before_step(session):                       # Hooks, in order
             EndTurn(reason) -> append(TurnCommitted(reason)); return
             Err(_)          -> append(TurnCommitted(Failed)); return
             Continue        -> {}
@@ -176,7 +176,7 @@ run_turn(session):
 
 - 不重复写 `TurnStarted`。
 - 若 frontier 落在 open step 内，不重复写 `StepStarted`，复用原 `StepStarted.seq` 作为投影水位。
-- 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。已存在的 `ToolCallRequested` 按 `provider_call_id` 对回 `AssistantMessage` 的 `ToolCall`；其 effective args 是权威值，不重跑 pre-execute。只有尚无意图的调用才重跑 pre-execute。
+- 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。已存在的 `ToolCallRequested` 按 `provider_call_id` 对回 `AssistantMessage` 的 `ToolCall`；其 effective args 是权威值，不重跑 `before_tool`。只有尚无意图的调用才重跑 `before_tool`。恢复的未完成 step 不再调用 `before_step`；框架补写的 `Interrupted` 不经过 `after_tool`。
 - 若该 step 无 `AssistantMessage` 且最后一条 `ModelCallAborted` 是 `Crash` / `Transport`，按重试策略重调模型；`Transport` 耗尽则 `StepCommitted` + `TurnCommitted(Failed)`。
 - 若最后一条 abort 是 `Cancelled` / `Rejected`，按取消/失败收尾，不重试（#3 §6）。
 - 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态，再投影并重试同一 step。
@@ -293,7 +293,7 @@ StepCommitted
 - 成功的模型调用在 `AssistantMessage` 收尾，`usage` 挂在这里；失败的 attempt 在 `ModelCallAborted` 收尾。
 - step 在 `StepCommitted` 收尾，回合在 `TurnCommitted` 收尾。
 - token 总量 = 该范围内 `AssistantMessage.usage` 求和；中断 attempt 的 partial usage 单独标注（[usage.md](usage.md)）。
-- 每次 append 承载 usage 的终态记录后，loop 发一条 `UsageRecorded`（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）；它是唯一发射点（#13）。
+- 承载 usage 的终态记录（`AssistantMessage` / `CompactionApplied` / `ModelCallAborted`）与其他记录一样经 append 入口送给 `Hooks::on_record`；用量桶判定用 protocol 的 `usage_of`（#13、#74、ADR-0025）。
 
 ## 10. 可配置默认
 
@@ -319,9 +319,9 @@ pub struct TurnConfig {
 | `cancel_grace` | `10s` | 0 = 立即 drop |
 | `tool_timeout` | `None` | 由 `ToolDescriptor` 决定；external 缺省 120s |
 | `kill_grace` | `5s` | 超时/取消后强杀外部工具的宽限；属 `ToolConfig`（[tools.md](tools.md) §9，#7） |
-| pre-step gate | 无 | 宿主注册 waterfall |
+| pre-step gate | 无 | 宿主注册 `Hooks::before_step` |
 | host stop | 无 | 宿主经 gate 返回 `Stopped { reason }` |
-| cost/budget 扩展 | 无 | 模块订阅 `UsageRecorded`，经 gate 返回 `Stopped { reason }`；最多超支一个 step；价格表/币种不在内核（#13） |
+| cost/budget 扩展 | 无 | `before_step` 读 `StepCtx::usage()` 返回 `Gate::EndTurn` → `Stopped { reason }`；最多超支一个 step；价格表/币种不在内核（#13） |
 
 ## 11. 验收场景
 
@@ -348,7 +348,7 @@ pub struct TurnConfig {
 - **#9**：已定。触发、保留、摘要调用、事件与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
-- **#13**：已定。token 聚合、`partial` 桶、`UsageRecorded` 发射点见 [usage.md](usage.md)。
+- **#13**：已定。token 聚合、`partial` 桶与实时观察（`on_record` + `usage_of`）见 [usage.md](usage.md)。
 - **#15**：已定。`AgentRunner::run` / `SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
 - **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、`DurableExecutor` 接缝见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#27**：已定。`Compactor` 契约、未装配时的 `NotConfigured` 路径见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。

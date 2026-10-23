@@ -20,7 +20,7 @@
 
 | crate | 职责 | 允许的 workspace 依赖 | 引入里程碑 |
 | --- | --- | --- | --- |
-| `asterpath-core` | 模块宿主、事件总线、`EventLog` / `Storage` / `SessionCatalog` / `DurableExecutor` 契约、ID、错误 | 无 | M0 |
+| `asterpath-core` | `EventLog` / `Storage` / `SessionCatalog` / `DurableExecutor` 契约、ID、错误 | 无 | M0 |
 | `asterpath-protocol` | 规范化模型、`Provider` / `Tool` / `ToolRegistry` / `AgentRunner` / `Compactor`、会话事件、`ConfigSnapshot`、`AgentEvent` | `core` | M0 |
 | `asterpath-agent` | `AgentRunner` 实现（turn/step loop） | `core`, `protocol` | M0 |
 | `asterpath-tools` | `ToolRegistry` 实现 | `core`, `protocol` | M0 |
@@ -107,6 +107,7 @@ pub struct AsterpathConfig {
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
     pub session_retirement: Option<Arc<dyn SessionRetirement>>,
     pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
+    pub hooks: Vec<Arc<dyn Hooks>>,             // 扩展钩子，按此顺序调用（ADR-0025）
 }
 
 impl Asterpath {
@@ -125,7 +126,9 @@ impl Asterpath {
 }
 ```
 
-- `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应（`hooks(Arc<dyn Hooks>)` 可多次调用、逐个追加），`build().await` 按固定顺序直接构造内部组件。
+- 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
+- 再导出：`asterpath::protocol`（= `asterpath-protocol`）与 core 的 id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId`、`Timestamp`），嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
 - `event_log` / `storage` 要么同时注入，要么都留空；只注入其一是 `AsterError::Config`。同时注入时 `database` 被忽略；都留空时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
@@ -133,9 +136,9 @@ impl Asterpath {
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
 - 关闭 `sqlite` feature 时，`event_log` / `storage` 必须注入，`session_catalog` 也必须注入；`session_retirement` 仍是可选的。
 - v1 的 `AsterpathConfig` 没有插件字段；插件清单属于 M5 的 `asterpath-plugin-host`（[plugins.md](plugins.md)）。也没有技能字段：技能由宿主发现并组成 `system` / 工具，见 [skills.md](skills.md) §8。
-- 没有 `executor` 注入：v1 只有一套 `DurableExecutor` 实现；需要替换它的嵌入者直接使用 `asterpath-core` 的 `ModuleHost`。
+- 没有 `executor` 注入：v1 只有一套 `DurableExecutor` 实现，不可替换。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
-- 替换超过一个模块、或需要自定义 `Module` 生命周期的嵌入者，直接使用 `asterpath-core` 的 `ModuleHost`；facade 不覆盖该场景。
+- 内置组件不是可替换模块；替换只经上述配置字段，观察与拦截只经 `hooks`。`shutdown()` 按固定顺序收尾（scheduler 子会话 → 其余）。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider` = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
 
 ### 3.3 Session 驱动
@@ -200,7 +203,7 @@ pub enum AgentError {
     NotFound { session: SessionId },
     Corrupt { session: SessionId, detail: String },
     Storage(StorageError),
-    Lifecycle(LifecycleError),
+    Execution(ExecutionError),
     Compaction(CompactionError),
 }
 
@@ -225,7 +228,6 @@ pub trait AgentRunner: Send + Sync {
 pub enum AsterError {
     Config { message: String },
     Agent(AgentError),
-    Lifecycle(LifecycleError),
     Storage(StorageError),
     Execution(ExecutionError),
     Provider(ProviderError),
