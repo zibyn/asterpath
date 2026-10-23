@@ -11,9 +11,9 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AgentError, AgentRunner, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
-    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, ProviderId,
-    RecordAppended, Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary,
-    TurnEndReason, decode_entry, dedup, encode_entry,
+    ConfigSnapshot, ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, RecordAppended,
+    Role, RunRequest, RunTrigger, SessionEvent, SubagentConfig, Summary, TurnEndReason,
+    decode_entry, dedup, encode_entry,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -813,7 +813,6 @@ impl Scheduler {
         &self,
         parent: ParentRef,
         at: LogId,
-        provider: &ProviderId,
     ) -> Result<Vec<Item>, ExecutionError> {
         let entries = scan(&*self.log, parent.session).await?;
         let Some(at_seq) = entries
@@ -834,7 +833,7 @@ impl Scheduler {
             .map(|(entry, _)| entry)
             .collect();
         let items = asterpath_protocol::history(&prefix).map_err(backend)?;
-        Ok(drop_foreign_items(items, provider))
+        Ok(items)
     }
 
     /// R2: create the child log's records from the parent record. Every write
@@ -876,9 +875,7 @@ impl Scheduler {
                 .iter()
                 .any(|(_, event)| matches!(event, SessionEvent::ContextForked { .. }))
         {
-            let items = self
-                .fork_snapshot(parent.clone(), *at, &config.model.provider)
-                .await?;
+            let items = self.fork_snapshot(parent.clone(), *at).await?;
             self.append(
                 child,
                 SessionEvent::ContextForked {
@@ -1167,57 +1164,6 @@ fn wait_outcome(outcome: &ChildOutcome) -> Result<ChildOutcome, WaitError> {
         } => Err(WaitError::Timeout),
         other => Ok(other.clone()),
     }
-}
-
-/// Cross-provider rule (#11 §11): opaque items from another provider are not
-/// copied into the fork snapshot at all; there is no translation.
-fn drop_foreign_items(items: Vec<Item>, provider: &ProviderId) -> Vec<Item> {
-    items
-        .into_iter()
-        .filter_map(|item| match item {
-            Item::Reasoning { raw, .. } if &raw.provider != provider => None,
-            Item::ProviderOpaque {
-                provider: item_provider,
-                ..
-            }
-            | Item::ServerToolCall {
-                provider: item_provider,
-                ..
-            }
-            | Item::ServerToolResult {
-                provider: item_provider,
-                ..
-            } if &item_provider != provider => None,
-            Item::Message { role, parts } => Some(Item::Message {
-                role,
-                parts: drop_foreign_parts(parts, provider),
-            }),
-            Item::ToolResult {
-                call_id,
-                provider_item_id,
-                parts,
-                is_error,
-                raw,
-            } => Some(Item::ToolResult {
-                call_id,
-                provider_item_id,
-                parts: drop_foreign_parts(parts, provider),
-                is_error,
-                raw,
-            }),
-            other => Some(other),
-        })
-        .collect()
-}
-
-fn drop_foreign_parts(parts: Vec<Part>, provider: &ProviderId) -> Vec<Part> {
-    parts
-        .into_iter()
-        .filter(|part| {
-            !matches!(part, Part::ProviderOpaque { provider: item_provider, .. }
-                if item_provider != provider)
-        })
-        .collect()
 }
 
 fn narrow_tools(
