@@ -7,11 +7,14 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 pub struct MockResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Byte offsets at which the body is cut into separate TCP writes.
+    pub split_at: Vec<usize>,
 }
 
 impl MockResponse {
@@ -20,6 +23,7 @@ impl MockResponse {
             status: 200,
             headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
             body: body.into(),
+            split_at: Vec::new(),
         }
     }
 
@@ -28,7 +32,14 @@ impl MockResponse {
             status,
             headers: vec![("content-type".to_owned(), "application/json".to_owned())],
             body: body.into(),
+            split_at: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn split_at(mut self, offsets: &[usize]) -> Self {
+        self.split_at = offsets.to_vec();
+        self
     }
 
     #[must_use]
@@ -70,8 +81,18 @@ impl MockServer {
                 }
                 head.push_str("\r\n");
                 let _ = socket.write_all(head.as_bytes());
-                let _ = socket.write_all(response.body.as_bytes());
-                let _ = socket.flush();
+                let _ = socket.set_nodelay(true);
+                let body = response.body.as_bytes();
+                let mut start = 0;
+                for end in response.split_at.iter().copied().chain([body.len()]) {
+                    let _ = socket.write_all(&body[start..end]);
+                    let _ = socket.flush();
+                    start = end;
+                    if end < body.len() {
+                        // Give the client time to read this piece as its own chunk.
+                        thread::sleep(Duration::from_millis(30));
+                    }
+                }
             }
         });
         Self { addr, requests }

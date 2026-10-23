@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use asterpath_http::{SseDecoder, SseEvent};
 use asterpath_protocol::{
     Item, JsonString, ModelSpec, Part, PartDelta, ProviderError, ProviderErrorKind, ProviderId,
     RawProviderData, ReasoningBinding, Role, StopReason, StreamEvent, ToolName, Usage,
@@ -79,7 +80,7 @@ pub(crate) fn stream(
     let state = State {
         normalizer: Normalizer::new(context, header_request_id),
         response,
-        buffer: String::new(),
+        decoder: SseDecoder::new(),
         done: false,
     };
     stream::unfold(Some(state), |state| async move {
@@ -90,8 +91,10 @@ pub(crate) fn stream(
             }
             match state.response.chunk().await {
                 Ok(Some(chunk)) => {
-                    state.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    let events = state.drain(false);
+                    let events = match state.decoder.push(&chunk) {
+                        Ok(frames) => state.process(frames),
+                        Err(error) => return Some((vec![Err(error)], None)),
+                    };
                     if !events.is_empty() {
                         let finished = state.normalizer.finished();
                         return Some((events, (!finished).then_some(state)));
@@ -99,7 +102,10 @@ pub(crate) fn stream(
                 }
                 Ok(None) => {
                     state.done = true;
-                    let mut events = state.drain(true);
+                    let mut events = match state.decoder.finish() {
+                        Ok(frames) => state.process(frames),
+                        Err(error) => return Some((vec![Err(error)], None)),
+                    };
                     if events.is_empty() && !state.normalizer.finished() {
                         events.push(Err(transport(
                             "openai stream ended without a terminal event",
@@ -527,51 +533,25 @@ impl Normalizer {
 }
 
 impl State {
-    fn drain(&mut self, flush: bool) -> Vec<Result<StreamEvent, ProviderError>> {
+    fn process(&mut self, frames: Vec<SseEvent>) -> Vec<Result<StreamEvent, ProviderError>> {
         let mut events = Vec::new();
-        while let Some(position) = self.buffer.find("\n\n") {
-            let block: String = self.buffer.drain(..position + 2).collect();
-            self.process_block(&block, &mut events);
-            if self.normalizer.finished() {
-                return events;
+        for frame in frames {
+            if frame.data.is_empty() || frame.data == "[DONE]" {
+                continue;
             }
-        }
-        if flush {
-            let rest = std::mem::take(&mut self.buffer);
-            if !rest.trim().is_empty() {
-                self.process_block(&rest, &mut events);
+            events.extend(self.normalizer.handle(&frame.data));
+            if self.normalizer.finished() {
+                break;
             }
         }
         events
-    }
-
-    fn process_block(&mut self, block: &str, events: &mut Vec<Result<StreamEvent, ProviderError>>) {
-        let mut data = String::new();
-        for line in block.lines() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if line.starts_with(':') {
-                continue;
-            }
-            let Some(value) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let value = value.strip_prefix(' ').unwrap_or(value);
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(value);
-        }
-        if data.is_empty() || data == "[DONE]" {
-            return;
-        }
-        events.extend(self.normalizer.handle(&data));
     }
 }
 
 struct State {
     response: reqwest::Response,
     normalizer: Normalizer,
-    buffer: String,
+    decoder: SseDecoder,
     done: bool,
 }
 

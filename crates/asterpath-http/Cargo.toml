@@ -1,0 +1,8 @@
+[package]
+name = "asterpath-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterpath-protocol = { path = "../asterpath-protocol" }
