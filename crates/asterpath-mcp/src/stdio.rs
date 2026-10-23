@@ -11,14 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use asterpath_protocol::ConfinedSpawn;
 use asterpath_protocol::{JsonString, ToolContext, ToolError, ToolOutput};
-use asterpath_sandbox::ConfinedSpawn;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Notify, oneshot};
 
-use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, PluginAdapter};
+use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, McpAdapter};
 use crate::mcp::{self, RpcClient, RpcFailure};
 
 const KILL_WAIT: Duration = Duration::from_millis(500);
@@ -70,15 +70,15 @@ impl StdioAdapter {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| io::Error::other("plugin process has no stdin"))?;
+            .ok_or_else(|| io::Error::other("MCP server process has no stdin"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::other("plugin process has no stdout"))?;
+            .ok_or_else(|| io::Error::other("MCP server process has no stdout"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| io::Error::other("plugin process has no stderr"))?;
+            .ok_or_else(|| io::Error::other("MCP server process has no stderr"))?;
 
         let shared = Arc::new(Shared {
             next_id: AtomicU64::new(0),
@@ -494,7 +494,7 @@ fn terminate(_pid: u32) {}
 #[cfg(not(unix))]
 fn kill_process(_pid: u32) {}
 
-impl PluginAdapter for StdioAdapter {
+impl McpAdapter for StdioAdapter {
     fn handshake(&mut self) -> BoxFuture<'_, Result<AdapterHandshake, AdapterError>> {
         Box::pin(mcp::handshake(self.shared.as_ref(), self.shared.startup))
     }
@@ -512,7 +512,7 @@ impl PluginAdapter for StdioAdapter {
         Box::pin(call_impl(self, original_name, args, ctx))
     }
 
-    fn shutdown(&mut self) -> BoxFuture<'_, ()> {
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(shutdown_impl(&self.shared))
     }
 }
@@ -533,12 +533,12 @@ mod tests {
     use std::time::Duration;
 
     use asterpath_protocol::{CancelToken, ToolContext};
+    use asterpath_protocol::{ConfinedSpawn, Enforcement};
     use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
-    use asterpath_sandbox::{ConfinedSpawn, Enforcement};
     use serde_json::json;
 
     use super::StdioAdapter;
-    use crate::adapter::{AdapterError, PluginAdapter};
+    use crate::adapter::{AdapterError, McpAdapter};
 
     fn fixture_bin() -> PathBuf {
         if let Ok(path) = std::env::var("ASTERPATH_MCP_FIXTURE") {

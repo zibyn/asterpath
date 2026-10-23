@@ -77,7 +77,7 @@ _Avoid_: 信任级别、信任边界
 进程内模块，把子进程或 MCP 插件暴露为同一批能力 trait。（已废弃，ADR-0027：adapter 是 `asterpath-mcp` 内部类型）
 
 **工具命名空间（Tool Namespace）**：
-外部工具对模型暴露时的 `<PluginId>__<名称>` 前缀约定；`__` 保留，进程内工具不得使用。
+外部工具对模型暴露时的 `<ServerId>__<名称>` 前缀约定（`ServerId` 即 MCP 服务配置的 `id`）；`__` 保留，进程内工具不得使用。
 _Avoid_: 前缀、别名
 
 **MCP 服务端（MCP Server）**：

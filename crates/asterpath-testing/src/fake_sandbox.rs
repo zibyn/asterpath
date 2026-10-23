@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use asterpath_sandbox::{
+use asterpath_protocol::{
     ConfinedSpawn, Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider,
     SpawnRequest,
 };
@@ -96,15 +96,17 @@ impl SandboxProvider for FakeSandboxProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(RecordedSpawnRequest::from_request(request));
+        request.policy.validate()?;
 
         match &self.outcome {
-            Outcome::Full => Ok(pass_through(request, Enforcement::Full)),
-            Outcome::Partial { unenforced } => Ok(pass_through(
-                request,
-                Enforcement::Partial {
+            Outcome::Full => Ok(ConfinedSpawn::unconfined(request)),
+            Outcome::Partial { unenforced } => {
+                let mut confined = ConfinedSpawn::unconfined(request);
+                confined.enforcement = Enforcement::Partial {
                     unenforced: unenforced.clone(),
-                },
-            )),
+                };
+                Ok(confined)
+            }
             Outcome::Unsupported { reason } => Err(SandboxError::Unsupported {
                 reason: reason.clone(),
             }),
@@ -118,23 +120,13 @@ impl SandboxProvider for FakeSandboxProvider {
     }
 }
 
-fn pass_through(request: &SpawnRequest<'_>, enforcement: Enforcement) -> ConfinedSpawn {
-    ConfinedSpawn::new(
-        request.program.to_os_string(),
-        request.args.to_vec(),
-        request.cwd.map(Path::to_path_buf),
-        request.env.clone(),
-        enforcement,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
 
-    use asterpath_sandbox::{
+    use asterpath_protocol::{
         Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider, SpawnRequest,
     };
 
@@ -348,5 +340,36 @@ mod tests {
             other => panic!("expected Setup, got {other:?}"),
         }
         assert!(error.to_string().starts_with("sandbox:"));
+    }
+
+    #[test]
+    fn empty_or_relative_writable_roots_are_unsupported_even_for_a_full_fake() {
+        let env = env();
+        let args = args();
+        let provider = FakeSandboxProvider::full();
+        for (roots, expected) in [
+            (
+                vec![],
+                "workspace-write requires at least one writable root".to_owned(),
+            ),
+            (
+                vec![PathBuf::from("/abs"), PathBuf::from("rel")],
+                "writable root must be absolute: rel".to_owned(),
+            ),
+        ] {
+            let policy = SandboxPolicy::WorkspaceWrite {
+                writable_roots: roots,
+            };
+            let error = provider
+                .confine(&request(
+                    OsStr::new("/usr/bin/server"),
+                    &args,
+                    None,
+                    &env,
+                    &policy,
+                ))
+                .unwrap_err();
+            assert_eq!(error, SandboxError::Unsupported { reason: expected });
+        }
     }
 }

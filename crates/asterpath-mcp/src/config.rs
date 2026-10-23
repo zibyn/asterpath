@@ -1,14 +1,15 @@
-//! Plugin manifest value shapes (`plugins.md` §4).
+//! MCP server configuration (`mcp.md` §2, ADR-0027).
 //!
-//! The host owns manifest data; this crate only defines the shape. Secrets in
-//! `env` and HTTP `headers` are redacted from `Debug` output.
+//! The embedder owns the data; this crate only defines the shape. Unknown
+//! fields are rejected. Secrets in `env` and HTTP `headers` are redacted from
+//! `Debug` output.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use asterpath_protocol::{ToolNameError, validate_plugin_id};
+use asterpath_protocol::{ToolNameError, validate_server_id};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -18,12 +19,12 @@ pub const DEFAULT_CALL: Duration = Duration::from_secs(120);
 /// `[a-z0-9-]{1,32}`; deserialization rejects anything else.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct PluginId(String);
+pub struct ServerId(String);
 
-impl PluginId {
+impl ServerId {
     pub fn new(value: impl Into<String>) -> Result<Self, ToolNameError> {
         let value = value.into();
-        validate_plugin_id(&value)?;
+        validate_server_id(&value)?;
         Ok(Self(value))
     }
 
@@ -32,45 +33,30 @@ impl PluginId {
     }
 }
 
-impl fmt::Debug for PluginId {
+impl fmt::Debug for ServerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PluginId({:?})", self.0)
+        write!(f, "ServerId({:?})", self.0)
     }
 }
 
-impl fmt::Display for PluginId {
+impl fmt::Display for ServerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl<'de> Deserialize<'de> for PluginId {
+impl<'de> Deserialize<'de> for ServerId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(D::Error::custom)
     }
 }
 
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginProtocol {
-    Mcp,
-    Acp,
-}
-
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginCapability {
-    Tools,
-}
-
 /// Transport configuration. `Debug` never prints env or header values.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum PluginTransport {
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpTransport {
     Stdio {
         command: String,
         #[serde(default)]
@@ -99,7 +85,7 @@ impl fmt::Debug for RedactedMap<'_> {
     }
 }
 
-impl fmt::Debug for PluginTransport {
+impl fmt::Debug for McpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stdio {
@@ -123,10 +109,11 @@ impl fmt::Debug for PluginTransport {
     }
 }
 
-/// Timeouts are millisecond fields in the manifest and `Duration` in Rust.
+/// Timeouts are millisecond fields in the config and `Duration` in Rust.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginTimeouts {
+#[serde(deny_unknown_fields)]
+pub struct McpTimeouts {
     #[serde(
         default,
         rename = "startup_ms",
@@ -143,7 +130,7 @@ pub struct PluginTimeouts {
     pub call: Option<Duration>,
 }
 
-impl PluginTimeouts {
+impl McpTimeouts {
     pub fn startup_timeout(&self) -> Duration {
         self.startup.unwrap_or(DEFAULT_STARTUP)
     }
@@ -179,26 +166,15 @@ mod millis {
     }
 }
 
-fn default_capabilities() -> Vec<PluginCapability> {
-    vec![PluginCapability::Tools]
-}
-
-/// A host-provided external plugin description. Unknown fields are ignored.
+/// One MCP server the embedder wants loaded. Unknown fields are rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginManifest {
-    pub manifest_version: u32,
-    pub id: PluginId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub id: ServerId,
+    pub transport: McpTransport,
     #[serde(default)]
     pub required: bool,
-    pub protocol: PluginProtocol,
     pub protocol_versions: Vec<String>,
-    pub transport: PluginTransport,
-    #[serde(default = "default_capabilities")]
-    pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
-    pub timeouts: PluginTimeouts,
+    pub timeouts: McpTimeouts,
 }

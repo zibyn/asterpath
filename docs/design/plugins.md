@@ -1,120 +1,90 @@
-# 插件清单、加载与版本兼容
+# MCP 服务配置与工具来源
 
-> 来源：[#16](https://github.com/zibyn/asterpath/issues/16)，2026-10-22 已定。本文件定义外部插件的清单形状、加载规则、工具命名空间与冲突策略、版本协商、失败隔离，以及插件与进程内模块的边界。
+> 来源：[#16](https://github.com/zibyn/asterpath/issues/16)（2026-10-22 已定），[#80](https://github.com/zibyn/asterpath/issues/80) 按 [ADR-0027](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md) 改写：外部扩展不再建模为“插件”，只有 MCP 服务配置；`asterpath-plugin-host` 改名 `asterpath-mcp`，是一个工具来源。本文件定义配置形状、加载规则、工具命名空间与冲突策略、版本协商与失败隔离。文件名保留以免断链。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 MCP adapter 与 ACP 边界](./mcp.md)、[#15 打包](https://github.com/zibyn/asterpath/issues/15)。
+> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 MCP adapter](./mcp.md)、[沙箱](./sandbox.md)、[打包](./packaging.md)。
 >
-> 相关 ADR：[0013 外部插件用清单加载，进程内模块编译期组装](../adr/0013-plugin-boundary.md)。
->
-> **2026-10-22 #32 范围调整 / 2026-10-23 M5 范围**：本文件的设计保留，实现归 **M5（post-v1，已交付）**；不属于 v1 交付，也不进 M0–M4 验收。M5 只实现 MCP 传输，`CustomStdio` 已从清单枚举移除。
+> 相关 ADR：[0027 MCP 是工具来源，不是插件宿主](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md)（取代 [0013](../adr/0013-plugin-boundary.md)）、[0018 MCP adapter](../adr/0018-mcp-adapter-and-acp-scope.md)、[0019 沙箱](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
-- **进程内模块与外部插件分开**：进程内模块随宿主编译，由组装根显式选择；没有清单、没有动态发现。只有外部插件（子进程 / MCP）有清单。
-- **清单是 host 提供的数据，框架只定义形状**：`PluginManifest` 在 `asterpath-plugin-host`；框架不读清单文件、不做发现、不展开环境变量、不持久化清单。
-- **加载是启动期一次性动作**：v1 不做动态发现、热替换、运行期安装/卸载；换插件 = 重启进程。
-- **命名空间强制**：外部工具以 `<plugin_id>__<tool_name>` 暴露；`__` 保留给外部命名空间；碰撞或超长 = 整插件加载失败，绝不 last-write-wins。
-- **版本协商是精确白名单**：`protocol_versions` 列出接受的协议版本；握手结果必须命中；插件自身 `version` 只用于诊断。
-- **失败按插件隔离**：可选插件失败不阻止宿主启动；`required: true` 的插件失败中止启动；没有部分能力降级。
-- **秘密不进日志**：manifest 的 `env` 等敏感字段 `Debug` 脱敏，manifest 永不进事件日志。
-- **未知工具是正常终态**：模型请求不存在的工具时仍写意图，随后以 `ToolResult{Failed, NotFound}` 闭合；恢复按请求记录里的 `replay` 与 `provenance` 处理。
+- **进程内模块与 MCP 服务分开**：进程内模块随宿主编译，由组装根显式选择；只有 MCP 服务有配置。
+- **配置是嵌入者提供的数据，框架只定义形状**：`McpServerConfig` 在 `asterpath-mcp`；框架不读配置文件、不做发现、不展开环境变量、不持久化配置。
+- **工具来源，不是插件宿主**：`McpServers::load` 返回已加载的工具；嵌入者把 `tools()` 交给 engine builder。facade 不新增工具来源接口（ADR-0027）。
+- **加载是启动期一次性动作**：不做动态发现、热替换、运行期安装/卸载；换服务 = 重启进程。
+- **命名空间强制**：外部工具以 `<server_id>__<tool_name>` 暴露；`__` 保留；碰撞或超长 = 整个服务加载失败，绝不 last-write-wins。
+- **版本协商是精确白名单**：`protocol_versions` 列出接受的协议版本；握手结果必须命中。
+- **失败按服务隔离**：可选服务失败不阻止宿主启动；`required: true` 的服务失败中止启动；没有部分能力降级。
+- **秘密不进日志**：`env` 与 HTTP `headers` 在 `Debug` 中脱敏，配置永不进事件日志。
+- **沙箱 fail closed**：stdio 进程启动前，provider 给出的强制级别不是 `Full` 即加载失败（§5、[sandbox.md](sandbox.md) §9）。
 
-## 2. 范围与术语
+## 2. 术语
 
-| 词 | 含义 |
-| --- | --- |
-| 插件（Plugin） | 经子进程或 MCP 接入的外部扩展；对内核只表现为叶子能力 |
-| 插件清单（Plugin Manifest） | host 提供的外部插件描述：标识、协议、传输、能力、超时、是否必需 |
-| 插件实例（Plugin Instance） | 加载集合中一个 `PluginId` 对应的外部插件运行体；同一实现可有多个实例，但标识必须不同 |
-| 插件宿主（Plugin Host） | 进程内模块 `asterpath-plugin-host`，负责启动/连接、握手、发现工具并注册为 `Provenance::External` |
-| 工具命名空间（Tool Namespace） | 外部工具对模型暴露时的 `<PluginId>__<名称>` 前缀约定；`__` 保留 |
+见 `GLOSSARY.md`「MCP 服务配置」「MCP 服务端」「工具命名空间」「必需插件」（对 MCP 服务同义）。
 
 边界：
 
-- 进程内模块（provider、storage、executor、agent loop 等）不是插件，没有 manifest；它们由组装根选择（§3.1）。
-- 插件是叶子能力：v1 只提供工具，不提供 provider、storage、executor 等核心能力（#2）。
-- 插件之间没有依赖关系；加载顺序不影响可用工具集。
+- 进程内模块（provider、storage、agent loop 等）没有配置；由组装根选择。
+- MCP 服务只提供工具，不提供 provider、storage 等核心能力（#2）。
+- 服务之间没有依赖关系；加载顺序不影响可用工具集。
 
-## 3. 加载形态
-
-### 3.1 进程内模块
-
-- 随宿主编译，经 Cargo 依赖进入二进制；组装根显式构造并注册。
-- "可选模块" = 独立 crate + 组装根的依赖/构造选择。
-- contract crate 与 module crate 一律不带 feature（ADR-0001）；facade / 参考 CLI 可用 feature 裁剪，具体布局归 [#15](https://github.com/zibyn/asterpath/issues/15)。
-- 没有 manifest，没有运行期发现，没有热替换。
-
-### 3.2 外部插件
-
-- host 构造一组 `PluginManifest`，交给 `asterpath-plugin-host`。
-- 插件宿主启动或连接插件、完成握手与能力发现，加载结果是 `Vec<Arc<dyn Tool>>`（`PluginHost::tools()`，由宿主交给 `AsterpathConfig.tools`），来源为 `Provenance::External { transport }`。
-- 一个插件可以提供多个工具。
-- 插件宿主自己不发现插件；清单从哪来（文件、代码、数据库）由 host 决定。
-
-## 4. 插件清单
+## 3. 嵌入
 
 ```rust
-pub struct PluginManifest {                  // host 构造或反序列化；字段集受 manifest_version 约束
-    pub manifest_version: u32,               // 只接受 1
-    pub id: PluginId,                        // [a-z0-9-]{1,32}
-    pub name: Option<String>,                // 缺省 = id
-    pub version: Option<String>,             // 插件自身版本；仅诊断，不参与门禁
-    pub required: bool,                      // 缺省 false
-    pub protocol: PluginProtocol,            // Mcp | Acp
-    pub protocol_versions: Vec<String>,      // 非空；精确匹配，不做范围
-    pub transport: PluginTransport,
-    pub capabilities: Vec<PluginCapability>, // 缺省 [Tools]
-    pub timeouts: PluginTimeouts,            // 缺省值见下
+let mcp = McpServers::load(configs, Some(Arc::new(LinuxSandbox::new())), policy).await?;
+let engine = AsterpathBuilder::new().tools(mcp.tools()) /* … */ .build().await?;
+// …运行…
+engine.shutdown().await; mcp.shutdown().await; // 先引擎、后 MCP
+```
+
+- 依赖：`asterpath` + `asterpath-mcp`（受限策略再加 `asterpath-sandbox-linux` 或宿主自己的 `SandboxProvider`）。
+- `statuses()` 按输入顺序给出每个配置的结果，供宿主展示。
+- `shutdown(self)` 对每个服务优雅关闭（stdio：关 stdin → 等宽限 → SIGTERM → SIGKILL）；之后仍被引擎持有的工具调用返回 `Transport`。不调用 `shutdown` 时，所有工具 drop 后 stdio 进程仍会被 kill。
+
+## 4. MCP 服务配置
+
+```rust
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub id: ServerId,                    // [a-z0-9-]{1,32}
+    pub transport: McpTransport,
+    pub required: bool,                  // 缺省 false
+    pub protocol_versions: Vec<String>,  // 非空；精确匹配，不做范围
+    pub timeouts: McpTimeouts,           // 缺省值见下
 }
 
-#[non_exhaustive]
-pub enum PluginProtocol {
-    Mcp,
-    Acp,
-}
-
-#[non_exhaustive]
-pub enum PluginTransport {                   // serde 内部标签 kind
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpTransport {
     Stdio {
         command: String,
         args: Vec<String>,
-        env: BTreeMap<String, String>,       // 追加到继承环境；同键覆盖
-        cwd: Option<PathBuf>,                // 缺省为宿主进程 cwd
+        env: BTreeMap<String, String>,   // 追加到继承环境；同键覆盖
+        cwd: Option<PathBuf>,            // 缺省为宿主进程 cwd
     },
     Http {
         url: String,
-        headers: BTreeMap<String, String>,   // 可选，缺省空；Debug 脱敏，不展开变量
+        headers: BTreeMap<String, String>, // Debug 脱敏，不展开变量
     },
 }
 
-pub enum PluginCapability {
-    Tools,                                   // v1 唯一支持的能力
-}
-
-pub struct PluginTimeouts {
-    pub startup: Option<Duration>,           // None -> 30s
-    pub call: Option<Duration>,              // None -> #7 external 默认 120s
+#[serde(deny_unknown_fields)]
+pub struct McpTimeouts {
+    pub startup: Option<Duration>,       // 字段 startup_ms；None -> 30s
+    pub call: Option<Duration>,          // 字段 call_ms；None -> 120s
 }
 ```
 
 序列化规则：
 
-- `transport` 用内部标签 `kind`（`stdio` / `http`）；`protocol`、`capabilities` 用小写字符串。
-- 超时在清单里用毫秒（`startup_ms` / `call_ms`），Rust 类型用 `Duration`；非正值是清单错误。
-- 未知字段忽略（与 #4 一致）；未知 enum 值、缺失必填字段、未知 `manifest_version`、声明未实现的能力，都是清单错误。
-- `version` 是自由字符串，不按 semver 校验，不参与任何兼容判断。
-- `capabilities` 缺省 `["tools"]`；声明 `tools` 之外的能力 = 加载失败，不静默忽略。
+- **未知字段一律拒绝**（顶层、`transport`、`timeouts`），包括旧插件清单的 `manifest_version`、`protocol`、`capabilities`、`name`、`version`。
+- 未知 `kind`、缺失必填字段、非正超时都是解析错误。
 
 示例：
 
 ```json
 {
-  "manifest_version": 1,
   "id": "weather",
-  "name": "Weather MCP",
-  "version": "0.3.1",
   "required": false,
-  "protocol": "mcp",
   "protocol_versions": ["2026-07-28"],
   "transport": {
     "kind": "stdio",
@@ -122,160 +92,83 @@ pub struct PluginTimeouts {
     "args": ["--stdio"],
     "env": { "WEATHER_API_KEY": "<secret>" }
   },
-  "capabilities": ["tools"],
   "timeouts": { "startup_ms": 30000, "call_ms": 120000 }
 }
 ```
 
 ### 4.1 传输与环境
 
-- `command` 直接交给操作系统执行，**不经过 shell**；`args` 原样传递，不做变量替换。
-- `env` 追加到宿主进程的环境；同键覆盖。框架不做 `${VAR}` 展开，host 在构造 manifest 前解析。
-- 秘密可以放在 `env` 或 HTTP `headers` 里；`Debug` 必须脱敏，错误信息只报字段名，不报值。
-- 插件进程**继承宿主进程的环境变量**；需要最小权限的宿主应在自己的进程中先净化环境。manifest 不是沙箱，也不声明沙箱档位；受限策略由宿主的 `SandboxProvider` 在进程启动前施加，provider 可经 `ConfinedSpawn.env` 收窄环境（[sandbox.md](sandbox.md)）。
-- manifest 本身不进入事件日志、trace 或 usage；它只是启动期配置。
+- `command` 直接交给操作系统执行，**不经过 shell**；`args` 原样传递。
+- `env` 追加到宿主进程的环境；同键覆盖。框架不做 `${VAR}` 展开。
+- 秘密可以放在 `env` 或 HTTP `headers` 里；`Debug` 脱敏，错误信息只报字段名，不报值。
+- 服务进程**继承宿主进程的环境变量**；配置不声明沙箱档位，受限策略由宿主的 `SandboxProvider` 在进程启动前施加，provider 可经 `ConfinedSpawn.env` 收窄环境（[sandbox.md](sandbox.md)）。
 
 ## 5. 加载规则
 
-每个插件的加载阶段固定为：
-
 ```text
-清单校验 -> 启动/连接（transport） -> 握手与版本协商（protocol） -> 能力发现 -> 名称合成与冲突校验 -> 原子注册
+配置校验 -> 沙箱（仅 stdio） -> 启动/连接 -> 握手与版本协商 -> 能力发现 -> 名称合成与冲突校验 -> 原子登记
 ```
 
-- **清单校验**在启动任何进程之前完成：`manifest_version`、`id` 字符集、`protocol_versions` 非空、能力受支持、超时为正。
-- **重复 `id`**：加载集合里共享同一 `id` 的所有 manifest 都失败；其中任一 `required` 则宿主启动失败。绝不"先到先得"。
-- **握手与版本协商**由协议 adapter 执行（[mcp.md](mcp.md)）；`protocol_versions` 是宿主接受的精确白名单，adapter 的协商结果必须命中，否则该插件失败。
-- **能力发现**（例如 MCP `tools/list`）由 adapter 完成；发现到的工具必须都能被命名空间规则合法暴露，否则整插件失败。
-- **原子注册**：先校验该插件的全部合成名称，再一次性注册；任何一个名称非法、超长或碰撞，都不注册该插件的任何工具。
-- 插件之间无依赖；宿主可以串行或并行加载，结果不依赖顺序。
-- 加载失败不产生半截状态：没有工具、没有连接、没有注册残留。
+- **配置校验**在启动任何进程之前完成：`id` 字符集、`protocol_versions` 非空且与 adapter 支持集有交集、超时为正。
+- **重复 `id`**：加载集合里共享同一 `id` 的所有配置都失败（`Config`）；其中任一 `required` 则加载返回 `McpError`。
+- **沙箱**：策略非 `FullAccess` 而没有 provider、provider 返回错误、或强制级别不是 `Full` → `Failed{Sandbox}`，进程不启动。`Enforcement::Partial` 暂时一律失败；`allow_partial` 落地后放开，并把强制级别透给宿主。
+- **握手、发现**由 adapter 完成（[mcp.md](mcp.md)）。
+- **原子登记**：先校验该服务的全部合成名称，再一次性加入工具集；任何名称非法、超长或与已加载工具碰撞，该服务不贡献任何工具。
+- 首个 `required` 失败即中止并返回 `McpError`；此前已加载的服务随之 drop（进程被 kill）。
 
 ## 6. 工具命名空间与冲突
 
-### 6.1 名称规则
-
-- **进程内工具**：裸名，字符集 `[A-Za-z0-9_-]`、长度 1–64；`__` 保留，出现在进程内工具名里是注册错误。
-- **外部工具**：`<plugin_id>__<sanitized_tool_name>`；模型与引擎工具表只看到合成名。
-- **sanitize**：把 `[A-Za-z0-9_-]` 之外的每个字符替换为 `_`，保留大小写；不做截断。
-- 合成名长度必须 1–64；超长或 sanitize 后为空 = 该插件加载失败。
-- 合成名在插件宿主加载的工具中全局唯一；重复是错误，不是覆盖（引擎工具表对重名保留先注册者）。
-
-### 6.2 冲突判定
-
-- 不同插件的 `id` 不同，而 `id` 不含 `_`，因此合成名天然带不同前缀；跨插件碰撞不可能发生。
-- 碰撞只可能发生在同一插件内部（两个原始工具名 sanitize 后相同）。此时整插件失败，不保留其中任何一个。
-- 同一插件多实例允许，但必须使用不同 `id`；同 `id` 多实例已在 §5 拒绝。
-- `spawn_agent` 等内置工具使用裸名，不会与外部工具的 `__` 命名空间相撞。
-
-### 6.3 映射
-
-插件宿主维护 `合成名 -> (plugin_id, 原始工具名)` 的映射：模型看到合成名，adapter 用原始名调用插件。`ToolCallRequested` 记录合成名，恢复与追踪都以合成名为准。
+- **进程内工具**：裸名 `[A-Za-z0-9_-]{1,64}`；`__` 保留。
+- **外部工具**：`<server_id>__<sanitized_tool_name>`；sanitize 把 `[A-Za-z0-9_-]` 之外的字符替换为 `_`，不截断；合成名 1–64，超长或为空 = 该服务失败。
+- 不同服务的 `id` 不同且不含 `_`，跨服务碰撞不可能；同一服务内两个原始名 sanitize 后相同 = 整个服务失败。
+- `ToolCallRequested` 记录合成名；adapter 用原始名调用。
 
 ## 7. 版本兼容
 
-### 7.1 合约 crate
-
-- 整个 workspace 锁同一版本；`asterpath` / `asterpath-protocol` 在 major 内保证源码兼容。
-- 1.0 之前 breaking 用 minor 版本，并写迁移说明；嵌入方用 caret。
-- module crate 不承诺独立兼容：必须与合约 crate 同一 workspace 版本。没有 ABI 承诺。
-- 公共稳定面最终由 [#15](https://github.com/zibyn/asterpath/issues/15) 收敛。
-
-### 7.2 外部插件协议
-
-- `protocol_versions` 是**精确字符串白名单**，不是 semver 范围；空列表是清单错误。
-- adapter 协商（MCP `server/discover`）返回的协议版本必须命中白名单；否则该插件加载失败。
-- 插件自身 `version` 只用于诊断展示，不参与兼容判断。
-- 不降级、不禁用部分能力、不尝试旧协议回退。
-- MCP v1 只支持 `2026-07-28`（无状态修订）；版本常量与 `server/discover` 协商见 [mcp.md](mcp.md)。
-- `PluginProtocol::Acp` 是清单能识别的值；M5 不实现 ACP（宿主/会话接口，不是工具传输，见 [mcp.md](mcp.md) §9）。识别值不等于实现，未实现的协议值使插件加载失败。
-
-### 7.3 Provider、model alias 与 raw
-
-- Provider 只有进程内路径（#2）：没有 manifest、没有动态加载、没有运行期版本协商；兼容性由合约 crate semver + 同 workspace 版本保证。
-- model alias 解析归 [#15](https://github.com/zibyn/asterpath/issues/15)；插件不提供 alias。
-- `RawProviderData.kind` 由 adapter 拥有、原样持久化；跨版本不翻译、不重新解释。旧 raw 若新 adapter 不能回放，按 #11 视为不可回放并记 trace；upcast 归 #4。
-
-### 7.4 清单版本与日志版本
-
-`manifest_version` 与 `LOG_SCHEMA_VERSION`（#4）相互独立：前者管插件清单形状，后者管事件日志。插件升级不需要日志迁移；清单形状变化只影响启动期解析。
+- `protocol_versions` 是精确字符串白名单；adapter 协商结果必须命中，否则 `Failed{Handshake}`。不降级、不回退。
+- MCP 只支持 `2026-07-28`（无状态修订），见 [mcp.md](mcp.md)。
+- 配置形状与 `LOG_SCHEMA_VERSION` 无关；配置不进日志。
 
 ## 8. 升级、恢复与在途调用
 
-- **没有热替换**：升级插件 = 重启宿主进程；运行中的会话靠日志恢复，不做运行期迁移。
-- **工具消失**（删除或改名）：
-  - 模型新请求该工具：pre-execute 照常运行；若未被拒绝，写 `ToolCallRequested`（`provenance = Unknown`，`replay = Unsafe`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。若 pre-execute 拒绝，写 `Denied`。
-  - 崩溃恢复遇到 open intent：`provenance = Unknown` 直接写 `Failed{NotFound}`；否则按记录里的 `replay` 处理——`Safe` 且工具不存在写 `Failed{NotFound}`，`Unsafe` 写 `Interrupted`（#3）。
-- **同名工具实现变更**：v1 不在 `ToolCallRequested` 里记录实现指纹；宿主/插件契约要求升级时保持同名工具的 replay 语义，否则插件应把该工具声明为 `Unsafe`。这是有意的 v1 边界。
-- **插件 server 在宿主运行中崩溃**：v1 不自动重连/重启（[mcp.md](mcp.md) §7.3）。stdio 在途调用记 `Failed{Transport}`，该插件在本进程内不可用；HTTP 每次调用独立。取消宽限到期记 `Interrupted`。manifest 在 v1 不定义重启策略。
+- **没有热替换**：升级服务 = 重启宿主进程；会话靠日志恢复。
+- **工具消失**：新请求写 `ToolCallRequested`（`provenance = Unknown`，`replay = Unsafe`）并以 `Failed{NotFound}` 闭合；恢复遇 open intent 按记录的 `replay` / `provenance` 处理（#3）。
+- **服务在运行中崩溃**：不自动重连（[mcp.md](mcp.md) §7.3）；stdio 在途调用记 `Failed{Transport}`。
 
 ## 9. 失败隔离与状态报告
 
-- **配置错误**（清单非法、重复 `id`）：相关 manifest 失败；若其中任一 `required`，宿主启动失败。
-- **运行期失败**（启动、握手、发现、注册）：`required: true` → 宿主启动失败；`required: false` → 插件不可用，宿主继续。
-- **没有隐式降级**：失败插件不贡献任何工具；模型看不到它；宿主不会得到"部分可用"的插件。
-- 加载结果按插件返回，供 host 记录/展示：
-
 ```rust
-pub enum PluginStatus {
+pub enum ServerStatus {
     Loaded { tools: Vec<ToolName> },
-    Failed { stage: PluginLoadStage, message: String },
-    Skipped { reason: String },              // host 策略显式跳过；框架不做发现
+    Failed { stage: LoadStage, message: String },
 }
 
-pub enum PluginLoadStage {
-    Manifest,
-    Spawn,
-    Handshake,
-    Discovery,
-    Registration,
-}
+pub enum LoadStage { Config, Sandbox, Spawn, Handshake, Discovery, Registration }
+
+pub struct McpError { pub server: ServerId, pub stage: LoadStage, pub message: String }
 ```
 
-- v1 不新增内核事件；状态与诊断由 host 消费。`message` 不得包含秘密值。
-- 可选插件失败后，宿主可以在自己的 UI/日志里展示状态；框架不提供插件管理面。
+- `required: false` 的失败只记状态；`required: true` 的失败使 `load` 返回 `McpError`。
+- 失败服务不贡献任何工具；`message` 不含秘密值。不新增内核事件。
 
-## 10. 与相邻票的边界
+## 10. 出界
 
-| 主题 | 归属 |
-| --- | --- |
-| manifest 形状、加载选择、`id`/命名空间/冲突、版本策略、安装边界 | **本票（#16）** |
-| 传输实现、MCP 版本常量、`server/discover`、`tools/list`、`tools/call`、取消、断连、协议错误映射 | [#20](./mcp.md)（已定） |
-| crate 打包、feature 布局、公共稳定面、`ToolName` 精确类型（v1 不提供 `plugin list`） | [#15](https://github.com/zibyn/asterpath/issues/15) / [#32](https://github.com/zibyn/asterpath/issues/32) |
-| 安装、更新、市场/registry、凭据/OAuth、环境变量展开、策略与脱敏 | host 或生态工具 |
-| provider / storage / executor / agent loop 等核心能力 | 进程内模块，不是插件（#2） |
+- 动态发现、运行期安装/卸载、热替换。
+- WASM / dylib 插件、registry、OAuth 与凭据管理。
+- MCP 之外的协议（ACP 若实现，是宿主 / 会话接口，不复用本工具来源，见 [mcp.md](mcp.md) §9）。
+- 部分工具登记；实现指纹恢复校验。
 
-## 11. v1 出界
-
-- 动态发现（扫目录、自动注册）与运行期安装/卸载。
-- 热替换、热重载、运行期升级。
-- WASM 与原生 dylib 插件。
-- registry / marketplace / 更新服务。
-- OAuth 与凭据管理；框架只接收 host 解析好的 manifest。
-- 插件提供 provider、storage、executor 等核心能力。
-- 插件提供 command / context 贡献（合约尚不存在）。
-- 部分工具注册：一个插件要么全部工具可用，要么整插件失败。
-- 实现指纹 / descriptor hash 恢复校验。
-- 自定义 stdio 插件协议（`CustomStdio`）：M5 不实现；清单只识别 `Mcp` 与 `Acp`。
-
-## 12. 验收场景
+## 11. 验收场景
 
 | # | 场景 | 断言 |
 | --- | --- | --- |
-| P1 | 两个 manifest 使用同一 `id` | 两个都失败；任一 `required` 则宿主启动失败；不注册任何工具 |
-| P2 | 同一插件的两个工具 sanitize 后同名（如 `a.b` 与 `a_b`），或合成名超 64 | 整插件失败，两个工具都不注册；其他插件不受影响 |
-| P3 | 握手返回的协议版本不在 `protocol_versions` | 插件 `Failed{Handshake}`；可选插件宿主继续，required 宿主失败 |
-| P4 | `required: true` 的插件启动失败 | 宿主启动失败；错误信息不含秘密值 |
-| P5 | 一个插件提供两个工具 | 注册为 `<id>__<name>`；模型看到合成名；adapter 用原始名调用；来源是 `Provenance::External` |
-| P6 | 重启后工具被删除，模型再次请求 | 写 `ToolCallRequested` 与 `ToolResult{Failed, NotFound}`，不执行、不审批；恢复场景按 §8 处理 |
-| P7 | manifest 带未知字段 / `manifest_version: 2` | 未知字段正常加载；未知版本 `Failed{Manifest}` |
-| P8 | 进程内模块 | 由 Cargo 依赖 + 组装根选择，无 manifest、无动态发现；工具名含 `__` 是注册错误 |
-| P9 | manifest 的 `env` 含秘密 | `Debug` 输出不含秘密值；manifest 不出现在事件日志、trace、usage |
-
-## 13. 留给下游
-
-- **#7**：`ToolErrorKind::NotFound`、未知工具管线路径、`Provenance::Unknown`、命名空间规则已回写 [tools.md](./tools.md)。
-- **#20**：已定。HTTP 静态 `headers` 随 `manifest_version: 1`；MCP 只支持 `2026-07-28`；unknown tool → `NotFound`；不自动重连。见 [mcp.md](./mcp.md)。
-- **#15 / #32**：`PluginManifest` / `PluginId` 的最终打包位置；feature 布局；`ToolName` 的精确类型与校验。v1 不提供 CLI `plugin list`，插件宿主归 M5。
-- **#4**：`Provenance` 新增 `Unknown` 值；日志 schema 在 v1 发布前完成该字段。
-- **#18**：manifest 不持久化，保留/归档无需处理插件清单。
+| P1 | 两个配置使用同一 `id` | 两个都 `Failed{Config}`；任一 `required` 则 `McpError`；不加载任何工具 |
+| P2 | 同一服务两个工具 sanitize 后同名，或合成名超 64 | 该服务失败，其他服务不受影响 |
+| P3 | 握手版本不在 `protocol_versions` | `Failed{Handshake}`；required 返回 `McpError` |
+| P4 | `required` 服务启动失败 | `McpError`；错误信息不含秘密值 |
+| P5 | 一个服务提供多个工具 | 以 `<id>__<name>` 暴露；来源 `Provenance::External` |
+| P6 | 重启后工具被删除，模型再次请求 | `ToolCallRequested` + `Failed{NotFound}`，不执行 |
+| P7 | 配置含未知字段（含旧 `manifest_version` / `protocol` / `capabilities`） | 解析失败 |
+| P9 | `env` / `headers` 含秘密 | `Debug` 不含秘密值；配置不进日志、trace、usage |
+| P10 | provider 返回 `Partial` | `Failed{Sandbox}`，进程未启动 |
+| P11 | `shutdown()` | stdio 进程已退出，即使引擎仍持有工具 |

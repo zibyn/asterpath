@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture};
 
-pub(crate) const ADAPTER_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
+/// Protocol versions this adapter speaks.
+pub const ADAPTER_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
 const MAX_LIST_PAGES: usize = 100;
 
 /// A failed request: either transport-level or a JSON-RPC error response.

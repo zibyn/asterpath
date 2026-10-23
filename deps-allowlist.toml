@@ -24,16 +24,11 @@ name = "asterpath-http"
 role = "adapter"
 allow = ["asterpath-protocol"]
 
-# `SandboxProvider` moves into protocol in #80 (ADR-0027).
-[[package]]
-name = "asterpath-sandbox"
-role = "adapter"
-allow = []
-
+# Linux bwrap backend for protocol's `SandboxProvider` (ADR-0027).
 [[package]]
 name = "asterpath-sandbox-linux"
 role = "adapter"
-allow = ["asterpath-sandbox"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-storage-sqlite"
@@ -50,10 +45,11 @@ name = "asterpath-provider-openai"
 role = "adapter"
 allow = ["asterpath-protocol", "asterpath-http"]
 
+# MCP tool source (ADR-0027).
 [[package]]
-name = "asterpath-plugin-host"
+name = "asterpath-mcp"
 role = "adapter"
-allow = ["asterpath-protocol", "asterpath-sandbox", "asterpath-http"]
+allow = ["asterpath-protocol", "asterpath-http"]
 
 [[package]]
 name = "asterpath-skills"
@@ -64,7 +60,7 @@ allow = ["asterpath-protocol"]
 [[package]]
 name = "asterpath-testing"
 role = "adapter"
-allow = ["asterpath-protocol", "asterpath-sandbox"]
+allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath"

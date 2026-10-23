@@ -1,5 +1,0 @@
-[package]
-name = "asterpath-sandbox"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true

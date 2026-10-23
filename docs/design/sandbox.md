@@ -1,8 +1,8 @@
 # 沙箱扩展模块：SandboxProvider 接缝与策略边界
 
-> 来源：[#21](https://github.com/zibyn/asterpath/issues/21)，2026-10-22 已定。本文件定义沙箱的接缝形状、策略模型、调用点、强制完整性与错误分类，以及与审批/插件/子会话的边界。
+> 来源：[#21](https://github.com/zibyn/asterpath/issues/21)，2026-10-22 已定。本文件定义沙箱的接缝形状、策略模型、调用点、强制完整性与错误分类，以及与审批/MCP 服务/子会话的边界。
 >
-> 对齐：[#7 工具契约](./tools.md)、[#8 子智能体](./subagents.md)、[#15 打包](./packaging.md)、[#16 插件清单](./plugins.md)、[#20 MCP adapter](./mcp.md)、[#3 事件日志](./event-log-recovery.md)。
+> 对齐：[#7 工具契约](./tools.md)、[#8 子智能体](./subagents.md)、[#15 打包](./packaging.md)、[#16 MCP 服务配置](./plugins.md)、[#20 MCP adapter](./mcp.md)、[#3 事件日志](./event-log-recovery.md)。
 >
 > 相关 ADR：[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 >
@@ -16,12 +16,13 @@
 
 - **沙箱是 spawn 点的纯变换**：`SandboxProvider::confine(SpawnRequest) -> ConfinedSpawn`，把「想启动的命令」变成「实际执行的命令」。它不是 `Tool` 装饰器。
 - **只有要起进程的调用点能被约束**：纯进程内 Rust 工具没有进程边界，OS 层面无法沙箱；包装器只能整次拒绝或审计。
-- **合约与后端分离**：合约 crate `asterpath-sandbox` 只含类型与 trait、零依赖；后端 crate 独立。v1 只在本文件定义合约形状，不建 crate、不实现、不进 workspace。
+- **合约与后端分离**：合约（`SandboxProvider`、`SpawnRequest`、`ConfinedSpawn`、`SandboxPolicy`、`Enforcement`、`SandboxError`）在 `asterpath-protocol` 的 `sandbox` 模块，只用 std（#80 / ADR-0027 起，原 `asterpath-sandbox` crate 已删除）；后端 crate（`asterpath-sandbox-linux`）独立并只依赖 protocol。宿主自写的 spawn 型工具直接用 protocol 中的合约。
+- **共享助手**：`SandboxPolicy::validate()`（`WorkspaceWrite` 的 `writable_roots` 必须非空且全为绝对路径，否则 `Unsupported`；provider 先调它）与 `ConfinedSpawn::unconfined(request)`（按请求原样构造 `Enforcement::Full`；`FullAccess` 直通与无 provider 路径使用）。
 - **策略只建模文件系统三档**：`ReadOnly` / `WorkspaceWrite` / `FullAccess`。网络与进程可见性不在 v1 schema 里。
 - **策略由宿主解析**：调用点静态配置 > session > 部署默认；模型参数不能放宽；不落日志、不进 `ConfigSnapshot`。
 - **默认 fail closed**：后端不能完整强制请求的策略就拒绝启动进程；`Partial` 必须宿主显式 opt-in。
 - **审批与沙箱正交**：`Allow` 不移除沙箱边界；v1 不做 escalation。
-- **插件清单不声明沙箱**；plugin-host 在每次进程启动前调用 provider。
+- **MCP 服务配置不声明沙箱**；`asterpath-mcp` 在每次 stdio 进程启动前调用 provider。
 - **子会话继承父的已解析策略**，只能收窄。
 
 ## 2. 范围与术语
@@ -64,7 +65,7 @@ pub struct ConfinedSpawn {                 // #[non_exhaustive]
 规则：
 
 - **纯变换、无状态、无 session**：策略已由调用方解析好；provider 不认 `SessionId`，可直接单测。
-- **完整环境进出**：调用方负责把继承环境与覆盖项合并成完整 `env`；provider 有权净化或追加。这样「插件进程继承宿主环境」的风险有了统一的收窄点。
+- **完整环境进出**：调用方负责把继承环境与覆盖项合并成完整 `env`；provider 有权净化或追加。这样「MCP 服务进程继承宿主环境」的风险有了统一的收窄点。
 - **返回数据，不返回 `Command`**：调用方自己构造进程与管道；stdio 归调用方，provider 不碰。
 - **不经过 shell**：`program` 与 `args` 原样传递，与 [#16](./plugins.md) 的传输规则一致。
 - provider 在组装期构造；后端缺失或初始化失败时由宿主决定中止启动，还是让受限调用点 fail closed。
@@ -75,7 +76,7 @@ pub struct ConfinedSpawn {                 // #[non_exhaustive]
 ```text
 宿主组装
   ├─ 构造 SandboxProvider（后端 + allow_partial）
-  ├─ 注入 plugin-host ──> 每次 MCP stdio 启动 ──> confine ──> spawn
+  ├─ 注入 asterpath-mcp ──> 每次 MCP stdio 启动 ──> confine ──> spawn
   ├─ 注入 spawn 型工具 ──> 每次子进程启动 ──> confine ──> spawn
   └─ 策略解析器（按 SessionId）
         └─ 工具调用时解析 policy ──> SpawnRequest.policy
@@ -86,7 +87,7 @@ HTTP MCP ──> 没有本地进程 ──> 不在沙箱范围
 
 | 调用点 | 能否约束 | 说明 |
 | --- | --- | --- |
-| plugin-host 启动 MCP stdio server | 是 | 启动时 constrain 一次；server 内部所有 tool call 共享同一边界，不再单独 confine |
+| asterpath-mcp 启动 MCP stdio server | 是 | 启动时 constrain 一次；server 内部所有 tool call 共享同一边界，不再单独 confine |
 | 宿主自带的 spawn 型工具（shell 等） | 是 | 每次 spawn 前调用 `confine` |
 | 纯进程内 Rust 工具 | 否 | 没有进程边界；只能由 pre-execute 或工具包装器整次拒绝/审计 |
 | HTTP MCP | 否 | 没有本地进程；网络维度不在 v1 策略里 |
@@ -156,7 +157,7 @@ pub enum SandboxError {
 | --- | --- |
 | `SandboxError::Refused` | `ToolError::Denied { message }` → `ToolResult{Failed, Denied}` |
 | `SandboxError::Unsupported` / `Setup` | `ToolError::Internal { message }` → `ToolResult{Failed, Internal}` |
-| 受限策略 + 没有 provider | 装配错误；工具调用点返回 `Internal`，plugin-host 让插件加载失败 |
+| 受限策略 + 没有 provider | 装配错误；工具调用点返回 `Internal`，`asterpath-mcp` 让该服务 `Failed{Sandbox}` |
 | 进程启动后的 `EACCES` / `EPERM` | 框架不可见；由工具自己的 `ToolError` 表达，**不是**管线的 `Denied` |
 
 - OS 运行期拒绝没有可靠签名：退出码、stderr、errno 都可能被工具吞掉或改写。框架不做启发式分类；需要区分的工具在 `invoke` 内自己判断，并选择 `Denied` 或 `Internal`。
@@ -170,15 +171,16 @@ pub enum SandboxError {
 - `ApprovalRequest` 不增加 sandbox 字段；`ApprovalPolicy` 是宿主代码，和沙箱解析器共享配置即可。
 - 宿主若要「先问再放宽」，只能在自己的 pre-execute 里换用更宽的已解析策略；框架不提供这条流程，也不记录它。
 
-## 9. 外部工具与插件
+## 9. 外部工具（MCP 服务）
 
-- `asterpath-plugin-host` 构造时注入 `Option<Arc<dyn SandboxProvider>>` 与部署级 `SandboxPolicy`；**每次进程启动**都先 `confine`。
-- **清单不声明沙箱**：`PluginManifest` 没有 sandbox 字段。manifest 是 host 提供的数据，让插件声明自己的约束等于让被约束方选择约束；[#16](./plugins.md) 的「manifest 不是沙箱」保持不变。
-- per-plugin 策略覆盖只作为宿主配置（按 `PluginId` 的宿主映射），不进 manifest，也不在 v1 规格里。
-- 受限策略 + 没有 provider：插件加载失败（`required` 则宿主启动失败），不裸跑。
+- `McpServers::load(configs, sandbox, policy)` 注入 `Option<Arc<dyn SandboxProvider>>` 与部署级 `SandboxPolicy`；**每次 stdio 进程启动**都先 `confine`。
+- **配置不声明沙箱**：`McpServerConfig` 没有 sandbox 字段（未知字段被拒绝）；让服务声明自己的约束等于让被约束方选择约束。
+- 按服务的策略覆盖只作为宿主配置（按 `ServerId` 的宿主映射），不进配置，也不在 v1 规格里。
+- 受限策略 + 没有 provider：该服务 `Failed{Sandbox}`（`required` 则 `McpError`），不裸跑。
+- **fail closed（现状）**：provider 返回的 `enforcement` 不是 `Full` 时，该服务 `Failed{Sandbox}`，进程不启动。`Enforcement::Partial` 变体保留；放开条件：后端落地 `allow_partial` 部署配置后，`asterpath-mcp` 接受 `Partial` 并把强制级别透给宿主（例如经 `ServerStatus`）。
 - MCP stdio：约束发生在 server 启动时；server 内部的 tool call 不再单独 confine——它们已经在同一个受限进程里。
 - MCP HTTP：没有本地进程可包，**不在沙箱范围**；受限策略不会阻止它。宿主若需要硬边界，必须自己禁用 HTTP 传输。
-- 插件重启 = 重新启动进程 = 重新 `confine`；不存在的「给运行中进程加沙箱」不做。
+- 服务重启 = 重新启动进程 = 重新 `confine`；不存在的「给运行中进程加沙箱」不做。
 - 环境净化：provider 可通过 `ConfinedSpawn.env` 删除继承变量；v1 不把它定义成策略档位的一部分，后端可以做得更严。
 
 ## 10. 子会话
@@ -207,10 +209,10 @@ pub enum SandboxError {
 
 **v1 交付（历史）**：
 
-- `asterpath-sandbox` 合约 crate 的形状（§3–§7）、本文件、ADR-0019、验收场景由 v1 交付。
-- M5 已实现该合约与 Linux bwrap 后端（`asterpath-sandbox` / `asterpath-sandbox-linux`），取代 v1 的“不建 crate、不写后端”；[#15](./packaging.md) 的预留名继续保留。
+- 合约形状（§3–§7）、本文件、ADR-0019、验收场景由 v1 交付。
+- M5 实现了合约 crate 与 Linux bwrap 后端；#80（ADR-0027）把合约并入 `asterpath-protocol`，`asterpath-sandbox-linux` 保留。
 
-**明确不做**：seccomp、网络隔离、PID/进程可见性、读白名单、Windows、进程内工具沙箱、escalation、热替换、manifest 声明策略、运行中改边界、把已运行进程纳入沙箱、mode 审计日志。
+**明确不做**：seccomp、网络隔离、PID/进程可见性、读白名单、Windows、进程内工具沙箱、escalation、热替换、配置声明策略、运行中改边界、把已运行进程纳入沙箱、mode 审计日志。
 
 ## 12. 测试与验收场景
 
@@ -226,7 +228,7 @@ pub enum SandboxError {
 | S4 | `Refused` | 无进程；`Failed{Denied}`，message 带 `sandbox:` 前缀 |
 | S5 | 策略优先级 | 调用点静态 > session > 部署默认；模型参数无法改变策略 |
 | S6 | 审批 Allow + `ReadOnly` | 仍按 `ReadOnly` 约束；Allow 不放宽沙箱 |
-| S7 | plugin-host 启动 stdio server | 以 `confine` 后的命令启动；server 内调用不再 confine |
+| S7 | `asterpath-mcp` 启动 stdio server | 以 `confine` 后的命令启动；server 内调用不再 confine |
 | S8 | HTTP MCP + 受限策略 | 不受沙箱约束；文档要求宿主自担（不在验收闸门） |
 | S9 | 子会话 | 继承父策略；收窄生效；放宽被拒 |
 | S10 | bwrap 缺失 | `Setup` → fail closed；不裸跑 |
@@ -237,7 +239,7 @@ pub enum SandboxError {
 
 - **#15**：facade / `AsterpathConfig` 不变；将来接入时，provider 与策略由模块/工具构造注入，不进稳定面。
 - **#20**：stdio 启动点调用 provider；HTTP 明确出界（[mcp.md](./mcp.md) §12）。
-- **#16**：清单无 sandbox 字段；受限策略下 plugin-host 必须有 provider，否则加载失败。
+- **#16 / #80**：配置无 sandbox 字段；受限策略下 `asterpath-mcp` 必须有 provider，否则 `Failed{Sandbox}`；非 `Full` 强制级别 fail closed。
 - **#8**：继承由宿主解析器完成；`ConfigSnapshot` 不变。
 - **#19**：无新故障注入点；`FakeSandboxProvider` 与 `tool:*` 装饰器足够。
-- **实现方**：先落合约 crate 与 fake，再接 plugin-host / spawn 型工具；参考后端按 §11 的映射实现。
+- **实现方**：合约在 protocol，fake 在 `asterpath-testing`，已接 `asterpath-mcp`；spawn 型工具同样调用 provider；参考后端按 §11 的映射实现。

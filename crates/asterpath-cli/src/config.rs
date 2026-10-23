@@ -9,10 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use asterpath_mcp::{
+    ADAPTER_PROTOCOL_VERSIONS, McpServerConfig, McpTimeouts, McpTransport, ServerId,
+};
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, ContextPolicy, ModelAlias,
     ModelId, ModelSpec, Provider, ProviderId, ReasoningEffort, ReasoningParams, RequestConfig,
-    SamplingParams, SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
+    SamplingParams, SandboxPolicy, SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -108,6 +111,7 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
     }
     // Resolve the value-shaped sections now so type errors exit 2, not at run.
     settings.file.request_config()?;
+    settings.mcp_servers()?;
     Ok(())
 }
 
@@ -141,7 +145,7 @@ pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSp
         model: ModelSpec {
             provider: ProviderId::new(provider),
             model: ModelId::new(model),
-            context_window: None,
+            context_window: settings.file.model.context_window,
         },
         system: Vec::new(),
         tools: asterpath_protocol::ToolSelection::All,
@@ -333,8 +337,11 @@ fn parse_effort(value: &str) -> Result<ReasoningEffort, String> {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
+    model: ModelSection,
+    sandbox: SandboxSection,
+    mcp_servers: BTreeMap<String, McpServerSection>,
     storage: StorageSection,
     providers: BTreeMap<String, ProviderSection>,
     turn: TurnSection,
@@ -348,25 +355,25 @@ pub struct FileConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct StorageSection {
     path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ProviderSection {
     base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct TurnSection {
     max_steps_per_turn: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RequestSection {
     max_output_tokens: Option<std::num::NonZeroU32>,
     tool_choice: Option<String>,
@@ -376,7 +383,7 @@ struct RequestSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SamplingSection {
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -385,7 +392,7 @@ struct SamplingSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ReasoningSection {
     effort: Option<String>,
     budget_tokens: Option<u32>,
@@ -393,12 +400,13 @@ struct ReasoningSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ToolsSection {
     max_parallel_calls: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelItem {
     provider: String,
     model: String,
@@ -417,7 +425,7 @@ impl ModelItem {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct CompactionSection {
     reserve_output_tokens: Option<u32>,
     target_ratio: Option<f32>,
@@ -427,7 +435,7 @@ struct CompactionSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SubagentSection {
     default_context: Option<ContextPolicy>,
     max_depth: Option<u8>,
@@ -438,16 +446,53 @@ struct SubagentSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ApprovalSection {
     default: Option<ApprovalMode>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SkillsSection {
     enabled: Option<bool>,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ModelSection {
+    /// Maps to `ModelSpec.context_window`; absent leaves compaction `NotConfigured`.
+    context_window: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    FullAccess,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SandboxSection {
+    mode: SandboxMode,
+}
+
+/// Codex-style `[mcp_servers.<id>]`: stdio uses `command`/`args`/`env`/`cwd`,
+/// HTTP uses `url`/`headers`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct McpServerSection {
+    command: Option<String>,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: Option<PathBuf>,
+    url: Option<String>,
+    headers: BTreeMap<String, String>,
+    required: bool,
+    protocol_versions: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -459,6 +504,58 @@ impl Settings {
     /// Explicit skill roots, highest priority first.
     pub fn skill_paths(&self) -> &[PathBuf] {
         &self.file.skills.paths
+    }
+
+    /// `[sandbox] mode`; `workspace-write` makes the working directory the
+    /// only writable root.
+    pub fn sandbox_policy(&self) -> SandboxPolicy {
+        match self.file.sandbox.mode {
+            SandboxMode::ReadOnly => SandboxPolicy::ReadOnly,
+            SandboxMode::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
+                writable_roots: std::env::current_dir().into_iter().collect(),
+            },
+            SandboxMode::FullAccess => SandboxPolicy::FullAccess,
+        }
+    }
+
+    /// `[mcp_servers.<id>]` mapped to adapter configs, in id order.
+    pub fn mcp_servers(&self) -> Result<Vec<McpServerConfig>, String> {
+        self.file
+            .mcp_servers
+            .iter()
+            .map(|(id, server)| {
+                let transport = match (&server.command, &server.url) {
+                    (Some(command), None) => McpTransport::Stdio {
+                        command: command.clone(),
+                        args: server.args.clone(),
+                        env: server.env.clone(),
+                        cwd: server.cwd.clone(),
+                    },
+                    (None, Some(url)) => McpTransport::Http {
+                        url: url.clone(),
+                        headers: server.headers.clone(),
+                    },
+                    _ => {
+                        return Err(format!(
+                            "mcp_servers.{id}: set exactly one of `command` or `url`"
+                        ));
+                    }
+                };
+                Ok(McpServerConfig {
+                    id: ServerId::new(id.clone())
+                        .map_err(|error| format!("mcp_servers.{id}: {error}"))?,
+                    transport,
+                    required: server.required,
+                    protocol_versions: server.protocol_versions.clone().unwrap_or_else(|| {
+                        ADAPTER_PROTOCOL_VERSIONS
+                            .iter()
+                            .map(|version| (*version).to_owned())
+                            .collect()
+                    }),
+                    timeouts: McpTimeouts::default(),
+                })
+            })
+            .collect()
     }
 }
 

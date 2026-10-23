@@ -1,4 +1,4 @@
-//! M5 end-to-end gate: the real fixture MCP server behind plugin-host, inside
+//! M5 end-to-end gate: the real fixture MCP server behind asterpath-mcp, inside
 //! bwrap, plus crash recovery from the same SQLite file.
 
 use std::collections::BTreeMap;
@@ -6,32 +6,29 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use asterpath_plugin_host::{
-    PluginCapability, PluginHost, PluginId, PluginLoadStage, PluginManifest, PluginProtocol,
-    PluginStatus, PluginTimeouts, PluginTransport,
+use asterpath_mcp::{
+    LoadStage, McpServerConfig, McpServers, McpTimeouts, McpTransport, ServerId, ServerStatus,
 };
+use asterpath_protocol::SandboxPolicy;
 use asterpath_protocol::{
     CancelToken, JsonString, Part, Provenance, SessionEvent, ToolContext, ToolErrorKind, ToolName,
     ToolResultStatus, TransportKind, TurnEndReason,
 };
 use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
-use asterpath_sandbox::SandboxPolicy;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use crate::common::{self, PluginScenario, Testdrive};
+use crate::common::{self, McpScenario, Testdrive};
 
-fn write_manifest(dir: &Path, name: &str, delay_ms: Option<u64>) -> PathBuf {
+fn write_config(dir: &Path, name: &str, delay_ms: Option<u64>) -> PathBuf {
     let mut args = vec!["--stdio".to_owned()];
     if let Some(delay) = delay_ms {
         args.push("--fault-delay-ms".to_owned());
         args.push(delay.to_string());
     }
-    let manifest = json!({
-        "manifest_version": 1,
+    let config = json!({
         "id": "fixture",
-        "protocol": "mcp",
         "protocol_versions": ["2026-07-28"],
         "transport": {
             "kind": "stdio",
@@ -41,15 +38,13 @@ fn write_manifest(dir: &Path, name: &str, delay_ms: Option<u64>) -> PathBuf {
         "timeouts": {"startup_ms": 30000, "call_ms": 120000},
     });
     let path = dir.join(name);
-    std::fs::write(&path, manifest.to_string()).expect("write manifest");
+    std::fs::write(&path, config.to_string()).expect("write MCP config");
     path
 }
 
-fn write_timeout_manifest(dir: &Path, name: &str, call_ms: u64, delay_ms: u64) -> PathBuf {
-    let manifest = json!({
-        "manifest_version": 1,
+fn write_timeout_config(dir: &Path, name: &str, call_ms: u64, delay_ms: u64) -> PathBuf {
+    let config = json!({
         "id": "fixture",
-        "protocol": "mcp",
         "protocol_versions": ["2026-07-28"],
         "transport": {
             "kind": "stdio",
@@ -59,22 +54,17 @@ fn write_timeout_manifest(dir: &Path, name: &str, call_ms: u64, delay_ms: u64) -
         "timeouts": {"startup_ms": 30000, "call_ms": call_ms},
     });
     let path = dir.join(name);
-    std::fs::write(&path, manifest.to_string()).expect("write manifest");
+    std::fs::write(&path, config.to_string()).expect("write MCP config");
     path
 }
 
-fn manifest(id: &str, transport: PluginTransport) -> PluginManifest {
-    PluginManifest {
-        manifest_version: 1,
-        id: PluginId::new(id).unwrap(),
-        name: None,
-        version: None,
+fn config(id: &str, transport: McpTransport) -> McpServerConfig {
+    McpServerConfig {
+        id: ServerId::new(id).unwrap(),
         required: false,
-        protocol: PluginProtocol::Mcp,
         protocol_versions: vec!["2026-07-28".to_owned()],
         transport,
-        capabilities: vec![PluginCapability::Tools],
-        timeouts: PluginTimeouts::default(),
+        timeouts: McpTimeouts::default(),
     }
 }
 
@@ -131,9 +121,9 @@ async fn events(db: &Path, session: SessionId) -> Vec<SessionEvent> {
     common::events(db, session).await
 }
 
-fn loaded_tools(status: &PluginStatus) -> &[ToolName] {
+fn loaded_tools(status: &ServerStatus) -> &[ToolName] {
     match status {
-        PluginStatus::Loaded { tools } => tools,
+        ServerStatus::Loaded { tools } => tools,
         other => panic!("expected Loaded, got {other:?}"),
     }
 }
@@ -141,18 +131,18 @@ fn loaded_tools(status: &PluginStatus) -> &[ToolName] {
 /// Scenario 1: discover / list / call through a real bwrap-confined stdio
 /// fixture, and the call is attributed to the external stdio transport.
 #[tokio::test]
-async fn e2e_stdio_plugin_loads_and_calls_inside_a_read_only_sandbox() {
+async fn e2e_stdio_server_loads_and_calls_inside_a_read_only_sandbox() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");
-    let manifest = write_manifest(dir.path(), "plugin.json", None);
+    let config = write_config(dir.path(), "mcp.json", None);
 
-    let lines = Testdrive::start_plugin(PluginScenario {
+    let lines = Testdrive::start_mcp(McpScenario {
         run: true,
         db: &db,
         fixture: "m5_echo.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&manifest),
+        configs: std::slice::from_ref(&config),
         sandbox: "read-only",
         kill_grace_ms: None,
     })
@@ -160,7 +150,7 @@ async fn e2e_stdio_plugin_loads_and_calls_inside_a_read_only_sandbox() {
     let session = common::session_id(&lines);
 
     // Discovery found all three fixture tools and the call completed.
-    let statuses = common::markers(&lines, "plugin_status");
+    let statuses = common::markers(&lines, "mcp_status");
     assert_eq!(statuses.len(), 1, "{statuses:?}");
     assert_eq!(statuses[0]["status"], "Loaded", "{statuses:?}");
     let mut tools: Vec<&str> = statuses[0]["tools"]
@@ -197,15 +187,15 @@ async fn safe_external_tool_reruns_once_after_a_host_sigkill() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");
-    let run_manifest = write_manifest(dir.path(), "run.json", Some(60_001));
-    let resume_manifest = write_manifest(dir.path(), "resume.json", None);
+    let run_config = write_config(dir.path(), "run.json", Some(60_001));
+    let resume_config = write_config(dir.path(), "resume.json", None);
 
-    let mut run = Testdrive::start_plugin(PluginScenario {
+    let mut run = Testdrive::start_mcp(McpScenario {
         run: true,
         db: &db,
         fixture: "m5_echo.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&run_manifest),
+        configs: std::slice::from_ref(&run_config),
         sandbox: "read-only",
         kill_grace_ms: None,
     });
@@ -216,12 +206,12 @@ async fn safe_external_tool_reruns_once_after_a_host_sigkill() {
     let session = common::session_id(&run_lines);
     common::assert_no_process(&common::mcp_fixture(), "60001");
 
-    let resume_lines = Testdrive::start_plugin(PluginScenario {
+    let resume_lines = Testdrive::start_mcp(McpScenario {
         run: false,
         db: &db,
         fixture: "m5_echo.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&resume_manifest),
+        configs: std::slice::from_ref(&resume_config),
         sandbox: "read-only",
         kill_grace_ms: None,
     })
@@ -251,15 +241,15 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");
-    let run_manifest = write_manifest(dir.path(), "run.json", Some(60_002));
-    let resume_manifest = write_manifest(dir.path(), "resume.json", None);
+    let run_config = write_config(dir.path(), "run.json", Some(60_002));
+    let resume_config = write_config(dir.path(), "resume.json", None);
 
-    let mut run = Testdrive::start_plugin(PluginScenario {
+    let mut run = Testdrive::start_mcp(McpScenario {
         run: true,
         db: &db,
         fixture: "m5_mutate.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&run_manifest),
+        configs: std::slice::from_ref(&run_config),
         sandbox: "read-only",
         kill_grace_ms: None,
     });
@@ -270,12 +260,12 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
     let session = common::session_id(&run_lines);
     common::assert_no_process(&common::mcp_fixture(), "60002");
 
-    let resume_lines = Testdrive::start_plugin(PluginScenario {
+    let resume_lines = Testdrive::start_mcp(McpScenario {
         run: false,
         db: &db,
         fixture: "m5_mutate.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&resume_manifest),
+        configs: std::slice::from_ref(&resume_config),
         sandbox: "read-only",
         kill_grace_ms: None,
     })
@@ -298,14 +288,13 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
     assert_eq!(turns(&events), vec![TurnEndReason::Completed]);
 }
 
-/// Scenario 4: a restricted policy without a provider fails the plugin load at
-/// `Spawn`, before any process could exist, and registers nothing.
+/// Scenario 4: a restricted policy without a provider fails the server load at
+/// `Sandbox`, before any process could exist, and loads nothing.
 #[tokio::test]
-async fn restricted_policy_without_a_provider_fails_at_spawn_before_any_process() {
-    let host = PluginHost::new(None, SandboxPolicy::ReadOnly);
-    let manifest = manifest(
+async fn restricted_policy_without_a_provider_fails_closed_before_any_process() {
+    let config = config(
         "fixture",
-        PluginTransport::Stdio {
+        McpTransport::Stdio {
             command: "definitely-not-a-real-binary".to_owned(),
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -313,37 +302,40 @@ async fn restricted_policy_without_a_provider_fails_at_spawn_before_any_process(
         },
     );
 
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    match &statuses[0] {
-        PluginStatus::Failed { stage, message } => {
-            assert_eq!(*stage, PluginLoadStage::Spawn);
+    let servers = McpServers::load(vec![config], None, SandboxPolicy::ReadOnly)
+        .await
+        .expect("optional");
+    match &servers.statuses()[0] {
+        ServerStatus::Failed { stage, message } => {
+            assert_eq!(*stage, LoadStage::Sandbox);
             assert!(
                 message.contains("requires a SandboxProvider"),
                 "failed at the provider check, not by trying to exec: {message}"
             );
         }
-        other => panic!("expected Failed at Spawn, got {other:?}"),
+        other => panic!("expected Failed at Sandbox, got {other:?}"),
     }
-    assert!(host.tools().is_empty());
+    assert!(servers.tools().is_empty());
 }
 
-/// Scenario 5: an HTTP plugin has no local process, so a restricted policy
+/// Scenario 5: an HTTP server has no local process, so a restricted policy
 /// without a provider neither blocks it nor sandboxes it.
 #[tokio::test]
-async fn http_plugin_loads_and_calls_without_a_sandbox() {
+async fn http_server_loads_and_calls_without_a_sandbox() {
     let fixture = HttpFixture::spawn().await;
-    let host = PluginHost::new(None, SandboxPolicy::ReadOnly);
-    let manifest = manifest(
+    let config = config(
         "fixture",
-        PluginTransport::Http {
+        McpTransport::Http {
             url: fixture.url(),
             headers: BTreeMap::new(),
         },
     );
 
-    let statuses = host.load(vec![manifest]).await.expect("load");
-    assert!(loaded_tools(&statuses[0]).contains(&ToolName::new("fixture__echo")));
-    let tool = host
+    let servers = McpServers::load(vec![config], None, SandboxPolicy::ReadOnly)
+        .await
+        .expect("load");
+    assert!(loaded_tools(&servers.statuses()[0]).contains(&ToolName::new("fixture__echo")));
+    let tool = servers
         .tools()
         .into_iter()
         .find(|tool| tool.descriptor().name == ToolName::new("fixture__echo"))
@@ -378,15 +370,15 @@ async fn pipeline_timeout_kills_the_server_and_later_calls_fail_transport() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");
-    let manifest = write_timeout_manifest(dir.path(), "plugin.json", 200, 5_000);
+    let config = write_timeout_config(dir.path(), "mcp.json", 200, 5_000);
 
     let started = Instant::now();
-    let lines = Testdrive::start_plugin(PluginScenario {
+    let lines = Testdrive::start_mcp(McpScenario {
         run: true,
         db: &db,
         fixture: "m5_timeout.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&manifest),
+        configs: std::slice::from_ref(&config),
         sandbox: "read-only",
         kill_grace_ms: Some(100),
     })
@@ -411,21 +403,21 @@ async fn pipeline_timeout_kills_the_server_and_later_calls_fail_transport() {
 }
 
 /// Scenario 7: crash mid-call on a `Safe` external tool, then resume with no
-/// plugin manifest. The tool is absent from the snapshot, so recovery records
+/// MCP config. The tool is absent from the snapshot, so recovery records
 /// exactly one intent and one `NotFound` result and never reruns it.
 #[tokio::test]
 async fn safe_external_tool_missing_after_resume_is_not_found_and_not_rerun() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");
-    let run_manifest = write_manifest(dir.path(), "run.json", Some(60_003));
+    let run_config = write_config(dir.path(), "run.json", Some(60_003));
 
-    let mut run = Testdrive::start_plugin(PluginScenario {
+    let mut run = Testdrive::start_mcp(McpScenario {
         run: true,
         db: &db,
         fixture: "m5_echo.json",
         effect: &effect,
-        manifests: std::slice::from_ref(&run_manifest),
+        configs: std::slice::from_ref(&run_config),
         sandbox: "read-only",
         kill_grace_ms: None,
     });
@@ -436,12 +428,12 @@ async fn safe_external_tool_missing_after_resume_is_not_found_and_not_rerun() {
     let session = common::session_id(&run_lines);
     common::assert_no_process(&common::mcp_fixture(), "60003");
 
-    let resume_lines = Testdrive::start_plugin(PluginScenario {
+    let resume_lines = Testdrive::start_mcp(McpScenario {
         run: false,
         db: &db,
         fixture: "m5_echo.json",
         effect: &effect,
-        manifests: &[],
+        configs: &[],
         sandbox: "read-only",
         kill_grace_ms: None,
     })
