@@ -1,7 +1,7 @@
 # asterpath-mcp-fixture
 
 Scriptable MCP server for the `2026-07-28` stateless revision. It implements the
-subset the Asterpath plugin host needs and is used by the plugin-host tests and
+subset `asterpath-mcp` needs and is used by the `asterpath-mcp` tests and
 the M5 end-to-end test. `publish = false`; dependencies are only `serde_json`
 and `tokio`.
 

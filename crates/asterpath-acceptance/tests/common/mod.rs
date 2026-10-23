@@ -157,13 +157,13 @@ pub struct Scenario<'a> {
     pub failpoints: Vec<String>,
 }
 
-/// M5 scenarios: the same driver plus a plugin manifest and a sandbox policy.
-pub struct PluginScenario<'a> {
+/// M5 scenarios: the same driver plus MCP server configs and a sandbox policy.
+pub struct McpScenario<'a> {
     pub run: bool,
     pub db: &'a Path,
     pub fixture: &'a str,
     pub effect: &'a Path,
-    pub manifests: &'a [PathBuf],
+    pub configs: &'a [PathBuf],
     pub sandbox: &'a str,
     pub kill_grace_ms: Option<u64>,
 }
@@ -175,7 +175,7 @@ impl Testdrive {
         Self::spawn(command, name)
     }
 
-    pub fn start_plugin(scenario: PluginScenario<'_>) -> Self {
+    pub fn start_mcp(scenario: McpScenario<'_>) -> Self {
         let name = scenario.fixture.to_owned();
         let mut command = Self::base_command(
             scenario.run,
@@ -184,8 +184,8 @@ impl Testdrive {
             scenario.effect,
             0,
         );
-        for manifest in scenario.manifests {
-            command.arg("--plugin-manifest").arg(manifest);
+        for config in scenario.configs {
+            command.arg("--mcp-config").arg(config);
         }
         command.arg("--sandbox").arg(scenario.sandbox);
         if let Some(grace) = scenario.kill_grace_ms {

@@ -3,12 +3,11 @@ resolver = "3"
 members = [
     "crates/asterpath-protocol",
     "crates/asterpath-http",
-    "crates/asterpath-sandbox",
     "crates/asterpath-sandbox-linux",
     "crates/asterpath-provider-openai",
     "crates/asterpath-storage-sqlite",
     "crates/asterpath-provider-anthropic",
-    "crates/asterpath-plugin-host",
+    "crates/asterpath-mcp",
     "crates/asterpath-skills",
     "crates/asterpath-mcp-fixture",
     "crates/asterpath-testing",

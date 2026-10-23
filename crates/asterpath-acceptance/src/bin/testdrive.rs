@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder};
-use asterpath_plugin_host::{PluginHost, PluginManifest, PluginStatus};
+use asterpath_mcp::{McpServerConfig, McpServers, ServerStatus};
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
@@ -23,7 +23,7 @@ use asterpath_protocol::{
     UserInput, decode_entry,
 };
 use asterpath_protocol::{InputId, SessionId, SessionStore};
-use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
+use asterpath_protocol::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
     Failpoint, FailpointEventLog, FailpointTool, Fixture, FixtureStep, ManualClock, Point,
@@ -56,7 +56,7 @@ struct Args {
     /// When set, use the real adapter for this id instead of the scripted one.
     provider: Option<String>,
     base_url: Option<String>,
-    plugin_manifests: Vec<PathBuf>,
+    mcp_configs: Vec<PathBuf>,
     sandbox: SandboxPolicy,
     sandbox_provider: bool,
     kill_grace: Duration,
@@ -79,7 +79,7 @@ fn run() -> Result<i32, String> {
     let mut specs = Vec::new();
     let mut provider = None;
     let mut base_url = None;
-    let mut plugin_manifests = Vec::new();
+    let mut mcp_configs = Vec::new();
     let mut policy = "full".to_owned();
     let mut writable_roots = Vec::new();
     let mut sandbox_provider = true;
@@ -92,9 +92,9 @@ fn run() -> Result<i32, String> {
             "--session" => session = args.next(),
             "--provider" => provider = args.next(),
             "--base-url" => base_url = args.next(),
-            "--plugin-manifest" => match args.next() {
-                Some(path) => plugin_manifests.push(PathBuf::from(path)),
-                None => return Ok(usage_error("--plugin-manifest needs a value")),
+            "--mcp-config" => match args.next() {
+                Some(path) => mcp_configs.push(PathBuf::from(path)),
+                None => return Ok(usage_error("--mcp-config needs a value")),
             },
             "--sandbox" => match args.next() {
                 Some(value) => policy = value,
@@ -149,7 +149,7 @@ fn run() -> Result<i32, String> {
         failpoints,
         provider,
         base_url,
-        plugin_manifests,
+        mcp_configs,
         sandbox,
         sandbox_provider,
         kill_grace,
@@ -438,20 +438,17 @@ async fn assemble(
     provider: Arc<dyn Provider>,
 ) -> Result<Asterpath, String> {
     let clock = Arc::new(ManualClock::new());
-    let plugin_tools = load_plugins(args).await?;
+    let mcp_tools = load_mcp(args).await?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let hold = Duration::from_millis(hold_millis(args.command == "run"));
     for name in &fixture.tools {
-        // External names are registered by plugin-host (or, after a resume
-        // without a manifest, intentionally absent).
+        // External names come from the MCP servers (or, after a resume
+        // without a config, are intentionally absent).
         if name.as_str().contains("__") {
             continue;
         }
-        // Plugin tools are already registered by the plugin host.
-        if plugin_tools
-            .iter()
-            .any(|tool| &tool.descriptor().name == name)
-        {
+        // MCP tools are added below.
+        if mcp_tools.iter().any(|tool| &tool.descriptor().name == name) {
             continue;
         }
         let mut tool: Arc<dyn Tool> = match name.as_str() {
@@ -466,7 +463,7 @@ async fn assemble(
         }
         tools.push(tool);
     }
-    tools.extend(plugin_tools);
+    tools.extend(mcp_tools);
 
     let provider: Arc<dyn Provider> = provider;
     let mut builder = AsterpathBuilder::new()
@@ -477,7 +474,7 @@ async fn assemble(
             kill_grace: args.kill_grace,
             ..ToolConfig::default()
         });
-    if !args.plugin_manifests.is_empty() {
+    if !args.mcp_configs.is_empty() {
         // External tools are `Ask` by default and there is no approval endpoint
         // in this driver, so the M5 scenarios allow them explicitly.
         builder = builder.approval(Arc::new(AllowExternal));
@@ -496,9 +493,9 @@ async fn assemble(
     builder.build().await.map_err(|error| error.to_string())
 }
 
-/// Loads the M5 plugin manifests and returns the registered external tools.
-async fn load_plugins(args: &Args) -> Result<Vec<Arc<dyn Tool>>, String> {
-    if args.plugin_manifests.is_empty() {
+/// Loads the M5 MCP server configs and returns their tools.
+async fn load_mcp(args: &Args) -> Result<Vec<Arc<dyn Tool>>, String> {
+    if args.mcp_configs.is_empty() {
         return Ok(Vec::new());
     }
     let sandbox: Option<Arc<dyn SandboxProvider>> =
@@ -507,70 +504,65 @@ async fn load_plugins(args: &Args) -> Result<Vec<Arc<dyn Tool>>, String> {
         } else {
             None
         };
-    let host = PluginHost::new(sandbox, args.sandbox.clone());
-    let manifests = read_manifests(&args.plugin_manifests)?;
-    match host.load(manifests).await {
-        Ok(statuses) => {
-            for status in &statuses {
-                emit_plugin_status(status);
-                if let PluginStatus::Failed { stage, message } = status {
-                    return Err(format!("plugin failed at {stage:?}: {message}"));
-                }
-            }
-        }
+    let configs = read_configs(&args.mcp_configs)?;
+    let servers = match McpServers::load(configs, sandbox, args.sandbox.clone()).await {
+        Ok(servers) => servers,
         Err(error) => {
             emit(json!({
-                "event": "plugin_status",
+                "event": "mcp_status",
                 "status": "Failed",
-                "id": error.plugin.as_str(),
+                "id": error.server.as_str(),
                 "stage": format!("{:?}", error.stage),
                 "message": error.message,
             }));
             return Err(error.to_string());
         }
+    };
+    for status in servers.statuses() {
+        emit_mcp_status(status);
+        if let ServerStatus::Failed { stage, message } = status {
+            return Err(format!("MCP server failed at {stage:?}: {message}"));
+        }
     }
-    Ok(host.tools())
+    // Dropping `servers` is fine here: the tools keep their connections and
+    // the stdio processes are killed when the engine drops them.
+    Ok(servers.tools())
 }
 
-/// Each file holds one manifest object or an array of them.
-fn read_manifests(paths: &[PathBuf]) -> Result<Vec<PluginManifest>, String> {
-    let mut manifests = Vec::new();
+/// Each file holds one MCP server config object or an array of them.
+fn read_configs(paths: &[PathBuf]) -> Result<Vec<McpServerConfig>, String> {
+    let mut configs = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("cannot read manifest {}: {error}", path.display()))?;
+            .map_err(|error| format!("cannot read MCP config {}: {error}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| format!("invalid manifest {}: {error}", path.display()))?;
+            .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
         let items = match value {
             serde_json::Value::Array(items) => items,
             value => vec![value],
         };
         for item in items {
-            manifests.push(
+            configs.push(
                 serde_json::from_value(item)
-                    .map_err(|error| format!("invalid manifest {}: {error}", path.display()))?,
+                    .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?,
             );
         }
     }
-    Ok(manifests)
+    Ok(configs)
 }
 
-fn emit_plugin_status(status: &PluginStatus) {
+fn emit_mcp_status(status: &ServerStatus) {
     let value = match status {
-        PluginStatus::Loaded { tools } => json!({
-            "event": "plugin_status",
+        ServerStatus::Loaded { tools } => json!({
+            "event": "mcp_status",
             "status": "Loaded",
             "tools": tools.iter().map(|tool| tool.as_str()).collect::<Vec<_>>(),
         }),
-        PluginStatus::Failed { stage, message } => json!({
-            "event": "plugin_status",
+        ServerStatus::Failed { stage, message } => json!({
+            "event": "mcp_status",
             "status": "Failed",
             "stage": format!("{stage:?}"),
             "message": message,
-        }),
-        PluginStatus::Skipped { reason } => json!({
-            "event": "plugin_status",
-            "status": "Skipped",
-            "reason": reason,
         }),
         _ => return,
     };

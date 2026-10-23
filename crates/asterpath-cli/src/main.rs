@@ -9,12 +9,13 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
+use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, Part, Role, SessionState,
-    Span, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope, UsageTotals, UserInput,
-    decode_entry, history,
+    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, Part, ProviderCatalog,
+    Role, SandboxPolicy, SandboxProvider, SessionState, Span, SpanId, SpanKind, SpanStatus, Tool,
+    TurnEndReason, UsageScope, UsageTotals, UserInput, decode_entry, history,
 };
 use asterpath_protocol::{
     Clock, InputId, LogEntry, SessionId, SessionStore, SystemClock, unique_bytes,
@@ -76,7 +77,8 @@ struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Parse and validate the configuration without initialising modules.
+    /// Validate the configuration and report each MCP server's load status,
+    /// without opening the database or the engine.
     Check(CheckArgs),
 }
 
@@ -161,7 +163,7 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         Command::Trace(args) => trace(args).await,
         Command::Usage(args) => usage(args).await,
         Command::Config(args) => match args.command {
-            ConfigCommand::Check(args) => config_check(args),
+            ConfigCommand::Check(args) => config_check(args).await,
         },
     }
 }
@@ -197,7 +199,7 @@ fn tty() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-fn config_check(args: CheckArgs) -> CliResult<()> {
+async fn config_check(args: CheckArgs) -> CliResult<()> {
     let settings = load(&args.common)?;
     // The `enabled` switch only governs new sessions, so diagnostics are
     // always available here.
@@ -206,6 +208,12 @@ fn config_check(args: CheckArgs) -> CliResult<()> {
     for diagnostic in discovery.diagnostics.iter().chain(&budget) {
         println!("skill: {diagnostic}");
     }
+    // Loading is the only way to report a server's status; stop them again.
+    let mcp = load_mcp(&settings).await?;
+    for line in mcp_status_lines(&settings, &mcp)? {
+        println!("{line}");
+    }
+    mcp.shutdown().await;
     println!("config ok");
     Ok(())
 }
@@ -221,7 +229,10 @@ async fn run(args: RunArgs) -> CliResult<()> {
     {
         eprintln!("skill: {diagnostic}");
     }
-    let tools = skills.tools();
+    let mcp = load_mcp(&settings).await?;
+    report_mcp_failures(&settings, &mcp)?;
+    let mut tools = skills.tools();
+    tools.extend(mcp.tools());
     let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
     if let Some(index) = skills.index.take() {
         spec.system.push(index);
@@ -240,13 +251,14 @@ async fn run(args: RunArgs) -> CliResult<()> {
         .map_err(aster_error)?;
 
     let outcome = drive_approving(&asterpath, &handle, approval).await?;
-    finish(asterpath, &handle, outcome, false).await
+    finish(asterpath, mcp, &handle, outcome, false).await
 }
 
 /// Shared tail: print the result, close the composition root and map the turn
 /// reason to the process exit code.
 async fn finish(
     asterpath: Asterpath,
+    mcp: McpServers,
     handle: &SessionHandle,
     outcome: DriveOutcome,
     print_idle: bool,
@@ -256,7 +268,10 @@ async fn finish(
     } else if let Some(text) = final_text(&asterpath, handle).await? {
         println!("{text}");
     }
-    asterpath.shutdown().await.map_err(aster_error)?;
+    // Engine first, then the MCP servers its tools call (ADR-0027).
+    let shutdown = asterpath.shutdown().await;
+    mcp.shutdown().await;
+    shutdown.map_err(aster_error)?;
 
     match outcome.reason {
         None | Some(TurnEndReason::Completed) => Ok(()),
@@ -276,12 +291,15 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     let providers = config::providers(&settings).map_err(CliError::config)?;
     // `resume` keeps the frozen index and always registers the loader; the
     // `[skills] enabled` switch only governs new sessions.
-    let tools = vec![Arc::new(LoadSkillTool::new(skill_roots(&settings))) as Arc<dyn Tool>];
+    let mcp = load_mcp(&settings).await?;
+    report_mcp_failures(&settings, &mcp)?;
+    let mut tools = vec![Arc::new(LoadSkillTool::new(skill_roots(&settings))) as Arc<dyn Tool>];
+    tools.extend(mcp.tools());
     let asterpath = assemble(&settings, providers, approval, tools).await?;
     let handle = asterpath.open_session(session).await.map_err(aster_error)?;
 
     let outcome = drive_approving(&asterpath, &handle, approval).await?;
-    finish(asterpath, &handle, outcome, true).await
+    finish(asterpath, mcp, &handle, outcome, true).await
 }
 
 async fn inspect(args: SessionArgs) -> CliResult<()> {
@@ -623,7 +641,11 @@ async fn assemble(
     approval: config::ApprovalMode,
     tools: Vec<Arc<dyn Tool>>,
 ) -> CliResult<Asterpath> {
+    // Sessions without a context window still report `NotConfigured`.
+    let catalog = ProviderCatalog::new(providers.clone())
+        .map_err(|error| CliError::config(error.to_string()))?;
     let mut builder = Asterpath::builder()
+        .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
         .database(&settings.db)
         .providers(providers)
         .tools(tools)
@@ -634,6 +656,58 @@ async fn assemble(
         builder = builder.approval(policy);
     }
     builder.build().await.map_err(aster_error)
+}
+
+/// Start every configured MCP server under the `[sandbox]` policy. A
+/// `required` failure is a configuration error.
+async fn load_mcp(settings: &config::Settings) -> CliResult<McpServers> {
+    let configs = settings.mcp_servers().map_err(CliError::config)?;
+    let policy = settings.sandbox_policy();
+    McpServers::load(configs, sandbox_provider(&policy), policy)
+        .await
+        .map_err(|error| CliError::config(error.to_string()))
+}
+
+/// bwrap on Linux. Elsewhere a restricted policy has no backend, so stdio
+/// servers fail closed at the sandbox stage unless the mode is `full-access`.
+fn sandbox_provider(policy: &SandboxPolicy) -> Option<Arc<dyn SandboxProvider>> {
+    #[cfg(target_os = "linux")]
+    if !matches!(policy, SandboxPolicy::FullAccess) {
+        return Some(Arc::new(asterpath_sandbox_linux::LinuxSandbox::new()));
+    }
+    let _ = policy;
+    None
+}
+
+/// One `mcp: <id> ...` line per configured server, in config order.
+fn mcp_status_lines(settings: &config::Settings, mcp: &McpServers) -> CliResult<Vec<String>> {
+    let configs = settings.mcp_servers().map_err(CliError::config)?;
+    Ok(configs
+        .iter()
+        .zip(mcp.statuses())
+        .map(|(config, status)| match status {
+            ServerStatus::Loaded { tools } => {
+                let mut names: Vec<&str> = tools.iter().map(|tool| tool.as_str()).collect();
+                names.sort_unstable();
+                format!("mcp: {} loaded: {}", config.id, names.join(", "))
+            }
+            ServerStatus::Failed { stage, message } => {
+                format!("mcp: {} failed at {stage:?}: {message}", config.id)
+            }
+            other => format!("mcp: {} {other:?}", config.id),
+        })
+        .collect())
+}
+
+/// Optional servers that failed are reported and skipped.
+fn report_mcp_failures(settings: &config::Settings, mcp: &McpServers) -> CliResult<()> {
+    let lines = mcp_status_lines(settings, mcp)?;
+    for (line, status) in lines.iter().zip(mcp.statuses()) {
+        if !matches!(status, ServerStatus::Loaded { .. }) {
+            eprintln!("{line}");
+        }
+    }
+    Ok(())
 }
 
 /// No providers and no drive: enough for log-derived projections.

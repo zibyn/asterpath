@@ -1,11 +1,11 @@
-//! Shared tool and plugin name rules.
+//! Shared tool and MCP server name rules.
 //!
 //! In-process tools use bare names; external tools are exposed as
-//! `<plugin_id>__<sanitized_tool_name>` and `__` is reserved for that namespace.
+//! `<server_id>__<sanitized_tool_name>` and `__` is reserved for that namespace.
 
 use crate::ids::ToolName;
 
-/// Why a tool or plugin name was rejected.
+/// Why a tool or MCP server name was rejected.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ToolNameError {
@@ -15,8 +15,8 @@ pub enum ToolNameError {
     ReservedSeparator,
     #[error("tool name exceeds 64 characters")]
     TooLong,
-    #[error("plugin id must be 1-32 characters of [a-z0-9-]")]
-    InvalidPluginId,
+    #[error("MCP server id must be 1-32 characters of [a-z0-9-]")]
+    InvalidServerId,
 }
 
 fn is_name_byte(byte: u8) -> bool {
@@ -39,7 +39,7 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolNameError> {
 }
 
 /// Validates an externally registered composed name: `[A-Za-z0-9_-]{1,64}`.
-/// `__` is allowed because plugin-host composes `<plugin_id>__<tool>`.
+/// `__` is allowed because asterpath-mcp composes `<server_id>__<tool>`.
 pub fn validate_external_tool_name(name: &str) -> Result<(), ToolNameError> {
     if name.is_empty() || name.len() > 64 || !name.bytes().all(is_name_byte) {
         return Err(ToolNameError::InvalidToolName);
@@ -47,8 +47,8 @@ pub fn validate_external_tool_name(name: &str) -> Result<(), ToolNameError> {
     Ok(())
 }
 
-/// Validates a plugin id: `[a-z0-9-]{1,32}`.
-pub fn validate_plugin_id(id: &str) -> Result<(), ToolNameError> {
+/// Validates an MCP server id: `[a-z0-9-]{1,32}`.
+pub fn validate_server_id(id: &str) -> Result<(), ToolNameError> {
     let valid = !id.is_empty()
         && id.len() <= 32
         && id
@@ -57,7 +57,7 @@ pub fn validate_plugin_id(id: &str) -> Result<(), ToolNameError> {
     if valid {
         Ok(())
     } else {
-        Err(ToolNameError::InvalidPluginId)
+        Err(ToolNameError::InvalidServerId)
     }
 }
 
@@ -68,14 +68,14 @@ pub fn sanitize_tool_name(raw: &str) -> String {
         .collect()
 }
 
-/// Composes the externally visible name `<plugin_id>__<sanitized raw name>`.
-pub fn external_tool_name(plugin_id: &str, raw: &str) -> Result<ToolName, ToolNameError> {
-    validate_plugin_id(plugin_id)?;
+/// Composes the externally visible name `<server_id>__<sanitized raw name>`.
+pub fn external_tool_name(server_id: &str, raw: &str) -> Result<ToolName, ToolNameError> {
+    validate_server_id(server_id)?;
     let sanitized = sanitize_tool_name(raw);
     if sanitized.is_empty() {
         return Err(ToolNameError::InvalidToolName);
     }
-    let name = format!("{plugin_id}__{sanitized}");
+    let name = format!("{server_id}__{sanitized}");
     if name.len() > 64 {
         return Err(ToolNameError::TooLong);
     }
@@ -123,9 +123,9 @@ mod tests {
     }
 
     #[test]
-    fn validates_plugin_ids() {
+    fn validates_server_ids() {
         for id in ["a", "weather-2", "0", &"a".repeat(32)] {
-            assert!(validate_plugin_id(id).is_ok(), "{id}");
+            assert!(validate_server_id(id).is_ok(), "{id}");
         }
         for id in [
             "",
@@ -136,8 +136,8 @@ mod tests {
             "dot.id",
         ] {
             assert_eq!(
-                validate_plugin_id(id),
-                Err(ToolNameError::InvalidPluginId),
+                validate_server_id(id),
+                Err(ToolNameError::InvalidServerId),
                 "{id}"
             );
         }

@@ -20,6 +20,7 @@ pub mod item;
 pub mod names;
 pub mod projection;
 pub mod provider;
+pub mod sandbox;
 pub mod time;
 pub mod tool;
 pub mod tracing;
@@ -67,12 +68,16 @@ pub use ids::{
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
 pub use names::{
     ToolNameError, external_tool_name, sanitize_tool_name, validate_external_tool_name,
-    validate_plugin_id, validate_tool_name,
+    validate_server_id, validate_tool_name,
 };
 pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, project};
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
     ProviderError, ProviderErrorKind, StreamEvent,
+};
+pub use sandbox::{
+    ConfinedSpawn, Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider,
+    SpawnRequest,
 };
 pub use time::{Clock, SystemClock, Timestamp, unique_bytes};
 pub use tool::{

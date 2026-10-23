@@ -642,6 +642,18 @@ async fn recovered_forced_compaction_retries_the_same_step() {
     )
     .await;
     // The forced compaction landed before the crash.
+    let caused_by = LogId::from_i64(4);
+    append_event(
+        &log,
+        SessionEvent::CompactionStarted {
+            trigger: asterpath_protocol::CompactionTrigger::ProviderError,
+            replaces_from: LogId::from_i64(1),
+            caused_by,
+            turn: Some(TURN),
+        },
+        Some(dedup::compaction(caused_by)),
+    )
+    .await;
     append_event(
         &log,
         SessionEvent::CompactionApplied {

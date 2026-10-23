@@ -16,7 +16,7 @@ use asterpath_protocol::{JsonString, ToolContext, ToolError, ToolOutput};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
-use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, PluginAdapter};
+use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, McpAdapter};
 use crate::mcp::{self, RpcClient, RpcFailure};
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -281,7 +281,7 @@ async fn call_impl(
     }
 }
 
-impl PluginAdapter for HttpAdapter {
+impl McpAdapter for HttpAdapter {
     fn handshake(&mut self) -> BoxFuture<'_, Result<AdapterHandshake, AdapterError>> {
         Box::pin(mcp::handshake(self, self.startup))
     }
@@ -299,7 +299,7 @@ impl PluginAdapter for HttpAdapter {
         Box::pin(call_impl(self, original_name, args, ctx))
     }
 
-    fn shutdown(&mut self) -> BoxFuture<'_, ()> {
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.dead.store(true, Ordering::SeqCst);
         })

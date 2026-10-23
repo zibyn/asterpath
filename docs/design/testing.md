@@ -10,7 +10,7 @@
 - 五个注入点中，**四个是 `asterpath-testing` 里的 trait 装饰器**，一个是**手动时钟**；core / protocol 不新增注入钩子。
 - 装饰器命中后的动作只有两档：`Halt`（写 marker 后永久挂起，由父进程 `SIGKILL`）与 `Panic`（进程内测试）。
 - **不用 panic / `abort` / `exit` / 注入异常冒充崩溃**；进程级验收一律真 `SIGKILL`（[acceptance.md](../spec/acceptance.md) §1）。
-- core 新增最小 `Clock { now() }` + `SystemClock`；`Storage` 保持显式 `now: Timestamp`（#5 不变）；`ManualClock` 在 `asterpath-testing`。
+- core 新增最小 `Clock { now() }` + `SystemClock`；存储契约不收时间（#73）；`ManualClock` 在 `asterpath-testing`。
 - 后端中立契约套件：**G2–G7 在 in-memory 与 SQLite 上都跑**；G1、G8、`Corrupt`、WAL/`flock`、迁移只测 SQLite。
 - CI 分三层：单测+契约（5 分钟）、进程级验收（Linux，整套 5 分钟，单 marker 等待 15 秒）、feature 矩阵。
 - 验收 fixture 单一来源：`asterpath-acceptance/fixtures/*.json`；#6 的 L 场景与 #17 的 R 场景复用，不另建。

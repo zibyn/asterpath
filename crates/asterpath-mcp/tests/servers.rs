@@ -1,4 +1,4 @@
-//! Plugin-host acceptance scenarios P1-P5, P7-P9 and MCP M1-M17, driven by the
+//! MCP tool source scenarios P1-P5, P7-P9 and MCP M1-M17, driven by the
 //! real `asterpath-mcp-fixture` binary over stdio and Streamable HTTP.
 
 use std::collections::BTreeMap;
@@ -8,16 +8,16 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath_plugin_host::{
-    PluginCapability, PluginHost, PluginId, PluginLoadStage, PluginManifest, PluginProtocol,
-    PluginStatus, PluginTimeouts, PluginTransport,
+use asterpath_mcp::{
+    LoadStage, McpError, McpServerConfig, McpServers, McpTimeouts, McpTransport, ServerId,
+    ServerStatus,
 };
 use asterpath_protocol::{
     CancelToken, JsonString, Parallelism, Part, Provenance, ReplaySafety, SideEffect, Tool,
     ToolContext, ToolError, ToolName, ToolOutput, TransportKind,
 };
+use asterpath_protocol::{SandboxPolicy, SandboxProvider};
 use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
-use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_testing::FakeSandboxProvider;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -53,41 +53,31 @@ fn fixture_bin() -> PathBuf {
     bin
 }
 
-fn stdio_manifest(id: &str, args: &[&str]) -> PluginManifest {
-    PluginManifest {
-        manifest_version: 1,
-        id: PluginId::new(id).unwrap(),
-        name: None,
-        version: None,
+fn stdio_config(id: &str, args: &[&str]) -> McpServerConfig {
+    McpServerConfig {
+        id: ServerId::new(id).unwrap(),
         required: false,
-        protocol: PluginProtocol::Mcp,
         protocol_versions: vec!["2026-07-28".to_owned()],
-        transport: PluginTransport::Stdio {
+        transport: McpTransport::Stdio {
             command: fixture_bin().to_string_lossy().into_owned(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             env: BTreeMap::new(),
             cwd: None,
         },
-        capabilities: vec![PluginCapability::Tools],
-        timeouts: PluginTimeouts::default(),
+        timeouts: McpTimeouts::default(),
     }
 }
 
-fn http_manifest(id: &str, url: &str, headers: BTreeMap<String, String>) -> PluginManifest {
-    PluginManifest {
-        manifest_version: 1,
-        id: PluginId::new(id).unwrap(),
-        name: None,
-        version: None,
+fn http_config(id: &str, url: &str, headers: BTreeMap<String, String>) -> McpServerConfig {
+    McpServerConfig {
+        id: ServerId::new(id).unwrap(),
         required: false,
-        protocol: PluginProtocol::Mcp,
         protocol_versions: vec!["2026-07-28".to_owned()],
-        transport: PluginTransport::Http {
+        transport: McpTransport::Http {
             url: url.to_owned(),
             headers,
         },
-        capabilities: vec![PluginCapability::Tools],
-        timeouts: PluginTimeouts::default(),
+        timeouts: McpTimeouts::default(),
     }
 }
 
@@ -145,25 +135,29 @@ impl HttpFixture {
     }
 }
 
-fn host(sandbox: Option<Arc<dyn SandboxProvider>>, policy: SandboxPolicy) -> PluginHost {
-    PluginHost::new(sandbox, policy)
+/// The embedder's sandbox wiring, reused across loads in one test.
+struct Host(Option<Arc<dyn SandboxProvider>>, SandboxPolicy);
+
+fn host(sandbox: Option<Arc<dyn SandboxProvider>>, policy: SandboxPolicy) -> Host {
+    Host(sandbox, policy)
 }
 
-/// Name lookups over the host's loaded tools.
+impl Host {
+    async fn load(&self, configs: Vec<McpServerConfig>) -> Result<McpServers, McpError> {
+        McpServers::load(configs, self.0.clone(), self.1.clone()).await
+    }
+}
+
+/// Name lookup over the loaded tools.
 trait Loaded {
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>>;
-    fn list(&self) -> Vec<Arc<dyn Tool>>;
 }
 
-impl Loaded for PluginHost {
+impl Loaded for McpServers {
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
         self.tools()
             .into_iter()
             .find(|tool| &tool.descriptor().name == name)
-    }
-
-    fn list(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools()
     }
 }
 
@@ -177,8 +171,8 @@ fn context() -> ToolContext {
     )
 }
 
-async fn invoke(host: &PluginHost, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
-    let tool = host
+async fn invoke(servers: &McpServers, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
+    let tool = servers
         .get(&ToolName::new(name))
         .unwrap_or_else(|| panic!("tool {name} is registered"));
     tool.invoke(JsonString::new(args.to_string()), context())
@@ -191,16 +185,16 @@ fn text(value: &str) -> Part {
     }
 }
 
-fn loaded_tools(status: &PluginStatus) -> &[ToolName] {
+fn loaded_tools(status: &ServerStatus) -> &[ToolName] {
     match status {
-        PluginStatus::Loaded { tools } => tools,
+        ServerStatus::Loaded { tools } => tools,
         other => panic!("expected Loaded, got {other:?}"),
     }
 }
 
-fn failed_stage(status: &PluginStatus) -> PluginLoadStage {
+fn failed_stage(status: &ServerStatus) -> LoadStage {
     match status {
-        PluginStatus::Failed { stage, .. } => *stage,
+        ServerStatus::Failed { stage, .. } => *stage,
         other => panic!("expected Failed, got {other:?}"),
     }
 }
@@ -210,49 +204,50 @@ fn failed_stage(status: &PluginStatus) -> PluginLoadStage {
 #[tokio::test]
 async fn p1_duplicate_ids_fail_every_manifest_and_register_nothing() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let first = stdio_manifest("dup", &["--stdio"]);
-    let second = stdio_manifest("dup", &["--stdio"]);
+    let first = stdio_config("dup", &["--stdio"]);
+    let second = stdio_config("dup", &["--stdio"]);
 
-    let statuses = host.load(vec![first, second]).await.expect("optional");
+    let servers = host.load(vec![first, second]).await.expect("optional");
+    let statuses = servers.statuses();
     assert_eq!(statuses.len(), 2);
-    for status in &statuses {
-        assert_eq!(failed_stage(status), PluginLoadStage::Manifest);
+    for status in statuses {
+        assert_eq!(failed_stage(status), LoadStage::Config);
     }
-    assert!(host.list().is_empty());
+    assert!(servers.tools().is_empty());
 }
 
 #[tokio::test]
 async fn p1_a_required_duplicate_aborts_startup() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let first = stdio_manifest("dup", &["--stdio"]);
-    let mut second = stdio_manifest("dup", &["--stdio"]);
+    let first = stdio_config("dup", &["--stdio"]);
+    let mut second = stdio_config("dup", &["--stdio"]);
     second.required = true;
 
     let error = host.load(vec![first, second]).await.unwrap_err();
-    assert_eq!(error.plugin.as_str(), "dup");
-    assert_eq!(error.stage, PluginLoadStage::Manifest);
-    assert!(host.list().is_empty());
+    assert_eq!(error.server.as_str(), "dup");
+    assert_eq!(error.stage, LoadStage::Config);
 }
 
-// P2 (registration atomicity is unit-tested; this checks plugin isolation) --
+// P2 (registration atomicity is unit-tested; this checks server isolation) --
 
 #[tokio::test]
-async fn p2_one_broken_plugin_does_not_affect_another() {
+async fn p2_one_broken_server_does_not_affect_another() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let mut broken = stdio_manifest("broken", &[]);
-    broken.transport = PluginTransport::Stdio {
+    let mut broken = stdio_config("broken", &[]);
+    broken.transport = McpTransport::Stdio {
         command: "/nonexistent/asterpath-test-binary".to_owned(),
         args: Vec::new(),
         env: BTreeMap::new(),
         cwd: None,
     };
-    let good = stdio_manifest("good", &["--stdio"]);
+    let good = stdio_config("good", &["--stdio"]);
 
-    let statuses = host.load(vec![broken, good]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Spawn);
+    let servers = host.load(vec![broken, good]).await.expect("optional");
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Spawn);
     assert_eq!(loaded_tools(&statuses[1]).len(), 3);
-    assert!(host.get(&ToolName::new("good__echo")).is_some());
-    assert!(host.get(&ToolName::new("broken__echo")).is_none());
+    assert!(servers.get(&ToolName::new("good__echo")).is_some());
+    assert!(servers.get(&ToolName::new("broken__echo")).is_none());
 }
 
 // P3 / M4 --------------------------------------------------------------
@@ -260,15 +255,16 @@ async fn p2_one_broken_plugin_does_not_affect_another() {
 #[tokio::test]
 async fn p3_version_mismatch_fails_handshake_and_required_aborts() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let manifest = stdio_manifest("weather", &["--stdio", "--force-version-mismatch"]);
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
-    assert!(host.list().is_empty());
+    let config = stdio_config("weather", &["--stdio", "--force-version-mismatch"]);
+    let servers = host.load(vec![config]).await.expect("optional");
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
+    assert!(servers.tools().is_empty());
 
-    let mut required = stdio_manifest("weather", &["--stdio", "--force-version-mismatch"]);
+    let mut required = stdio_config("weather", &["--stdio", "--force-version-mismatch"]);
     required.required = true;
     let error = host.load(vec![required]).await.unwrap_err();
-    assert_eq!(error.stage, PluginLoadStage::Handshake);
+    assert_eq!(error.stage, LoadStage::Handshake);
 }
 
 #[tokio::test]
@@ -278,13 +274,14 @@ async fn m4_a_server_without_a_common_version_fails_handshake_without_spawning()
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let manifest = stdio_manifest(
+    let config = stdio_config(
         "weather",
         &["--stdio", "--supported-versions", "2027-01-01"],
     );
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
-    assert!(host.list().is_empty());
+    let servers = host.load(vec![config]).await.expect("optional");
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
+    assert!(servers.tools().is_empty());
     assert_eq!(provider.recorded().len(), 1);
 }
 
@@ -295,10 +292,11 @@ async fn version_intersection_is_checked_before_spawn() {
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let mut manifest = stdio_manifest("weather", &["--stdio"]);
-    manifest.protocol_versions = vec!["2025-11-25".to_owned()];
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
+    let mut config = stdio_config("weather", &["--stdio"]);
+    config.protocol_versions = vec!["2025-11-25".to_owned()];
+    let servers = host.load(vec![config]).await.expect("optional");
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     assert!(provider.recorded().is_empty());
 }
 
@@ -307,34 +305,29 @@ async fn version_intersection_is_checked_before_spawn() {
 #[tokio::test]
 async fn p4_required_spawn_failure_aborts_and_never_leaks_secrets() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let mut manifest = stdio_manifest("bad", &[]);
-    manifest.required = true;
-    manifest.transport = PluginTransport::Stdio {
+    let mut config = stdio_config("bad", &[]);
+    config.required = true;
+    config.transport = McpTransport::Stdio {
         command: "/nonexistent/asterpath-test-binary".to_owned(),
         args: Vec::new(),
         env: BTreeMap::from([("SECRET".to_owned(), "s3cr4t".to_owned())]),
         cwd: None,
     };
-    let debug = format!("{manifest:?}");
+    let debug = format!("{config:?}");
     assert!(!debug.contains("s3cr4t"), "{debug}");
 
-    let error = host.load(vec![manifest]).await.unwrap_err();
-    assert_eq!(error.stage, PluginLoadStage::Spawn);
+    let error = host.load(vec![config]).await.unwrap_err();
+    assert_eq!(error.stage, LoadStage::Spawn);
     assert!(!error.to_string().contains("s3cr4t"));
-    assert!(host.list().is_empty());
 }
 
 #[test]
 fn p9_manifest_debug_redacts_env_and_header_values() {
-    let stdio = PluginManifest {
-        manifest_version: 1,
-        id: PluginId::new("weather").unwrap(),
-        name: None,
-        version: None,
+    let stdio = McpServerConfig {
+        id: ServerId::new("weather").unwrap(),
         required: false,
-        protocol: PluginProtocol::Mcp,
         protocol_versions: vec!["2026-07-28".to_owned()],
-        transport: PluginTransport::Stdio {
+        transport: McpTransport::Stdio {
             command: "weather-mcp".to_owned(),
             args: vec!["--stdio".to_owned()],
             env: BTreeMap::from([
@@ -343,15 +336,14 @@ fn p9_manifest_debug_redacts_env_and_header_values() {
             ]),
             cwd: None,
         },
-        capabilities: vec![PluginCapability::Tools],
-        timeouts: PluginTimeouts::default(),
+        timeouts: McpTimeouts::default(),
     };
     let debug = format!("{stdio:?}");
     assert!(!debug.contains("s3cr4t"), "{debug}");
     assert!(debug.contains("WEATHER_API_KEY"), "{debug}");
 
-    let http = PluginManifest {
-        transport: PluginTransport::Http {
+    let http = McpServerConfig {
+        transport: McpTransport::Http {
             url: "https://example.test/mcp".to_owned(),
             headers: BTreeMap::from([(
                 "Authorization".to_owned(),
@@ -374,9 +366,10 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let manifest = stdio_manifest("weather", &["--stdio", "--page-size", "1"]);
+    let config = stdio_config("weather", &["--stdio", "--page-size", "1"]);
 
-    let statuses = host.load(vec![manifest]).await.expect("load");
+    let servers = host.load(vec![config]).await.expect("load");
+    let statuses = servers.statuses();
     assert_eq!(
         loaded_tools(&statuses[0]),
         &[
@@ -391,7 +384,7 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
     assert_eq!(recorded[0].program, fixture_bin().into_os_string());
     assert_eq!(recorded[0].policy, SandboxPolicy::ReadOnly);
 
-    let echo = host
+    let echo = servers
         .get(&ToolName::new("weather__echo"))
         .unwrap()
         .descriptor()
@@ -408,7 +401,7 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
     assert_eq!(echo.side_effect, SideEffect::ReadOnly);
     assert_eq!(echo.replay, ReplaySafety::Safe);
 
-    let mutate = host
+    let mutate = servers
         .get(&ToolName::new("weather__mutate"))
         .unwrap()
         .descriptor()
@@ -416,12 +409,12 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
     assert_eq!(mutate.side_effect, SideEffect::Mutating);
     assert_eq!(mutate.replay, ReplaySafety::Unsafe);
 
-    let output = invoke(&host, "weather__echo", json!({"text": "hi"}))
+    let output = invoke(&servers, "weather__echo", json!({"text": "hi"}))
         .await
         .expect("call");
     assert_eq!(output.content, vec![text("hi")]);
 
-    let mutation = invoke(&host, "weather__mutate", json!({}))
+    let mutation = invoke(&servers, "weather__mutate", json!({}))
         .await
         .expect("call");
     assert_eq!(mutation.content[0], text("mutation 1"));
@@ -430,11 +423,12 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
 #[tokio::test]
 async fn m14_maps_every_content_block_and_structured_content() {
     let host = host(None, SandboxPolicy::FullAccess);
-    host.load(vec![stdio_manifest("weather", &["--stdio"])])
+    let servers = host
+        .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("load");
 
-    let output = invoke(&host, "weather__content", json!({}))
+    let output = invoke(&servers, "weather__content", json!({}))
         .await
         .expect("call");
     assert_eq!(
@@ -460,49 +454,52 @@ async fn m14_maps_every_content_block_and_structured_content() {
 #[tokio::test]
 async fn m5_a_repeated_cursor_fails_discovery() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let statuses = host
-        .load(vec![stdio_manifest(
+    let servers = host
+        .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-repeat-cursor"],
         )])
         .await
         .expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Discovery);
-    assert!(host.list().is_empty());
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Discovery);
+    assert!(servers.tools().is_empty());
 }
 
 #[tokio::test]
 async fn m5_more_than_100_pages_fails_discovery() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let statuses = host
-        .load(vec![stdio_manifest(
+    let servers = host
+        .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-endless-pages"],
         )])
         .await
         .expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Discovery);
-    assert!(host.list().is_empty());
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Discovery);
+    assert!(servers.tools().is_empty());
 }
 
-// S8: registration failure is isolated per plugin ---------------------
+// S8: registration failure is isolated per server ---------------------
 
 #[tokio::test]
-async fn s8_a_broken_plugin_registers_nothing_and_a_healthy_one_still_loads() {
+async fn s8_a_broken_server_registers_nothing_and_a_healthy_one_still_loads() {
     for tool_set in ["collision", "oversized"] {
         let host = host(None, SandboxPolicy::FullAccess);
-        let broken = stdio_manifest("broken", &["--stdio", "--tool-set", tool_set]);
-        let healthy = stdio_manifest("healthy", &["--stdio"]);
+        let broken = stdio_config("broken", &["--stdio", "--tool-set", tool_set]);
+        let healthy = stdio_config("healthy", &["--stdio"]);
 
-        let statuses = host.load(vec![broken, healthy]).await.expect("load");
+        let servers = host.load(vec![broken, healthy]).await.expect("load");
+        let statuses = servers.statuses();
         assert_eq!(
             failed_stage(&statuses[0]),
-            PluginLoadStage::Registration,
+            LoadStage::Registration,
             "{tool_set}"
         );
         assert!(loaded_tools(&statuses[1]).len() == 3, "{tool_set}");
-        let names: Vec<String> = host
-            .list()
+        let names: Vec<String> = servers
+            .tools()
             .iter()
             .map(|tool| tool.descriptor().name.as_str().to_owned())
             .collect();
@@ -519,14 +516,17 @@ async fn s8_a_broken_plugin_registers_nothing_and_a_healthy_one_still_loads() {
 #[tokio::test]
 async fn m7_is_error_maps_to_internal_with_joined_text() {
     let host = host(None, SandboxPolicy::FullAccess);
-    host.load(vec![stdio_manifest(
-        "weather",
-        &["--stdio", "--fault-is-error"],
-    )])
-    .await
-    .expect("load");
+    let servers = host
+        .load(vec![stdio_config(
+            "weather",
+            &["--stdio", "--fault-is-error"],
+        )])
+        .await
+        .expect("load");
 
-    let error = invoke(&host, "weather__echo", json!({})).await.unwrap_err();
+    let error = invoke(&servers, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
     match error {
         ToolError::Internal { message } => assert_eq!(message, "scripted\nfailure"),
         other => panic!("expected Internal, got {other:?}"),
@@ -536,14 +536,17 @@ async fn m7_is_error_maps_to_internal_with_joined_text() {
 #[tokio::test]
 async fn m15_input_required_is_internal_and_not_retried() {
     let host = host(None, SandboxPolicy::FullAccess);
-    host.load(vec![stdio_manifest(
-        "weather",
-        &["--stdio", "--fault-input-required"],
-    )])
-    .await
-    .expect("load");
+    let servers = host
+        .load(vec![stdio_config(
+            "weather",
+            &["--stdio", "--fault-input-required"],
+        )])
+        .await
+        .expect("load");
 
-    let error = invoke(&host, "weather__echo", json!({})).await.unwrap_err();
+    let error = invoke(&servers, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
     assert!(matches!(error, ToolError::Internal { .. }), "{error:?}");
 }
 
@@ -552,11 +555,11 @@ async fn m15_input_required_is_internal_and_not_retried() {
 #[tokio::test]
 async fn m9_call_timeout_comes_from_the_manifest() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let mut manifest = stdio_manifest("weather", &["--stdio"]);
-    manifest.timeouts.call = Some(Duration::from_millis(250));
-    host.load(vec![manifest]).await.expect("load");
+    let mut config = stdio_config("weather", &["--stdio"]);
+    config.timeouts.call = Some(Duration::from_millis(250));
+    let servers = host.load(vec![config]).await.expect("load");
 
-    let descriptor = host
+    let descriptor = servers
         .get(&ToolName::new("weather__echo"))
         .unwrap()
         .descriptor()
@@ -567,28 +570,31 @@ async fn m9_call_timeout_comes_from_the_manifest() {
 #[tokio::test]
 async fn m10_crash_fails_in_flight_and_later_calls() {
     let host = host(None, SandboxPolicy::FullAccess);
-    host.load(vec![stdio_manifest(
-        "weather",
-        &["--stdio", "--fault-crash-after", "0"],
-    )])
-    .await
-    .expect("load");
+    let servers = host
+        .load(vec![stdio_config(
+            "weather",
+            &["--stdio", "--fault-crash-after", "0"],
+        )])
+        .await
+        .expect("load");
 
-    let first = invoke(&host, "weather__echo", json!({})).await.unwrap_err();
+    let first = invoke(&servers, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
     assert!(matches!(first, ToolError::Transport { .. }), "{first:?}");
-    let second = invoke(&host, "weather__echo", json!({})).await.unwrap_err();
+    let second = invoke(&servers, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
     assert!(matches!(second, ToolError::Transport { .. }), "{second:?}");
 }
 
 // P7 -------------------------------------------------------------------
 
 #[tokio::test]
-async fn p7_unknown_fields_load_and_unknown_manifest_version_fails() {
+async fn p7_a_config_with_millisecond_timeouts_loads() {
     let host = host(None, SandboxPolicy::FullAccess);
     let value = json!({
-        "manifest_version": 1,
         "id": "weather",
-        "protocol": "mcp",
         "protocol_versions": ["2026-07-28"],
         "transport": {
             "kind": "stdio",
@@ -597,45 +603,58 @@ async fn p7_unknown_fields_load_and_unknown_manifest_version_fails() {
             "env": {},
         },
         "timeouts": {"startup_ms": 5000, "call_ms": 250},
-        "future_field": {"ignored": true},
     });
-    let manifest: PluginManifest = serde_json::from_value(value).expect("unknown fields ignored");
-    let statuses = host.load(vec![manifest]).await.expect("load");
-    assert_eq!(loaded_tools(&statuses[0]).len(), 3);
+    let config: McpServerConfig = serde_json::from_value(value).expect("valid config");
+    let servers = host.load(vec![config]).await.expect("load");
+    assert_eq!(loaded_tools(&servers.statuses()[0]).len(), 3);
     assert_eq!(
-        host.get(&ToolName::new("weather__echo"))
+        servers
+            .get(&ToolName::new("weather__echo"))
             .unwrap()
             .descriptor()
             .timeout,
         Some(Duration::from_millis(250))
     );
-
-    let value = json!({
-        "manifest_version": 2,
-        "id": "weather",
-        "protocol": "mcp",
-        "protocol_versions": ["2026-07-28"],
-        "transport": {
-            "kind": "stdio",
-            "command": fixture_bin().to_string_lossy(),
-            "args": ["--stdio"],
-        },
-    });
-    let manifest: PluginManifest = serde_json::from_value(value).expect("parses with version 2");
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Manifest);
 }
 
 #[test]
-fn p7_unknown_enum_values_are_manifest_parse_errors() {
-    let value = json!({
-        "manifest_version": 1,
+fn unknown_config_fields_are_rejected() {
+    let valid = json!({
         "id": "weather",
-        "protocol": "custom",
         "protocol_versions": ["2026-07-28"],
         "transport": {"kind": "stdio", "command": "x"},
     });
-    assert!(serde_json::from_value::<PluginManifest>(value).is_err());
+    assert!(serde_json::from_value::<McpServerConfig>(valid.clone()).is_ok());
+
+    for (field, value) in [
+        ("manifest_version", json!(1)),
+        ("protocol", json!("mcp")),
+        ("capabilities", json!(["tools"])),
+        ("future_field", json!(true)),
+    ] {
+        let mut config = valid.clone();
+        config[field] = value;
+        let error = serde_json::from_value::<McpServerConfig>(config).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+
+    let mut transport = valid.clone();
+    transport["transport"]["shell"] = json!(true);
+    assert!(serde_json::from_value::<McpServerConfig>(transport).is_err());
+
+    let mut timeouts = valid;
+    timeouts["timeouts"] = json!({"idle_ms": 5});
+    assert!(serde_json::from_value::<McpServerConfig>(timeouts).is_err());
+}
+
+#[test]
+fn unknown_transport_kinds_are_parse_errors() {
+    let value = json!({
+        "id": "weather",
+        "protocol_versions": ["2026-07-28"],
+        "transport": {"kind": "websocket", "url": "x"},
+    });
+    assert!(serde_json::from_value::<McpServerConfig>(value).is_err());
 }
 
 // HTTP transport: M2, M3, M11, M16 ------------------------------------
@@ -645,9 +664,10 @@ async fn m2_http_json_loads_paginates_registers_and_calls() {
     let fixture = HttpFixture::spawn(&["--page-size", "1"]).await;
     // No sandbox provider: HTTP has no local process (S8).
     let host = host(None, SandboxPolicy::ReadOnly);
-    let manifest = http_manifest("weather", &fixture.url(), BTreeMap::new());
+    let config = http_config("weather", &fixture.url(), BTreeMap::new());
 
-    let statuses = host.load(vec![manifest]).await.expect("load");
+    let servers = host.load(vec![config]).await.expect("load");
+    let statuses = servers.statuses();
     assert_eq!(
         loaded_tools(&statuses[0]),
         &[
@@ -657,7 +677,7 @@ async fn m2_http_json_loads_paginates_registers_and_calls() {
         ]
     );
 
-    let echo = host
+    let echo = servers
         .get(&ToolName::new("weather__echo"))
         .unwrap()
         .descriptor()
@@ -674,12 +694,12 @@ async fn m2_http_json_loads_paginates_registers_and_calls() {
     assert_eq!(echo.side_effect, SideEffect::ReadOnly);
     assert_eq!(echo.replay, ReplaySafety::Safe);
 
-    let output = invoke(&host, "weather__echo", json!({"text": "over http"}))
+    let output = invoke(&servers, "weather__echo", json!({"text": "over http"}))
         .await
         .expect("call");
     assert_eq!(output.content, vec![text("over http")]);
 
-    let mutation = invoke(&host, "weather__mutate", json!({}))
+    let mutation = invoke(&servers, "weather__mutate", json!({}))
         .await
         .expect("call");
     assert_eq!(mutation.content[0], text("mutation 1"));
@@ -692,13 +712,14 @@ async fn m3_http_request_scoped_sse_ignores_notifications() {
     let fixture = HttpFixture::spawn(&[]).await;
     let host = host(None, SandboxPolicy::FullAccess);
     // Manifest Accept forces the fixture's request-scoped SSE path.
-    let manifest = http_manifest("weather", &fixture.url(), sse_headers());
+    let config = http_config("weather", &fixture.url(), sse_headers());
 
     // Handshake and discovery are SSE too; progress notifications are ignored.
-    let statuses = host.load(vec![manifest]).await.expect("load");
+    let servers = host.load(vec![config]).await.expect("load");
+    let statuses = servers.statuses();
     assert_eq!(loaded_tools(&statuses[0]).len(), 3);
 
-    let output = invoke(&host, "weather__echo", json!({"text": "over sse"}))
+    let output = invoke(&servers, "weather__echo", json!({"text": "over sse"}))
         .await
         .expect("call");
     assert_eq!(output.content, vec![text("over sse")]);
@@ -712,24 +733,23 @@ async fn m11_sse_interruption_fails_only_that_call() {
     let host = host(None, SandboxPolicy::FullAccess);
 
     let healthy = HttpFixture::spawn_at(&addr, &[]).await;
-    host.load(vec![http_manifest(
-        "weather",
-        &healthy.url(),
-        sse_headers(),
-    )])
-    .await
-    .expect("load");
+    let servers = host
+        .load(vec![http_config("weather", &healthy.url(), sse_headers())])
+        .await
+        .expect("load");
     healthy.stop().await;
 
     // Same endpoint, now closing each SSE stream before the response.
     let interrupted = HttpFixture::spawn_at(&addr, &["--fault-sse-interrupt"]).await;
-    let error = invoke(&host, "weather__echo", json!({})).await.unwrap_err();
+    let error = invoke(&servers, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
     assert!(matches!(error, ToolError::Transport { .. }), "{error:?}");
     interrupted.stop().await;
 
     // The adapter is not dead: the next call reaches a healthy server.
     let recovered = HttpFixture::spawn_at(&addr, &[]).await;
-    let output = invoke(&host, "weather__echo", json!({"text": "again"}))
+    let output = invoke(&servers, "weather__echo", json!({"text": "again"}))
         .await
         .expect("next call succeeds");
     assert_eq!(output.content, vec![text("again")]);
@@ -742,22 +762,23 @@ async fn m16_http_errors_do_not_leak_url_or_header_values() {
         "Authorization".to_owned(),
         "Bearer header-s3cr4t".to_owned(),
     )]);
-    let manifest = http_manifest(
+    let config = http_config(
         "weather",
         "http://127.0.0.1:1/mcp?token=url-s3cr4t",
         headers.clone(),
     );
-    assert!(!format!("{manifest:?}").contains("header-s3cr4t"));
+    assert!(!format!("{config:?}").contains("header-s3cr4t"));
     let host = host(None, SandboxPolicy::FullAccess);
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
+    let servers = host.load(vec![config]).await.expect("optional");
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     let rendered = format!("{:?}", statuses[0]);
     assert!(!rendered.contains("s3cr4t"), "{rendered}");
     assert!(!rendered.contains("127.0.0.1"), "{rendered}");
     assert!(!rendered.contains("Bearer"), "{rendered}");
-    assert!(host.list().is_empty());
+    assert!(servers.tools().is_empty());
 
-    let mut required = http_manifest(
+    let mut required = http_config(
         "weather",
         "http://127.0.0.1:1/mcp?token=url-s3cr4t",
         headers,
@@ -774,29 +795,18 @@ async fn m16_http_errors_do_not_leak_url_or_header_values() {
 async fn http_no_common_version_fails_handshake() {
     let fixture = HttpFixture::spawn(&["--supported-versions", "2027-01-01"]).await;
     let host = host(None, SandboxPolicy::FullAccess);
-    let statuses = host
-        .load(vec![http_manifest(
+    let servers = host
+        .load(vec![http_config(
             "weather",
             &fixture.url(),
             BTreeMap::new(),
         )])
         .await
         .expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
-    assert!(host.list().is_empty());
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
+    assert!(servers.tools().is_empty());
     fixture.stop().await;
-}
-
-// Manifest / transport gating -----------------------------------------
-
-#[tokio::test]
-async fn acp_manifests_fail_at_the_manifest_stage() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let mut manifest = stdio_manifest("weather", &["--stdio"]);
-    manifest.protocol = PluginProtocol::Acp;
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Manifest);
-    assert!(host.list().is_empty());
 }
 
 // Sandbox seam ---------------------------------------------------------
@@ -804,12 +814,13 @@ async fn acp_manifests_fail_at_the_manifest_stage() {
 #[tokio::test]
 async fn restricted_policy_without_a_provider_fails_without_spawning() {
     let host = host(None, SandboxPolicy::ReadOnly);
-    let statuses = host
-        .load(vec![stdio_manifest("weather", &["--stdio"])])
+    let servers = host
+        .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Spawn);
-    assert!(host.list().is_empty());
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Sandbox);
+    assert!(servers.tools().is_empty());
 }
 
 #[tokio::test]
@@ -819,14 +830,14 @@ async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let mut manifest = stdio_manifest("weather", &["--stdio"]);
-    manifest.transport = PluginTransport::Stdio {
+    let mut config = stdio_config("weather", &["--stdio"]);
+    config.transport = McpTransport::Stdio {
         command: fixture_bin().to_string_lossy().into_owned(),
         args: vec!["--stdio".to_owned()],
         env: BTreeMap::from([("WEATHER_API_KEY".to_owned(), "test-token".to_owned())]),
         cwd: None,
     };
-    host.load(vec![manifest]).await.expect("load");
+    host.load(vec![config]).await.expect("load");
 
     let recorded = provider.recorded();
     assert_eq!(recorded.len(), 1);
@@ -838,27 +849,115 @@ async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
 }
 
 #[tokio::test]
-async fn a_sandbox_refusal_fails_the_plugin_at_spawn() {
+async fn a_sandbox_refusal_fails_the_server_at_the_sandbox_stage() {
     let provider = Arc::new(FakeSandboxProvider::refused("policy denies spawn"));
     let host = host(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let statuses = host
-        .load(vec![stdio_manifest("weather", &["--stdio"])])
+    let servers = host
+        .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Spawn);
+    let statuses = servers.statuses();
+    assert_eq!(failed_stage(&statuses[0]), LoadStage::Sandbox);
     assert_eq!(provider.recorded().len(), 1);
-    assert!(host.list().is_empty());
+    assert!(servers.tools().is_empty());
 }
 
 #[tokio::test]
 async fn full_access_runs_without_a_provider() {
     let host = host(None, SandboxPolicy::FullAccess);
-    let statuses = host
-        .load(vec![stdio_manifest("weather", &["--stdio"])])
+    let servers = host
+        .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("load");
+    let statuses = servers.statuses();
     assert_eq!(loaded_tools(&statuses[0]).len(), 3);
+}
+
+/// A unique scratch path under the system temp dir; removed before use.
+fn scratch(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("asterpath-mcp-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// A stdio config whose process, if it ever starts, runs `script` under `sh`.
+fn shell_config(id: &str, script: String) -> McpServerConfig {
+    let mut config = stdio_config(id, &[]);
+    config.transport = McpTransport::Stdio {
+        command: "/bin/sh".to_owned(),
+        args: vec!["-c".to_owned(), script],
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    config
+}
+
+#[tokio::test]
+async fn partial_enforcement_fails_closed_before_the_process_starts() {
+    let marker = scratch("partial-started");
+    let provider = Arc::new(FakeSandboxProvider::partial(vec![
+        asterpath_protocol::SandboxAspect::FilesystemWrite,
+    ]));
+    let host = host(
+        Some(provider.clone() as Arc<dyn SandboxProvider>),
+        SandboxPolicy::ReadOnly,
+    );
+    let config = shell_config(
+        "weather",
+        format!(
+            "touch '{}'; exec '{}' --stdio",
+            marker.display(),
+            fixture_bin().display()
+        ),
+    );
+
+    let servers = host.load(vec![config.clone()]).await.expect("optional");
+    assert_eq!(failed_stage(&servers.statuses()[0]), LoadStage::Sandbox);
+    assert!(servers.tools().is_empty());
+    assert_eq!(provider.recorded().len(), 1);
+
+    let mut required = config;
+    required.required = true;
+    let error = host.load(vec![required]).await.unwrap_err();
+    assert_eq!(error.stage, LoadStage::Sandbox);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists(), "the server process was started");
+}
+
+#[tokio::test]
+async fn shutdown_stops_server_processes_even_while_tools_are_held() {
+    let pid_file = scratch("shutdown-pid");
+    let config = shell_config(
+        "weather",
+        format!(
+            "echo $$ > '{}'; exec '{}' --stdio",
+            pid_file.display(),
+            fixture_bin().display()
+        ),
+    );
+    let servers = McpServers::load(vec![config], None, SandboxPolicy::FullAccess)
+        .await
+        .expect("load");
+    let pid = std::fs::read_to_string(&pid_file).expect("pid written");
+    let proc_dir = PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(proc_dir.exists(), "server is running");
+
+    // The engine may still hold the tools; shutdown must not wait for them.
+    let held = servers.tools();
+    servers.shutdown().await;
+
+    assert!(
+        !proc_dir.exists(),
+        "server process still running after shutdown"
+    );
+    let error = held[0]
+        .invoke(JsonString::new("{}".to_owned()), context())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Transport { .. }), "{error:?}");
+    let _ = std::fs::remove_file(pid_file);
 }
