@@ -49,7 +49,8 @@ pub use ids::{
 pub use intents::{IntentDelta, OpenIntent, OpenIntents, SessionState, StepState};
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role};
 pub use names::{
-    ToolNameError, external_tool_name, sanitize_tool_name, validate_plugin_id, validate_tool_name,
+    ToolNameError, external_tool_name, sanitize_tool_name, validate_external_tool_name,
+    validate_plugin_id, validate_tool_name,
 };
 pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, project};
 pub use provider::{

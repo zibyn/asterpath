@@ -73,6 +73,21 @@ impl SandboxProvider for LinuxSandbox {
             ));
         }
 
+        if let SandboxPolicy::WorkspaceWrite { writable_roots } = request.policy {
+            // An empty or relative root set is a configuration error: fail
+            // closed instead of degrading to read-only or binding relative paths.
+            if writable_roots.is_empty() {
+                return Err(SandboxError::Unsupported {
+                    reason: "workspace-write requires at least one writable root".to_owned(),
+                });
+            }
+            if let Some(root) = writable_roots.iter().find(|root| !root.is_absolute()) {
+                return Err(SandboxError::Unsupported {
+                    reason: format!("writable root must be absolute: {}", root.display()),
+                });
+            }
+        }
+
         let program = resolve_bwrap(&self.bwrap).ok_or_else(|| SandboxError::Setup {
             message: format!("bwrap not found: {}", self.bwrap.display()),
         })?;

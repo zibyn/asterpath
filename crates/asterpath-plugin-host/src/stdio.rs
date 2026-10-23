@@ -61,6 +61,10 @@ impl StdioAdapter {
         if let Some(cwd) = &confined.cwd {
             command.current_dir(cwd);
         }
+        // Own process group so the whole tree (bwrap and its child) can be
+        // signalled at once (`mcp.md` §3.3).
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn()?;
         let pid = child.id().unwrap_or_default();
         let stdin = child
@@ -257,6 +261,63 @@ impl RpcClient for Shared {
     }
 }
 
+/// Kills the process group and marks the adapter dead if the call future is
+/// dropped while the call is still in flight (the pipeline drops it at grace
+/// expiry). The pipeline, not the adapter, writes the terminal then.
+struct InFlight<'a> {
+    shared: &'a Shared,
+    armed: bool,
+}
+
+impl<'a> InFlight<'a> {
+    fn new(shared: &'a Shared) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            mark_dead(self.shared, "MCP stdio call abandoned");
+            kill_process(self.shared.pid);
+        }
+    }
+}
+
+/// Removes JSON whitespace outside string literals so a legal multi-line
+/// argument value still fits the one-message-per-line framing. Bytes inside
+/// strings (including escapes) and number lexemes are preserved.
+fn compact_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if !ch.is_ascii_whitespace() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 async fn call_impl(
     adapter: &StdioAdapter,
     original_name: &str,
@@ -271,11 +332,13 @@ async fn call_impl(
         });
     }
     let id = shared.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-    // Embed the caller's raw argument text so replay sees the same bytes.
+    // Compact (not re-serialize): interior bytes and number lexemes survive,
+    // while the request stays on one line.
+    let args = compact_json(args.as_str());
     let params = format!(
         "{{\"name\":{},\"arguments\":{},\"_meta\":{}}}",
         serde_json::to_string(original_name).expect("name is serializable"),
-        args.as_str(),
+        args,
         mcp::meta_json(&shared.protocol_version()),
     );
     let line = format!(
@@ -309,33 +372,46 @@ async fn call_impl(
         });
     }
 
+    let mut guard = InFlight::new(shared);
+    let on_protocol_error = |code| {
+        if matches!(
+            code,
+            -32020 | -32021 | -32022 | -32600 | -32601 | -32603 | -32700
+        ) {
+            mark_dead(shared, "MCP protocol error");
+        }
+    };
     tokio::select! {
         response = &mut receiver => {
+            guard.disarm();
             let received = match response {
                 Ok(received) => received,
                 Err(_) => Err(RpcFailure::Transport("MCP response channel closed".to_owned())),
             };
-            mcp::map_call_response(received, |code| {
-                if matches!(
-                    code,
-                    -32020 | -32021 | -32022 | -32600 | -32601 | -32603 | -32700
-                ) {
-                    mark_dead(shared, "MCP protocol error");
-                }
-            })
+            mcp::map_call_response(received, on_protocol_error)
         }
         _ = ctx.cancel.cancelled() => {
             send_cancelled(shared, id).await;
-            let responded = matches!(
-                tokio::time::timeout(shared.grace, &mut receiver).await,
-                Ok(Ok(_))
-            );
-            if !responded {
-                kill_now(shared).await;
+            // A response inside the grace window wins; otherwise kill the
+            // process group, mark dead and stay pending. The pipeline owns the
+            // terminal (`mcp.md` §8, `tools.md` §6): its per-call deadline
+            // writes `Timeout`, a turn cancel writes `Interrupted`.
+            match tokio::time::timeout(shared.grace, &mut receiver).await {
+                Ok(received) => {
+                    guard.disarm();
+                    let received = match received {
+                        Ok(response) => response,
+                        Err(_) => Err(RpcFailure::Transport(
+                            "MCP response channel closed".to_owned(),
+                        )),
+                    };
+                    mcp::map_call_response(received, on_protocol_error)
+                }
+                Err(_) => {
+                    kill_now(shared).await;
+                    std::future::pending::<Result<ToolOutput, ToolError>>().await
+                }
             }
-            Err(ToolError::Cancelled {
-                message: "tool call cancelled".to_owned(),
-            })
         }
     }
 }
@@ -388,14 +464,28 @@ async fn shutdown_impl(shared: &Shared) {
 
 #[cfg(unix)]
 fn terminate(pid: u32) {
-    // SAFETY: kill(2) with our own child's pid.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    signal_process_tree(pid, libc::SIGTERM);
 }
 
 #[cfg(unix)]
 fn kill_process(pid: u32) {
-    // SAFETY: kill(2) with our own child's pid.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    signal_process_tree(pid, libc::SIGKILL);
+}
+
+/// Signals the child's process group (it is spawned as the group leader); if
+/// the group is already gone, falls back to the direct pid.
+#[cfg(unix)]
+fn signal_process_tree(pid: u32, signal: libc::c_int) {
+    // `kill(0)` would signal our own group; never do that.
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: kill(2) with our own child's pid and a valid signal.
+    let sent = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if sent != 0 {
+        // SAFETY: same child, direct-pid fallback.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
 }
 
 #[cfg(not(unix))]
@@ -552,8 +642,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_grace_kills_and_marks_dead() {
-        let mut adapter = adapter(&["--fault-delay-ms", "10000"], Duration::from_millis(100));
+    async fn multiline_argument_whitespace_stays_on_one_line() {
+        let mut adapter = adapter(&[], Duration::from_secs(1));
+        adapter.handshake().await.expect("handshake");
+        adapter.discover().await.expect("discover");
+        let output = adapter
+            .call(
+                "echo",
+                asterpath_protocol::JsonString::new(
+                    "{\n  \"text\"\t: \"line\\nbreak\",\n  \"n\": 1.5e2\n}",
+                ),
+                &context(CancelToken::new()),
+            )
+            .await
+            .expect("multiline arguments are compacted");
+        assert_eq!(
+            output.content,
+            vec![asterpath_protocol::Part::Text {
+                text: "line\nbreak".to_owned()
+            }]
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_within_grace_returns_the_real_response() {
+        let mut adapter = adapter(&["--fault-delay-ms", "50"], Duration::from_secs(1));
+        adapter.handshake().await.expect("handshake");
+        adapter.discover().await.expect("discover");
+        let cancel = CancelToken::new();
+        let task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            task.cancel();
+        });
+        let output = adapter
+            .call(
+                "echo",
+                asterpath_protocol::JsonString::new("{\"text\":\"late\"}"),
+                &context(cancel),
+            )
+            .await
+            .expect("the response wins inside the grace window");
+        assert_eq!(
+            output.content,
+            vec![asterpath_protocol::Part::Text {
+                text: "late".to_owned()
+            }]
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_grace_kills_and_never_resolves_the_call() {
+        let mut adapter = adapter(&["--fault-delay-ms", "70234"], Duration::from_millis(100));
         adapter.handshake().await.expect("handshake");
         adapter.discover().await.expect("discover");
         let cancel = CancelToken::new();
@@ -562,18 +704,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             task.cancel();
         });
-        let error = adapter
-            .call(
+        // The adapter must not settle: the pipeline owns Timeout/Interrupted.
+        let result = tokio::time::timeout(
+            Duration::from_millis(600),
+            adapter.call(
                 "echo",
                 asterpath_protocol::JsonString::new("{}"),
                 &context(cancel),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, asterpath_protocol::ToolError::Cancelled { .. }),
-            "{error:?}"
-        );
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "call resolved on its own: {result:?}");
         let follow_up = adapter
             .call(
                 "echo",
@@ -587,5 +728,116 @@ mod tests {
             "{follow_up:?}"
         );
         adapter.shutdown().await;
+        #[cfg(target_os = "linux")]
+        assert_no_pids(&fixture_bin(), "70234");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancel_kills_a_wrapper_and_its_child_process_group() {
+        let fixture = fixture_bin();
+        let delay = "70123";
+        // `sh -c` wraps the fixture in a second process. The trailing command
+        // stops the shell from exec-optimizing its last command, so the wrapper
+        // stays alive while the fixture runs (no temp script: an inherited
+        // write fd could make exec fail with ETXTBSY).
+        let args = vec![
+            OsString::from("-c"),
+            OsString::from("\"$@\"\ncode=$?\nexit $code"),
+            OsString::from("sh"),
+            fixture.clone().into_os_string(),
+            OsString::from("--stdio"),
+            OsString::from("--fault-delay-ms"),
+            OsString::from(delay),
+        ];
+        let confined = ConfinedSpawn::new(
+            OsString::from("/bin/sh"),
+            args,
+            None,
+            std::collections::BTreeMap::new(),
+            Enforcement::Full,
+        );
+        let mut adapter = StdioAdapter::spawn(
+            &confined,
+            "2026-07-28",
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .expect("spawn wrapper");
+        adapter.handshake().await.expect("handshake");
+        adapter.discover().await.expect("discover");
+        // The shell wrapper and the fixture it runs are both alive.
+        let pids = matching_pids(&fixture, delay);
+        assert!(
+            pids.len() >= 2,
+            "expected a wrapper plus its child: {pids:?}"
+        );
+
+        let cancel = CancelToken::new();
+        let task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            task.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(800),
+            adapter.call(
+                "echo",
+                asterpath_protocol::JsonString::new("{}"),
+                &context(cancel),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "call resolved on its own: {result:?}");
+        let follow_up = adapter
+            .call(
+                "echo",
+                asterpath_protocol::JsonString::new("{}"),
+                &context(CancelToken::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(follow_up, asterpath_protocol::ToolError::Transport { .. }),
+            "{follow_up:?}"
+        );
+        adapter.shutdown().await;
+        assert_no_pids(&fixture, delay);
+    }
+
+    /// Pids whose command line names this fixture with this unique delay arg.
+    #[cfg(target_os = "linux")]
+    fn matching_pids(fixture: &std::path::Path, delay: &str) -> Vec<i32> {
+        let fixture = fixture.to_string_lossy();
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("proc") {
+            let Ok(entry) = entry else { continue };
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+            if args.contains(&fixture.as_bytes()) && args.contains(&delay.as_bytes()) {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_pids(fixture: &std::path::Path, delay: &str) {
+        for _ in 0..100 {
+            if matching_pids(fixture, delay).is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "processes still running for fixture {} delay {delay}: {:?}",
+            fixture.display(),
+            matching_pids(fixture, delay)
+        );
     }
 }

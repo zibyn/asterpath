@@ -35,7 +35,7 @@ Every response uses `Connection: close`. HTTP has no sessions.
 | Method | Behaviour |
 | --- | --- |
 | `server/discover` | Returns `supportedVersions`, `capabilities.tools`, `serverInfo`. Reads `params._meta["io.modelcontextprotocol/protocolVersion"]`; an unsupported requested version returns `-32022` with `error.data.supported`. Client name/capabilities are accepted but never required. |
-| `tools/list` | Paginated with `nextCursor`; `--page-size` controls page size (default 2). A cursor is the next index as a string; anything else is `-32602`. |
+| `tools/list` | Paginated with `nextCursor`; `--page-size` controls page size (default 2). A cursor is the next index as a string; anything else is `-32602`. `--fault-repeat-cursor` always echoes the current cursor; `--fault-endless-pages` always returns a fresh one (exercises the 100-page cap). |
 | `tools/call` | `params.arguments` must be an object. Unknown tool → `-32602`. |
 | `notifications/cancelled` | Accepted and ignored (no response). |
 
@@ -50,6 +50,10 @@ Unknown methods return `-32601`; malformed JSON returns `-32700` with `id: null`
 | `content` | `readOnlyHint: true` | one block of every type: `text`, `image`, `audio`, `resource_link`, `resource`, plus `structuredContent` |
 
 Calling any other name exercises the unknown-tool `-32602` path.
+
+`--tool-set` changes the advertised set: `default` (the table above),
+`collision` (`a.b` plus `a_b`, both sanitize to the same name) and `oversized`
+(one 70-character name that cannot compose within 64 characters).
 
 ## Fault switches
 
@@ -67,6 +71,8 @@ input-required → oversized → normal dispatch.
 | `--fault-oversized <BYTES>` | One text block of exactly `BYTES` bytes. |
 | `--fault-sse-interrupt` | SSE responses send the progress notification then close before the final response. Applies to HTTP only. |
 | `--force-version-mismatch` | `server/discover` always returns `-32022` with `data.supported` (no-common-version path). |
+| `--fault-repeat-cursor` | `tools/list` repeats the cursor it received (repeat-cursor failure). |
+| `--fault-endless-pages` | `tools/list` always returns a fresh `nextCursor` (100-page cap failure). |
 | `--supported-versions <V[,V...]>` | Overrides the advertised/validated versions (default `2026-07-28`). |
 
 Examples:

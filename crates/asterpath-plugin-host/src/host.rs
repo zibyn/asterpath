@@ -312,19 +312,20 @@ fn failed(stage: PluginLoadStage, message: impl Into<String>) -> PluginStatus {
 }
 
 fn adapter_message(error: AdapterError) -> String {
-    match error {
-        AdapterError::Spawn { message }
-        | AdapterError::Handshake { message }
-        | AdapterError::Discovery { message }
-        | AdapterError::Transport { message } => message,
-    }
+    error.message().to_owned()
 }
 
 fn candidate_version(manifest: &PluginManifest) -> Option<&str> {
-    manifest
-        .protocol_versions
+    highest_common(&manifest.protocol_versions, ADAPTER_PROTOCOL_VERSIONS)
+}
+
+/// The highest candidate version wins (`mcp.md` §3.2). Versions are date
+/// strings, so lexicographic order is chronological.
+fn highest_common<'a>(versions: &'a [String], supported: &[&str]) -> Option<&'a str> {
+    versions
         .iter()
-        .find(|version| ADAPTER_PROTOCOL_VERSIONS.contains(&version.as_str()))
+        .filter(|version| supported.contains(&version.as_str()))
+        .max()
         .map(String::as_str)
 }
 
@@ -479,6 +480,23 @@ mod tests {
         let names = compose_names("plugin", vec![tool("echo"), tool("a.b")]).unwrap();
         assert_eq!(names[0].0, ToolName::new("plugin__echo"));
         assert_eq!(names[1].0, ToolName::new("plugin__a_b"));
+    }
+
+    #[test]
+    fn candidate_version_picks_the_highest_supported_entry() {
+        let supported = ["2025-11-25", "2026-07-28"];
+        assert_eq!(
+            highest_common(
+                &["2026-07-28".to_owned(), "2025-11-25".to_owned()],
+                &supported
+            ),
+            Some("2026-07-28")
+        );
+        assert_eq!(
+            highest_common(&["2025-11-25".to_owned()], &supported),
+            Some("2025-11-25")
+        );
+        assert_eq!(highest_common(&["2024-01-01".to_owned()], &supported), None);
     }
 
     #[test]

@@ -88,21 +88,22 @@ impl Asterpath {
             });
         }
         for tool in &config.tools {
-            // External names are `<plugin_id>__<tool>` and were validated by
-            // plugin-host; only bare in-process names are checked here.
-            if matches!(
-                tool.descriptor().provenance,
-                asterpath_protocol::Provenance::InProcess
-            ) {
-                asterpath_protocol::validate_tool_name(tool.descriptor().name.as_str()).map_err(
-                    |error| AsterError::Config {
-                        message: format!(
-                            "invalid tool name {}: {error}",
-                            tool.descriptor().name.as_str()
-                        ),
-                    },
-                )?;
-            }
+            let name = tool.descriptor().name.as_str();
+            let validated = match tool.descriptor().provenance {
+                asterpath_protocol::Provenance::InProcess => {
+                    asterpath_protocol::validate_tool_name(name)
+                }
+                asterpath_protocol::Provenance::External { .. } => {
+                    asterpath_protocol::validate_external_tool_name(name)
+                }
+                // `Unknown` is an intent-only provenance; it is not registrable.
+                asterpath_protocol::Provenance::Unknown => {
+                    Err(asterpath_protocol::ToolNameError::InvalidToolName)
+                }
+            };
+            validated.map_err(|error| AsterError::Config {
+                message: format!("invalid tool name {name}: {error}"),
+            })?;
         }
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {

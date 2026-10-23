@@ -190,7 +190,7 @@ pub enum SandboxError {
 
 ## 11. 参考后端与 v1 范围
 
-**Linux（参考后端规格，不实现）**：用 bwrap 做文件系统映射。
+**Linux（M5 已实现的后端：`asterpath-sandbox-linux`）**：用 bwrap 做文件系统映射。
 
 | 策略 | 变换 |
 | --- | --- |
@@ -205,10 +205,10 @@ pub enum SandboxError {
 
 **macOS**：`sandbox-exec -p <profile>` 的形态记录为第二后端，v1 不实现、不验收。**Windows**：出界。
 
-**v1 交付（本 effort）**：
+**v1 交付（历史）**：
 
-- `asterpath-sandbox` 合约 crate 的形状（§3–§7）、本文件、ADR-0019、验收场景。
-- **不建 crate、不写后端、不加 CLI 标志、不改 facade / `AsterpathConfig`**；[#15](./packaging.md) 的预留名继续预留。
+- `asterpath-sandbox` 合约 crate 的形状（§3–§7）、本文件、ADR-0019、验收场景由 v1 交付。
+- M5 已实现该合约与 Linux bwrap 后端（`asterpath-sandbox` / `asterpath-sandbox-linux`），取代 v1 的“不建 crate、不写后端”；[#15](./packaging.md) 的预留名继续保留。
 
 **明确不做**：seccomp、网络隔离、PID/进程可见性、读白名单、Windows、进程内工具沙箱、escalation、热替换、manifest 声明策略、运行中改边界、把已运行进程纳入沙箱、mode 审计日志。
 

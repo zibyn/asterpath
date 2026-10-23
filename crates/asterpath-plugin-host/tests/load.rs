@@ -462,6 +462,68 @@ async fn m14_maps_every_content_block_and_structured_content() {
     );
 }
 
+// M5 negative pagination ----------------------------------------------
+
+#[tokio::test]
+async fn m5_a_repeated_cursor_fails_discovery() {
+    let registry = registry();
+    let host = host(&registry, None, SandboxPolicy::FullAccess);
+    let statuses = host
+        .load(vec![stdio_manifest(
+            "weather",
+            &["--stdio", "--fault-repeat-cursor"],
+        )])
+        .await
+        .expect("optional");
+    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Discovery);
+    assert!(registry.list().is_empty());
+}
+
+#[tokio::test]
+async fn m5_more_than_100_pages_fails_discovery() {
+    let registry = registry();
+    let host = host(&registry, None, SandboxPolicy::FullAccess);
+    let statuses = host
+        .load(vec![stdio_manifest(
+            "weather",
+            &["--stdio", "--fault-endless-pages"],
+        )])
+        .await
+        .expect("optional");
+    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Discovery);
+    assert!(registry.list().is_empty());
+}
+
+// S8: registration failure is isolated per plugin ---------------------
+
+#[tokio::test]
+async fn s8_a_broken_plugin_registers_nothing_and_a_healthy_one_still_loads() {
+    for tool_set in ["collision", "oversized"] {
+        let registry = registry();
+        let host = host(&registry, None, SandboxPolicy::FullAccess);
+        let broken = stdio_manifest("broken", &["--stdio", "--tool-set", tool_set]);
+        let healthy = stdio_manifest("healthy", &["--stdio"]);
+
+        let statuses = host.load(vec![broken, healthy]).await.expect("load");
+        assert_eq!(
+            failed_stage(&statuses[0]),
+            PluginLoadStage::Registration,
+            "{tool_set}"
+        );
+        assert!(loaded_tools(&statuses[1]).len() == 3, "{tool_set}");
+        let names: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|tool| tool.descriptor().name.as_str().to_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{tool_set}: {names:?}");
+        assert!(
+            names.iter().all(|name| name.starts_with("healthy__")),
+            "{tool_set}: {names:?}"
+        );
+    }
+}
+
 // M7 / M15 -------------------------------------------------------------
 
 #[tokio::test]

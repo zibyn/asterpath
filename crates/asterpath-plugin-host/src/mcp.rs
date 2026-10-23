@@ -317,7 +317,12 @@ fn map_result(result: Value) -> Result<ToolOutput, ToolError> {
         let message = if texts.is_empty() {
             "MCP tool reported an error".to_owned()
         } else {
-            texts.join("\n")
+            // Fail-safe bound: an error must not bypass the pipeline's default
+            // output limit just because it travels in `error.message`.
+            truncate_utf8(
+                texts.join("\n"),
+                asterpath_protocol::ToolConfig::default().max_output_bytes,
+            )
         };
         return Err(ToolError::Internal { message });
     }
@@ -333,6 +338,19 @@ fn map_result(result: Value) -> Result<ToolOutput, ToolError> {
         });
     }
     Ok(ToolOutput::new(content))
+}
+
+/// Cuts at the largest UTF-8 boundary not past `limit`.
+fn truncate_utf8(mut text: String, limit: usize) -> String {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 fn map_content(block: &Value) -> Part {
@@ -416,5 +434,43 @@ fn map_resource(resource: Option<&Value>) -> Part {
     }
     Part::Text {
         text: "[unsupported MCP resource]".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use asterpath_protocol::{ToolConfig, ToolError};
+
+    use super::map_result;
+
+    #[test]
+    fn is_error_messages_are_bounded_and_split_on_utf8_boundaries() {
+        let limit = ToolConfig::default().max_output_bytes;
+        let huge = "x".repeat(limit * 2);
+        let error = map_result(json!({
+            "isError": true,
+            "content": [{"type": "text", "text": huge}],
+        }))
+        .unwrap_err();
+        let ToolError::Internal { message } = error else {
+            panic!("expected Internal, got {error:?}");
+        };
+        assert_eq!(message.len(), limit);
+
+        // A multi-byte character straddling the limit is dropped whole.
+        let mut text = "a".repeat(limit - 1);
+        text.push('é');
+        let error = map_result(json!({
+            "isError": true,
+            "content": [{"type": "text", "text": text}],
+        }))
+        .unwrap_err();
+        let ToolError::Internal { message } = error else {
+            panic!("expected Internal, got {error:?}");
+        };
+        assert_eq!(message.len(), limit - 1);
+        assert!(message.is_char_boundary(message.len()));
     }
 }
