@@ -26,6 +26,8 @@
 ## Consequences
 
 - **2026-10-22 #32 修订**：v1 是单进程显式驱动，没有并发消费者，删除 `Storage::claim` / `ack`、租约字段与 `writer_lease` 表；唤醒改为只读 `Storage::wakeable`，待处理输入由 `pending_inputs` 派生。存储不再有调度队列。
+- **2026-10-23 ADR-0024 修订**：通用 timer 删除，“timer 触发与派生行同事务”一句作废，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
+- **2026-10-23 ADR-0023 修订**：删除 `Storage` trait 与 `open_intents` / `timers` / `pending_inputs` 派生表；SQLite 只维护 `sessions` 与墓碑，唤醒由会话事实折叠发现，见 [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md)。
 - **2026-10-22 #18 修订**：日志仍不支持原地删除、裁剪或改写；整会话退役（日志 + 墓碑）是可选管理能力，见 [ADR-0016](0016-retention-and-archive-seam.md)。
 - 掉电也不丢已返回的 append，代价是每 step 约 4~6 次 fsync；在 LLM 延迟尺度下可接受。
 - 写入路径只有一条：日志行与派生行同事务，不存在索引与日志分叉。

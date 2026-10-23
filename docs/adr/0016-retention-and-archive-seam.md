@@ -3,6 +3,7 @@
 **Status**: accepted (2026-10-22)
 **来源**: [#18 日志保留/归档扩展的 seam](https://github.com/zibyn/asterpath/issues/18)
 **前置**: [ADR-0004](0004-log-schema-version-and-upcasting.md)、[ADR-0005](0005-storage-contract-and-sqlite.md)、[ADR-0009](0009-context-compaction.md)、[ADR-0012](0012-usage-accounting.md)
+**2026-10-23 ADR-0023 修订**: 退役的 `idle` 判定改为在退役事务内折叠本会话与父会话日志，不再读派生表，见 [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md)。
 
 ## Context
 

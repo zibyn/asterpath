@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#12](https://github.com/zibyn/asterpath/issues/12)
+**2026-10-23 ADR-0024 修订**: 等待 span 只剩审批与子会话；timer span 与通用 signal span 删除，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
 
 ## Context
 

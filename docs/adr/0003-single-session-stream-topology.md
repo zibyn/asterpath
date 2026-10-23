@@ -4,6 +4,7 @@
 **Supersedes in part**: [ADR-0002](0002-log-topology-and-commit-semantics.md)（仅 Workflow 流类型与工作流重放部分）
 
 **来源**: 地图范围调整（2026-10-22）。原 [#3](https://github.com/zibyn/asterpath/issues/3) 的日志语义保留；[#10 工作流 / 编排 API](https://github.com/zibyn/asterpath/issues/10) 出界。
+**2026-10-23 ADR-0024 修订**: 持久等待只剩人工审批与子会话完成；通用 timer 与外部 signal 删除，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
 
 ## Context
 
