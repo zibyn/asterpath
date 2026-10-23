@@ -959,42 +959,26 @@ async fn http_errors_are_classified() {
     assert!(context.context_exceeded());
 }
 
-fn text_deltas(events: &[Result<StreamEvent, ProviderError>]) -> String {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            Ok(StreamEvent::PartDelta {
-                delta: asterpath_protocol::PartDelta::Text { text },
-                ..
-            }) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+struct OpenAiWire;
+
+impl asterpath_testing::ProviderWire for OpenAiWire {
+    fn provider(&self, base_url: &str) -> Box<dyn Provider> {
+        Box::new(OpenAiProvider::new("test-key").with_base_url(format!("{base_url}/v1")))
+    }
+
+    fn text_response(&self, text: &str) -> Vec<Value> {
+        let item = message_item("msg_1", text);
+        vec![
+            created(0),
+            added(1, 0, message_item("msg_1", "")),
+            text_delta(2, 0, text),
+            done(3, 0, item.clone()),
+            completed(4, vec![item], usage_json(10, 0, 2)),
+        ]
+    }
 }
 
 #[tokio::test]
-async fn multibyte_text_delta_split_across_tcp_chunks_is_byte_exact() {
-    let text = "你好🙂世界";
-    let body = completed_text_body(text);
-    let cjk = body.find('好').expect("cjk in body");
-    let emoji = body.find('🙂').expect("emoji in body");
-    let server = MockServer::start(vec![
-        MockResponse::sse(body).split_at(&[cjk + 1, emoji + 2]),
-    ]);
-    let events = collect(&provider(&server), request(vec![user_text("hi")])).await;
-    assert!(events.iter().all(Result::is_ok), "{events:?}");
-    assert_eq!(text_deltas(&events), text);
-    assert_eq!(completed_items(&events), vec![(0, completed_item(text))]);
-}
-
-#[tokio::test]
-async fn crlf_framed_stream_matches_lf_stream() {
-    let lf = completed_text_body("Hi");
-    let crlf = lf.replace('\n', "\r\n");
-    let server = MockServer::start(vec![MockResponse::sse(lf), MockResponse::sse(crlf)]);
-    let provider = provider(&server);
-    let from_lf = collect(&provider, request(vec![user_text("hi")])).await;
-    let from_crlf = collect(&provider, request(vec![user_text("hi")])).await;
-    assert!(from_lf.iter().all(Result::is_ok), "{from_lf:?}");
-    assert_eq!(format!("{from_crlf:?}"), format!("{from_lf:?}"));
+async fn openai_satisfies_the_provider_contract() {
+    asterpath_testing::provider_contract(&OpenAiWire).await;
 }

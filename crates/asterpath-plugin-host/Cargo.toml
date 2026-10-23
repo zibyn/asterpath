@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 asterpath-core = { path = "../asterpath-core" }
+asterpath-http = { path = "../asterpath-http" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-sandbox = { path = "../asterpath-sandbox" }
 libc = "0.2"

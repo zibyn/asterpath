@@ -602,7 +602,7 @@ pub enum ProviderErrorKind {
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
 
-`tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；请求前对每条 `Reasoning` 重算比较。
+`tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；请求前对每条 `Reasoning` 重算比较。
 
 `prefix_epoch` 的定义：会话中截至请求水位已发生的 `CompactionApplied` 数量。`Reasoning.binding.prefix_epoch` 在产出时写入（取自 `request.prefix_epoch`）；压缩后旧 reasoning 自然失效，压缩后新产出的 reasoning 使用新代次。
 

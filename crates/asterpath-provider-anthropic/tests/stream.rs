@@ -777,3 +777,31 @@ async fn empty_response_is_a_valid_end_turn() {
             .any(|event| matches!(event, StreamEvent::ItemStarted { .. }))
     );
 }
+
+struct AnthropicWire;
+
+impl asterpath_testing::ProviderWire for AnthropicWire {
+    fn provider(&self, base_url: &str) -> Box<dyn asterpath_protocol::Provider> {
+        Box::new(
+            asterpath_provider_anthropic::AnthropicProvider::new("test-key")
+                .with_base_url(base_url),
+        )
+    }
+
+    fn text_response(&self, text: &str) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        vec![
+            json!({"type": "message_start", "message": {"id": "msg_c", "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+            json!({"type": "message_stop"}),
+        ]
+    }
+}
+
+#[tokio::test]
+async fn anthropic_satisfies_the_provider_contract() {
+    asterpath_testing::provider_contract(&AnthropicWire).await;
+}

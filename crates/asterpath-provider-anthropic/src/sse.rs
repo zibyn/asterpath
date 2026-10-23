@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
+use asterpath_http::{SseDecoder, SseEvent};
 use asterpath_protocol::{
     ImageSource, InputTokens, Item, JsonString, ModelId, OutputTokens, Part, PartDelta,
     ProviderError, ProviderId, RawProviderData, ReasoningBinding, Role, StopReason, StreamEvent,
@@ -40,10 +41,7 @@ pub(crate) struct Decoder {
     terminal: bool,
     queue: VecDeque<Result<StreamEvent, ProviderError>>,
 
-    buffer: Vec<u8>,
-    event_name: Option<String>,
-    data: String,
-    has_data: bool,
+    sse: SseDecoder,
 
     sequence: u64,
     started: bool,
@@ -106,10 +104,7 @@ impl Decoder {
             phase: Some(Phase::Connect),
             terminal: false,
             queue: VecDeque::new(),
-            buffer: Vec::new(),
-            event_name: None,
-            data: String::new(),
-            has_data: false,
+            sse: SseDecoder::new(),
             sequence: 0,
             started: false,
             request_id_header: None,
@@ -137,8 +132,8 @@ impl Decoder {
                 Some(Phase::Connect) => self.connect().await,
                 Some(Phase::Read(mut stream)) => match stream.next().await {
                     Some(Ok(chunk)) => {
-                        self.buffer.extend_from_slice(&chunk);
-                        self.pump();
+                        let events = self.sse.push(&chunk);
+                        self.pump(events);
                         if !self.terminal {
                             self.phase = Some(Phase::Read(stream));
                         }
@@ -152,6 +147,8 @@ impl Decoder {
                         self.fail(error);
                     }
                     None => {
+                        let events = self.sse.finish();
+                        self.pump(events);
                         if !self.terminal {
                             self.fail(error::truncated(
                                 self.request_id.clone(),
@@ -208,74 +205,22 @@ impl Decoder {
         self.phase = None;
     }
 
-    fn pump(&mut self) {
-        loop {
-            let Some(line) = self.take_line() else {
-                return;
-            };
-            let line = match line {
-                Ok(line) => line,
-                Err(error) => {
-                    self.fail(error);
-                    return;
-                }
-            };
-            if line.is_empty() {
-                let Some((name, data)) = self.take_event() else {
-                    continue;
-                };
-                match self.handle_event(name.as_deref(), &data) {
-                    Ok(events) => {
-                        self.queue.extend(events.into_iter().map(Ok));
-                        if self.terminal {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        self.fail(error);
+    fn pump(&mut self, events: Result<Vec<SseEvent>, ProviderError>) {
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => return self.fail(error),
+        };
+        for event in events {
+            match self.handle_event(event.event.as_deref(), &event.data) {
+                Ok(events) => {
+                    self.queue.extend(events.into_iter().map(Ok));
+                    if self.terminal {
                         return;
                     }
                 }
-            } else if line.starts_with(':') {
-                // SSE comment / keep-alive.
-            } else {
-                let (field, value) = line.split_once(':').unwrap_or((&line, ""));
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                match field {
-                    "event" => self.event_name = Some(value.to_owned()),
-                    "data" => {
-                        if self.has_data {
-                            self.data.push('\n');
-                        }
-                        self.data.push_str(value);
-                        self.has_data = true;
-                    }
-                    _ => {}
-                }
+                Err(error) => return self.fail(error),
             }
         }
-    }
-
-    fn take_line(&mut self) -> Option<Result<String, ProviderError>> {
-        let position = self.buffer.iter().position(|byte| *byte == b'\n')?;
-        let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
-        line.pop();
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        Some(String::from_utf8(line).map_err(|_| error::protocol("SSE line is not valid UTF-8")))
-    }
-
-    fn take_event(&mut self) -> Option<(Option<String>, String)> {
-        if !self.has_data {
-            self.event_name = None;
-            self.data.clear();
-            return None;
-        }
-        let name = self.event_name.take();
-        let data = std::mem::take(&mut self.data);
-        self.has_data = false;
-        Some((name, data))
     }
 
     fn handle_event(

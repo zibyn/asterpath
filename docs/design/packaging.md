@@ -30,7 +30,7 @@
 | `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | M3；**可选装配**，不进通过条件 |
 | `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol`, `http` | M2 |
 | `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol`, `http` | M2 |
-| `asterpath-http` | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）；不属于稳定面（ADR-0026 修订）；白名单角色记为 `contract` 以便模块依赖 | `protocol` | 2026-10-23 重审（#66） |
+| `asterpath-http` | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；不属于稳定面（ADR-0026 修订）；白名单角色记为 `contract` 以便模块依赖 | `protocol`、reqwest | 2026-10-23 重审（#66） |
 | `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | M3 |
 | `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | M3 |
 | `asterpath-testing` | in-memory fakes、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)） | `core`, `protocol` | M0 |

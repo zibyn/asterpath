@@ -11,6 +11,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use asterpath_http::SseDecoder;
 use asterpath_protocol::{JsonString, ToolContext, ToolError, ToolOutput};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
@@ -224,43 +225,28 @@ async fn read_json(response: reqwest::Response) -> Result<Value, RpcFailure> {
 /// and unrelated messages are ignored; EOF before the response is a transport
 /// failure for this call only.
 async fn read_sse(mut response: reqwest::Response, expected_id: u64) -> Result<Value, RpcFailure> {
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut data = String::new();
+    let mut decoder = SseDecoder::new();
     loop {
         let chunk = response
             .chunk()
             .await
             .map_err(|error| RpcFailure::Transport(reqwest_message(&error)))?;
-        let Some(chunk) = chunk else {
+        let events = match &chunk {
+            Some(chunk) => decoder.push(chunk),
+            None => decoder.finish(),
+        }
+        // The decoder only fails on invalid UTF-8.
+        .map_err(|_| RpcFailure::Transport("MCP SSE stream is not valid UTF-8".to_owned()))?;
+        for event in events.iter().filter(|event| !event.data.is_empty()) {
+            let message = parse_sse_message(&event.data)?;
+            if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
+                return Ok(message);
+            }
+        }
+        if chunk.is_none() {
             return Err(RpcFailure::Transport(
                 "MCP SSE stream ended before the response".to_owned(),
             ));
-        };
-        buffer.extend_from_slice(&chunk);
-        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            let line = buffer.drain(..=newline).collect::<Vec<u8>>();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                if !data.is_empty() {
-                    let message = parse_sse_message(&data)?;
-                    data.clear();
-                    if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
-                        return Ok(message);
-                    }
-                }
-                continue;
-            }
-            if line.starts_with(':') {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("data:") {
-                let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(rest);
-            }
         }
     }
 }

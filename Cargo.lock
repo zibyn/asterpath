@@ -199,6 +199,7 @@ name = "asterpath-plugin-host"
 version = "0.1.0"
 dependencies = [
  "asterpath-core",
+ "asterpath-http",
  "asterpath-protocol",
  "asterpath-sandbox",
  "asterpath-testing",
