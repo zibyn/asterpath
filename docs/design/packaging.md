@@ -69,7 +69,8 @@ pub struct ConfigSnapshot {
 
 | 模块 | 内容 | 原 crate |
 | --- | --- | --- |
-| `agent` | `Agent`：turn / step 循环、工具管线、恢复；`spawn_agent` 调用转给 `Scheduler::run_spawn_tool`，并把自己作为子会话驱动者传入 | `asterpath-agent` |
+| `agent` | `Agent`：turn / step 循环、模型调用、恢复；`spawn_agent` 调用转给 `Scheduler::run_spawn_tool`，并把自己作为子会话驱动者传入 | `asterpath-agent` |
+| `agent::pipeline` | `ToolPipeline`：一个步骤的全部工具调用到结果（准入、审批、Parallel/Exclusive 锁、并发上限、截断、取消收尾）；唯一操作 `run`，依赖构造时注入，可脱离回合直接测试（#68） | — |
 | `scheduler` | `Scheduler`：spawn / 物化 / 准入 / 等待 / 超时 / 取消；`SpawnTool` 只是工具表里的描述符 | `asterpath-scheduler` |
 | `waits` | `Waits`：审批 signal 与子会话完成的持久等待 | `asterpath-runtime` |
 | `tools` | `ToolTable`：按名有序、重名保留先注册者 | `asterpath-tools` |

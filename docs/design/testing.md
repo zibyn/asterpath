@@ -203,6 +203,8 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它不实�
 | --- | --- | --- |
 | 验收脚本（provider 响应、工具调用、场景参数） | `asterpath-acceptance/fixtures/*.json` | A1–A3、(b)、(c) 的单一来源 |
 | `ScriptedProvider` 回放 | `asterpath-testing` | 只读 fixture，不依赖具体模块 |
+| `TestTool`（闭包行为、记录收到的参数） | `asterpath-testing` | 工具替身的单一定义 |
+| agent 测试共用夹具（配置、描述符、日志读写、驱动） | `crates/asterpath/src/agent/tests/support.rs` | `pipeline` / `tool_pipeline` / `recovery` / `compaction_turn` 共用；工具管线直接测在 `pipeline.rs`，不经 provider |
 | 契约测试数据 | `asterpath-testing` 内的 Rust builder | 不进 JSON |
 | 各 crate 单测数据 | 各 crate `#[cfg(test)]` | 就近构造，不共享 |
 | 引擎内部类型的测试 | `crates/asterpath/src/<mod>/tests`（`#[cfg(test)] mod tests;`） | agent / scheduler / waits / tools / views / compaction；用真实组件 + `asterpath-testing` 的 in-memory 后端，没有引擎 trait 的替身 |
