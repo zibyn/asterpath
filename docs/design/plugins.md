@@ -6,7 +6,7 @@
 >
 > 相关 ADR：[0013 外部插件用清单加载，进程内模块编译期组装](../adr/0013-plugin-boundary.md)。
 >
-> **2026-10-22 #32 范围调整**：本文件的设计保留，实现归 **M5（post-v1）**；不属于 v1 交付，也不进 M0–M4 验收。
+> **2026-10-22 #32 范围调整 / 2026-10-23 M5 范围**：本文件的设计保留，实现归 **M5（post-v1，进行中）**；不属于 v1 交付，也不进 M0–M4 验收。M5 只实现 MCP 传输，`CustomStdio` 已从清单枚举移除。
 
 ## 1. 决策摘要
 
@@ -60,7 +60,7 @@ pub struct PluginManifest {                  // host 构造或反序列化；字
     pub name: Option<String>,                // 缺省 = id
     pub version: Option<String>,             // 插件自身版本；仅诊断，不参与门禁
     pub required: bool,                      // 缺省 false
-    pub protocol: PluginProtocol,            // Mcp | Acp | CustomStdio
+    pub protocol: PluginProtocol,            // Mcp | Acp
     pub protocol_versions: Vec<String>,      // 非空；精确匹配，不做范围
     pub transport: PluginTransport,
     pub capabilities: Vec<PluginCapability>, // 缺省 [Tools]
@@ -71,7 +71,6 @@ pub struct PluginManifest {                  // host 构造或反序列化；字
 pub enum PluginProtocol {
     Mcp,
     Acp,
-    CustomStdio,
 }
 
 #[non_exhaustive]
@@ -188,8 +187,8 @@ pub struct PluginTimeouts {
 - adapter 协商（MCP `server/discover`）返回的协议版本必须命中白名单；否则该插件加载失败。
 - 插件自身 `version` 只用于诊断展示，不参与兼容判断。
 - 不降级、不禁用部分能力、不尝试旧协议回退。
-- MCP v1 只支持 `2026-07-28`（无状态修订）；版本常量与 `server/discover` 协商见 [mcp.md](mcp.md)。自定义 stdio 协议版本是 adapter 定义的 opaque 字符串，同样精确匹配。
-- `PluginProtocol::Acp` 是清单能识别的值；v1 不实现 ACP（宿主/会话接口，不是工具传输，见 [mcp.md](mcp.md) §9）。识别值不等于实现，未实现的协议值使插件加载失败。
+- MCP v1 只支持 `2026-07-28`（无状态修订）；版本常量与 `server/discover` 协商见 [mcp.md](mcp.md)。
+- `PluginProtocol::Acp` 是清单能识别的值；M5 不实现 ACP（宿主/会话接口，不是工具传输，见 [mcp.md](mcp.md) §9）。识别值不等于实现，未实现的协议值使插件加载失败。
 
 ### 7.3 Provider、model alias 与 raw
 
@@ -257,6 +256,7 @@ pub enum PluginLoadStage {
 - 插件提供 command / context 贡献（合约尚不存在）。
 - 部分工具注册：一个插件要么全部工具可用，要么整插件失败。
 - 实现指纹 / descriptor hash 恢复校验。
+- 自定义 stdio 插件协议（`CustomStdio`）：M5 不实现；清单只识别 `Mcp` 与 `Acp`。
 
 ## 12. 验收场景
 

@@ -11,7 +11,7 @@
 三个事实约束答案：
 
 - **工具是 Rust trait object**，`invoke` 是不透明 future。装饰器无法替工具内部的 `Command::spawn` 加隔离，只能整次拒绝或审计；纯进程内工具根本没有进程边界。
-- **只有进程启动点能被 OS 约束**：plugin-host 启动 MCP stdio server / `CustomStdio`，宿主自带的 shell 类工具每次起子进程。MCP HTTP 没有本地进程。
+- **只有进程启动点能被 OS 约束**：plugin-host 启动 MCP stdio server，宿主自带的 shell 类工具每次起子进程。MCP HTTP 没有本地进程。
 - **manifest 不是沙箱**（[#16](../design/plugins.md)）：让插件清单声明自己的约束档位，等于让被约束方选择约束。
 
 ## Decision

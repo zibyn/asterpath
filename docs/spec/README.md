@@ -12,7 +12,7 @@
 
 - 内核、打包、保留/归档与测试工具链已定稿（[#2](https://github.com/zibyn/asterpath/issues/2)–[#19](https://github.com/zibyn/asterpath/issues/19)）。
 - 扩展 seam：[#21](https://github.com/zibyn/asterpath/issues/21) 沙箱已定（[sandbox.md](../design/sandbox.md)）；[#20](https://github.com/zibyn/asterpath/issues/20) MCP 映射已定（ACP 出界）。这些不影响 M0–M4 开工。
-- `asterpath-plugin-host`、MCP adapter、沙箱与插件分发归 **M5（post-v1）**，不进 v1 workspace 与 v1 验收（见 [packaging.md §5](../design/packaging.md#5-交付清单与里程碑)）。
+- `asterpath-plugin-host`、MCP adapter 与沙箱归 **M5（post-v1）**，不进 v1 workspace 与 v1 验收；插件分发、ACP 与 WASM 出界（见 [packaging.md §5](../design/packaging.md#5-交付清单与里程碑)）。
 
 ## 阅读顺序
 

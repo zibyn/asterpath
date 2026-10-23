@@ -6,7 +6,7 @@
 >
 > 相关 ADR：[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
 >
-> **2026-10-22 #32 范围调整**：本文件的设计保留，实现归 **M5（post-v1）**；不属于 v1 交付，也不进 M0–M4 验收。
+> **2026-10-22 #32 范围调整 / 2026-10-23 M5 范围**：本文件的设计保留，实现归 **M5（post-v1，进行中）**；不属于 v1 交付，也不进 M0–M4 验收。M5 只实现 MCP stdio 的 spawn 点。
 >
 > 本票对 #7 的修订（已同步到 `tools.md`）：
 >
@@ -75,7 +75,7 @@ pub struct ConfinedSpawn {                 // #[non_exhaustive]
 ```text
 宿主组装
   ├─ 构造 SandboxProvider（后端 + allow_partial）
-  ├─ 注入 plugin-host ──> 每次 stdio / CustomStdio 启动 ──> confine ──> spawn
+  ├─ 注入 plugin-host ──> 每次 MCP stdio 启动 ──> confine ──> spawn
   ├─ 注入 spawn 型工具 ──> 每次子进程启动 ──> confine ──> spawn
   └─ 策略解析器（按 SessionId）
         └─ 工具调用时解析 policy ──> SpawnRequest.policy
@@ -87,7 +87,6 @@ HTTP MCP ──> 没有本地进程 ──> 不在沙箱范围
 | 调用点 | 能否约束 | 说明 |
 | --- | --- | --- |
 | plugin-host 启动 MCP stdio server | 是 | 启动时 constrain 一次；server 内部所有 tool call 共享同一边界，不再单独 confine |
-| plugin-host 启动 `CustomStdio` 插件 | 是 | 同上 |
 | 宿主自带的 spawn 型工具（shell 等） | 是 | 每次 spawn 前调用 `confine` |
 | 纯进程内 Rust 工具 | 否 | 没有进程边界；只能由 pre-execute 或工具包装器整次拒绝/审计 |
 | HTTP MCP | 否 | 没有本地进程；网络维度不在 v1 策略里 |
@@ -177,7 +176,7 @@ pub enum SandboxError {
 - **清单不声明沙箱**：`PluginManifest` 没有 sandbox 字段。manifest 是 host 提供的数据，让插件声明自己的约束等于让被约束方选择约束；[#16](./plugins.md) 的「manifest 不是沙箱」保持不变。
 - per-plugin 策略覆盖只作为宿主配置（按 `PluginId` 的宿主映射），不进 manifest，也不在 v1 规格里。
 - 受限策略 + 没有 provider：插件加载失败（`required` 则宿主启动失败），不裸跑。
-- MCP stdio / `CustomStdio`：约束发生在 server 启动时；server 内部的 tool call 不再单独 confine——它们已经在同一个受限进程里。
+- MCP stdio：约束发生在 server 启动时；server 内部的 tool call 不再单独 confine——它们已经在同一个受限进程里。
 - MCP HTTP：没有本地进程可包，**不在沙箱范围**；受限策略不会阻止它。宿主若需要硬边界，必须自己禁用 HTTP 传输。
 - 插件重启 = 重新启动进程 = 重新 `confine`；不存在的「给运行中进程加沙箱」不做。
 - 环境净化：provider 可通过 `ConfinedSpawn.env` 删除继承变量；v1 不把它定义成策略档位的一部分，后端可以做得更严。

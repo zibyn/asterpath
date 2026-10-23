@@ -1,6 +1,7 @@
 # 外部插件用清单加载，进程内模块编译期组装
 
 **Status**: accepted (2026-10-22)；实现里程碑 M5（post-v1，[#32](https://github.com/zibyn/asterpath/issues/32)）
+**修订**: 2026-10-23 M5 范围——清单枚举移除 `CustomStdio`，M5 只实现 MCP 传输；`Acp` 保持识别但不支持。插件分发仍归 host/生态。
 **来源**: [#16](https://github.com/zibyn/asterpath/issues/16)
 
 ## Context
