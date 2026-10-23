@@ -6,6 +6,7 @@
 **修订**: ADR-0005 的派生索引、ADR-0016 的退役空闲判定、ADR-0022 的服务清单
 **2026-10-23 ADR-0024 修订**: `is_wakeable` 不再含到期 timer（通用 timer 已删除），见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
 **2026-10-23 #73 扩展修订**: `EventLog`、`SessionCatalog`、`SessionRetirement` 合并为一个 `SessionStore` trait（`retire` 默认 `Unsupported`）；facade 只接收一个 `store`；存储契约套件异步化并覆盖目录与退役，memory 后端实现退役。下文的 `Asterpath::wakeable(now)` 落地为不带参数的 `wakeable()`（通用 timer 删除后不再需要 `now`），`session_catalog` 注入入口落地为 `store`。
+**2026-10-23 ADR-0028 修订**: `sessions()` 改为带过滤与游标的 `sessions(query)`，返回目录项；`children()` 删除，见 [ADR-0028](0028-catalog-entries-and-in-process-pending-approvals.md)。
 
 ## Context
 
@@ -29,7 +30,7 @@ ADR-0005 让 SQLite 在 `append` 同事务内维护 `open_intents`、`timers`、
 ## Consequences
 
 - 唤醒规则只有一份，由会话事实（#64）实现；第三个存储后端只需能追加、扫描、列会话。
-- 启动发现读取全部会话日志，成本随会话总量线性增长。会话量大时在 SQLite 模块内部加索引，不改接口。
+- 启动发现读取全部会话日志，成本随会话总量线性增长。唤醒发现在 facade 内折叠，`SessionStore` 没有唤醒方法，因此加索引必然扩展存储契约；出现实测瓶颈前不做（#84）。
 - 退役读取两个会话的完整日志；退役是低频管理操作，可接受。
 - G5 的唤醒断言从后端契约套件移到 facade 测试（双后端）；契约套件只验证 `sessions()`。
 
