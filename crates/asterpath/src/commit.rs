@@ -1,4 +1,4 @@
-//! The single append entry (ADR-0025). Every engine writer (agent, runtime,
+//! The single append entry (ADR-0025). Every engine writer (agent, waits,
 //! scheduler, facade) appends through this log: after a successful append it
 //! shows each new record to the hosts' `on_record` hooks, in session order.
 

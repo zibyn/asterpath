@@ -33,7 +33,7 @@ const MAX_PARENT_CHAIN: u8 = 64;
 
 pub(crate) struct Scheduler {
     log: Arc<dyn SessionStore>,
-    executor: Arc<Waits>,
+    waits: Arc<Waits>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
     /// Process-wide cap on live children across all parents.
@@ -63,14 +63,14 @@ struct ParentAdmission {
 
 impl Scheduler {
     #[cfg(test)]
-    pub(crate) fn new(
+    pub(crate) fn with_defaults(
         log: Arc<dyn SessionStore>,
-        executor: Arc<Waits>,
+        waits: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
     ) -> Self {
-        Self::with_runtime(
+        Self::new(
             log,
-            executor,
+            waits,
             aliases,
             Arc::new(asterpath_protocol::SystemClock),
             DEFAULT_MAX_LIVE_CHILDREN,
@@ -80,9 +80,9 @@ impl Scheduler {
 
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
-    pub(crate) fn with_runtime(
+    pub(crate) fn new(
         log: Arc<dyn SessionStore>,
-        executor: Arc<Waits>,
+        waits: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
         max_live_children: NonZeroUsize,
@@ -90,7 +90,7 @@ impl Scheduler {
     ) -> Self {
         Self {
             log,
-            executor,
+            waits,
             aliases,
             clock,
             max_live_children,
@@ -376,7 +376,7 @@ impl Scheduler {
                 let drive = drive_child(agent, child.child);
                 tokio::pin!(drive);
                 let wake = self
-                    .executor
+                    .waits
                     .await_wake(child.parent.session, WakeCause::ChildCompleted(child.child));
                 tokio::pin!(wake);
                 let deadline_wait = async {
@@ -417,7 +417,7 @@ impl Scheduler {
                     }
                     Some(Err(AgentError::Busy { .. })) => {
                         let _ = self
-                            .executor
+                            .waits
                             .await_wake(
                                 child.parent.session,
                                 WakeCause::ChildCompleted(child.child),
@@ -805,7 +805,7 @@ impl Scheduler {
         .await
         .map_err(WaitError::Execution)?;
         self.release_slot(child.parent.session, child.parent.tool_call);
-        self.executor
+        self.waits
             .wake(child.parent.session, WakeCause::ChildCompleted(child.child));
         Ok(())
     }

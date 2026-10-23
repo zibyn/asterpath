@@ -79,7 +79,7 @@ fn assistant(text_value: &str) -> Item {
     }
 }
 
-// --- tools and executor ---------------------------------------------------
+// --- tools and waits ---------------------------------------------------
 
 struct AlwaysCompact;
 

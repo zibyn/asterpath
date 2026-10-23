@@ -116,7 +116,7 @@ fn agent_with<L: SessionStore + 'static>(
     tools: Vec<Arc<dyn Tool>>,
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
-    executor: Option<Arc<Waits>>,
+    waits: Option<Arc<Waits>>,
     hooks: Option<Arc<dyn Hooks>>,
 ) -> Agent {
     support::agent_with(
@@ -126,7 +126,7 @@ fn agent_with<L: SessionStore + 'static>(
         ToolConfig::default(),
         approval,
         gate,
-        executor,
+        waits,
     )
     .with_hooks(hooks.into_iter().collect(), None)
 }
@@ -999,7 +999,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
 
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register();
-    let executor = Arc::new(Waits::new(log.clone()));
+    let waits = Arc::new(Waits::new(log.clone()));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -1011,7 +1011,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
         vec![tool],
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
-        Some(executor.clone()),
+        Some(waits.clone()),
         None,
     );
 
@@ -1036,7 +1036,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
         "no terminal while waiting"
     );
 
-    executor
+    waits
         .deliver_signal(SignalDelivery {
             session: SESSION,
             signal: approval_signal_id(CALL),

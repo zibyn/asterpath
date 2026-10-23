@@ -64,7 +64,7 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// The composition root supplies policy, gate and durable executor; this
+    /// The composition root supplies policy, gate and durable waits; this
     /// module never constructs them, so approval waits are real.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -74,7 +74,7 @@ impl Agent {
         tool_config: ToolConfig,
         approval: Arc<dyn ApprovalPolicy>,
         gate: Arc<ApprovalGate>,
-        executor: Arc<Waits>,
+        waits: Arc<Waits>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -84,7 +84,7 @@ impl Agent {
                 tool_config,
                 approval,
                 gate,
-                executor,
+                waits,
                 Arc::clone(&clock),
             ),
             log,

@@ -64,7 +64,7 @@ pub struct Asterpath {
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
     usage: Arc<UsageService>,
-    executor: Arc<Waits>,
+    waits: Arc<Waits>,
     gate: Arc<ApprovalGate>,
     cancellations: Arc<CancellationRegistry>,
     clock: Arc<dyn Clock>,
@@ -145,14 +145,14 @@ impl Asterpath {
         let event_log: Arc<dyn SessionStore> =
             Arc::new(commit::CommitLog::new(backend, config.hooks.clone()));
 
-        let executor = Arc::new(Waits::new(Arc::clone(&event_log)));
+        let waits = Arc::new(Waits::new(Arc::clone(&event_log)));
         let cancellations = Arc::new(CancellationRegistry::new());
 
         // The agent owns the scheduler and passes itself to drive children,
         // so nothing points back at the agent.
-        let scheduler = Arc::new(Scheduler::with_runtime(
+        let scheduler = Arc::new(Scheduler::new(
             Arc::clone(&event_log),
-            Arc::clone(&executor),
+            Arc::clone(&waits),
             config.model_aliases.clone(),
             Arc::clone(&config.clock),
             config.max_live_children,
@@ -185,7 +185,7 @@ impl Asterpath {
                 config.tool.clone(),
                 approval,
                 Arc::clone(&gate),
-                Arc::clone(&executor),
+                Arc::clone(&waits),
                 Arc::clone(&config.clock),
             )
             .with_hooks(config.hooks, Some(usage_lookup))
@@ -200,7 +200,7 @@ impl Asterpath {
             tools,
             agent,
             usage,
-            executor,
+            waits,
             gate,
             cancellations,
             clock,
@@ -266,7 +266,7 @@ impl Asterpath {
             session,
             event_log: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
-            executor: Arc::clone(&self.executor),
+            waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
         })
     }
@@ -281,7 +281,7 @@ impl Asterpath {
             session: id,
             event_log: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
-            executor: Arc::clone(&self.executor),
+            waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
         })
     }
@@ -362,7 +362,7 @@ pub struct SessionHandle {
     session: SessionId,
     event_log: Arc<dyn SessionStore>,
     agent: Arc<Agent>,
-    executor: Arc<Waits>,
+    waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
 }
 
@@ -419,7 +419,7 @@ impl SessionHandle {
         let payload = serde_json::to_value(decision).map_err(|error| AsterError::Config {
             message: error.to_string(),
         })?;
-        self.executor
+        self.waits
             .deliver_signal(SignalDelivery {
                 session: self.session,
                 signal: approval_signal_id(call),

@@ -119,7 +119,7 @@ fn new_scheduler<L: SessionStore + 'static>(
     aliases: BTreeMap<ModelAlias, ModelSpec>,
 ) -> (Arc<Scheduler>, Agent) {
     let log: Arc<dyn SessionStore> = log;
-    let scheduler = Arc::new(Scheduler::new(
+    let scheduler = Arc::new(Scheduler::with_defaults(
         Arc::clone(&log),
         Arc::new(Waits::new(Arc::clone(&log))),
         aliases,
@@ -133,7 +133,7 @@ fn new_scheduler_with<L: SessionStore + 'static>(
     clock: Arc<dyn Clock>,
 ) -> (Arc<Scheduler>, Agent) {
     let log: Arc<dyn SessionStore> = log;
-    let scheduler = Arc::new(Scheduler::with_runtime(
+    let scheduler = Arc::new(Scheduler::new(
         Arc::clone(&log),
         Arc::new(Waits::new(Arc::clone(&log))),
         BTreeMap::new(),

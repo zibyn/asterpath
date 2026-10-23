@@ -16,13 +16,13 @@ const SESSION: SessionId = SessionId::from_bytes([7; 16]);
 
 struct Fixture {
     log: Arc<InMemoryEventLog>,
-    executor: Arc<Waits>,
+    waits: Arc<Waits>,
 }
 
 fn fixture() -> Fixture {
     let log = Arc::new(InMemoryEventLog::new());
-    let executor = Arc::new(Waits::new(log.clone()));
-    Fixture { log, executor }
+    let waits = Arc::new(Waits::new(log.clone()));
+    Fixture { log, waits }
 }
 
 async fn events(log: &InMemoryEventLog) -> Vec<SessionEvent> {
@@ -54,7 +54,7 @@ async fn approval_signal_uses_tool_call_id_and_writes_no_intent() {
         ToolCallId::from_bytes(tool_call).to_hex()
     ));
 
-    let waiting = Arc::clone(&fixture.executor);
+    let waiting = Arc::clone(&fixture.waits);
     let awaited_name = name.clone();
     let handle = tokio::spawn(async move {
         waiting
@@ -68,7 +68,7 @@ async fn approval_signal_uses_tool_call_id_and_writes_no_intent() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     fixture
-        .executor
+        .waits
         .deliver_signal(SignalDelivery {
             session: SESSION,
             signal: SignalId::from_bytes(tool_call),
@@ -102,13 +102,13 @@ async fn duplicate_delivery_and_repeat_waits_collapse() {
         payload: serde_json::json!({"n": 1}),
     };
     fixture
-        .executor
+        .waits
         .deliver_signal(delivery.clone())
         .await
         .expect("deliver");
     // The second delivery must not write a second record.
     fixture
-        .executor
+        .waits
         .deliver_signal(SignalDelivery {
             payload: serde_json::json!({"n": 2}),
             ..delivery
@@ -122,12 +122,12 @@ async fn duplicate_delivery_and_repeat_waits_collapse() {
         name,
     };
     let first = fixture
-        .executor
+        .waits
         .await_signal(request.clone())
         .await
         .expect("first wait");
     let second = fixture
-        .executor
+        .waits
         .await_signal(request)
         .await
         .expect("second wait");
@@ -143,7 +143,7 @@ async fn a_delivered_signal_satisfies_a_later_wake_wait() {
     let fixture = fixture();
     let signal = SignalId::from_bytes([5; 16]);
     fixture
-        .executor
+        .waits
         .deliver_signal(SignalDelivery {
             session: SESSION,
             signal,
@@ -153,7 +153,7 @@ async fn a_delivered_signal_satisfies_a_later_wake_wait() {
         .await
         .expect("deliver");
     fixture
-        .executor
+        .waits
         .await_wake(SESSION, WakeCause::Signal(signal))
         .await
         .expect("the recorded signal satisfies the wait");
