@@ -94,7 +94,7 @@ allow = []
 [[package]]
 name = "asterpath-testing"
 role = "module"
-allow = ["asterpath-core", "asterpath-protocol"]
+allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox"]
 
 [[package]]
 name = "asterpath"
