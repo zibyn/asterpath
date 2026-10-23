@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
-    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, OpenIntents, Part, Provenance, ProviderId,
-    ReplaySafety, SessionEvent, ToolName, ToolResultStatus, Usage, decode_entry, dedup,
+    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, Part, Provenance, ProviderId, ReplaySafety,
+    SessionEvent, SessionFacts, ToolName, ToolResultStatus, Usage, dedup,
 };
 use asterpath_protocol::{
     DedupKey, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId, SignalId,
@@ -696,24 +696,12 @@ fn expected_wakeable(log: &dyn EventLog, sessions: &BTreeSet<SessionId>) -> Vec<
     let mut wakeable = Vec::new();
     for &session in sessions {
         let entries = scan(log, session);
-        let intents = OpenIntents::fold(&entries).expect("fold open intents");
-        if !intents.is_idle() || pending_input(&entries) {
+        let facts = SessionFacts::fold(&entries).expect("fold session facts");
+        if !facts.is_idle() || facts.has_pending_input() {
             wakeable.push(session);
         }
     }
     wakeable
-}
-
-fn pending_input(entries: &[LogEntry]) -> bool {
-    let mut pending = false;
-    for entry in entries {
-        match decode_entry(entry).expect("decode log entry") {
-            SessionEvent::InputRecorded { .. } => pending = true,
-            SessionEvent::StepStarted { .. } => pending = false,
-            _ => {}
-        }
-    }
-    pending
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

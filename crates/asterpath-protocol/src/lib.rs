@@ -1,7 +1,7 @@
 //! The contract crate: ids, the opaque log envelope and storage contracts,
 //! clock, errors, adapter traits, hooks, and the typed protocol view of the
 //! log (items, events, configuration snapshots, read-time upcasting, dedup-key
-//! construction, open-intent folding and projection). ADR-0026.
+//! construction, session facts and projection). ADR-0026.
 
 pub mod agent;
 pub mod compactor;
@@ -12,10 +12,10 @@ pub mod dedup;
 pub mod encode;
 pub mod error;
 pub mod event;
+pub mod facts;
 pub mod hash;
 pub mod hooks;
 pub mod ids;
-pub mod intents;
 pub mod item;
 pub mod names;
 pub mod projection;
@@ -53,6 +53,10 @@ pub use event::{
     ParentRef, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo, ToolErrorKind,
     ToolResultStatus, TurnEndReason,
 };
+pub use facts::{
+    IntentDelta, OpenChild, OpenCompaction, OpenIntent, OpenStep, OpenTool, SessionFacts,
+    SessionState, StepState,
+};
 pub use hash::Fnv;
 pub use hooks::{
     CommittedRecord, Gate, HookError, Hooks, StepCtx, ToolCallCtx, ToolGate, ToolResultView,
@@ -62,7 +66,6 @@ pub use ids::{
     InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
     SessionId, SignalId, StepId, ToolArgs, ToolCallId, ToolName, TurnId,
 };
-pub use intents::{IntentDelta, OpenIntent, OpenIntents, SessionState, StepState};
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
 pub use names::{
     ToolNameError, external_tool_name, sanitize_tool_name, validate_external_tool_name,

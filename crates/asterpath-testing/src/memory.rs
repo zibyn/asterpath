@@ -13,7 +13,7 @@ use asterpath_protocol::{
     Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, Storage,
     StorageError, SystemClock, Timestamp,
 };
-use asterpath_protocol::{OpenIntents, SessionEvent, decode_entry, decode_payload};
+use asterpath_protocol::{SessionEvent, SessionFacts, decode_entry, decode_payload};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -189,34 +189,6 @@ impl InMemoryStorage {
     }
 }
 
-struct SessionFacts {
-    intents: OpenIntents,
-    pending_input: bool,
-}
-
-fn session_facts(session: SessionId, entries: &[LogEntry]) -> Result<SessionFacts, StorageError> {
-    let mut intents = OpenIntents::default();
-    let mut pending_input = false;
-
-    for entry in entries {
-        let event = decode_entry(entry).map_err(|error| StorageError::Corrupt {
-            session: Some(session),
-            detail: error.to_string(),
-        })?;
-        intents.apply(&event, entry.dedup_key.as_ref());
-        match event {
-            SessionEvent::InputRecorded { .. } => pending_input = true,
-            SessionEvent::StepStarted { .. } => pending_input = false,
-            _ => {}
-        }
-    }
-
-    Ok(SessionFacts {
-        intents,
-        pending_input,
-    })
-}
-
 impl Storage for InMemoryStorage {
     fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
         let result = self.wakeable_sync(now);
@@ -234,8 +206,11 @@ impl InMemoryStorage {
         let mut wakeable = Vec::new();
         for (session, mut entries) in by_session {
             entries.sort_by_key(|entry| entry.seq);
-            let facts = session_facts(session, &entries)?;
-            if !facts.intents.is_idle() || facts.pending_input {
+            let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
+                session: Some(session),
+                detail: error.to_string(),
+            })?;
+            if !facts.is_idle() || facts.has_pending_input() {
                 wakeable.push(session);
             }
         }

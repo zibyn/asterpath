@@ -173,7 +173,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
 - 解码在查重之前，同时给出 `event_kind` 与派生输入；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
-- 派生规则（`open_intents` 的折叠与恢复的分类器共享同一个 `OpenIntents` 函数，不各写一套）：
+- 派生规则（`open_intents` 的折叠与恢复的分类器共享 protocol 的 `IntentDelta::of` / `SessionFacts`，不各写一套）：
 
 | 事件 | `open_intents` 动作 | 其他派生动作 |
 | --- | --- | --- |
@@ -232,7 +232,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
 - **G5 唤醒发现完备**：任何存在非 compaction 未闭合意图或待处理输入的 session 都出现在 `wakeable`；同一 session 每次调用只返回一次；重复驱动不产生重复记录（幂等 append + `drive()` 单飞）。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
-- **G7 索引可重建**：`sessions` / `open_intents` / `pending_inputs` 可完全由日志重建，不是真相源。`open_intents` 折叠出的集合必须与恢复的 `OpenIntents` 折叠一致。
+- **G7 索引可重建**：`sessions` / `open_intents` / `pending_inputs` 可完全由日志重建，不是真相源。`open_intents` 折叠出的集合必须与恢复的 `SessionFacts` 折叠一致。
 - **G8 退役原子性（可选能力）**：`SessionRetirement::retire` 在同一事务里写墓碑、删日志与全部派生行；要么全部生效，要么全部不生效；退役后的会话对 `EventLog` / `Storage` / `SessionCatalog` 不可见。契约见 [retention.md](retention.md)。
 
 trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、`flock`、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。

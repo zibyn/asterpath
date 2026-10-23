@@ -16,7 +16,7 @@ use asterpath_protocol::{
     Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError,
     SessionCatalog, SessionId, SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
 };
-use asterpath_protocol::{OpenIntent, OpenIntents, SessionEvent, decode_payload};
+use asterpath_protocol::{IntentDelta, OpenIntent, SessionEvent, decode_payload};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -563,7 +563,7 @@ fn apply_derived(
 ) -> Result<(), StorageError> {
     let session = entry.session.as_bytes();
 
-    let delta = OpenIntents::default().apply_delta(event, entry.dedup_key.as_ref());
+    let delta = IntentDelta::of(event, entry.dedup_key.as_ref());
     for intent in delta.opened {
         let (kind, ref_id) = intent_row(intent);
         tx.execute(

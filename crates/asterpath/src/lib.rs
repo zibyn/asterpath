@@ -41,8 +41,8 @@ use crate::views::usage::UsageService;
 use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, OpenIntents,
-    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState, Span,
+    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProviderCatalog,
+    RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span,
     SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
@@ -457,16 +457,20 @@ impl SessionHandle {
         Ok(())
     }
 
-    /// State is the log-derived classification, not driver memory.
-    pub async fn state(&self) -> Result<SessionState, AsterError> {
+    /// The session facts folded from the log, not driver memory.
+    pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
         let entries = scan_all(&*self.event_log, self.session).await?;
-        let intents = OpenIntents::fold(&entries).map_err(|error| {
+        SessionFacts::fold(&entries).map_err(|error| {
             AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
                 session: self.session,
                 detail: error.to_string(),
             })
-        })?;
-        Ok(intents.state())
+        })
+    }
+
+    /// State is the log-derived classification, not driver memory.
+    pub async fn state(&self) -> Result<SessionState, AsterError> {
+        Ok(self.facts().await?.state())
     }
 
     /// Run one manual compaction. Only allowed while idle and undriven.
