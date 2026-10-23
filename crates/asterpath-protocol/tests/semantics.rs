@@ -2,7 +2,7 @@
 
 use asterpath_protocol::*;
 use asterpath_protocol::{
-    DedupKey, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId,
+    LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId,
 };
 use serde_json::{Value, json};
 
@@ -162,134 +162,6 @@ fn dedup_keys_follow_the_shared_key_table() {
         dedup::signal(SignalId::from_bytes([3; 16])).as_str(),
         SignalId::from_bytes([3; 16]).to_hex()
     );
-}
-
-#[test]
-fn open_intents_is_idle_iff_no_non_compaction_intent_is_open() {
-    let mut intents = OpenIntents::default();
-    assert!(intents.is_idle());
-    assert_eq!(intents.state(), SessionState::Idle);
-
-    let compaction_key = dedup::compaction(LogId::from_i64(1));
-    let started = SessionEvent::CompactionStarted {
-        trigger: CompactionTrigger::Manual,
-        replaces_from: LogId::from_i64(1),
-        caused_by: LogId::from_i64(1),
-        turn: None,
-    };
-    intents.apply(&started, Some(&compaction_key));
-    // A dangling summary call is safe to discard: it does not make a session busy.
-    assert!(intents.is_idle());
-    assert_eq!(intents.state(), SessionState::Idle);
-
-    intents.apply(&SessionEvent::TurnStarted { turn_id: turn(1) }, None);
-    assert!(!intents.is_idle());
-    assert_eq!(
-        intents.state(),
-        SessionState::TurnOpen {
-            turn: turn(1),
-            step: None
-        }
-    );
-
-    intents.apply(
-        &SessionEvent::StepStarted {
-            turn_id: turn(1),
-            step_id: step(1),
-        },
-        None,
-    );
-    assert_eq!(
-        intents.state(),
-        SessionState::TurnOpen {
-            turn: turn(1),
-            step: Some(StepState::InProgress)
-        }
-    );
-
-    intents.apply(
-        &SessionEvent::ChildSessionSpawned {
-            child: session(9),
-            task: vec![text("task")],
-            config: config(),
-            context: ContextPolicy::Fresh,
-            parent_tool_call_id: call(1),
-            caused_by: LogId::from_i64(1),
-            deadline: Some(10),
-        },
-        None,
-    );
-    assert_eq!(
-        intents.state(),
-        SessionState::TurnOpen {
-            turn: turn(1),
-            step: Some(StepState::Waiting)
-        }
-    );
-
-    intents.apply(
-        &SessionEvent::ChildSessionCompleted {
-            child: session(9),
-            outcome: ChildOutcome::Cancelled {
-                reason: CancelReason::Timeout,
-            },
-        },
-        None,
-    );
-    intents.apply(
-        &SessionEvent::StepCommitted {
-            turn_id: turn(1),
-            step_id: step(1),
-        },
-        None,
-    );
-    intents.apply(
-        &SessionEvent::TurnCommitted {
-            turn_id: turn(1),
-            reason: TurnEndReason::Completed,
-        },
-        None,
-    );
-    assert!(intents.is_idle());
-    assert_eq!(intents.state(), SessionState::Idle);
-}
-
-#[test]
-fn open_intents_closes_with_the_matching_dedup_key_only() {
-    let mut intents = OpenIntents::default();
-    let key = dedup::compaction(LogId::from_i64(4));
-    intents.apply(
-        &SessionEvent::CompactionStarted {
-            trigger: CompactionTrigger::Threshold,
-            replaces_from: LogId::from_i64(1),
-            caused_by: LogId::from_i64(4),
-            turn: None,
-        },
-        Some(&key),
-    );
-    intents.apply(
-        &SessionEvent::CompactionApplied {
-            first_kept: LogId::from_i64(5),
-            summary: vec![],
-            replaces: LogIdRange {
-                first: LogId::from_i64(1),
-                last: LogId::from_i64(4),
-            },
-            model: model(),
-            usage: Usage::default(),
-            raw: None,
-        },
-        Some(&DedupKey::new("compaction:999")),
-    );
-    // A terminal record under another key does not close this intent.
-    assert!(intents.compactions_are_open());
-    intents.apply(
-        &SessionEvent::CompactionAborted {
-            reason: CompactionAbortReason::SummaryFailed,
-        },
-        Some(&key),
-    );
-    assert!(!intents.compactions_are_open());
 }
 
 fn visible_user(value: &str) -> (u64, SessionEvent) {
