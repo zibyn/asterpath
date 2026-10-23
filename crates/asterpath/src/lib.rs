@@ -87,6 +87,16 @@ impl Asterpath {
                 message: "max_steps_per_turn must be greater than zero".to_owned(),
             });
         }
+        for tool in &config.tools {
+            asterpath_protocol::validate_tool_name(tool.descriptor().name.as_str()).map_err(
+                |error| AsterError::Config {
+                    message: format!(
+                        "invalid tool name {}: {error}",
+                        tool.descriptor().name.as_str()
+                    ),
+                },
+            )?;
+        }
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {
             AsterError::Config {
