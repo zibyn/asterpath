@@ -9,6 +9,10 @@
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
 
+mod attempt;
+
+use attempt::{Attempts, Failure, Forced, Next};
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -260,19 +264,24 @@ impl Agent {
         .await?;
 
         let current = decode_entries(self.scan(session).await?, session)?;
+        let max_attempts = config.turn.max_attempts.get();
         let Some(OpenStep {
             step,
             seq: watermark,
             ..
         }) = open_step(&fold_facts(&current), turn)
         else {
-            // Between steps: continue with the turn's normal continue rules.
+            // Between steps: the last committed step decides whether the turn
+            // goes on, exactly as it did live.
+            if let Some(reason) = committed_step_end(&current, turn, max_attempts, facts) {
+                return self.commit_turn(session, turn, reason, events).await;
+            }
             return self
                 .run_steps(session, config, turn, None, cancel, events)
                 .await;
         };
 
-        if has_assistant_message(&current, turn, step) {
+        if assistant_message(&current, turn, step).is_some() {
             // The model call is committed: never call it again.
             match self
                 .resume_step(session, config, turn, step, cancel, events)
@@ -288,62 +297,46 @@ impl Agent {
                 .await;
         }
 
-        let last = last_abort(&current, turn, step);
-        // C5: a forced compaction committed after the rejected attempt redoes
-        // the same step with the new projection, never the failure terminal.
-        let force_compacted = matches!(last, Some((_, AbortKind::Rejected)))
-            && compaction_after_last_abort(&current, turn, step);
-        match last.map(|(_, kind)| kind) {
-            Some(AbortKind::Cancelled) => {
-                self.commit_step(session, turn, step).await?;
-                return self
-                    .commit_turn(session, turn, TurnEndReason::Cancelled, events)
-                    .await;
-            }
-            Some(AbortKind::Rejected) if !force_compacted => {
-                self.commit_step(session, turn, step).await?;
-                return self
-                    .commit_turn(session, turn, TurnEndReason::Failed, events)
-                    .await;
-            }
-            _ => {}
-        }
-
-        let start_attempt = match last {
-            Some((attempt, _)) => attempt.saturating_add(1),
-            None => {
-                // No attempt was ever decided: record the crash, then retry.
-                self.append(
-                    session,
-                    SessionEvent::ModelCallAborted {
-                        turn_id: turn,
-                        step_id: step,
-                        attempt: 1,
-                        kind: AbortKind::Crash,
-                        partial: None,
-                        model: config.model.clone(),
-                        backoff_ms: 0,
-                        usage: None,
-                    },
-                    None,
-                )
-                .await?;
-                2
-            }
-        };
-        // §4.1: an exhausted retry budget is a failure terminal, never an
-        // unbudgeted model call.
-        if start_attempt > config.turn.max_attempts.get() {
-            self.commit_step(session, turn, step).await?;
-            return self
-                .commit_turn(session, turn, TurnEndReason::Failed, events)
-                .await;
-        }
+        // The attempt policy replays the step's history. D3: a recorded
+        // backoff is not waited out; D4: an attempt in flight after a
+        // recorded abort is redone under the same number.
+        let (history, next) =
+            match attempt::replay(max_attempts, step_records(&current, turn, step)) {
+                Some(decided) => decided,
+                None => {
+                    // No attempt was ever decided: record the crash first.
+                    self.append(
+                        session,
+                        SessionEvent::ModelCallAborted {
+                            turn_id: turn,
+                            step_id: step,
+                            attempt: 1,
+                            kind: AbortKind::Crash,
+                            partial: None,
+                            model: config.model.clone(),
+                            backoff_ms: 0,
+                            usage: None,
+                        },
+                        None,
+                    )
+                    .await?;
+                    let history = Attempts::FIRST;
+                    (
+                        history,
+                        attempt::after_failure(max_attempts, history, Failure::Crash),
+                    )
+                }
+            };
         self.run_steps(
             session,
             config,
             turn,
-            Some((step, watermark, start_attempt, force_compacted)),
+            Some(OpenAttempt {
+                step,
+                watermark,
+                history,
+                next,
+            }),
             cancel,
             events,
         )
@@ -430,11 +423,11 @@ impl Agent {
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
-        existing_step: Option<(StepId, u64, u32, bool)>,
+        open: Option<OpenAttempt>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let mut pending = existing_step;
+        let mut pending = open;
         let mut steps_started = 0u32;
         // Steps of this turn already in the log; only read when hooks need it.
         let prior_steps = if self.hooks.is_empty() {
@@ -445,10 +438,8 @@ impl Agent {
         let mut auto_compactions = 0u32;
 
         loop {
-            let (step, watermark, start_attempt, force_compacted) = match pending.take() {
-                Some((step, watermark, attempt, force_compacted)) => {
-                    (step, watermark, attempt, force_compacted)
-                }
+            let open = match pending.take() {
+                Some(open) => open,
                 None => {
                     // Between steps: cancellation closes the turn with no step.
                     if cancel.is_cancelled() {
@@ -544,22 +535,20 @@ impl Agent {
                         .await?;
                     let seq = self.seq_of(session, log_id).await?;
                     steps_started += 1;
-                    (step, seq, 1, false)
+                    OpenAttempt {
+                        step,
+                        watermark: seq,
+                        history: Attempts::FIRST,
+                        next: Next::Retry {
+                            attempt: 1,
+                            backoff: false,
+                        },
+                    }
                 }
             };
 
             match self
-                .run_step(
-                    session,
-                    config,
-                    turn,
-                    step,
-                    watermark,
-                    start_attempt,
-                    force_compacted,
-                    cancel,
-                    events,
-                )
+                .run_step(session, config, turn, open, cancel, events)
                 .await?
             {
                 StepOutcome::Continue => {}
@@ -604,27 +593,47 @@ impl Agent {
         GateOutcome::Continue
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Drive one step's model attempts. `open.next` is where the attempt
+    /// policy left the step: the first call, a retry or the forced compaction.
     async fn run_step(
         &self,
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
-        step: StepId,
-        watermark: u64,
-        start_attempt: u32,
-        force_compacted: bool,
+        open: OpenAttempt,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
+        let OpenAttempt {
+            step,
+            watermark,
+            mut history,
+            mut next,
+        } = open;
         // The projection is computed once per step; retries reuse it (L12).
         // A forced compaction re-projects the same step.
         let mut request = self.build_request(session, config, watermark).await?;
         let max_attempts = config.turn.max_attempts.get();
-        let mut attempt = start_attempt;
-        let mut force_compacted = force_compacted;
 
         loop {
+            let attempt = match next {
+                Next::End(reason) => {
+                    self.commit_step(session, turn, step).await?;
+                    return Ok(StepOutcome::Turn(reason));
+                }
+                Next::ForceCompact => {
+                    history.compacted = true;
+                    let forced = self.force_compact(session, config, turn, watermark).await?;
+                    if forced == Forced::Applied {
+                        request = self.build_request(session, config, watermark).await?;
+                    }
+                    next = attempt::after_compaction(history, forced);
+                    continue;
+                }
+                Next::Retry { attempt, .. } => attempt,
+            };
+            history.attempt = attempt;
+
             // A step still open when cancellation arrives never calls the model.
             if cancel.is_cancelled() {
                 self.abort_cancelled(session, config, turn, step, attempt, None)
@@ -753,11 +762,19 @@ impl Agent {
                     "model stream ended without ResponseEnded",
                 )
             });
-            let will_retry = error.retryable && !error.context_exceeded() && attempt < max_attempts;
-            let backoff = if will_retry {
-                backoff(&config.turn, attempt, self.clock.now())
+            let failure = if error.context_exceeded() {
+                Failure::ContextExceeded
+            } else if error.retryable {
+                Failure::Retryable
             } else {
-                Duration::ZERO
+                Failure::Rejected
+            };
+            next = attempt::after_failure(max_attempts, history, failure);
+            let backoff = match next {
+                Next::Retry { backoff: true, .. } => {
+                    backoff(&config.turn, attempt, self.clock.now())
+                }
+                _ => Duration::ZERO,
             };
             let partial: Option<Vec<Item>> = if completed.is_empty() {
                 None
@@ -785,35 +802,11 @@ impl Agent {
             )
             .await?;
 
-            // Context exhaustion before any `AssistantMessage`: try one forced
-            // compaction inside this same step, then retry the same step.
-            if error.context_exceeded() && !force_compacted {
-                force_compacted = true;
-                let (input, frontier) = self
-                    .compaction_input(session, config, CompactionTrigger::ProviderError, watermark)
-                    .await?;
-                match self
-                    .perform_compaction(session, input, frontier, Some(turn), None)
-                    .await?
-                {
-                    CompactionRun::Done(CompactResult::Applied(_)) => {
-                        request = self.build_request(session, config, watermark).await?;
-                        attempt += 1;
-                        continue;
-                    }
-                    CompactionRun::Done(_) => {
-                        self.commit_step(session, turn, step).await?;
-                        return Ok(StepOutcome::Turn(TurnEndReason::ContextExhausted));
-                    }
-                    CompactionRun::Failed(_) => {
-                        self.commit_step(session, turn, step).await?;
-                        return Ok(StepOutcome::Turn(TurnEndReason::CompactionFailed));
-                    }
+            match &next {
+                Next::End(_) if cancel.is_cancelled() => {
+                    next = Next::End(TurnEndReason::Cancelled);
                 }
-            }
-
-            if will_retry {
-                if !backoff.is_zero() {
+                Next::Retry { attempt, .. } if !backoff.is_zero() => {
                     let token = cancel.clone();
                     let cancel_wait = token.cancelled();
                     tokio::pin!(cancel_wait);
@@ -822,35 +815,40 @@ impl Agent {
                         _ = &mut cancel_wait => {
                             // Cancellation interrupts the backoff sleep and is
                             // the last abort the recovery classifier sees.
-                            self.abort_cancelled(
-                                session, config, turn, step, attempt + 1, None,
-                            )
-                            .await?;
+                            self.abort_cancelled(session, config, turn, step, *attempt, None)
+                                .await?;
                             self.commit_step(session, turn, step).await?;
                             return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
                         }
                         _ = tokio::time::sleep(backoff) => {}
                     }
                 }
-                if cancel.is_cancelled() {
-                    self.abort_cancelled(session, config, turn, step, attempt + 1, None)
-                        .await?;
-                    self.commit_step(session, turn, step).await?;
-                    return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
-                }
-                attempt += 1;
-                continue;
+                _ => {}
             }
-
-            self.commit_step(session, turn, step).await?;
-            return Ok(StepOutcome::Turn(if cancel.is_cancelled() {
-                TurnEndReason::Cancelled
-            } else if error.context_exceeded() {
-                TurnEndReason::ContextExhausted
-            } else {
-                TurnEndReason::Failed
-            }));
         }
+    }
+
+    /// The step's one forced compaction (C5), at the step's watermark.
+    async fn force_compact(
+        &self,
+        session: SessionId,
+        config: &ConfigSnapshot,
+        turn: TurnId,
+        watermark: u64,
+    ) -> Result<Forced, AgentError> {
+        let (input, frontier) = self
+            .compaction_input(session, config, CompactionTrigger::ProviderError, watermark)
+            .await?;
+        Ok(
+            match self
+                .perform_compaction(session, input, frontier, Some(turn), None)
+                .await?
+            {
+                CompactionRun::Done(CompactResult::Applied(_)) => Forced::Applied,
+                CompactionRun::Done(_) => Forced::Exhausted,
+                CompactionRun::Failed(_) => Forced::Failed,
+            },
+        )
     }
 
     /// Record one aborted attempt that will not be retried.
@@ -2037,8 +2035,14 @@ impl Agent {
             return Ok(None);
         };
         let (key, trigger) = (open.key.clone(), open.trigger);
+        // D5: a forced (C5) compaction is redone at the open step's watermark,
+        // as live; threshold and manual compactions see the whole log.
+        let watermark = match (trigger, facts.open_step()) {
+            (CompactionTrigger::ProviderError, Some(step)) => step.seq,
+            _ => u64::MAX,
+        };
         let (input, frontier) = self
-            .compaction_input(session, config, trigger, u64::MAX)
+            .compaction_input(session, config, trigger, watermark)
             .await?;
         match self
             .perform_compaction(session, input, frontier, None, Some(key))
@@ -2453,53 +2457,104 @@ fn fold_facts(decoded: &[(LogEntry, SessionEvent)]) -> SessionFacts {
     facts
 }
 
-fn has_assistant_message(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> bool {
-    decoded.iter().any(|(_, event)| {
-        matches!(
-            event,
-            SessionEvent::AssistantMessage { turn_id, step_id, .. }
-                if *turn_id == turn && *step_id == step
-        )
-    })
+/// Where the attempt policy left a step: its watermark, attempt history and
+/// the next action.
+struct OpenAttempt {
+    step: StepId,
+    watermark: u64,
+    history: Attempts,
+    next: Next,
 }
 
-/// The last decided model attempt for a step, in `seq` order.
-fn last_abort(
+/// The step's committed `AssistantMessage`: its items and stop reason.
+fn assistant_message(
     decoded: &[(LogEntry, SessionEvent)],
     turn: TurnId,
     step: StepId,
-) -> Option<(u32, AbortKind)> {
-    decoded.iter().rev().find_map(|(_, event)| match event {
-        SessionEvent::ModelCallAborted {
+) -> Option<(&[Item], &StopReason)> {
+    decoded.iter().find_map(|(_, event)| match event {
+        SessionEvent::AssistantMessage {
             turn_id,
             step_id,
-            attempt,
-            kind,
+            items,
+            stop_reason,
             ..
-        } if *turn_id == turn && *step_id == step => Some((*attempt, *kind)),
+        } if *turn_id == turn && *step_id == step => Some((items.as_slice(), stop_reason)),
         _ => None,
     })
 }
 
-/// C5: the step's last abort was followed by a forced `CompactionApplied`, so
-/// recovery redoes the same step once with the new projection.
-fn compaction_after_last_abort(
+/// The step's attempt history as the attempt policy reads it: its aborts and
+/// its forced compaction, in `seq` order. Only a forced compaction runs
+/// between a step's `StepStarted` and `StepCommitted`.
+fn step_records(
     decoded: &[(LogEntry, SessionEvent)],
     turn: TurnId,
     step: StepId,
-) -> bool {
-    let abort_seq = decoded.iter().rev().find_map(|(entry, event)| match event {
-        SessionEvent::ModelCallAborted {
-            turn_id, step_id, ..
-        } if *turn_id == turn && *step_id == step => Some(entry.seq),
+) -> Vec<attempt::Record> {
+    let mut records = Vec::new();
+    let mut in_step = false;
+    let mut forced_open = false;
+    for (_, event) in decoded {
+        match event {
+            SessionEvent::StepStarted { step_id, .. } if *step_id == step => in_step = true,
+            SessionEvent::StepCommitted { step_id, .. } if *step_id == step => break,
+            SessionEvent::ModelCallAborted {
+                turn_id,
+                step_id,
+                attempt,
+                kind,
+                ..
+            } if *turn_id == turn && *step_id == step => {
+                records.push(attempt::Record::Aborted {
+                    attempt: *attempt,
+                    kind: *kind,
+                });
+            }
+            SessionEvent::CompactionStarted {
+                trigger: CompactionTrigger::ProviderError,
+                ..
+            } if in_step => {
+                forced_open = true;
+                records.push(attempt::Record::ForcedStarted);
+            }
+            SessionEvent::CompactionApplied { .. } if forced_open => {
+                forced_open = false;
+                records.push(attempt::Record::ForcedApplied);
+            }
+            SessionEvent::CompactionAborted { reason } if forced_open => {
+                forced_open = false;
+                records.push(attempt::Record::ForcedAborted(*reason));
+            }
+            _ => {}
+        }
+    }
+    records
+}
+
+/// Between steps of an open turn: the end reason the turn's last committed
+/// step decided, or `None` when the turn goes on.
+fn committed_step_end(
+    decoded: &[(LogEntry, SessionEvent)],
+    turn: TurnId,
+    max_attempts: u32,
+    facts: &SessionFacts,
+) -> Option<TurnEndReason> {
+    let step = decoded.iter().rev().find_map(|(_, event)| match event {
+        SessionEvent::StepStarted { turn_id, step_id } if *turn_id == turn => Some(*step_id),
         _ => None,
-    });
-    let Some(abort_seq) = abort_seq else {
-        return false;
-    };
-    decoded.iter().any(|(entry, event)| {
-        entry.seq > abort_seq && matches!(event, SessionEvent::CompactionApplied { .. })
-    })
+    })?;
+    if let Some((items, stop_reason)) = assistant_message(decoded, turn, step) {
+        let had_calls = !tool_calls(items).is_empty();
+        return match step_outcome(stop_reason, had_calls, facts.has_pending_input()) {
+            StepOutcome::Continue => None,
+            StepOutcome::Turn(reason) => Some(reason),
+        };
+    }
+    match attempt::replay(max_attempts, step_records(decoded, turn, step)) {
+        Some((_, Next::End(reason))) => Some(reason),
+        _ => None,
+    }
 }
 
 fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {
