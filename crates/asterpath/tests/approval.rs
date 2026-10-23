@@ -12,14 +12,13 @@ use asterpath::protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider,
     ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
-    StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolName, ToolOutput, ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id,
-    approval_signal_name, decode_entry, dedup, encode_entry,
+    StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolDescriptor, ToolName, ToolOutput,
+    ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id, approval_signal_name,
+    decode_entry, dedup, encode_entry,
 };
 use asterpath::protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_testing::ScriptedProvider;
-use futures_core::future::BoxFuture;
+use asterpath_testing::{ScriptedProvider, TestTool};
 use futures_util::StreamExt;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -99,66 +98,10 @@ impl ApprovalPolicy for AlwaysAsk {
     }
 }
 
-type InvokeFn = Arc<
-    dyn Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync,
->;
-
-struct TestTool {
-    descriptor: ToolDescriptor,
-    calls: Arc<Mutex<Vec<ToolArgs>>>,
-    invoke: InvokeFn,
-}
-
-impl TestTool {
-    fn new(
-        name: &str,
-        calls: Arc<Mutex<Vec<ToolArgs>>>,
-        invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            descriptor: descriptor(name, None),
-            calls,
-            invoke: Arc::new(invoke),
-        }
-    }
-
-    fn timed(mut self, timeout: Duration) -> Self {
-        self.descriptor.timeout = Some(timeout);
-        self
-    }
-
-    fn external(mut self) -> Self {
-        self.descriptor.provenance = asterpath::protocol::Provenance::External {
-            transport: asterpath::protocol::TransportKind::Stdio,
-        };
-        self
-    }
-}
-
-impl Tool for TestTool {
-    fn descriptor(&self) -> &ToolDescriptor {
-        &self.descriptor
-    }
-
-    fn invoke(
-        &self,
-        args: ToolArgs,
-        ctx: ToolContext,
-    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        self.calls.lock().unwrap().push(args.clone());
-        (self.invoke)(args, ctx)
-    }
-}
-
 fn echo_tool(calls: Arc<Mutex<Vec<ToolArgs>>>) -> Arc<dyn Tool> {
-    Arc::new(TestTool::new("echo", calls, |_args, _ctx| {
+    TestTool::new(descriptor("echo", None), calls, |_args, _ctx| {
         Box::pin(async { Ok(ToolOutput::new(vec![text("tool says hi")])) })
-    }))
+    })
 }
 
 async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
@@ -628,16 +571,17 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
 async fn cancel_before_deadline_wins_over_timeout() {
     let db = temp_db("cancel");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let stubborn = Arc::new(
-        TestTool::new("stubborn", Arc::clone(&calls), |_args, ctx| {
+    let stubborn = TestTool::new(
+        descriptor("stubborn", Some(Duration::from_millis(10))),
+        Arc::clone(&calls),
+        |_args, ctx| {
             Box::pin(async move {
                 // The tool notices cancellation, then hangs until dropped.
                 ctx.cancel.cancel();
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(ToolOutput::new(vec![text("never")]))
             })
-        })
-        .timed(Duration::from_millis(10)),
+        },
     );
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         vec![tool_call("stubborn")],
@@ -678,16 +622,17 @@ async fn cancel_before_deadline_wins_over_timeout() {
 async fn real_result_within_grace_beats_cancellation() {
     let db = temp_db("cancel-real");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let cooperative = Arc::new(
-        TestTool::new("cooperative", Arc::clone(&calls), |_args, ctx| {
+    let cooperative = TestTool::new(
+        descriptor("cooperative", Some(Duration::from_millis(10))),
+        Arc::clone(&calls),
+        |_args, ctx| {
             Box::pin(async move {
                 while !ctx.cancel.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 Ok(ToolOutput::new(vec![text("finished anyway")]))
             })
-        })
-        .timed(Duration::from_millis(10)),
+        },
     );
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         vec![tool_call("cooperative")],
@@ -726,12 +671,13 @@ async fn real_result_within_grace_beats_cancellation() {
 async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listens() {
     let db = temp_db("default-policy");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let tool = Arc::new(
-        TestTool::new("remote", Arc::clone(&calls), |_args, _ctx| {
-            Box::pin(async { Ok(ToolOutput::new(vec![text("remote ok")])) })
-        })
-        .external(),
-    );
+    let mut remote = descriptor("remote", None);
+    remote.provenance = asterpath::protocol::Provenance::External {
+        transport: asterpath::protocol::TransportKind::Stdio,
+    };
+    let tool = TestTool::new(remote, Arc::clone(&calls), |_args, _ctx| {
+        Box::pin(async { Ok(ToolOutput::new(vec![text("remote ok")])) })
+    });
     let end_turn = |value: &str| {
         vec![Item::Message {
             role: Role::Assistant,

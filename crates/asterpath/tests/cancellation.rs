@@ -4,8 +4,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::protocol::{
@@ -19,6 +19,7 @@ use asterpath::protocol::{
 use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_testing::ScriptedProvider;
+use asterpath_testing::{TestTool, ToolCalls};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -102,52 +103,19 @@ fn input(id: u8, value: &str) -> UserInput {
     }
 }
 
-type InvokeFn = Arc<
-    dyn Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync,
->;
-
-struct TestTool {
-    descriptor: ToolDescriptor,
-    calls: Arc<Mutex<Vec<ToolArgs>>>,
-    invoke: InvokeFn,
-}
-
-impl TestTool {
-    fn build(
-        name: &str,
-        invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Arc<dyn Tool> {
-        Arc::new(Self {
-            descriptor: descriptor(name),
-            calls: Arc::new(Mutex::new(Vec::new())),
-            invoke: Arc::new(invoke),
-        })
-    }
-}
-
-impl Tool for TestTool {
-    fn descriptor(&self) -> &ToolDescriptor {
-        &self.descriptor
-    }
-
-    fn invoke(
-        &self,
-        args: ToolArgs,
-        ctx: ToolContext,
-    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        self.calls.lock().unwrap().push(args.clone());
-        (self.invoke)(args, ctx)
-    }
+fn closure_tool(
+    name: &str,
+    invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
+    + Send
+    + Sync
+    + 'static,
+) -> Arc<dyn Tool> {
+    TestTool::new(descriptor(name), ToolCalls::default(), invoke)
 }
 
 /// Blocks until released; used to hold a step open for steering.
 fn blocking_tool(started: Arc<Notify>, release: Arc<Notify>) -> Arc<dyn Tool> {
-    TestTool::build("blocking", move |_args, _ctx| {
+    closure_tool("blocking", move |_args, _ctx| {
         let started = Arc::clone(&started);
         let release = Arc::clone(&release);
         Box::pin(async move {
@@ -398,7 +366,7 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
 async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
     let db = temp_db("tool-zero");
     let started = Arc::new(Notify::new());
-    let tool = TestTool::build("blocking", move |_args, _ctx| {
+    let tool = closure_tool("blocking", move |_args, _ctx| {
         let started = Arc::clone(&started);
         Box::pin(async move {
             started.notify_one();
@@ -460,7 +428,7 @@ async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
 #[tokio::test]
 async fn cancel_with_grace_keeps_a_tool_result_that_returns_in_time() {
     let db = temp_db("tool-grace");
-    let tool = TestTool::build("cooperative", |_args, ctx| {
+    let tool = closure_tool("cooperative", |_args, ctx| {
         Box::pin(async move {
             ctx.cancel.cancelled().await;
             Ok(ToolOutput::new(vec![text("finished")]))
@@ -506,7 +474,7 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
     let db = temp_db("approval-cancel");
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&calls);
-    let tool = TestTool::build("guarded", move |_args, _ctx| {
+    let tool = closure_tool("guarded", move |_args, _ctx| {
         counter.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(ToolOutput::new(vec![text("ran")])) })
     });
@@ -551,7 +519,7 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
 async fn idempotent_cancel_during_a_tool_and_idle_cancel_is_a_no_op() {
     let db = temp_db("idempotent");
     let started = Arc::new(Notify::new());
-    let tool = TestTool::build("blocking", move |_args, _ctx| {
+    let tool = closure_tool("blocking", move |_args, _ctx| {
         let started = Arc::clone(&started);
         Box::pin(async move {
             started.notify_one();
@@ -698,7 +666,7 @@ async fn steering_enters_the_next_step_projection_in_seq_order() {
 #[tokio::test]
 async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_step() {
     let db = temp_db("wait-steer");
-    let tool = TestTool::build("guarded", |_args, _ctx| {
+    let tool = closure_tool("guarded", |_args, _ctx| {
         Box::pin(async { Ok(ToolOutput::new(vec![text("ran")])) })
     });
     let provider = Arc::new(
@@ -762,7 +730,7 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
 #[tokio::test]
 async fn max_steps_per_turn_ends_with_max_steps_exceeded() {
     let db = temp_db("max-steps");
-    let tool = TestTool::build("echo", |_args, _ctx| {
+    let tool = closure_tool("echo", |_args, _ctx| {
         Box::pin(async { Ok(ToolOutput::new(vec![text("ok")])) })
     });
     let provider = Arc::new(
