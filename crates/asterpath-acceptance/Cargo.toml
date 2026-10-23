@@ -10,9 +10,8 @@ path = "src/bin/testdrive.rs"
 
 [dependencies]
 asterpath = { path = "../asterpath" }
-asterpath-plugin-host = { path = "../asterpath-plugin-host" }
+asterpath-mcp = { path = "../asterpath-mcp" }
 asterpath-protocol = { path = "../asterpath-protocol" }
-asterpath-sandbox = { path = "../asterpath-sandbox" }
 asterpath-sandbox-linux = { path = "../asterpath-sandbox-linux" }
 asterpath-skills = { path = "../asterpath-skills" }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }

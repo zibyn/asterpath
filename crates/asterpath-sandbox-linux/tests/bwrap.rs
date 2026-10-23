@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use asterpath_sandbox::{
+use asterpath_protocol::{
     ConfinedSpawn, Enforcement, SandboxError, SandboxPolicy, SandboxProvider, SpawnRequest,
 };
 use asterpath_sandbox_linux::LinuxSandbox;

@@ -1,8 +1,9 @@
 //! Sandbox contract: confine a spawn request according to a resolved policy.
 //!
 //! [`SandboxProvider::confine`] is a pure transform at a process spawn point.
-//! Policy resolution, audit and backend construction belong to the host; this
-//! crate has no dependencies and no features (ADR-0019).
+//! Policy resolution, audit and backend construction belong to the host
+//! (ADR-0019). The contract lives in protocol so hosts' own spawn-type tools can
+//! use it without depending on MCP (ADR-0027).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -75,6 +76,18 @@ impl ConfinedSpawn {
             enforcement,
         }
     }
+
+    /// The request unchanged with `Enforcement::Full`: the `FullAccess`
+    /// pass-through and the no-provider path at a spawn point.
+    pub fn unconfined(request: &SpawnRequest<'_>) -> Self {
+        Self::new(
+            request.program.to_os_string(),
+            request.args.to_vec(),
+            request.cwd.map(Path::to_path_buf),
+            request.env.clone(),
+            Enforcement::Full,
+        )
+    }
 }
 
 /// Filesystem policy resolved by the host.
@@ -87,6 +100,28 @@ pub enum SandboxPolicy {
     WorkspaceWrite { writable_roots: Vec<PathBuf> },
     /// No confinement.
     FullAccess,
+}
+
+impl SandboxPolicy {
+    /// Rejects policies no backend may enforce. Providers call this first: an
+    /// empty or relative root set fails closed instead of degrading to
+    /// read-only or binding relative paths.
+    pub fn validate(&self) -> Result<(), SandboxError> {
+        let Self::WorkspaceWrite { writable_roots } = self else {
+            return Ok(());
+        };
+        if writable_roots.is_empty() {
+            return Err(SandboxError::Unsupported {
+                reason: "workspace-write requires at least one writable root".to_owned(),
+            });
+        }
+        if let Some(root) = writable_roots.iter().find(|root| !root.is_absolute()) {
+            return Err(SandboxError::Unsupported {
+                reason: format!("writable root must be absolute: {}", root.display()),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// How completely the backend enforced the requested policy.
