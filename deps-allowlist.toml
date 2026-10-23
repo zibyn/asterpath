@@ -34,32 +34,7 @@ role = "module"
 allow = ["asterpath-sandbox"]
 
 [[package]]
-name = "asterpath-agent"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
-name = "asterpath-tools"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
 name = "asterpath-storage-sqlite"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
-name = "asterpath-runtime"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
-name = "asterpath-scheduler"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
-name = "asterpath-compaction"
 role = "module"
 allow = ["asterpath-protocol"]
 
@@ -72,16 +47,6 @@ allow = ["asterpath-protocol", "asterpath-http"]
 name = "asterpath-provider-openai"
 role = "module"
 allow = ["asterpath-protocol", "asterpath-http"]
-
-[[package]]
-name = "asterpath-tracing"
-role = "module"
-allow = ["asterpath-protocol"]
-
-[[package]]
-name = "asterpath-usage"
-role = "module"
-allow = ["asterpath-protocol"]
 
 [[package]]
 name = "asterpath-plugin-host"

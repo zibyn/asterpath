@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asterpath_plugin_host::{
@@ -13,11 +12,10 @@ use asterpath_plugin_host::{
 };
 use asterpath_protocol::{
     CancelToken, JsonString, Part, Provenance, SessionEvent, ToolContext, ToolErrorKind, ToolName,
-    ToolRegistry, ToolResultStatus, TransportKind, TurnEndReason,
+    ToolResultStatus, TransportKind, TurnEndReason,
 };
 use asterpath_protocol::{SessionId, StepId, ToolCallId, TurnId};
 use asterpath_sandbox::SandboxPolicy;
-use asterpath_tools::InMemoryToolRegistry;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -304,8 +302,7 @@ async fn unsafe_external_tool_is_interrupted_and_never_reruns_after_a_sigkill() 
 /// `Spawn`, before any process could exist, and registers nothing.
 #[tokio::test]
 async fn restricted_policy_without_a_provider_fails_at_spawn_before_any_process() {
-    let registry = Arc::new(InMemoryToolRegistry::new());
-    let host = PluginHost::new(registry.clone(), None, SandboxPolicy::ReadOnly);
+    let host = PluginHost::new(None, SandboxPolicy::ReadOnly);
     let manifest = manifest(
         "fixture",
         PluginTransport::Stdio {
@@ -327,7 +324,7 @@ async fn restricted_policy_without_a_provider_fails_at_spawn_before_any_process(
         }
         other => panic!("expected Failed at Spawn, got {other:?}"),
     }
-    assert!(registry.list().is_empty());
+    assert!(host.tools().is_empty());
 }
 
 /// Scenario 5: an HTTP plugin has no local process, so a restricted policy
@@ -335,8 +332,7 @@ async fn restricted_policy_without_a_provider_fails_at_spawn_before_any_process(
 #[tokio::test]
 async fn http_plugin_loads_and_calls_without_a_sandbox() {
     let fixture = HttpFixture::spawn().await;
-    let registry = Arc::new(InMemoryToolRegistry::new());
-    let host = PluginHost::new(registry.clone(), None, SandboxPolicy::ReadOnly);
+    let host = PluginHost::new(None, SandboxPolicy::ReadOnly);
     let manifest = manifest(
         "fixture",
         PluginTransport::Http {
@@ -347,8 +343,10 @@ async fn http_plugin_loads_and_calls_without_a_sandbox() {
 
     let statuses = host.load(vec![manifest]).await.expect("load");
     assert!(loaded_tools(&statuses[0]).contains(&ToolName::new("fixture__echo")));
-    let tool = registry
-        .get(&ToolName::new("fixture__echo"))
+    let tool = host
+        .tools()
+        .into_iter()
+        .find(|tool| tool.descriptor().name == ToolName::new("fixture__echo"))
         .expect("fixture__echo registered");
     assert_eq!(
         tool.descriptor().provenance,

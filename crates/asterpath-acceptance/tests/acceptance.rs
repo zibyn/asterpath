@@ -1046,7 +1046,7 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
 /// capabilities, never on a provider identity.
 #[test]
 fn agent_loop_contains_no_provider_branch() {
-    let source = include_str!("../../asterpath-agent/src/lib.rs");
+    let source = include_str!("../../asterpath/src/agent/mod.rs");
     assert!(!source.contains("anthropic"));
     assert!(!source.contains("openai"));
 }

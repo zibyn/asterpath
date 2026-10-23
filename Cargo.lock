@@ -77,20 +77,14 @@ dependencies = [
 name = "asterpath"
 version = "0.1.0"
 dependencies = [
- "asterpath-agent",
- "asterpath-compaction",
  "asterpath-protocol",
  "asterpath-provider-anthropic",
  "asterpath-provider-openai",
- "asterpath-runtime",
- "asterpath-scheduler",
  "asterpath-storage-sqlite",
  "asterpath-testing",
- "asterpath-tools",
- "asterpath-tracing",
- "asterpath-usage",
  "futures-core",
  "futures-util",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -110,24 +104,11 @@ dependencies = [
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
- "asterpath-tools",
  "futures-util",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-agent"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "asterpath-testing",
- "futures-core",
- "futures-util",
- "serde_json",
  "tokio",
 ]
 
@@ -148,18 +129,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
-]
-
-[[package]]
-name = "asterpath-compaction"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "asterpath-testing",
- "futures-core",
- "futures-util",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -186,7 +155,6 @@ dependencies = [
  "asterpath-protocol",
  "asterpath-sandbox",
  "asterpath-testing",
- "asterpath-tools",
  "libc",
  "reqwest",
  "serde",
@@ -238,18 +206,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asterpath-runtime"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "asterpath-testing",
- "futures-core",
- "futures-util",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "asterpath-sandbox"
 version = "0.1.0"
 
@@ -258,20 +214,6 @@ name = "asterpath-sandbox-linux"
 version = "0.1.0"
 dependencies = [
  "asterpath-sandbox",
-]
-
-[[package]]
-name = "asterpath-scheduler"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "asterpath-testing",
- "futures-core",
- "futures-util",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -311,38 +253,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-tools"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "futures-core",
- "serde_json",
-]
-
-[[package]]
-name = "asterpath-tracing"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "asterpath-testing",
- "futures-core",
- "futures-util",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-usage"
-version = "0.1.0"
-dependencies = [
- "asterpath-protocol",
- "futures-core",
- "futures-util",
  "serde_json",
  "tokio",
 ]

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use asterpath::DefaultCompactor;
 use asterpath::{Asterpath, SessionHandle};
-use asterpath_compaction::DefaultCompactor;
 use asterpath_protocol::{
     AgentError, AgentEvent, CompactionAbortReason, CompactionConfig, CompactionTrigger, Compactor,
     InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism, Part, Provider,

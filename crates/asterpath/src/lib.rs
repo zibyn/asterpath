@@ -7,9 +7,17 @@
 // The public error enum is fixed by packaging.md §3.5.
 #![allow(clippy::result_large_err)]
 
+mod agent;
 mod commit;
+mod compaction;
 pub mod config;
 pub mod error;
+mod scheduler;
+mod tools;
+mod views;
+mod waits;
+
+pub use compaction::DefaultCompactor;
 
 /// The contract crate: adapter traits, hooks and value types.
 pub use asterpath_protocol as protocol;
@@ -25,7 +33,12 @@ pub use asterpath_provider_anthropic as anthropic;
 
 use std::sync::Arc;
 
-use asterpath_agent::Agent;
+use crate::agent::Agent;
+use crate::scheduler::{Scheduler, SpawnTool};
+use crate::tools::InMemoryToolRegistry;
+use crate::views::trace::{TracingQuery, TracingTap};
+use crate::views::usage::UsageService;
+use crate::waits::RuntimeExecutor;
 use asterpath_protocol::{
     AgentError, AgentEvent, AgentRunner, ApprovalDecision, CancellationRegistry, CompactResult,
     OpenIntents, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionSpec, SessionState,
@@ -36,11 +49,6 @@ use asterpath_protocol::{
     ApprovalGate, Clock, DurableExecutor, EventLog, LogQuery, SessionCatalog, SessionRetirement,
     SignalDelivery, Storage, unique_bytes,
 };
-use asterpath_runtime::RuntimeExecutor;
-use asterpath_scheduler::{Scheduler, SpawnTool};
-use asterpath_tools::InMemoryToolRegistry;
-use asterpath_tracing::{TracingQuery, TracingTap};
-use asterpath_usage::UsageService;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 

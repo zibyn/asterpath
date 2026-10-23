@@ -18,8 +18,8 @@ use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
     ModelSpec, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
     RequestConfig, SessionSpec, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolSelection, TurnConfig,
-    TurnEndReason, UserInput, decode_entry,
+    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig, TurnEndReason,
+    UserInput, decode_entry,
 };
 use asterpath_protocol::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
 use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
@@ -28,7 +28,6 @@ use asterpath_testing::{
     Failpoint, FailpointEventLog, FailpointTool, Fixture, FixtureStep, ManualClock, Point,
     ScriptedProvider,
 };
-use asterpath_tools::InMemoryToolRegistry;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
@@ -449,7 +448,7 @@ async fn assemble(
     provider: Arc<dyn Provider>,
 ) -> Result<Asterpath, String> {
     let clock = Arc::new(ManualClock::new());
-    let (plugin_tools, plugin_registry) = load_plugins(args).await?;
+    let plugin_tools = load_plugins(args).await?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let hold = Duration::from_millis(hold_millis(args.command == "run"));
     for name in &fixture.tools {
@@ -459,9 +458,9 @@ async fn assemble(
             continue;
         }
         // Plugin tools are already registered by the plugin host.
-        if plugin_registry
-            .as_ref()
-            .is_some_and(|registry| registry.get(name).is_some())
+        if plugin_tools
+            .iter()
+            .any(|tool| &tool.descriptor().name == name)
         {
             continue;
         }
@@ -513,20 +512,17 @@ async fn assemble(
 }
 
 /// Loads the M5 plugin manifests and returns the registered external tools.
-async fn load_plugins(
-    args: &Args,
-) -> Result<(Vec<Arc<dyn Tool>>, Option<Arc<InMemoryToolRegistry>>), String> {
+async fn load_plugins(args: &Args) -> Result<Vec<Arc<dyn Tool>>, String> {
     if args.plugin_manifests.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok(Vec::new());
     }
-    let registry = Arc::new(InMemoryToolRegistry::new());
     let sandbox: Option<Arc<dyn SandboxProvider>> =
         if args.sandbox_provider && !matches!(args.sandbox, SandboxPolicy::FullAccess) {
             Some(Arc::new(LinuxSandbox::new()))
         } else {
             None
         };
-    let host = PluginHost::new(registry.clone(), sandbox, args.sandbox.clone());
+    let host = PluginHost::new(sandbox, args.sandbox.clone());
     let manifests = read_manifests(&args.plugin_manifests)?;
     match host.load(manifests).await {
         Ok(statuses) => {
@@ -548,8 +544,7 @@ async fn load_plugins(
             return Err(error.to_string());
         }
     }
-    let tools = registry.list();
-    Ok((tools, Some(registry)))
+    Ok(host.tools())
 }
 
 /// Each file holds one manifest object or an array of them.

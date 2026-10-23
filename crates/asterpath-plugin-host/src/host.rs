@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
     JsonString, Parallelism, Provenance, Tool, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, ToolRegistry, TransportKind, external_tool_name, validate_plugin_id,
+    ToolOutput, TransportKind, external_tool_name, validate_plugin_id,
 };
 use asterpath_sandbox::{ConfinedSpawn, Enforcement, SandboxPolicy, SandboxProvider, SpawnRequest};
 
@@ -57,24 +57,29 @@ pub struct PluginHostError {
     pub message: String,
 }
 
-/// Loads external plugins into a `ToolRegistry`.
+/// Loads external plugins; the host hands [`Self::tools`] to the facade.
 pub struct PluginHost {
-    registry: Arc<dyn ToolRegistry>,
+    /// Loaded external tools in load order; names are unique.
+    tools: Mutex<Vec<Arc<dyn Tool>>>,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
 }
 
 impl PluginHost {
-    pub fn new(
-        registry: Arc<dyn ToolRegistry>,
-        sandbox: Option<Arc<dyn SandboxProvider>>,
-        policy: SandboxPolicy,
-    ) -> Self {
+    pub fn new(sandbox: Option<Arc<dyn SandboxProvider>>, policy: SandboxPolicy) -> Self {
         Self {
-            registry,
+            tools: Mutex::new(Vec::new()),
             sandbox,
             policy,
         }
+    }
+
+    /// Every tool loaded so far, in load order.
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Loads every manifest, returning one status per manifest in input order.
@@ -269,8 +274,9 @@ impl PluginHost {
                 return failed(PluginLoadStage::Registration, message);
             }
         };
+        let loaded = self.tools();
         for (name, _) in &composed {
-            if self.registry.get(name).is_some() {
+            if loaded.iter().any(|tool| &tool.descriptor().name == name) {
                 adapter.shutdown().await;
                 return failed(
                     PluginLoadStage::Registration,
@@ -293,11 +299,14 @@ impl PluginHost {
                 timeout: Some(manifest.timeouts.call_timeout()),
                 max_output_bytes: None,
             };
-            self.registry.register(Arc::new(ExternalTool {
-                descriptor,
-                adapter: Arc::clone(&adapter),
-                original_name: tool.original_name.clone(),
-            }));
+            self.tools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::new(ExternalTool {
+                    descriptor,
+                    adapter: Arc::clone(&adapter),
+                    original_name: tool.original_name.clone(),
+                }));
             names.push(name);
         }
         PluginStatus::Loaded { tools: names }
