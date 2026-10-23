@@ -181,7 +181,7 @@ impl Waits {
         })
     }
 
-    pub(crate) fn wake(&self, _session: SessionId, cause: WakeCause) {
+    pub(crate) fn wake(&self, cause: WakeCause) {
         let key = match cause {
             WakeCause::Signal(signal) => WaitKey::Signal(signal),
             WakeCause::ChildCompleted(child) => WaitKey::Child(child),
