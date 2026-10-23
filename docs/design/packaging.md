@@ -106,9 +106,7 @@ pub struct AsterpathConfig {
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
     pub session_retirement: Option<Arc<dyn SessionRetirement>>,
-    pub turn: TurnConfig,
-    pub compaction: CompactionConfig,
-    pub subagents: SubagentConfig,
+    pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
 }
 
 impl Asterpath {
@@ -128,6 +126,7 @@ impl Asterpath {
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
 - `event_log` / `storage` 要么同时注入，要么都留空；只注入其一是 `AsterError::Config`。同时注入时 `database` 被忽略；都留空时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
@@ -306,7 +305,8 @@ model = "claude-fable-5-1"
 # CompactionConfig 字段
 
 [subagents]
-# SubagentConfig 字段
+# SubagentConfig 字段（进 SessionSpec）
+# max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
 default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级为 deny

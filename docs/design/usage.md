@@ -139,10 +139,28 @@ pub enum UsageError {
 - `fork` 只物化投影条目，不复制日志，因此子会话**不继承**父用量；用量归实际发起模型调用的会话。
 - 没有独立的 subagent 用量桶：子会话本身就是一级 session，子树汇总即父子归因。
 
+### 桶判定：`usage_of`
+
+```rust
+// asterpath-protocol
+pub struct UsageEntry {
+    pub bucket: UsageBucket,
+    pub usage: Usage,
+    pub model: ModelSpec,
+    pub turn: Option<TurnId>,
+    pub step: Option<StepId>,
+}
+
+/// `compaction_turn`：同 dedup key 的 `CompactionStarted.turn`，仅对 `CompactionApplied` 生效。
+pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option<UsageEntry>;
+```
+
+- “一条记录算哪个桶、归哪个 turn / step”只有这一份判定。`UsageQuery` 折叠、`UsageRecorded` 的发射方与成本 / 预算观察者都调用它，不各写一份。
+- 不承载用量的记录（含 `usage: None` 的 `ModelCallAborted`）返回 `None`。
+
 ### 压缩的 turn 归属
 
-- 折叠到 `CompactionApplied` 时，取与其同 dedup key 的 `CompactionStarted.caused_by`（同一 session 同一时刻至多一个压缩意图）。
-- `caused_by` 落在某个回合内 → `turn = Some(该回合)`；落在回合外 → `turn = None`。
+- 回合由写入方记录：agent 写 `CompactionStarted.turn`（回合内为 `Some(该回合)`，Idle 为 `None`）。折叠到 `CompactionApplied` 时取与其同 dedup key 的 `CompactionStarted.turn`，不再从日志位置推导。
 - `step` 恒为 `None`：即使强制压缩发生在 step 的错误路径中，按 #9 也不把用量下沉到 step。这与 tracing 把 compaction span 挂到 step 的做法有意不同（trace 表达因果，usage 表达计费归属）。
 
 ### 会话树
@@ -188,7 +206,7 @@ pub struct UsageRecorded {
 }
 ```
 
-- **唯一写入者发射**：agent loop（`AssistantMessage`、`CompactionApplied`、`ModelCallAborted` 的 append 方）在 append 成功后发出；`CompactionApplied` 虽由压缩模块产生结果，仍由 loop 统一 append，所以只有一个发射点。
+- **唯一写入者发射**：agent loop（`AssistantMessage`、`CompactionApplied`、`ModelCallAborted` 的 append 方）在 append 成功后发出，字段由 `usage_of` 得出；`CompactionApplied` 虽由压缩模块产生结果，仍由 loop 统一 append，所以只有一个发射点。
 - 载荷不含 `recorded_at`：`EventLog::append` 只返回 `LogId`，时间由存储层分配；需要时间的一方用 `UsageQuery` 查。
 - 总线 `emit` 按注册顺序 await 处理者，处理者错误只记录不传播（[module-contracts.md](module-contracts.md) §3.3）。因此成本模块在下一次 pre-step gate 前一定看到最新用量。
 - `ModelCallAborted.usage = None` 时不发事件。

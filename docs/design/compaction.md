@@ -107,6 +107,7 @@ CompactionStarted {
     trigger: CompactionTrigger,   // Threshold | Manual | ProviderError
     replaces_from: LogId,         // 本次将被替换区间的起点
     caused_by: LogId,             // 触发点的日志锚点
+    turn: Option<TurnId>,         // 所属回合；Idle 的 compact_now 为 None
 }
 
 CompactionApplied {
@@ -126,7 +127,7 @@ pub enum CompactionAbortReason { SummaryFailed, Insufficient }
 ```
 
 - 压缩不是 step：不写 `StepStarted` / `StepCommitted`，可以发生在回合内（BetweenSteps / 强制压缩）或回合外的 Idle。
-- `CompactionStarted` 是意图记录，由 agent 在 `plan` 返回 `Summarize` 后写；终态是 `CompactionApplied`（成功）或 `CompactionAborted`（`SummaryFailed` / `Insufficient`），同样由 agent 写。失败 attempt 的 usage 与原始数据不落日志（只有 trace tap 可见），`CompactionAborted` 因此不携带 `usage` / `raw`；被丢弃的摘要调用成本不计入统计。
+- `CompactionStarted` 是意图记录，由 agent 在 `plan` 返回 `Summarize` 后写，写入时填 `turn`：回合内（阈值 / 强制）压缩填当前回合，Idle 的 `compact_now` 填 `None`（字段无 serde 默认值；发布前改动，不做 upcast）；终态是 `CompactionApplied`（成功）或 `CompactionAborted`（`SummaryFailed` / `Insufficient`），同样由 agent 写。失败 attempt 的 usage 与原始数据不落日志（只有 trace tap 可见），`CompactionAborted` 因此不携带 `usage` / `raw`；被丢弃的摘要调用成本不计入统计。
 - 唯一提交点是终态的 append；崩溃在 append 之前等于什么都没发生，恢复后重做压缩（会重复消耗摘要 token，可接受）。
 - dedup key = `compaction:<意图提交前的 frontier LogId>`；`CompactionStarted` / `CompactionApplied` / `CompactionAborted` 共用该键（按事件类型隔离），同一 frontier 重放得到同一条记录。`CompactionAborted` 本身推进 frontier，同一 frontier 的再次尝试因此使用新键。
 
@@ -180,7 +181,7 @@ project(entries):
 
 - **前缀缓存**：压缩必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
 - **追踪**：`CompactionStarted` 到 `CompactionApplied` / `CompactionAborted` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
-- **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取 `CompactionStarted.caused_by` 所在回合；最终口径见 [usage.md](usage.md)（#13）。
+- **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取同 dedup key 的 `CompactionStarted.turn`；最终口径见 [usage.md](usage.md)（#13）。
 
 ## 8. 可配置默认
 

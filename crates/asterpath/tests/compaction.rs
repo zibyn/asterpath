@@ -838,6 +838,7 @@ async fn seed_open_compaction(
         trigger,
         replaces_from: entries.first().expect("first").log_id,
         caused_by: frontier,
+        turn: None,
     };
     asterpath
         .event_log()
@@ -995,6 +996,7 @@ async fn c10_same_frontier_append_is_idempotent() {
         trigger: CompactionTrigger::Manual,
         replaces_from: entries.first().expect("first").log_id,
         caused_by: frontier,
+        turn: None,
     };
     let first = asterpath
         .event_log()

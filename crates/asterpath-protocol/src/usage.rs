@@ -8,6 +8,7 @@ use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ModelSpec;
+use crate::event::SessionEvent;
 use crate::ids::ModelId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +52,62 @@ pub enum UsageBucket {
     Compaction,
     /// A failed or interrupted attempt's best-effort usage.
     Partial,
+}
+
+/// What one usage-carrying record counts as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageEntry {
+    pub bucket: UsageBucket,
+    pub usage: Usage,
+    pub model: ModelSpec,
+    pub turn: Option<TurnId>,
+    pub step: Option<StepId>,
+}
+
+/// The single bucket decision for one record; `None` when it carries no usage.
+///
+/// `compaction_turn` is the `turn` recorded on the `CompactionStarted` sharing
+/// this record's dedup key; it is read only for `CompactionApplied`.
+pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option<UsageEntry> {
+    let (bucket, usage, model, turn, step) = match event {
+        SessionEvent::AssistantMessage {
+            turn_id,
+            step_id,
+            model,
+            usage,
+            ..
+        } => (
+            UsageBucket::ModelCall,
+            usage,
+            model,
+            Some(*turn_id),
+            Some(*step_id),
+        ),
+        SessionEvent::CompactionApplied { model, usage, .. } => {
+            (UsageBucket::Compaction, usage, model, compaction_turn, None)
+        }
+        SessionEvent::ModelCallAborted {
+            turn_id,
+            step_id,
+            model,
+            usage: Some(usage),
+            ..
+        } => (
+            UsageBucket::Partial,
+            usage,
+            model,
+            Some(*turn_id),
+            Some(*step_id),
+        ),
+        _ => return None,
+    };
+    Some(UsageEntry {
+        bucket,
+        usage: *usage,
+        model: model.clone(),
+        turn,
+        step,
+    })
 }
 
 /// The slice of the log a query folds.

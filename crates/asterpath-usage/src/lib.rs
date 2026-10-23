@@ -14,8 +14,8 @@ use asterpath_core::{
     SessionCatalog, SessionId, StepId, StorageError, TurnId,
 };
 use asterpath_protocol::{
-    USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageError, UsageFilter, UsageQuery, UsageRecord,
-    UsageReport, UsageScope, UsageTotals, decode_entry,
+    USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageQuery,
+    UsageRecord, UsageReport, UsageScope, UsageTotals, decode_entry, usage_of,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -207,10 +207,8 @@ struct Records {
 struct SessionScan {
     session: SessionId,
     after: Option<asterpath_core::LogId>,
-    /// Turn open when each log record was written.
-    current_turn: Option<TurnId>,
-    /// `CompactionStarted` dedup key -> turn at its `caused_by` frontier.
-    compaction_turns: HashMap<DedupKey, Option<TurnId>>,
+    /// `CompactionStarted` dedup key -> the turn it recorded.
+    started: HashMap<DedupKey, Option<TurnId>>,
 }
 
 impl SessionScan {
@@ -218,8 +216,7 @@ impl SessionScan {
         Self {
             session,
             after: None,
-            current_turn: None,
-            compaction_turns: HashMap::new(),
+            started: HashMap::new(),
         }
     }
 }
@@ -236,64 +233,25 @@ fn evaluate(
         detail: error.to_string(),
     })?;
 
-    match &event {
-        asterpath_protocol::SessionEvent::TurnStarted { turn_id } => {
-            scan.current_turn = Some(*turn_id);
-        }
-        asterpath_protocol::SessionEvent::TurnCommitted { turn_id, .. } => {
-            if scan.current_turn == Some(*turn_id) {
-                scan.current_turn = None;
-            }
-        }
-        // The `caused_by` frontier is the record just before this intent, so
-        // the open turn here is exactly the turn the compaction belongs to.
-        asterpath_protocol::SessionEvent::CompactionStarted { .. } => {
-            if let Some(key) = &entry.dedup_key {
-                scan.compaction_turns.insert(key.clone(), scan.current_turn);
-            }
-        }
-        _ => {}
+    if let (asterpath_protocol::SessionEvent::CompactionStarted { turn, .. }, Some(key)) =
+        (&event, &entry.dedup_key)
+    {
+        scan.started.insert(key.clone(), *turn);
     }
-
-    let candidate = match &event {
-        asterpath_protocol::SessionEvent::AssistantMessage {
-            turn_id,
-            step_id,
-            model,
-            usage,
-            ..
-        } => Some((
-            Some(*turn_id),
-            Some(*step_id),
-            model.clone(),
-            UsageBucket::ModelCall,
-            *usage,
-        )),
-        asterpath_protocol::SessionEvent::CompactionApplied { model, usage, .. } => {
-            let turn = entry
-                .dedup_key
-                .as_ref()
-                .and_then(|key| scan.compaction_turns.get(key))
-                .copied()
-                .flatten();
-            Some((turn, None, model.clone(), UsageBucket::Compaction, *usage))
-        }
-        asterpath_protocol::SessionEvent::ModelCallAborted {
-            turn_id,
-            step_id,
-            model,
-            usage: Some(usage),
-            ..
-        } => Some((
-            Some(*turn_id),
-            Some(*step_id),
-            model.clone(),
-            UsageBucket::Partial,
-            *usage,
-        )),
-        _ => None,
-    };
-    let Some((turn, step, model, bucket, usage)) = candidate else {
+    let compaction_turn = entry
+        .dedup_key
+        .as_ref()
+        .and_then(|key| scan.started.get(key))
+        .copied()
+        .flatten();
+    let Some(UsageEntry {
+        bucket,
+        usage,
+        model,
+        turn,
+        step,
+    }) = usage_of(&event, compaction_turn)
+    else {
         return Ok(None);
     };
 
