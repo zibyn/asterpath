@@ -79,6 +79,7 @@ fn compaction_started(frontier: LogId) -> SessionEvent {
         trigger: CompactionTrigger::Manual,
         replaces_from: LogId::from_i64(1),
         caused_by: frontier,
+        turn: None,
     }
 }
 

@@ -1495,6 +1495,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
             trigger: asterpath_protocol::CompactionTrigger::ProviderError,
             replaces_from: turn,
             caused_by: at,
+            turn: Some(FORK_TURN),
         },
         key.clone(),
     )

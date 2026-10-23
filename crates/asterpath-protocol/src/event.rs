@@ -99,6 +99,8 @@ pub enum SessionEvent {
         trigger: CompactionTrigger,
         replaces_from: LogId,
         caused_by: LogId,
+        /// The turn the compaction runs in; `None` for an Idle `compact_now`.
+        turn: Option<TurnId>,
     },
     CompactionApplied {
         first_kept: LogId,

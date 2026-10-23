@@ -32,8 +32,8 @@ use asterpath_protocol::{
     ProviderErrorKind, RecordAppended, ReplaySafety, ResumeReason, RunRequest, SessionEvent,
     SessionState, StopReason, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext, ToolDescriptor,
     ToolError, ToolErrorInfo, ToolErrorKind, ToolName, ToolOutput, ToolRegistry, ToolResultStatus,
-    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageBucket, UsageRecorded, approval_signal_id,
-    approval_signal_name, decode_entry, dedup,
+    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageRecorded, approval_signal_id,
+    approval_signal_name, decode_entry, dedup, usage_of,
 };
 use futures_core::Stream;
 use futures_core::future::BoxFuture;
@@ -149,48 +149,21 @@ impl Agent {
         // The loop is the unique writer of every usage terminal, so it is the
         // only emitter. Awaiting keeps the event ordered before the next gate.
         if let Some(hooks) = &self.hooks {
-            let recorded = match &event {
-                SessionEvent::AssistantMessage {
-                    turn_id,
-                    step_id,
-                    model,
-                    usage,
-                    ..
-                } => Some(UsageRecorded {
-                    session,
-                    turn: Some(*turn_id),
-                    step: Some(*step_id),
-                    model: model.clone(),
-                    bucket: UsageBucket::ModelCall,
-                    usage: *usage,
-                    log: log_id,
-                }),
-                SessionEvent::CompactionApplied { model, usage, .. } => Some(UsageRecorded {
-                    session,
-                    turn: self.compaction_turn(session, key.as_ref()).await?,
-                    step: None,
-                    model: model.clone(),
-                    bucket: UsageBucket::Compaction,
-                    usage: *usage,
-                    log: log_id,
-                }),
-                SessionEvent::ModelCallAborted {
-                    turn_id,
-                    step_id,
-                    model,
-                    usage: Some(usage),
-                    ..
-                } => Some(UsageRecorded {
-                    session,
-                    turn: Some(*turn_id),
-                    step: Some(*step_id),
-                    model: model.clone(),
-                    bucket: UsageBucket::Partial,
-                    usage: *usage,
-                    log: log_id,
-                }),
+            let compaction_turn = match &event {
+                SessionEvent::CompactionApplied { .. } => {
+                    self.compaction_turn(session, key.as_ref()).await?
+                }
                 _ => None,
             };
+            let recorded = usage_of(&event, compaction_turn).map(|entry| UsageRecorded {
+                session,
+                turn: entry.turn,
+                step: entry.step,
+                model: entry.model,
+                bucket: entry.bucket,
+                usage: entry.usage,
+                log: log_id,
+            });
             if let Some(recorded) = recorded {
                 hooks.emit(recorded).await;
             }
@@ -202,8 +175,7 @@ impl Agent {
         Ok(log_id)
     }
 
-    /// The turn a compaction belongs to: the open turn at its
-    /// `CompactionStarted`, which is the turn of the `caused_by` frontier.
+    /// The turn recorded on the `CompactionStarted` with this dedup key.
     async fn compaction_turn(
         &self,
         session: SessionId,
@@ -212,23 +184,16 @@ impl Agent {
         let Some(key) = key else {
             return Ok(None);
         };
-        let mut current = None;
         for entry in self.scan(session).await? {
+            if entry.dedup_key.as_ref() != Some(key) {
+                continue;
+            }
             let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
             })?;
-            match &event {
-                SessionEvent::TurnStarted { turn_id } => current = Some(*turn_id),
-                SessionEvent::TurnCommitted { turn_id, .. } => {
-                    if current == Some(*turn_id) {
-                        current = None;
-                    }
-                }
-                SessionEvent::CompactionStarted { .. } if entry.dedup_key.as_ref() == Some(key) => {
-                    return Ok(current);
-                }
-                _ => {}
+            if let SessionEvent::CompactionStarted { turn, .. } = event {
+                return Ok(turn);
             }
         }
         Ok(None)
@@ -630,7 +595,7 @@ impl Agent {
                             )
                             .await?;
                         match self
-                            .perform_compaction(session, input, frontier, None)
+                            .perform_compaction(session, input, frontier, Some(turn), None)
                             .await?
                         {
                             CompactionRun::Done(CompactResult::Applied(_)) => {
@@ -934,7 +899,7 @@ impl Agent {
                     .compaction_input(session, config, CompactionTrigger::ProviderError, watermark)
                     .await?;
                 match self
-                    .perform_compaction(session, input, frontier, None)
+                    .perform_compaction(session, input, frontier, Some(turn), None)
                     .await?
                 {
                     CompactionRun::Done(CompactResult::Applied(_)) => {
@@ -2022,7 +1987,7 @@ impl AgentRunner for Agent {
                 .compaction_input(session, &config, CompactionTrigger::Manual, u64::MAX)
                 .await?;
             match self
-                .perform_compaction(session, input, frontier, None)
+                .perform_compaction(session, input, frontier, None, None)
                 .await?
             {
                 CompactionRun::Done(result) => Ok(result),
@@ -2116,6 +2081,7 @@ impl Agent {
 
     /// Plan, record the intent, run the summary and write its terminal.
     ///
+    /// `turn` is the turn the compaction runs in (`None` when Idle).
     /// `existing_key` replays an open `CompactionStarted` from recovery: the
     /// intent is already recorded, so only the terminal is appended.
     async fn perform_compaction(
@@ -2123,6 +2089,7 @@ impl Agent {
         session: SessionId,
         input: CompactionInput,
         frontier: LogId,
+        turn: Option<TurnId>,
         existing_key: Option<DedupKey>,
     ) -> Result<CompactionRun, AgentError> {
         let Some(compactor) = &self.compactor else {
@@ -2145,6 +2112,7 @@ impl Agent {
                     trigger: input.trigger,
                     replaces_from: job.replaces.first,
                     caused_by: frontier,
+                    turn,
                 },
                 Some(key.clone()),
             )
@@ -2243,7 +2211,7 @@ impl Agent {
             .compaction_input(session, config, trigger, u64::MAX)
             .await?;
         match self
-            .perform_compaction(session, input, frontier, Some(key))
+            .perform_compaction(session, input, frontier, None, Some(key))
             .await?
         {
             CompactionRun::Done(CompactResult::Insufficient) => {

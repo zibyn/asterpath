@@ -69,6 +69,7 @@ pub use tracing::{
     ToolCallAttrs, TraceError, TraceId, TraceQuery, TraceTap, TurnAttrs, WaitAttrs, WaitKind,
 };
 pub use usage::{
-    InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageError, UsageFilter,
-    UsageQuery, UsageRecord, UsageRecorded, UsageReport, UsageScope, UsageTotals,
+    InputTokens, OutputTokens, USAGE_QUERY_SERVICE, Usage, UsageBucket, UsageEntry, UsageError,
+    UsageFilter, UsageQuery, UsageRecord, UsageRecorded, UsageReport, UsageScope, UsageTotals,
+    usage_of,
 };

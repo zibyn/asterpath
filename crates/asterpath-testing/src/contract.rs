@@ -117,6 +117,7 @@ fn compaction_started() -> SessionEvent {
         trigger: CompactionTrigger::Manual,
         replaces_from: LogId::from_i64(1),
         caused_by: LogId::from_i64(1),
+        turn: None,
     }
 }
 
