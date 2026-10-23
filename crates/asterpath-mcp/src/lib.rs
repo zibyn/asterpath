@@ -15,4 +15,5 @@ mod stdio;
 pub use config::{
     DEFAULT_CALL, DEFAULT_STARTUP, McpServerConfig, McpTimeouts, McpTransport, ServerId,
 };
+pub use mcp::ADAPTER_PROTOCOL_VERSIONS;
 pub use servers::{LoadStage, McpError, McpServers, ServerStatus};

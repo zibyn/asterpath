@@ -117,7 +117,9 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "asterpath",
+ "asterpath-mcp",
  "asterpath-protocol",
+ "asterpath-sandbox-linux",
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",

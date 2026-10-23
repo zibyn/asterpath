@@ -266,7 +266,7 @@ pub enum AsterError {
 | `asterpath inspect [OPTIONS] <SESSION>` | 打印投影摘要与未闭合意图；`--json` 输出完整投影 |
 | `asterpath trace [OPTIONS] <SESSION>` | 打印 span 树（`Asterpath::trace`）；`--json` |
 | `asterpath usage [OPTIONS] <SESSION>` | 分列 `own` / `descendants`；`--json` |
-| `asterpath config check [OPTIONS]` | 只解析与校验配置，不初始化模块；成功退出 0，失败退出 2 |
+| `asterpath config check [OPTIONS]` | 解析与校验配置，不打开数据库、不初始化引擎；加载 `[mcp_servers]` 并逐个打印状态后关闭（`mcp: <id> loaded: <tools>` / `mcp: <id> failed at <stage>: <message>`）；成功退出 0，配置错误或 `required` 服务失败退出 2 |
 
 通用选项：`--config <path>`、`--db <path>`、`--provider <id>`、`--model <id>`、`--approval <ask|allow|deny>`、`--json`。
 
@@ -274,12 +274,31 @@ pub enum AsterError {
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
 - 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。策略取 `--approval` > `[approval] default` > `ask`。TTY 上 `ask` 提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 上来自配置或缺省的 `ask` 一律降级为 `deny`（无法提示），而显式 `--approval ask` 是用法错误（退出码 2）。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
+- MCP（ADR-0027）：`run` / `resume` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。外部工具（`<id>__<tool>`）默认 `Ask`，走上面的审批路径。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
+- 压缩：`run` / `resume` 总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
 
 ### 4.1 配置
 
 `asterpath.toml`，默认从 `--config` 或 `ASTERPATH_CONFIG` 取；不存在时使用默认值。优先级：CLI flag > 环境变量 > 文件。
 
 ```toml
+[model]
+context_window = 200000       # 映射到 ModelSpec.context_window；省略 = 不自动压缩
+
+[sandbox]
+mode = "workspace-write"      # read-only | workspace-write（默认，可写根 = 工作目录）| full-access
+
+[mcp_servers.docs]            # 表名即 server id（[a-z0-9-]{1,32}），工具名为 docs__<tool>
+command = "docs-mcp"          # stdio：command / args / env / cwd
+args = ["--stdio"]
+env = { DOCS_ROOT = "/srv/docs" }
+required = false              # true：加载失败即配置错误（退出码 2）
+# protocol_versions = ["2026-07-28"]   # 省略 = 适配器支持的全部版本
+
+[mcp_servers.search]
+url = "https://mcp.example.com/mcp"   # http：url / headers；与 command 二选一
+headers = { "X-Team" = "core" }
+
 [storage]
 path = "~/.local/share/asterpath/sessions.db"   # 默认 XDG_DATA_HOME/asterpath/sessions.db
 
@@ -321,6 +340,8 @@ default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级
 - API key **只从环境变量读**：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`。配置文件出现 `api_key` / `secret` / `token` 字段直接报错（退出码 2）。
 - 环境变量覆盖：`ASTERPATH_CONFIG`、`ASTERPATH_DB`、`ASTERPATH_PROVIDER`、`ASTERPATH_MODEL`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。
+- 未知字段（任一层级）是配置错误（退出码 2）。
+- 沙箱只约束 stdio MCP 服务进程（HTTP 不沙箱）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。
 
 ## 5. 交付清单与里程碑
 
