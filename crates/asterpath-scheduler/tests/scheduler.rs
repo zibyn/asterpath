@@ -204,7 +204,6 @@ fn new_scheduler_with(
     catalog: Arc<dyn SessionCatalog>,
     executor: Arc<dyn DurableExecutor>,
     clock: Arc<dyn Clock>,
-    subagents: SubagentConfig,
 ) -> Arc<Scheduler> {
     Arc::new(Scheduler::with_runtime(
         log,
@@ -212,7 +211,7 @@ fn new_scheduler_with(
         executor,
         BTreeMap::new(),
         clock,
-        subagents,
+        NonZeroUsize::new(32).expect("non-zero"),
         Arc::new(CancellationRegistry::new()),
     ))
 }
@@ -1617,141 +1616,6 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
 }
 
 #[tokio::test]
-async fn fork_drops_foreign_provider_opaque_items_without_translation() {
-    let log = Arc::new(InMemoryEventLog::new());
-    append(
-        &*log,
-        PARENT,
-        SessionEvent::SessionCreated {
-            config: config(3),
-            parent: None,
-        },
-    )
-    .await;
-    append(
-        &*log,
-        PARENT,
-        SessionEvent::TurnStarted { turn_id: FORK_TURN },
-    )
-    .await;
-    append(
-        &*log,
-        PARENT,
-        SessionEvent::StepStarted {
-            turn_id: FORK_TURN,
-            step_id: STEP_1,
-        },
-    )
-    .await;
-    append(
-        &*log,
-        PARENT,
-        assistant_at(
-            STEP_1,
-            vec![
-                reasoning("q"),
-                Item::ProviderOpaque {
-                    provider: ProviderId::new("q"),
-                    kind: "unknown".to_owned(),
-                    raw: raw("q", "unknown"),
-                },
-                Item::ServerToolCall {
-                    provider: ProviderId::new("q"),
-                    name: "web".to_owned(),
-                    call_id: None,
-                    raw: raw("q", "server_tool"),
-                },
-                Item::Message {
-                    role: Role::Assistant,
-                    parts: vec![
-                        text("kept text"),
-                        Part::ProviderOpaque {
-                            provider: ProviderId::new("q"),
-                            kind: "opaque".to_owned(),
-                            raw: raw("q", "opaque"),
-                        },
-                        Part::ProviderOpaque {
-                            provider: ProviderId::new("p"),
-                            kind: "opaque".to_owned(),
-                            raw: raw("p", "opaque"),
-                        },
-                    ],
-                },
-                reasoning("p"),
-                Item::ProviderOpaque {
-                    provider: ProviderId::new("p"),
-                    kind: "known".to_owned(),
-                    raw: raw("p", "known"),
-                },
-            ],
-        ),
-    )
-    .await;
-    let at = append(
-        &*log,
-        PARENT,
-        SessionEvent::StepStarted {
-            turn_id: FORK_TURN,
-            step_id: STEP_2,
-        },
-    )
-    .await;
-    let caused_by = append(
-        &*log,
-        PARENT,
-        SessionEvent::ToolCallRequested {
-            turn_id: FORK_TURN,
-            step_id: STEP_2,
-            tool_call_id: CALL_SPAWN,
-            provider_call_id: "spawn-call".to_owned(),
-            name: ToolName::new("spawn_agent"),
-            raw_args: asterpath_protocol::JsonString::new("{}"),
-            replay: ReplaySafety::Safe,
-            provenance: Provenance::InProcess,
-        },
-    )
-    .await;
-
-    let scheduler = new_scheduler(
-        log.clone(),
-        Arc::new(FakeCatalog::default()),
-        BTreeMap::new(),
-    );
-    let child = scheduler
-        .spawn(fork_request(caused_by, at))
-        .await
-        .expect("fork spawn");
-
-    let child_events = events(&*log, child.child).await;
-    let SessionEvent::ContextForked { items, .. } = fork_event(&child_events) else {
-        unreachable!()
-    };
-    assert_eq!(
-        items,
-        &vec![
-            Item::Message {
-                role: Role::Assistant,
-                parts: vec![
-                    text("kept text"),
-                    Part::ProviderOpaque {
-                        provider: ProviderId::new("p"),
-                        kind: "opaque".to_owned(),
-                        raw: raw("p", "opaque"),
-                    },
-                ],
-            },
-            reasoning("p"),
-            Item::ProviderOpaque {
-                provider: ProviderId::new("p"),
-                kind: "known".to_owned(),
-                raw: raw("p", "known"),
-            },
-        ],
-        "foreign opaque items are dropped verbatim; same-provider raw is kept"
-    );
-}
-
-#[tokio::test]
 async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
     let log = Arc::new(InMemoryEventLog::new());
     let (caused_by, at) = seed_fork_parent(&*log, &SubagentConfig::default()).await;
@@ -1931,7 +1795,6 @@ async fn admission_queues_over_the_limit_in_tool_call_seq_order() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
 
     // The first call takes the only slot.
@@ -2018,7 +1881,6 @@ async fn a_spawn_cancelled_before_admission_does_not_block_a_later_spawn() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
     let child = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2066,7 +1928,6 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents.clone(),
     );
 
     // R1: replay reuses the admitted child and writes no second record.
@@ -2282,10 +2143,6 @@ impl DurableExecutor for TestExecutor {
 #[tokio::test]
 async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
     let log = Arc::new(InMemoryEventLog::new());
-    let subagents = SubagentConfig {
-        default_context: ContextPolicy::Fresh,
-        ..SubagentConfig::default()
-    };
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     // The spawn tool leaves the request at its `Fresh` default.
     let scheduler = new_scheduler_with(
@@ -2293,7 +2150,6 @@ async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents,
     );
     let child = scheduler
         .spawn(SpawnRequest::new(reference, caused_by, vec![text("task")]))
@@ -2334,7 +2190,6 @@ async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
         Arc::new(FakeCatalog::default()),
         Arc::new(NoopExecutor),
         Arc::new(SystemClock),
-        subagents,
     );
     // Same request the spawn tool builds: `Fresh` unless the snapshot says otherwise.
     let child = scheduler
@@ -2439,7 +2294,6 @@ async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
         Arc::new(FakeCatalog::default()),
         executor,
         clock,
-        subagents,
     );
     let runner: Arc<dyn AgentRunner> = Arc::new(CompletingRunner {
         log: Arc::clone(&log),
@@ -2505,7 +2359,6 @@ async fn a_committed_child_terminal_wins_over_an_expired_spawn_timer() {
         Arc::new(FakeCatalog::default()),
         executor,
         clock,
-        SubagentConfig::default(),
     );
     let outcome = scheduler
         .await_completion(&ChildRef {

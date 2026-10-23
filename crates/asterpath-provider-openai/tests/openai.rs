@@ -960,3 +960,43 @@ async fn http_errors_are_classified() {
     assert!(!context.retryable);
     assert!(context.context_exceeded());
 }
+
+fn text_deltas(events: &[Result<StreamEvent, ProviderError>]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::PartDelta {
+                delta: asterpath_protocol::PartDelta::Text { text },
+                ..
+            }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn multibyte_text_delta_split_across_tcp_chunks_is_byte_exact() {
+    let text = "你好🙂世界";
+    let body = completed_text_body(text);
+    let cjk = body.find('好').expect("cjk in body");
+    let emoji = body.find('🙂').expect("emoji in body");
+    let server = MockServer::start(vec![
+        MockResponse::sse(body).split_at(&[cjk + 1, emoji + 2]),
+    ]);
+    let events = collect(&provider(&server), request(vec![user_text("hi")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(text_deltas(&events), text);
+    assert_eq!(completed_items(&events), vec![(0, completed_item(text))]);
+}
+
+#[tokio::test]
+async fn crlf_framed_stream_matches_lf_stream() {
+    let lf = completed_text_body("Hi");
+    let crlf = lf.replace('\n', "\r\n");
+    let server = MockServer::start(vec![MockResponse::sse(lf), MockResponse::sse(crlf)]);
+    let provider = provider(&server);
+    let from_lf = collect(&provider, request(vec![user_text("hi")])).await;
+    let from_crlf = collect(&provider, request(vec![user_text("hi")])).await;
+    assert!(from_lf.iter().all(Result::is_ok), "{from_lf:?}");
+    assert_eq!(format!("{from_crlf:?}"), format!("{from_lf:?}"));
+}

@@ -6,7 +6,7 @@
 
 ## 1. 决策摘要
 
-- v1 workspace = 16 个库/应用成员 + 1 个 `xtask`，按里程碑增量创建（M0 只建 7 个 crate + `xtask`）；一模块一 crate，模块之间零依赖。M5 扩展再加 4 个成员（`asterpath-plugin-host`、`asterpath-sandbox`、`asterpath-sandbox-linux`、`asterpath-mcp-fixture`），共 20 个库/应用成员 + 1 个 `xtask`；M6 再加 1 个成员（`asterpath-skills`），共 21 个库/应用成员 + 1 个 `xtask`。
+- v1 workspace = 16 个库/应用成员 + 1 个 `xtask`，按里程碑增量创建（M0 只建 7 个 crate + `xtask`）；一模块一 crate，模块之间零依赖。M5 扩展再加 4 个成员（`asterpath-plugin-host`、`asterpath-sandbox`、`asterpath-sandbox-linux`、`asterpath-mcp-fixture`），共 20 个库/应用成员 + 1 个 `xtask`；M6 再加 1 个成员（`asterpath-skills`），共 21 个库/应用成员 + 1 个 `xtask`；2026-10-23 重审再加 `asterpath-http`（[#66](https://github.com/zibyn/asterpath/issues/66)），共 22 个。
 - 依赖方向固定 `core ← protocol ← modules ← app`，由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade、core、protocol 与日志 schema**，模块 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
@@ -28,8 +28,9 @@
 | `asterpath-runtime` | `DurableExecutor` 实现（timer / signal / wake） | `core`, `protocol` | M3 |
 | `asterpath-scheduler` | `SubagentSpawner` 实现；子会话准入与等待 | `core`, `protocol` | M3 |
 | `asterpath-compaction` | `Compactor` 实现（摘要压缩） | `core`, `protocol` | M3；**可选装配**，不进通过条件 |
-| `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol` | M2 |
-| `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol` | M2 |
+| `asterpath-provider-anthropic` | Anthropic Messages adapter | `core`, `protocol`, `http` | M2 |
+| `asterpath-provider-openai` | OpenAI Responses adapter | `core`, `protocol`, `http` | M2 |
+| `asterpath-http` | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）；不属于稳定面（ADR-0026 修订）；白名单角色记为 `contract` 以便模块依赖 | `protocol` | 2026-10-23 重审（#66） |
 | `asterpath-tracing` | `TraceQuery` / `TraceTap` 实现 | `core`, `protocol` | M3 |
 | `asterpath-usage` | `UsageQuery` 实现 | `core`, `protocol` | M3 |
 | `asterpath-testing` | in-memory fakes、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)） | `core`, `protocol` | M0 |
@@ -37,7 +38,7 @@
 | `asterpath-cli` | 参考 CLI 二进制 `asterpath` | 任意 | M4 |
 | `asterpath-acceptance` | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 | M1 |
 | `xtask` | `check-deps` 与 CI 辅助；`publish = false` | 无 | M0 |
-| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol`, `sandbox` | M5（post-v1） |
+| `asterpath-plugin-host` | 外部插件清单、子进程与 MCP adapter（[mcp.md](mcp.md)）；ACP 不做 | `core`, `protocol`, `sandbox`, `http` | M5（post-v1） |
 | `asterpath-sandbox` | 零依赖沙箱合约：`SandboxProvider` / `SpawnRequest` / `ConfinedSpawn` / 策略与错误（[sandbox.md](sandbox.md)） | 无 | M5（post-v1） |
 | `asterpath-sandbox-linux` | Linux bwrap 参考后端 | `sandbox` | M5（post-v1） |
 | `asterpath-mcp-fixture` | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） | M5（post-v1） |
@@ -105,9 +106,7 @@ pub struct AsterpathConfig {
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
     pub session_catalog: Option<Arc<dyn SessionCatalog>>,
     pub session_retirement: Option<Arc<dyn SessionRetirement>>,
-    pub turn: TurnConfig,
-    pub compaction: CompactionConfig,
-    pub subagents: SubagentConfig,
+    pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
 }
 
 impl Asterpath {
@@ -127,6 +126,7 @@ impl Asterpath {
 ```
 
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应，`build().await` 执行拓扑初始化。
+- 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
 - `event_log` / `storage` 要么同时注入，要么都留空；只注入其一是 `AsterError::Config`。同时注入时 `database` 被忽略；都留空时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
@@ -305,7 +305,8 @@ model = "claude-fable-5-1"
 # CompactionConfig 字段
 
 [subagents]
-# SubagentConfig 字段
+# SubagentConfig 字段（进 SessionSpec）
+# max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
 default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级为 deny
