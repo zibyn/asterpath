@@ -1,0 +1,41 @@
+{
+  "provider": "p",
+  "model": "model-1",
+  "system": [{"Text": {"text": "use the plugin"}}],
+  "tools": ["fixture__echo"],
+  "steps": [
+    {
+      "items": [
+        {
+          "ToolCall": {
+            "call_id": "call-1",
+            "provider_item_id": null,
+            "name": "fixture__echo",
+            "raw_args": "{\"text\":\"hi\"}",
+            "raw": null
+          }
+        }
+      ],
+      "stop_reason": "ToolUse",
+      "usage": {
+        "input": {"uncached": 10, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 5, "reasoning": 0}
+      }
+    },
+    {
+      "items": [
+        {
+          "Message": {
+            "role": "Assistant",
+            "parts": [{"Text": {"text": "done"}}]
+          }
+        }
+      ],
+      "stop_reason": "EndTurn",
+      "usage": {
+        "input": {"uncached": 20, "cache_read": 0, "cache_write": 0},
+        "output": {"total": 3, "reasoning": 0}
+      }
+    }
+  ]
+}

@@ -87,6 +87,24 @@ impl Asterpath {
                 message: "max_steps_per_turn must be greater than zero".to_owned(),
             });
         }
+        for tool in &config.tools {
+            let name = tool.descriptor().name.as_str();
+            let validated = match tool.descriptor().provenance {
+                asterpath_protocol::Provenance::InProcess => {
+                    asterpath_protocol::validate_tool_name(name)
+                }
+                asterpath_protocol::Provenance::External { .. } => {
+                    asterpath_protocol::validate_external_tool_name(name)
+                }
+                // `Unknown` is an intent-only provenance; it is not registrable.
+                asterpath_protocol::Provenance::Unknown => {
+                    Err(asterpath_protocol::ToolNameError::InvalidToolName)
+                }
+            };
+            validated.map_err(|error| AsterError::Config {
+                message: format!("invalid tool name {name}: {error}"),
+            })?;
+        }
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {
             AsterError::Config {

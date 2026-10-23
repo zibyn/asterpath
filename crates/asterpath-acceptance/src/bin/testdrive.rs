@@ -14,16 +14,21 @@ use std::time::Duration;
 
 use asterpath::{Asterpath, AsterpathBuilder};
 use asterpath_core::{Clock, EventLog, InputId, LogQuery, SessionCatalog, SessionId, Storage};
+use asterpath_plugin_host::{PluginHost, PluginManifest, PluginStatus};
 use asterpath_protocol::{
-    AgentEvent, Item, ModelId, ModelRequest, ModelSpec, Part, Provider, ProviderCapabilities,
-    ProviderError, ProviderErrorKind, ProviderId, RequestConfig, SessionSpec, StreamEvent, Tool,
-    ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
-    TurnConfig, TurnEndReason, UserInput, decode_entry,
+    AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, ModelId, ModelRequest,
+    ModelSpec, Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
+    RequestConfig, SessionSpec, StreamEvent, Tool, ToolArgs, ToolConfig, ToolContext,
+    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolRegistry, ToolSelection, TurnConfig,
+    TurnEndReason, UserInput, decode_entry,
 };
+use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
+use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
     Failpoint, FailpointEventLog, FailpointTool, Fixture, FixtureStep, ManualClock, Point,
     ScriptedProvider,
 };
+use asterpath_tools::InMemoryToolRegistry;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
@@ -51,6 +56,10 @@ struct Args {
     /// When set, use the real adapter for this id instead of the scripted one.
     provider: Option<String>,
     base_url: Option<String>,
+    plugin_manifests: Vec<PathBuf>,
+    sandbox: SandboxPolicy,
+    sandbox_provider: bool,
+    kill_grace: Duration,
 }
 
 fn usage_error(message: &str) -> i32 {
@@ -70,6 +79,11 @@ fn run() -> Result<i32, String> {
     let mut specs = Vec::new();
     let mut provider = None;
     let mut base_url = None;
+    let mut plugin_manifests = Vec::new();
+    let mut policy = "full".to_owned();
+    let mut writable_roots = Vec::new();
+    let mut sandbox_provider = true;
+    let mut kill_grace = ToolConfig::default().kill_grace;
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,6 +92,28 @@ fn run() -> Result<i32, String> {
             "--session" => session = args.next(),
             "--provider" => provider = args.next(),
             "--base-url" => base_url = args.next(),
+            "--plugin-manifest" => match args.next() {
+                Some(path) => plugin_manifests.push(PathBuf::from(path)),
+                None => return Ok(usage_error("--plugin-manifest needs a value")),
+            },
+            "--sandbox" => match args.next() {
+                Some(value) => policy = value,
+                None => return Ok(usage_error("--sandbox needs a value")),
+            },
+            "--writable-root" => match args.next() {
+                Some(path) => writable_roots.push(PathBuf::from(path)),
+                None => return Ok(usage_error("--writable-root needs a value")),
+            },
+            "--no-sandbox-provider" => sandbox_provider = false,
+            "--kill-grace-ms" => match args.next() {
+                Some(value) => {
+                    let millis = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --kill-grace-ms value {value}"))?;
+                    kill_grace = Duration::from_millis(millis);
+                }
+                None => return Ok(usage_error("--kill-grace-ms needs a value")),
+            },
             "--failpoint" => match args.next() {
                 Some(spec) => specs.push(spec),
                 None => return Ok(usage_error("--failpoint needs a value")),
@@ -87,6 +123,12 @@ fn run() -> Result<i32, String> {
             }
         }
     }
+    let sandbox = match policy.as_str() {
+        "full" => SandboxPolicy::FullAccess,
+        "read-only" => SandboxPolicy::ReadOnly,
+        "workspace-write" => SandboxPolicy::WorkspaceWrite { writable_roots },
+        other => return Ok(usage_error(&format!("unknown sandbox policy {other}"))),
+    };
     let Some(db) = db else {
         return Ok(usage_error("--db is required"));
     };
@@ -107,6 +149,10 @@ fn run() -> Result<i32, String> {
         failpoints,
         provider,
         base_url,
+        plugin_manifests,
+        sandbox,
+        sandbox_provider,
+        kill_grace,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -403,9 +449,22 @@ async fn assemble(
     provider: Arc<dyn Provider>,
 ) -> Result<Asterpath, String> {
     let clock = Arc::new(ManualClock::new());
+    let (plugin_tools, plugin_registry) = load_plugins(args).await?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let hold = Duration::from_millis(hold_millis(args.command == "run"));
     for name in &fixture.tools {
+        // External names are registered by plugin-host (or, after a resume
+        // without a manifest, intentionally absent).
+        if name.as_str().contains("__") {
+            continue;
+        }
+        // Plugin tools are already registered by the plugin host.
+        if plugin_registry
+            .as_ref()
+            .is_some_and(|registry| registry.get(name).is_some())
+        {
+            continue;
+        }
         let mut tool: Arc<dyn Tool> = match name.as_str() {
             "set_marker" => Arc::new(SetMarker::new(effect_file()?, hold)),
             "append_line" => Arc::new(AppendLine::new(effect_file()?, hold)),
@@ -418,12 +477,22 @@ async fn assemble(
         }
         tools.push(tool);
     }
+    tools.extend(plugin_tools);
 
     let provider: Arc<dyn Provider> = provider;
     let mut builder = AsterpathBuilder::new()
         .providers(vec![provider])
         .tools(tools)
-        .clock(clock);
+        .clock(clock)
+        .tool(ToolConfig {
+            kill_grace: args.kill_grace,
+            ..ToolConfig::default()
+        });
+    if !args.plugin_manifests.is_empty() {
+        // External tools are `Ask` by default and there is no approval endpoint
+        // in this driver, so the M5 scenarios allow them explicitly.
+        builder = builder.approval(Arc::new(AllowExternal));
+    }
     if !args.failpoints.is_empty() {
         let backend =
             asterpath_storage_sqlite::open(&args.db).map_err(|error| error.to_string())?;
@@ -441,6 +510,100 @@ async fn assemble(
         builder = builder.database(&args.db);
     }
     builder.build().await.map_err(|error| error.to_string())
+}
+
+/// Loads the M5 plugin manifests and returns the registered external tools.
+async fn load_plugins(
+    args: &Args,
+) -> Result<(Vec<Arc<dyn Tool>>, Option<Arc<InMemoryToolRegistry>>), String> {
+    if args.plugin_manifests.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let registry = Arc::new(InMemoryToolRegistry::new());
+    let sandbox: Option<Arc<dyn SandboxProvider>> =
+        if args.sandbox_provider && !matches!(args.sandbox, SandboxPolicy::FullAccess) {
+            Some(Arc::new(LinuxSandbox::new()))
+        } else {
+            None
+        };
+    let host = PluginHost::new(registry.clone(), sandbox, args.sandbox.clone());
+    let manifests = read_manifests(&args.plugin_manifests)?;
+    match host.load(manifests).await {
+        Ok(statuses) => {
+            for status in &statuses {
+                emit_plugin_status(status);
+                if let PluginStatus::Failed { stage, message } = status {
+                    return Err(format!("plugin failed at {stage:?}: {message}"));
+                }
+            }
+        }
+        Err(error) => {
+            emit(json!({
+                "event": "plugin_status",
+                "status": "Failed",
+                "id": error.plugin.as_str(),
+                "stage": format!("{:?}", error.stage),
+                "message": error.message,
+            }));
+            return Err(error.to_string());
+        }
+    }
+    let tools = registry.list();
+    Ok((tools, Some(registry)))
+}
+
+/// Each file holds one manifest object or an array of them.
+fn read_manifests(paths: &[PathBuf]) -> Result<Vec<PluginManifest>, String> {
+    let mut manifests = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read manifest {}: {error}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("invalid manifest {}: {error}", path.display()))?;
+        let items = match value {
+            serde_json::Value::Array(items) => items,
+            value => vec![value],
+        };
+        for item in items {
+            manifests.push(
+                serde_json::from_value(item)
+                    .map_err(|error| format!("invalid manifest {}: {error}", path.display()))?,
+            );
+        }
+    }
+    Ok(manifests)
+}
+
+fn emit_plugin_status(status: &PluginStatus) {
+    let value = match status {
+        PluginStatus::Loaded { tools } => json!({
+            "event": "plugin_status",
+            "status": "Loaded",
+            "tools": tools.iter().map(|tool| tool.as_str()).collect::<Vec<_>>(),
+        }),
+        PluginStatus::Failed { stage, message } => json!({
+            "event": "plugin_status",
+            "status": "Failed",
+            "stage": format!("{stage:?}"),
+            "message": message,
+        }),
+        PluginStatus::Skipped { reason } => json!({
+            "event": "plugin_status",
+            "status": "Skipped",
+            "reason": reason,
+        }),
+        _ => return,
+    };
+    emit(value);
+}
+
+/// Test-only: the driver has no approval endpoint, so external tools pass.
+struct AllowExternal;
+
+impl ApprovalPolicy for AllowExternal {
+    fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
+        ApprovalVerdict::Allow
+    }
 }
 
 async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
@@ -560,6 +723,9 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
             }
             AgentEvent::TurnCommitted { reason, .. } => {
                 emit(json!({"event": "turn_committed", "reason": reason_name(&reason)}));
+            }
+            AgentEvent::ToolStarted { tool, .. } => {
+                emit(json!({"event": "tool_started", "tool": tool.as_str()}));
             }
             AgentEvent::Idle { .. } => marker("idle"),
             _ => {}

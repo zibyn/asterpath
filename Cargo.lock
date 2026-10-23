@@ -98,9 +98,13 @@ dependencies = [
  "assert_cmd",
  "asterpath",
  "asterpath-core",
+ "asterpath-plugin-host",
  "asterpath-protocol",
+ "asterpath-sandbox",
+ "asterpath-sandbox-linux",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "futures-util",
  "libc",
  "serde",
@@ -166,6 +170,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterpath-mcp-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "asterpath-core",
+ "asterpath-protocol",
+ "asterpath-sandbox",
+ "asterpath-testing",
+ "asterpath-tools",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "asterpath-protocol"
 version = "0.1.0"
 dependencies = [
@@ -220,6 +249,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterpath-sandbox"
+version = "0.1.0"
+
+[[package]]
+name = "asterpath-sandbox-linux"
+version = "0.1.0"
+dependencies = [
+ "asterpath-sandbox",
+]
+
+[[package]]
 name = "asterpath-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -255,6 +295,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-core",
  "asterpath-protocol",
+ "asterpath-sandbox",
  "futures",
  "futures-core",
  "futures-util",
@@ -1449,6 +1490,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1596,6 +1647,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
