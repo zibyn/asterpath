@@ -4,6 +4,7 @@
 **来源**: [#9](https://github.com/zibyn/asterpath/issues/9)
 **2026-10-22 #24 审计修订**: 强制压缩改为同 step 内层重试；压缩失败以 `CompactionAborted` 闭合；摘要输入只保留文本；窗口唯一来源是 `ModelSpec.context_window`；恢复次数上限归宿主。
 **2026-10-22 #27 审计修订**: `Compactor` 改为两段式 `plan` / `compact`；默认实现可选装配（M0 为 `None`）；意图由 agent 在 `plan` 判定 `Summarize` 后写；`CompactionOutcome` 携带摘要调用实际使用的 `model`。
+**2026-10-23 ADR-0026 修订**: `asterpath-compaction` 并入引擎作为默认 compactor；`Compactor` trait 仍在 protocol、可替换，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
 
 ## Context
 

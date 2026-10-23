@@ -4,6 +4,7 @@
 **来源**: [#17](https://github.com/zibyn/asterpath/issues/17)
 **2026-10-22 #29 修订**: 排队按 open spawn `ToolCallRequested` 的 `seq` 重建；spawn timeout timer 归 spawn 重放收尾，先查子终态（R3）再处理 deadline。
 **2026-10-23 ADR-0024 修订**: spawn 超时改为 `ChildSessionSpawned.deadline`（绝对时间，与 spawn 同一次 append），不再写 timer 记录；R3 先查子终态不变，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
+**2026-10-23 ADR-0026 修订**: `SubagentSpawner` 不再是公开 trait，spawn/await/cancel 是引擎内部 scheduler 的方法，语义不变，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
 
 ## Context
 

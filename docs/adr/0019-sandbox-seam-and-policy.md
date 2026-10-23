@@ -3,6 +3,7 @@
 **Status**: accepted (2026-10-22)
 **来源**: [#21 沙箱扩展模块](https://github.com/zibyn/asterpath/issues/21)
 **前置**: [ADR-0007](0007-approval-and-sandbox-layers.md)、[ADR-0013](0013-plugin-boundary.md)、[ADR-0015](0015-packaging-and-stability.md)、[ADR-0017](0017-fault-injection-and-test-tooling.md)
+**2026-10-23 ADR-0027 修订**: 合约 crate `asterpath-sandbox` 并入 `asterpath-protocol`；`asterpath-sandbox-linux` 依赖 protocol；沙箱语义不变，见 [ADR-0027](0027-mcp-is-a-tool-source-not-a-plugin-host.md)。
 
 ## Context
 

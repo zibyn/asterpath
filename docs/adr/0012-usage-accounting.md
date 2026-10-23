@@ -2,6 +2,8 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#13](https://github.com/zibyn/asterpath/issues/13)
+**2026-10-23 ADR-0026 修订**: `UsageQuery` 不再是 trait，改为 facade 方法 `usage(session, scope)`，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
+**2026-10-23 重审候选 4 修订**: `UsageRecorded` 删除；用量桶判定归 protocol `usage_of`（usage 折叠与观察者共用），成本 / 预算经 `Hooks::on_record` 或 `before_step` 的 `usage()` 接入。
 
 ## Context
 

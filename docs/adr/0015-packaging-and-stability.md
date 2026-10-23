@@ -2,7 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#15](https://github.com/zibyn/asterpath/issues/15)
-**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `SessionSpec` / `ConfigSnapshot` 增加 `request`；`providers` 在 `build()` 经 `ProviderCatalog` 去重；facade 暴露 `approval_gate()`。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— `ConfigSnapshot.tools` 存解析后的 `Vec<ToolDescriptor>`，模型请求只从快照渲染。2026-10-23（[#72](https://github.com/zibyn/asterpath/issues/72)）— facade 接受宿主模块并公开保证的服务清单，取代“自定义模块就直接使用 `ModuleHost`”的口径，见 [ADR-0022](0022-facade-accepts-host-modules.md)。
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `SessionSpec` / `ConfigSnapshot` 增加 `request`；`providers` 在 `build()` 经 `ProviderCatalog` 去重；facade 暴露 `approval_gate()`。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— `ConfigSnapshot.tools` 存解析后的 `Vec<ToolDescriptor>`，模型请求只从快照渲染。2026-10-23（[#72](https://github.com/zibyn/asterpath/issues/72)）— facade 接受宿主模块并公开保证的服务清单，取代“自定义模块就直接使用 `ModuleHost`”的口径，见 [ADR-0022](0022-facade-accepts-host-modules.md)。2026-10-23（ADR-0025）— 宿主模块被钩子取代：facade 接收 `Hooks`，不再公开模块宿主或服务清单，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。2026-10-23（ADR-0026）— 一模块一 crate 与模块间零依赖作废，引擎是一个 crate；稳定面改为 facade + `asterpath-protocol` + 日志 schema，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
 
 ## Context
 

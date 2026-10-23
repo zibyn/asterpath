@@ -1,6 +1,7 @@
 # 内核只持有合约，依赖单向流动
 
-**Status**: accepted (2026-10-22)
+**Status**: superseded by [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md) (2026-10-23)
+**2026-10-23 ADR-0025 修订**: 内核不再包含模块宿主、服务注册表与类型化事件总线；扩展点是 protocol 中的 `Hooks` trait，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。
 
 ## Context
 

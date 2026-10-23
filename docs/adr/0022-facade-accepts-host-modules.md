@@ -1,6 +1,6 @@
 # facade 接受宿主模块，注册表与事件总线对嵌入者开放
 
-**Status**: accepted (2026-10-23)
+**Status**: superseded by [ADR-0025](0025-extension-points-are-typed-hooks.md) (2026-10-23)
 **来源**: [#72](https://github.com/zibyn/asterpath/issues/72)（架构审计候选 7）
 **前置**: [ADR-0001](0001-dependency-direction.md)、[ADR-0007](0007-approval-and-sandbox-layers.md)、[ADR-0013](0013-plugin-boundary.md)、[ADR-0015](0015-packaging-and-stability.md)
 **2026-10-23 ADR-0023 修订**: 服务清单删去“存储”（`Storage` trait 已删除），见 [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md)。

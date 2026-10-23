@@ -3,6 +3,9 @@
 **Status**: accepted (2026-10-22)
 **来源**: [#12](https://github.com/zibyn/asterpath/issues/12)
 **2026-10-23 ADR-0024 修订**: 等待 span 只剩审批与子会话；timer span 与通用 signal span 删除，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
+**2026-10-23 ADR-0025 修订**: 实时导出不再经事件总线；tracing 由引擎 append 入口直接调用，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。
+**2026-10-23 ADR-0026 修订**: `TraceQuery` / `TraceTap` 不再是 trait，改为 facade 方法 `trace(session)` / `trace_updates()`，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
+**2026-10-23 重审候选 4 修订**: 不提供 span 实时推送（`TraceTap` 删除，facade 无 `trace_updates()`）；trace 只有拉取 `trace(session)`，实时导出由宿主经 `Hooks::on_record` 自行增量折叠。
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#7](https://github.com/zibyn/asterpath/issues/7)
-**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— 「有审批端」由 `ApprovalGate` 的 RAII 注册门表达；门关闭时 `Ask` 立即 `Denied`，不发 `ApprovalRequested`、不挂起。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— 工具调用采用框架 `tool_call_id` + provider `provider_call_id` 双身份；已记录意图不重跑 pre-execute；每个调用由单一 supervisor 写终态。
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— 「有审批端」由 `ApprovalGate` 的 RAII 注册门表达；门关闭时 `Ask` 立即 `Denied`，不发 `ApprovalRequested`、不挂起。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— 工具调用采用框架 `tool_call_id` + provider `provider_call_id` 双身份；已记录意图不重跑 pre-execute；每个调用由单一 supervisor 写终态。2026-10-23（ADR-0025）— pre-execute / post-execute waterfall 改为 `Hooks::before_tool` / `after_tool`，调用点与语义不变，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。
 
 ## Context
 

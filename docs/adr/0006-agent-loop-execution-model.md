@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#6](https://github.com/zibyn/asterpath/issues/6)
+**2026-10-23 ADR-0025 修订**: pre-step waterfall gate 改为 `Hooks::before_step`，语义不变，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。
 
 ## Context
 

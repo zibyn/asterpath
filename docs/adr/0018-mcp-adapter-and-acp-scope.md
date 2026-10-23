@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#20](https://github.com/zibyn/asterpath/issues/20)
+**2026-10-23 ADR-0027 修订**: `PluginProtocol::Acp` 删除，MCP 配置不含协议字段；MCP 映射规则不变，crate 改名 `asterpath-mcp`，见 [ADR-0027](0027-mcp-is-a-tool-source-not-a-plugin-host.md)。
 
 ## Context
 
