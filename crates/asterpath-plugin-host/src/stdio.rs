@@ -5,16 +5,13 @@
 //! task. On EOF, read error or process exit the adapter is marked dead and every
 //! pending call fails with `Transport`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use asterpath_protocol::{
-    ImageSource, JsonString, Parallelism, Part, ReplaySafety, SideEffect, ToolContext, ToolError,
-    ToolOutput,
-};
+use asterpath_protocol::{JsonString, ToolContext, ToolError, ToolOutput};
 use asterpath_sandbox::ConfinedSpawn;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,31 +19,11 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Notify, oneshot};
 
 use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, PluginAdapter};
+use crate::mcp::{self, RpcClient, RpcFailure};
 
-pub(crate) const ADAPTER_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
-const MAX_LIST_PAGES: usize = 100;
 const KILL_WAIT: Duration = Duration::from_millis(500);
 
 type PendingSender = oneshot::Sender<Result<Value, RpcFailure>>;
-
-#[derive(Clone, Debug)]
-enum RpcFailure {
-    Transport(String),
-    Rpc {
-        code: i64,
-        message: String,
-        data: Option<Value>,
-    },
-}
-
-impl RpcFailure {
-    fn message(&self) -> String {
-        match self {
-            Self::Transport(message) => message.clone(),
-            Self::Rpc { code, message, .. } => format!("JSON-RPC error {code}: {message}"),
-        }
-    }
-}
 
 struct Shared {
     next_id: AtomicU64,
@@ -186,21 +163,6 @@ fn mark_dead(shared: &Shared, message: &str) {
     }
 }
 
-fn meta_json(shared: &Shared) -> String {
-    let version = shared
-        .protocol_version
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    format!(
-        "{{\"io.modelcontextprotocol/protocolVersion\":{},\
-          \"io.modelcontextprotocol/clientCapabilities\":{{}},\
-          \"io.modelcontextprotocol/clientInfo\":{{\"name\":\"asterpath\",\"version\":{}}}}}",
-        serde_json::to_string(&version).expect("version is serializable"),
-        serde_json::to_string(env!("CARGO_PKG_VERSION")).expect("version is serializable"),
-    )
-}
-
 async fn write_line(shared: &Shared, line: &str) -> io::Result<()> {
     let mut writer = shared.writer.lock().await;
     let Some(stdin) = writer.as_mut() else {
@@ -211,7 +173,7 @@ async fn write_line(shared: &Shared, line: &str) -> io::Result<()> {
     stdin.flush().await
 }
 
-async fn request(
+async fn request_impl(
     shared: &Shared,
     method: &str,
     params: &str,
@@ -270,194 +232,29 @@ async fn request(
     }
 }
 
-fn split_response(response: Value) -> Result<Value, RpcFailure> {
-    let Value::Object(mut object) = response else {
-        return Err(RpcFailure::Transport(
-            "MCP response is not a JSON object".to_owned(),
-        ));
-    };
-    if let Some(error) = object.remove("error") {
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("JSON-RPC error")
-            .to_owned();
-        return Err(RpcFailure::Rpc {
-            code,
-            message,
-            data: error.get("data").cloned(),
-        });
+impl RpcClient for Shared {
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a str,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<Value, RpcFailure>> {
+        Box::pin(request_impl(self, method, params, timeout))
     }
-    object.remove("result").ok_or_else(|| {
-        RpcFailure::Transport("MCP response has neither result nor error".to_owned())
-    })
-}
 
-async fn handshake_impl(shared: &Shared) -> Result<AdapterHandshake, AdapterError> {
-    let params = format!("{{\"_meta\":{}}}", meta_json(shared));
-    let first = request(shared, "server/discover", &params, shared.startup).await;
-    let response = match first {
-        Ok(response) => response,
-        Err(RpcFailure::Rpc {
-            code: -32022, data, ..
-        }) => {
-            let supported = data
-                .as_ref()
-                .and_then(|data| data.get("supported"))
-                .and_then(Value::as_array);
-            let common = supported.and_then(|supported| {
-                supported
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .find(|version| ADAPTER_PROTOCOL_VERSIONS.contains(version))
-            });
-            let Some(common) = common else {
-                return Err(handshake_error("no common protocol version"));
-            };
-            *shared
-                .protocol_version
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = common.to_owned();
-            let params = format!("{{\"_meta\":{}}}", meta_json(shared));
-            request(shared, "server/discover", &params, shared.startup)
-                .await
-                .map_err(|error| AdapterError::Handshake {
-                    message: error.message(),
-                })?
-        }
-        Err(error) => {
-            return Err(AdapterError::Handshake {
-                message: error.message(),
-            });
-        }
-    };
-    let result = split_response(response).map_err(|error| AdapterError::Handshake {
-        message: error.message(),
-    })?;
-    let version = shared
-        .protocol_version
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    let Some(supported) = result.get("supportedVersions").and_then(Value::as_array) else {
-        return Err(handshake_error(
-            "server/discover did not return supportedVersions",
-        ));
-    };
-    if !supported
-        .iter()
-        .any(|candidate| candidate.as_str() == Some(version.as_str()))
-    {
-        return Err(handshake_error(format!(
-            "server does not support protocol version {version}"
-        )));
+    fn protocol_version(&self) -> String {
+        self.protocol_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
-    if result
-        .pointer("/capabilities/tools")
-        .is_none_or(Value::is_null)
-    {
-        return Err(handshake_error(
-            "server does not declare the tools capability",
-        ));
-    }
-    Ok(AdapterHandshake {
-        protocol_version: version,
-    })
-}
 
-fn handshake_error(message: impl Into<String>) -> AdapterError {
-    AdapterError::Handshake {
-        message: message.into(),
+    fn set_protocol_version(&self, version: &str) {
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = version.to_owned();
     }
-}
-
-fn discovery_error(message: impl Into<String>) -> AdapterError {
-    AdapterError::Discovery {
-        message: message.into(),
-    }
-}
-
-async fn discover_impl(shared: &Shared) -> Result<Vec<AdapterTool>, AdapterError> {
-    let mut cursor: Option<String> = None;
-    let mut seen = HashSet::new();
-    let mut tools = Vec::new();
-    for _ in 0..MAX_LIST_PAGES {
-        let meta = meta_json(shared);
-        let params = match &cursor {
-            Some(cursor) => format!(
-                "{{\"cursor\":{},\"_meta\":{meta}}}",
-                serde_json::to_string(cursor).expect("cursor is serializable"),
-            ),
-            None => format!("{{\"_meta\":{meta}}}"),
-        };
-        let response = request(shared, "tools/list", &params, shared.startup)
-            .await
-            .map_err(|error| discovery_error(error.message()))?;
-        let result = split_response(response).map_err(|error| discovery_error(error.message()))?;
-        if let Some(result_type) = result.get("resultType")
-            && result_type.as_str() != Some("complete")
-        {
-            return Err(discovery_error("tools/list resultType is not complete"));
-        }
-        let Some(page) = result.get("tools").and_then(Value::as_array) else {
-            return Err(discovery_error("tools/list result has no tools array"));
-        };
-        for tool in page {
-            tools.push(parse_tool(tool)?);
-        }
-        match result.get("nextCursor").and_then(Value::as_str) {
-            None => return Ok(tools),
-            Some(next) => {
-                if !seen.insert(next.to_owned()) {
-                    return Err(discovery_error("tools/list repeated a cursor"));
-                }
-                cursor = Some(next.to_owned());
-            }
-        }
-    }
-    Err(discovery_error("tools/list exceeded 100 pages"))
-}
-
-fn parse_tool(tool: &Value) -> Result<AdapterTool, AdapterError> {
-    let Some(object) = tool.as_object() else {
-        return Err(discovery_error("tools/list entry is not an object"));
-    };
-    let Some(original_name) = object.get("name").and_then(Value::as_str) else {
-        return Err(discovery_error("tools/list entry has no name"));
-    };
-    let description = object
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let Some(schema) = object.get("inputSchema") else {
-        return Err(discovery_error("tool has no inputSchema"));
-    };
-    if !schema.is_object() {
-        return Err(discovery_error("inputSchema root must be an object"));
-    }
-    let read_only = object
-        .get("annotations")
-        .and_then(|annotations| annotations.get("readOnlyHint"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    Ok(AdapterTool {
-        original_name: original_name.to_owned(),
-        description,
-        schema: schema.clone(),
-        replay: if read_only {
-            ReplaySafety::Safe
-        } else {
-            ReplaySafety::Unsafe
-        },
-        side_effect: if read_only {
-            SideEffect::ReadOnly
-        } else {
-            SideEffect::Mutating
-        },
-        parallelism: Parallelism::Parallel,
-    })
 }
 
 async fn call_impl(
@@ -466,15 +263,7 @@ async fn call_impl(
     args: JsonString,
     ctx: &ToolContext,
 ) -> Result<ToolOutput, ToolError> {
-    let parsed: Value =
-        serde_json::from_str(args.as_str()).map_err(|_| ToolError::InvalidArgs {
-            message: "tool arguments must be valid JSON".to_owned(),
-        })?;
-    if !parsed.is_object() {
-        return Err(ToolError::InvalidArgs {
-            message: "tool arguments must be a JSON object".to_owned(),
-        });
-    }
+    mcp::parse_call_args(&args)?;
     let shared = adapter.shared();
     if shared.dead.load(Ordering::SeqCst) {
         return Err(ToolError::Transport {
@@ -487,7 +276,7 @@ async fn call_impl(
         "{{\"name\":{},\"arguments\":{},\"_meta\":{}}}",
         serde_json::to_string(original_name).expect("name is serializable"),
         args.as_str(),
-        meta_json(shared),
+        mcp::meta_json(&shared.protocol_version()),
     );
     let line = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{params}}}"
@@ -526,7 +315,14 @@ async fn call_impl(
                 Ok(received) => received,
                 Err(_) => Err(RpcFailure::Transport("MCP response channel closed".to_owned())),
             };
-            map_call_response(adapter, received)
+            mcp::map_call_response(received, |code| {
+                if matches!(
+                    code,
+                    -32020 | -32021 | -32022 | -32600 | -32601 | -32603 | -32700
+                ) {
+                    mark_dead(shared, "MCP protocol error");
+                }
+            })
         }
         _ = ctx.cancel.cancelled() => {
             send_cancelled(shared, id).await;
@@ -549,167 +345,6 @@ async fn send_cancelled(shared: &Shared, id: u64) {
         "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{id},\"reason\":\"cancelled\"}}}}"
     );
     let _ = write_line(shared, &line).await;
-}
-
-fn map_call_response(
-    adapter: &StdioAdapter,
-    received: Result<Value, RpcFailure>,
-) -> Result<ToolOutput, ToolError> {
-    match received {
-        Err(RpcFailure::Transport(message)) => Err(ToolError::Transport { message }),
-        Err(RpcFailure::Rpc { code, message, .. }) => Err(map_rpc_error(adapter, code, message)),
-        Ok(response) => match split_response(response) {
-            Ok(result) => map_result(result),
-            Err(RpcFailure::Transport(message)) => Err(ToolError::Transport { message }),
-            Err(RpcFailure::Rpc { code, message, .. }) => {
-                Err(map_rpc_error(adapter, code, message))
-            }
-        },
-    }
-}
-
-fn map_rpc_error(adapter: &StdioAdapter, code: i64, message: String) -> ToolError {
-    if code == -32602 {
-        if message.to_ascii_lowercase().contains("unknown tool") {
-            return ToolError::NotFound { message };
-        }
-        return ToolError::InvalidArgs { message };
-    }
-    if matches!(
-        code,
-        -32020 | -32021 | -32022 | -32600 | -32601 | -32603 | -32700
-    ) {
-        mark_dead(adapter.shared(), "MCP protocol error");
-    }
-    ToolError::Transport {
-        message: format!("JSON-RPC error {code}: {message}"),
-    }
-}
-
-fn map_result(result: Value) -> Result<ToolOutput, ToolError> {
-    if let Some(result_type) = result.get("resultType")
-        && result_type.as_str() != Some("complete")
-    {
-        return Err(ToolError::Internal {
-            message: "MCP resultType is not supported".to_owned(),
-        });
-    }
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        let texts: Vec<String> = result
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let message = if texts.is_empty() {
-            "MCP tool reported an error".to_owned()
-        } else {
-            texts.join("\n")
-        };
-        return Err(ToolError::Internal { message });
-    }
-    let mut content = Vec::new();
-    if let Some(blocks) = result.get("content").and_then(Value::as_array) {
-        for block in blocks {
-            content.push(map_content(block));
-        }
-    }
-    if let Some(structured) = result.get("structuredContent") {
-        content.push(Part::Text {
-            text: serde_json::to_string(structured).unwrap_or_default(),
-        });
-    }
-    Ok(ToolOutput::new(content))
-}
-
-fn map_content(block: &Value) -> Part {
-    let kind = block
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    match kind {
-        "text" => Part::Text {
-            text: block
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-        },
-        "image" => {
-            let media_type = block.get("mimeType").and_then(Value::as_str).unwrap_or("");
-            match (
-                block.get("data").and_then(Value::as_str),
-                media_type.is_empty(),
-            ) {
-                (Some(data), false) => Part::Image {
-                    media_type: media_type.to_owned(),
-                    source: ImageSource::Base64 {
-                        data: data.to_owned(),
-                    },
-                },
-                _ => Part::Text {
-                    text: format!("[image content: {media_type}]"),
-                },
-            }
-        }
-        "audio" => Part::Text {
-            text: format!(
-                "[audio content: {}]",
-                block.get("mimeType").and_then(Value::as_str).unwrap_or("")
-            ),
-        },
-        "resource_link" => Part::Text {
-            text: format!(
-                "[resource_link: name={} uri={} mime={}]",
-                block.get("name").and_then(Value::as_str).unwrap_or(""),
-                block.get("uri").and_then(Value::as_str).unwrap_or(""),
-                block.get("mimeType").and_then(Value::as_str).unwrap_or(""),
-            ),
-        },
-        "resource" => map_resource(block.get("resource")),
-        other => Part::Text {
-            text: format!("[unsupported MCP content: {other}]"),
-        },
-    }
-}
-
-fn map_resource(resource: Option<&Value>) -> Part {
-    let Some(resource) = resource else {
-        return Part::Text {
-            text: "[unsupported MCP resource]".to_owned(),
-        };
-    };
-    if let Some(text) = resource.get("text").and_then(Value::as_str) {
-        return Part::Text {
-            text: text.to_owned(),
-        };
-    }
-    if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
-        let media_type = resource
-            .get("mimeType")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if media_type.starts_with("image/") {
-            return Part::Image {
-                media_type: media_type.to_owned(),
-                source: ImageSource::Base64 {
-                    data: blob.to_owned(),
-                },
-            };
-        }
-        return Part::Text {
-            text: format!("[resource blob: {media_type}]"),
-        };
-    }
-    Part::Text {
-        text: "[unsupported MCP resource]".to_owned(),
-    }
 }
 
 async fn wait_exited(shared: &Shared, duration: Duration) -> bool {
@@ -771,11 +406,11 @@ fn kill_process(_pid: u32) {}
 
 impl PluginAdapter for StdioAdapter {
     fn handshake(&mut self) -> BoxFuture<'_, Result<AdapterHandshake, AdapterError>> {
-        Box::pin(handshake_impl(&self.shared))
+        Box::pin(mcp::handshake(self.shared.as_ref(), self.shared.startup))
     }
 
     fn discover(&mut self) -> BoxFuture<'_, Result<Vec<AdapterTool>, AdapterError>> {
-        Box::pin(discover_impl(&self.shared))
+        Box::pin(mcp::discover(self.shared.as_ref(), self.shared.startup))
     }
 
     fn call<'a>(
@@ -860,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_rejects_a_non_object_input_schema() {
         let schema = json!("not an object");
-        let error = super::parse_tool(&json!({
+        let error = crate::mcp::parse_tool(&json!({
             "name": "bad",
             "inputSchema": schema,
         }))

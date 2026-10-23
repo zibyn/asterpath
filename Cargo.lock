@@ -183,6 +183,7 @@ dependencies = [
  "asterpath-testing",
  "asterpath-tools",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
