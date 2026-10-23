@@ -303,7 +303,7 @@ impl Asterpath {
     /// open or an input waits for its step. Retired sessions are never
     /// listed. The host decides when to drive them.
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
-        // shortcut: 启动时全量折叠，会话量大时在 sqlite 模块内部加索引
+        // shortcut: folds every session on each call; index inside the sqlite module once session counts grow
         let mut wakeable = Vec::new();
         for session in self.store.sessions().await? {
             let entries = scan_all(&*self.store, session).await?;
