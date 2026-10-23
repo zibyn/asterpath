@@ -12,10 +12,12 @@ use asterpath_protocol::{
 use asterpath_sandbox::{ConfinedSpawn, Enforcement, SandboxPolicy, SandboxProvider, SpawnRequest};
 
 use crate::adapter::{AdapterError, AdapterTool, BoxFuture, PluginAdapter};
+use crate::http::HttpAdapter;
 use crate::manifest::{
     PluginCapability, PluginId, PluginManifest, PluginProtocol, PluginTransport,
 };
-use crate::stdio::{ADAPTER_PROTOCOL_VERSIONS, StdioAdapter};
+use crate::mcp::ADAPTER_PROTOCOL_VERSIONS;
+use crate::stdio::StdioAdapter;
 
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -94,9 +96,7 @@ impl PluginHost {
                 ))
             } else if let Err(failure) = validate_manifest(manifest) {
                 Some(failure)
-            } else if matches!(&manifest.transport, PluginTransport::Stdio { .. })
-                && candidate_version(manifest).is_none()
-            {
+            } else if candidate_version(manifest).is_none() {
                 Some((
                     PluginLoadStage::Handshake,
                     "no common protocol version".to_owned(),
@@ -140,19 +140,27 @@ impl PluginHost {
     }
 
     async fn load_one(&self, manifest: &PluginManifest) -> PluginStatus {
+        let candidate = candidate_version(manifest).expect("checked during manifest validation");
         match &manifest.transport {
-            PluginTransport::Http { .. } => failed(
-                PluginLoadStage::Spawn,
-                "HTTP transport is not enabled in this build",
-            ),
+            PluginTransport::Http { url, headers } => {
+                let adapter = match HttpAdapter::new(
+                    url,
+                    headers,
+                    candidate,
+                    manifest.timeouts.startup_timeout(),
+                ) {
+                    Ok(adapter) => adapter,
+                    Err(error) => return failed(PluginLoadStage::Spawn, adapter_message(error)),
+                };
+                self.finish_load(manifest, Box::new(adapter), TransportKind::Http)
+                    .await
+            }
             PluginTransport::Stdio {
                 command,
                 args,
                 env,
                 cwd,
             } => {
-                let candidate =
-                    candidate_version(manifest).expect("checked during manifest validation");
                 self.load_stdio(manifest, candidate, command, args, env, cwd)
                     .await
             }
@@ -198,7 +206,7 @@ impl PluginHost {
             ),
         };
 
-        let mut adapter = match StdioAdapter::spawn(
+        let adapter = match StdioAdapter::spawn(
             &confined,
             candidate,
             manifest.timeouts.startup_timeout(),
@@ -212,7 +220,18 @@ impl PluginHost {
                 );
             }
         };
+        self.finish_load(manifest, Box::new(adapter), TransportKind::Stdio)
+            .await
+    }
 
+    /// Handshake, discovery, naming and atomic registration; shared by both
+    /// transports.
+    async fn finish_load(
+        &self,
+        manifest: &PluginManifest,
+        mut adapter: Box<dyn PluginAdapter>,
+        transport: TransportKind,
+    ) -> PluginStatus {
         let handshake = match adapter.handshake().await {
             Ok(handshake) => handshake,
             Err(error) => {
@@ -260,7 +279,7 @@ impl PluginHost {
             }
         }
 
-        let adapter: Arc<dyn PluginAdapter> = Arc::new(adapter);
+        let adapter: Arc<dyn PluginAdapter> = Arc::from(adapter);
         let mut names = Vec::with_capacity(composed.len());
         for (name, tool) in composed {
             let descriptor = ToolDescriptor {
@@ -270,9 +289,7 @@ impl PluginHost {
                 parallelism: Parallelism::Parallel,
                 replay: tool.replay,
                 side_effect: tool.side_effect,
-                provenance: Provenance::External {
-                    transport: TransportKind::Stdio,
-                },
+                provenance: Provenance::External { transport },
                 timeout: Some(manifest.timeouts.call_timeout()),
                 max_output_bytes: None,
             };

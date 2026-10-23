@@ -6,7 +6,9 @@
 
 pub mod adapter;
 mod host;
+mod http;
 mod manifest;
+mod mcp;
 mod stdio;
 
 pub use adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture, PluginAdapter};

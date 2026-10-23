@@ -1,9 +1,10 @@
-//! Plugin-host acceptance scenarios P1-P5, P7-P9 and MCP M1/M4-M10/M12-M17
-//! (stdio), driven by the real `asterpath-mcp-fixture` binary.
+//! Plugin-host acceptance scenarios P1-P5, P7-P9 and MCP M1-M17, driven by the
+//! real `asterpath-mcp-fixture` binary over stdio and Streamable HTTP.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_testing::FakeSandboxProvider;
 use asterpath_tools::InMemoryToolRegistry;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
 
 fn fixture_bin() -> PathBuf {
     if let Ok(path) = std::env::var("ASTERPATH_MCP_FIXTURE") {
@@ -56,6 +59,78 @@ fn stdio_manifest(id: &str, args: &[&str]) -> PluginManifest {
         },
         capabilities: vec![PluginCapability::Tools],
         timeouts: PluginTimeouts::default(),
+    }
+}
+
+fn http_manifest(id: &str, url: &str, headers: BTreeMap<String, String>) -> PluginManifest {
+    PluginManifest {
+        manifest_version: 1,
+        id: PluginId::new(id).unwrap(),
+        name: None,
+        version: None,
+        required: false,
+        protocol: PluginProtocol::Mcp,
+        protocol_versions: vec!["2026-07-28".to_owned()],
+        transport: PluginTransport::Http {
+            url: url.to_owned(),
+            headers,
+        },
+        capabilities: vec![PluginCapability::Tools],
+        timeouts: PluginTimeouts::default(),
+    }
+}
+
+fn sse_headers() -> BTreeMap<String, String> {
+    BTreeMap::from([("Accept".to_owned(), "text/event-stream".to_owned())])
+}
+
+fn free_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick a free port");
+    listener.local_addr().expect("local addr").to_string()
+}
+
+/// A real HTTP fixture child. `kill_on_drop` keeps a panicking test leak-free.
+struct HttpFixture {
+    child: Child,
+    addr: String,
+}
+
+impl HttpFixture {
+    async fn spawn(args: &[&str]) -> Self {
+        Self::spawn_at("127.0.0.1:0", args).await
+    }
+
+    async fn spawn_at(addr: &str, args: &[&str]) -> Self {
+        let mut child = Command::new(fixture_bin())
+            .args(["--http", addr])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fixture");
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let line = BufReader::new(stdout)
+            .lines()
+            .next_line()
+            .await
+            .expect("read listen line")
+            .expect("fixture announced its address");
+        let addr = line
+            .strip_prefix("listening on ")
+            .expect("fixture listen line")
+            .to_owned();
+        Self { child, addr }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+
+    async fn stop(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
     }
 }
 
@@ -513,31 +588,164 @@ fn p7_unknown_enum_values_are_manifest_parse_errors() {
     assert!(serde_json::from_value::<PluginManifest>(value).is_err());
 }
 
-// Manifest / transport gating -----------------------------------------
+// HTTP transport: M2, M3, M11, M16 ------------------------------------
 
 #[tokio::test]
-async fn http_manifests_are_rejected_as_spawn_failures_in_this_ticket() {
+async fn m2_http_json_loads_paginates_registers_and_calls() {
+    let fixture = HttpFixture::spawn(&["--page-size", "1"]).await;
+    let registry = registry();
+    // No sandbox provider: HTTP has no local process (S8).
+    let host = host(&registry, None, SandboxPolicy::ReadOnly);
+    let manifest = http_manifest("weather", &fixture.url(), BTreeMap::new());
+
+    let statuses = host.load(vec![manifest]).await.expect("load");
+    assert_eq!(
+        loaded_tools(&statuses[0]),
+        &[
+            ToolName::new("weather__echo"),
+            ToolName::new("weather__mutate"),
+            ToolName::new("weather__content"),
+        ]
+    );
+
+    let echo = registry
+        .get(&ToolName::new("weather__echo"))
+        .unwrap()
+        .descriptor()
+        .clone();
+    assert_eq!(
+        echo.provenance,
+        Provenance::External {
+            transport: TransportKind::Http
+        }
+    );
+    assert_eq!(echo.timeout, Some(Duration::from_secs(120)));
+    assert_eq!(echo.max_output_bytes, None);
+    assert_eq!(echo.parallelism, Parallelism::Parallel);
+    assert_eq!(echo.side_effect, SideEffect::ReadOnly);
+    assert_eq!(echo.replay, ReplaySafety::Safe);
+
+    let output = invoke(&registry, "weather__echo", json!({"text": "over http"}))
+        .await
+        .expect("call");
+    assert_eq!(output.content, vec![text("over http")]);
+
+    let mutation = invoke(&registry, "weather__mutate", json!({}))
+        .await
+        .expect("call");
+    assert_eq!(mutation.content[0], text("mutation 1"));
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn m3_http_request_scoped_sse_ignores_notifications() {
+    let fixture = HttpFixture::spawn(&[]).await;
     let registry = registry();
     let host = host(&registry, None, SandboxPolicy::FullAccess);
-    let manifest = PluginManifest {
-        manifest_version: 1,
-        id: PluginId::new("weather").unwrap(),
-        name: None,
-        version: None,
-        required: false,
-        protocol: PluginProtocol::Mcp,
-        protocol_versions: vec!["2026-07-28".to_owned()],
-        transport: PluginTransport::Http {
-            url: "https://example.test/mcp".to_owned(),
-            headers: BTreeMap::new(),
-        },
-        capabilities: vec![PluginCapability::Tools],
-        timeouts: PluginTimeouts::default(),
-    };
-    let statuses = host.load(vec![manifest]).await.expect("optional");
-    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Spawn);
-    assert!(registry.list().is_empty());
+    // Manifest Accept forces the fixture's request-scoped SSE path.
+    let manifest = http_manifest("weather", &fixture.url(), sse_headers());
+
+    // Handshake and discovery are SSE too; progress notifications are ignored.
+    let statuses = host.load(vec![manifest]).await.expect("load");
+    assert_eq!(loaded_tools(&statuses[0]).len(), 3);
+
+    let output = invoke(&registry, "weather__echo", json!({"text": "over sse"}))
+        .await
+        .expect("call");
+    assert_eq!(output.content, vec![text("over sse")]);
+
+    fixture.stop().await;
 }
+
+#[tokio::test]
+async fn m11_sse_interruption_fails_only_that_call() {
+    let addr = free_addr();
+    let registry = registry();
+    let host = host(&registry, None, SandboxPolicy::FullAccess);
+
+    let healthy = HttpFixture::spawn_at(&addr, &[]).await;
+    host.load(vec![http_manifest(
+        "weather",
+        &healthy.url(),
+        sse_headers(),
+    )])
+    .await
+    .expect("load");
+    healthy.stop().await;
+
+    // Same endpoint, now closing each SSE stream before the response.
+    let interrupted = HttpFixture::spawn_at(&addr, &["--fault-sse-interrupt"]).await;
+    let error = invoke(&registry, "weather__echo", json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Transport { .. }), "{error:?}");
+    interrupted.stop().await;
+
+    // The adapter is not dead: the next call reaches a healthy server.
+    let recovered = HttpFixture::spawn_at(&addr, &[]).await;
+    let output = invoke(&registry, "weather__echo", json!({"text": "again"}))
+        .await
+        .expect("next call succeeds");
+    assert_eq!(output.content, vec![text("again")]);
+    recovered.stop().await;
+}
+
+#[tokio::test]
+async fn m16_http_errors_do_not_leak_url_or_header_values() {
+    let headers = BTreeMap::from([(
+        "Authorization".to_owned(),
+        "Bearer header-s3cr4t".to_owned(),
+    )]);
+    let manifest = http_manifest(
+        "weather",
+        "http://127.0.0.1:1/mcp?token=url-s3cr4t",
+        headers.clone(),
+    );
+    assert!(!format!("{manifest:?}").contains("header-s3cr4t"));
+
+    let registry = registry();
+    let host = host(&registry, None, SandboxPolicy::FullAccess);
+    let statuses = host.load(vec![manifest]).await.expect("optional");
+    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
+    let rendered = format!("{:?}", statuses[0]);
+    assert!(!rendered.contains("s3cr4t"), "{rendered}");
+    assert!(!rendered.contains("127.0.0.1"), "{rendered}");
+    assert!(!rendered.contains("Bearer"), "{rendered}");
+    assert!(registry.list().is_empty());
+
+    let mut required = http_manifest(
+        "weather",
+        "http://127.0.0.1:1/mcp?token=url-s3cr4t",
+        headers,
+    );
+    required.required = true;
+    let error = host.load(vec![required]).await.unwrap_err();
+    let rendered = error.to_string();
+    assert!(!rendered.contains("s3cr4t"), "{rendered}");
+    assert!(!rendered.contains("127.0.0.1"), "{rendered}");
+    assert!(!rendered.contains("Bearer"), "{rendered}");
+}
+
+#[tokio::test]
+async fn http_no_common_version_fails_handshake() {
+    let fixture = HttpFixture::spawn(&["--supported-versions", "2027-01-01"]).await;
+    let registry = registry();
+    let host = host(&registry, None, SandboxPolicy::FullAccess);
+    let statuses = host
+        .load(vec![http_manifest(
+            "weather",
+            &fixture.url(),
+            BTreeMap::new(),
+        )])
+        .await
+        .expect("optional");
+    assert_eq!(failed_stage(&statuses[0]), PluginLoadStage::Handshake);
+    assert!(registry.list().is_empty());
+    fixture.stop().await;
+}
+
+// Manifest / transport gating -----------------------------------------
 
 #[tokio::test]
 async fn acp_manifests_fail_at_the_manifest_stage() {
