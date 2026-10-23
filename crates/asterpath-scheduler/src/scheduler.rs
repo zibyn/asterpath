@@ -1,6 +1,7 @@
 //! Spawn, materialization, outcome mapping and the durable wait.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ use futures_util::StreamExt;
 use crate::tool::SPAWN_TOOL_NAME;
 use crate::{ChildRef, SpawnError, SpawnRequest, SubagentSpawner, WaitError};
 
+pub(crate) const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
+
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
 
@@ -34,7 +37,8 @@ pub struct Scheduler {
     executor: Arc<dyn DurableExecutor>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
-    config: SubagentConfig,
+    /// Process-wide cap on live children across all parents.
+    max_live_children: NonZeroUsize,
     /// Shared with the agent runner so child drives see cancellation.
     cancellations: Arc<CancellationRegistry>,
     /// Set by the composition root after the agent is built. Weak: the agent
@@ -76,20 +80,20 @@ impl Scheduler {
             executor,
             aliases,
             Arc::new(SystemClock),
-            SubagentConfig::default(),
+            DEFAULT_MAX_LIVE_CHILDREN,
             Arc::new(CancellationRegistry::new()),
         )
     }
 
-    /// Full wiring: the facade passes the injected clock, scheduler-wide
-    /// defaults and the registry the agent shares.
+    /// Full wiring: the facade passes the injected clock, the global live-child
+    /// cap and the registry the agent shares.
     pub fn with_runtime(
         log: Arc<dyn EventLog>,
         catalog: Arc<dyn SessionCatalog>,
         executor: Arc<dyn DurableExecutor>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
-        config: SubagentConfig,
+        max_live_children: NonZeroUsize,
         cancellations: Arc<CancellationRegistry>,
     ) -> Self {
         Self {
@@ -98,7 +102,7 @@ impl Scheduler {
             executor,
             aliases,
             clock,
-            config,
+            max_live_children,
             cancellations,
             runner: OnceLock::new(),
             bus: Mutex::new(None),
@@ -279,7 +283,7 @@ impl SubagentSpawner for Scheduler {
             self.admit(
                 &mut queue_guard,
                 subagents.max_concurrent_children.get(),
-                self.config.max_live_children.get(),
+                self.max_live_children.get(),
             )
             .await;
             drop(queue_guard);
@@ -745,7 +749,8 @@ impl Scheduler {
         }
         let grace = find_spawn(&parent_events, child.parent.tool_call)
             .map(|record| record.config.subagents.cancel_grace)
-            .unwrap_or(self.config.cancel_grace);
+            // No spawn record violates an invariant; fall back to the default grace.
+            .unwrap_or(SubagentConfig::default().cancel_grace);
 
         self.drain_child(child.child, grace).await;
 

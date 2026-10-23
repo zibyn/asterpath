@@ -1,6 +1,7 @@
 //! Composition root configuration and builder.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,8 +9,8 @@ use asterpath_core::{
     ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
 };
 use asterpath_protocol::{
-    AgentRunner, ApprovalPolicy, CompactionConfig, Compactor, DefaultApprovalPolicy, ModelAlias,
-    ModelSpec, Provider, SubagentConfig, Tool, ToolConfig, TurnConfig,
+    AgentRunner, ApprovalPolicy, Compactor, DefaultApprovalPolicy, ModelAlias, ModelSpec, Provider,
+    Tool, ToolConfig,
 };
 
 use crate::error::AsterError;
@@ -35,9 +36,8 @@ pub struct AsterpathConfig {
     pub approval: Arc<dyn ApprovalPolicy>,
     /// The framework approval endpoint gate, shared with the default policy.
     pub gate: Arc<ApprovalGate>,
-    pub turn: TurnConfig,
-    pub compaction: CompactionConfig,
-    pub subagents: SubagentConfig,
+    /// Process-wide cap on live child sessions across all parents.
+    pub max_live_children: NonZeroUsize,
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
 }
 
@@ -58,9 +58,7 @@ impl Default for AsterpathConfig {
             clock: Arc::new(SystemClock),
             approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
             gate,
-            turn: TurnConfig::default(),
-            compaction: CompactionConfig::default(),
-            subagents: SubagentConfig::default(),
+            max_live_children: NonZeroUsize::new(32).expect("non-zero"),
             model_aliases: BTreeMap::new(),
         }
     }
@@ -155,20 +153,8 @@ impl AsterpathBuilder {
     }
 
     #[must_use]
-    pub fn turn(mut self, turn: TurnConfig) -> Self {
-        self.config.turn = turn;
-        self
-    }
-
-    #[must_use]
-    pub fn compaction(mut self, compaction: CompactionConfig) -> Self {
-        self.config.compaction = compaction;
-        self
-    }
-
-    #[must_use]
-    pub fn subagents(mut self, subagents: SubagentConfig) -> Self {
-        self.config.subagents = subagents;
+    pub fn max_live_children(mut self, max_live_children: NonZeroUsize) -> Self {
+        self.config.max_live_children = max_live_children;
         self
     }
 

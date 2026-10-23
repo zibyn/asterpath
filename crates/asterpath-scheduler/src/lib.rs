@@ -115,20 +115,20 @@ impl SchedulerModule {
             executor,
             model_aliases,
             std::sync::Arc::new(SystemClock),
-            asterpath_protocol::SubagentConfig::default(),
+            crate::scheduler::DEFAULT_MAX_LIVE_CHILDREN,
             std::sync::Arc::new(CancellationRegistry::new()),
         )
     }
 
-    /// Full wiring, used by the facade: injected clock, scheduler-wide
-    /// `SubagentConfig` and the registry the agent shares.
+    /// Full wiring, used by the facade: injected clock, global live-child cap
+    /// and the registry the agent shares.
     pub fn with_runtime(
         log: std::sync::Arc<dyn asterpath_core::EventLog>,
         catalog: std::sync::Arc<dyn asterpath_core::SessionCatalog>,
         executor: std::sync::Arc<dyn asterpath_core::DurableExecutor>,
         model_aliases: std::collections::BTreeMap<ModelAlias, asterpath_protocol::ModelSpec>,
         clock: std::sync::Arc<dyn Clock>,
-        config: asterpath_protocol::SubagentConfig,
+        max_live_children: std::num::NonZeroUsize,
         cancellations: std::sync::Arc<CancellationRegistry>,
     ) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl SchedulerModule {
                 executor,
                 model_aliases,
                 clock,
-                config,
+                max_live_children,
                 cancellations,
             )),
         }

@@ -644,9 +644,7 @@ async fn assemble(
         .providers(providers)
         .tools(tools)
         .tool(config::tool_config(settings))
-        .turn(config::turn_config(settings))
-        .compaction(config::compaction_config(settings))
-        .subagents(config::subagent_config(settings))
+        .max_live_children(config::max_live_children(settings))
         .model_aliases(config::model_aliases(settings));
     if let Some(policy) = config::approval_policy(approval) {
         builder = builder.approval(policy);
