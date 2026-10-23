@@ -28,6 +28,8 @@
 
 **M5（post-v1）**：[插件](../design/plugins.md)、[MCP adapter](../design/mcp.md)、[沙箱](../design/sandbox.md)。设计已定，不是 v1 的实现依据。
 
+**M6（post-v1）**：[技能](../design/skills.md)。设计已定，不是 v1 的实现依据。
+
 ## 规范与历史
 
 - `docs/design/*.md` 与 `docs/spec/*.md` 是**规范**；`docs/adr/*.md` 是需要长期保留的决策与理由。
