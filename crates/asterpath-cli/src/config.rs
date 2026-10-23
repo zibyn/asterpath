@@ -340,6 +340,7 @@ pub struct FileConfig {
     compaction: CompactionSection,
     subagents: SubagentSection,
     approval: ApprovalSection,
+    skills: SkillsSection,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -436,6 +437,25 @@ struct SubagentSection {
 #[serde(default)]
 struct ApprovalSection {
     default: Option<ApprovalMode>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct SkillsSection {
+    enabled: Option<bool>,
+    paths: Vec<PathBuf>,
+}
+
+impl Settings {
+    /// `[skills] enabled`; absent means enabled.
+    pub fn skills_enabled(&self) -> bool {
+        self.file.skills.enabled.unwrap_or(true)
+    }
+
+    /// Explicit skill roots, highest priority first.
+    pub fn skill_paths(&self) -> &[PathBuf] {
+        &self.file.skills.paths
+    }
 }
 
 impl FileConfig {

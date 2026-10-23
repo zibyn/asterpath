@@ -87,6 +87,11 @@ role = "module"
 allow = ["asterpath-core", "asterpath-protocol", "asterpath-sandbox"]
 
 [[package]]
+name = "asterpath-skills"
+role = "module"
+allow = ["asterpath-protocol"]
+
+[[package]]
 name = "asterpath-mcp-fixture"
 role = "tool"
 allow = []

@@ -6,31 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use assert_cmd::Command;
 use asterpath::{Asterpath, anthropic::AnthropicProvider};
 use asterpath_core::{InputId, TurnId};
 use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionEvent,
     SessionSpec, SubagentConfig, ToolSelection, TurnConfig, UserInput, encode_entry,
 };
-use common::MockServer;
-
-fn bin() -> Command {
-    let mut command = Command::cargo_bin("asterpath").expect("asterpath binary");
-    // The host environment must not decide what the tests exercise.
-    for name in [
-        "ASTERPATH_CONFIG",
-        "ASTERPATH_DB",
-        "ASTERPATH_PROVIDER",
-        "ASTERPATH_MODEL",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-    ] {
-        command.env_remove(name);
-    }
-    command.env("ANTHROPIC_API_KEY", "test-key");
-    command
-}
+use common::{MockServer, bin};
 
 struct TestDir {
     path: PathBuf,

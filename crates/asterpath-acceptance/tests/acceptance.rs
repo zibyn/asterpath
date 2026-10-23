@@ -3,6 +3,7 @@
 
 mod common;
 mod m5;
+mod m6;
 
 use std::collections::HashSet;
 use std::path::Path;

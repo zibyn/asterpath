@@ -44,7 +44,7 @@
 | `asterpath-skills` | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` | M6（post-v1） |
 
 - `asterpath-sandbox-macos` 仍为预留名，M5 不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 并入 `asterpath-plugin-host`，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
-- `asterpath-skills` 是 M6（post-v1）新增的可选模块；只依赖 `protocol` 与外部 `saphyr`。创建 crate 时同步 `deps-allowlist.toml`（`role = "module"`，`allow = ["asterpath-protocol"]`）。技能不新增事件，日志 schema 不变。
+- `asterpath-skills` 是 M6（post-v1）新增的可选模块；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。创建 crate 时同步 `deps-allowlist.toml`（`role = "module"`，`allow = ["asterpath-protocol"]`）。技能不新增事件，日志 schema 不变。
 - `asterpath-testing` 维持合约依赖白名单，**不得**依赖 facade 或具体模块；需要组装真实模块的测试一律放 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：模块 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件（SQLite 即如此），`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`（M0 创建，随里程碑增长）；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 - `xtask` 校验：workspace 依赖边在白名单内；任意两个模块 crate 之间零边；`core` / `protocol` 的 `features` 为空。

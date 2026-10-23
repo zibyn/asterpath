@@ -16,6 +16,7 @@ members = [
     "crates/asterpath-storage-sqlite",
     "crates/asterpath-provider-anthropic",
     "crates/asterpath-plugin-host",
+    "crates/asterpath-skills",
     "crates/asterpath-mcp-fixture",
     "crates/asterpath-testing",
     "crates/asterpath-acceptance",

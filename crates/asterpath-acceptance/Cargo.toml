@@ -15,6 +15,7 @@ asterpath-plugin-host = { path = "../asterpath-plugin-host" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-sandbox = { path = "../asterpath-sandbox" }
 asterpath-sandbox-linux = { path = "../asterpath-sandbox-linux" }
+asterpath-skills = { path = "../asterpath-skills" }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }
 asterpath-testing = { path = "../asterpath-testing" }
 asterpath-tools = { path = "../asterpath-tools" }

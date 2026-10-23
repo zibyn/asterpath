@@ -318,6 +318,7 @@ mod tests {
             ("asterpath-tracing", Role::Module),
             ("asterpath-usage", Role::Module),
             ("asterpath-plugin-host", Role::Module),
+            ("asterpath-skills", Role::Module),
             ("asterpath-mcp-fixture", Role::Tool),
             ("asterpath-testing", Role::Module),
             ("asterpath", Role::App),

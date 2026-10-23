@@ -18,6 +18,7 @@ sqlite = ["asterpath/sqlite"]
 asterpath = { path = "../asterpath", default-features = false }
 asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-skills = { path = "../asterpath-skills" }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +28,7 @@ toml = "0.9"
 
 [dev-dependencies]
 assert_cmd = "2"
+asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }
 asterpath-testing = { path = "../asterpath-testing" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }

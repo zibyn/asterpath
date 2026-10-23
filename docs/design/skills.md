@@ -164,7 +164,7 @@ pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
 `asterpath-skills`（M6，Tier 2 module）：
 
-- workspace 依赖只有 `asterpath-protocol`；外部依赖 `saphyr`。
+- workspace 依赖只有 `asterpath-protocol`；外部依赖 `saphyr`（YAML）、`futures-core`（`Tool::invoke` 的 `BoxFuture`）、`serde` / `serde_json`（参数与工具 schema）。
 - 不实现 `Module`，也不注册服务：宿主在组装期调用它，把工具放进 `AsterpathConfig.tools`。
 
 形状（实现可按需调整，公开面保持最小）：
@@ -178,6 +178,7 @@ pub struct SkillRoot {
 pub struct SkillSummary {
     pub name: String,
     pub description: String,
+    pub root: PathBuf,           // 发现它的根；供索引预算诊断使用
 }
 
 pub struct SkillDiagnostic {
@@ -199,7 +200,10 @@ pub struct LoadSkillTool { /* roots */ }
 impl Tool for LoadSkillTool { /* ... */ }
 
 pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
+pub const DEFAULT_INDEX_BUDGET: usize = 8_000;
 ```
+
+实现补充：`SkillDiagnostic` 实现 `Display`（命令行诊断输出）；`SkillDiagnosticKind` 为 `#[non_exhaustive]`，实现多出 `Unreadable` 与 `DescriptionInvalid` 两个变体（见 §9）。
 
 ### 8.2 参考 CLI
 
@@ -218,9 +222,11 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 
 | 诊断 | 触发 | 处理 |
 | --- | --- | --- |
+| `Unreadable` | 文件读失败或不是 UTF-8 | 跳过该技能 |
 | `FrontmatterMissing` | 文件不以 `---` 开始 | 跳过该技能 |
 | `FrontmatterInvalid` | YAML 解析失败 | 跳过该技能 |
 | `DescriptionMissing` | `description` 缺失或为空 | 跳过该技能 |
+| `DescriptionInvalid` | `description` 超过 1024 字符 | 跳过该技能 |
 | `FieldTypeInvalid` | `name` / `description` 不是字符串 | 跳过该技能 |
 | `NameInvalid` | 名称不匹配正则或超长 | 跳过该技能 |
 | `NameMismatch` | frontmatter `name` 与目录名不同 | 跳过该技能 |

@@ -16,8 +16,12 @@ use asterpath_core::{
 };
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, OpenIntent, OpenIntents,
-    Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, TurnEndReason,
+    Part, Role, SessionState, Span, SpanFilter, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason,
     UsageFilter, UsageScope, UsageTotals, UserInput, decode_entry, history,
+};
+use asterpath_skills::{
+    DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
+    SkillRootLabel, discover, render_index,
 };
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
@@ -49,6 +53,9 @@ enum Command {
 struct RunArgs {
     #[command(flatten)]
     common: Common,
+    /// Skip skill discovery for this new session.
+    #[arg(long)]
+    no_skills: bool,
     /// User input for the new session.
     prompt: String,
 }
@@ -191,7 +198,14 @@ fn tty() -> bool {
 }
 
 fn config_check(args: CheckArgs) -> CliResult<()> {
-    load(&args.common)?;
+    let settings = load(&args.common)?;
+    // The `enabled` switch only governs new sessions, so diagnostics are
+    // always available here.
+    let discovery = discover(&skill_roots(&settings));
+    let (_, budget) = render_index(&discovery.skills, DEFAULT_INDEX_BUDGET);
+    for diagnostic in discovery.diagnostics.iter().chain(&budget) {
+        println!("skill: {diagnostic}");
+    }
     println!("config ok");
     Ok(())
 }
@@ -199,9 +213,21 @@ fn config_check(args: CheckArgs) -> CliResult<()> {
 async fn run(args: RunArgs) -> CliResult<()> {
     let settings = load(&args.common)?;
     let approval = effective_approval(settings.approval, args.common.approval, tty())?;
-    let spec = config::session_spec(&settings).map_err(CliError::config)?;
+    let mut skills = skill_setup(&settings, args.no_skills);
+    for diagnostic in skills
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind != SkillDiagnosticKind::AuthorityFieldIgnored)
+    {
+        eprintln!("skill: {diagnostic}");
+    }
+    let tools = skills.tools();
+    let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
+    if let Some(index) = skills.index.take() {
+        spec.system.push(index);
+    }
     let providers = config::providers(&settings).map_err(CliError::config)?;
-    let asterpath = assemble(&settings, providers, approval).await?;
+    let asterpath = assemble(&settings, providers, approval, tools).await?;
 
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
@@ -248,7 +274,10 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     let mut settings = settings;
     settings.provider = Some(snapshot.model.provider.as_str().to_owned());
     let providers = config::providers(&settings).map_err(CliError::config)?;
-    let asterpath = assemble(&settings, providers, approval).await?;
+    // `resume` keeps the frozen index and always registers the loader; the
+    // `[skills] enabled` switch only governs new sessions.
+    let tools = vec![Arc::new(LoadSkillTool::new(skill_roots(&settings))) as Arc<dyn Tool>];
+    let asterpath = assemble(&settings, providers, approval, tools).await?;
     let handle = asterpath.open_session(session).await.map_err(aster_error)?;
 
     let outcome = drive_approving(&asterpath, &handle, approval).await?;
@@ -531,14 +560,89 @@ async fn session_snapshot(
     snapshot.ok_or_else(|| CliError::run(format!("session {session:?} has no SessionCreated")))
 }
 
+struct SkillSetup {
+    roots: Vec<SkillRoot>,
+    index: Option<Part>,
+    diagnostics: Vec<SkillDiagnostic>,
+}
+
+impl SkillSetup {
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        if self.roots.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::new(LoadSkillTool::new(self.roots.clone()))]
+        }
+    }
+}
+
+/// New-session skill policy: `--no-skills` beats `[skills] enabled`.
+fn skill_setup(settings: &config::Settings, no_skills: bool) -> SkillSetup {
+    if no_skills || !settings.skills_enabled() {
+        return SkillSetup {
+            roots: Vec::new(),
+            index: None,
+            diagnostics: Vec::new(),
+        };
+    }
+    let roots = skill_roots(settings);
+    let discovery = discover(&roots);
+    let (index, budget) = render_index(&discovery.skills, DEFAULT_INDEX_BUDGET);
+    SkillSetup {
+        roots,
+        index,
+        diagnostics: discovery.diagnostics.into_iter().chain(budget).collect(),
+    }
+}
+
+/// Explicit paths, then the project and user roots in priority order.
+fn skill_roots(settings: &config::Settings) -> Vec<SkillRoot> {
+    let mut roots: Vec<SkillRoot> = settings
+        .skill_paths()
+        .iter()
+        .map(|path| SkillRoot {
+            path: path.clone(),
+            label: SkillRootLabel::Explicit,
+        })
+        .collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    roots.push(SkillRoot {
+        path: cwd.join(".asterpath/skills"),
+        label: SkillRootLabel::ProjectNative,
+    });
+    roots.push(SkillRoot {
+        path: cwd.join(".agents/skills"),
+        label: SkillRootLabel::ProjectAgents,
+    });
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    if let Some(home) = config_home {
+        roots.push(SkillRoot {
+            path: home.join("asterpath/skills"),
+            label: SkillRootLabel::UserNative,
+        });
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(SkillRoot {
+            path: PathBuf::from(home).join(".agents/skills"),
+            label: SkillRootLabel::UserAgents,
+        });
+    }
+    roots
+}
+
 async fn assemble(
     settings: &config::Settings,
     providers: Vec<Arc<dyn asterpath_protocol::Provider>>,
     approval: config::ApprovalMode,
+    tools: Vec<Arc<dyn Tool>>,
 ) -> CliResult<Asterpath> {
     let mut builder = Asterpath::builder()
         .database(&settings.db)
         .providers(providers)
+        .tools(tools)
         .tool(config::tool_config(settings))
         .turn(config::turn_config(settings))
         .compaction(config::compaction_config(settings))
