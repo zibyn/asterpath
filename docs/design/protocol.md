@@ -809,4 +809,4 @@ pub enum ProviderErrorKind {
 - **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。
-- **#8**：fork 复制规范 item 与 raw；跨 provider 丢弃规则同样适用。
+- **#8**：fork 原样复制规范 item 与 raw，不做过滤；跨 provider 丢弃由 adapter 渲染请求时执行。
