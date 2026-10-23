@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 asterpath-core = { path = "../asterpath-core" }
 asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-sandbox = { path = "../asterpath-sandbox" }
 futures = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"

@@ -6,11 +6,13 @@
 pub mod clock;
 pub mod contract;
 pub mod failpoint;
+pub mod fake_sandbox;
 pub mod memory;
 pub mod scripted;
 
 pub use clock::ManualClock;
 pub use contract::{BackendFactory, BackendHandle, event_log_contract, storage_contract};
 pub use failpoint::{Action, Failpoint, FailpointEventLog, FailpointTool, Point};
+pub use fake_sandbox::{FakeSandboxProvider, RecordedSpawnRequest};
 pub use memory::{InMemoryEventLog, InMemoryStorage, MemoryBackend};
 pub use scripted::{Fixture, FixtureStep, ScriptedProvider, ScriptedStep};
