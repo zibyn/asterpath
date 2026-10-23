@@ -177,9 +177,9 @@ run_turn(session):
 - 不重复写 `TurnStarted`。
 - 若 frontier 落在 open step 内，不重复写 `StepStarted`，复用原 `StepStarted.seq` 作为投影水位。
 - 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。已存在的 `ToolCallRequested` 按 `provider_call_id` 对回 `AssistantMessage` 的 `ToolCall`；其 effective args 是权威值，不重跑 `before_tool`。只有尚无意图的调用才重跑 `before_tool`。恢复的未完成 step 不再调用 `before_step`；框架补写的 `Interrupted` 不经过 `after_tool`。
-- 若该 step 无 `AssistantMessage` 且最后一条 `ModelCallAborted` 是 `Crash` / `Transport`，按重试策略重调模型；`Transport` 耗尽则 `StepCommitted` + `TurnCommitted(Failed)`。
-- 若最后一条 abort 是 `Cancelled` / `Rejected`，按取消/失败收尾，不重试（#3 §6）。
-- 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态，再投影并重试同一 step。
+- 若该 step 无 `AssistantMessage`，把本 step 的尝试历史（`ModelCallAborted` 与本 step 内的强制压缩记录，按 `seq`）交给**尝试策略**（§7.1）重放，按它给出的下一动作继续：重试（带编号）、强制压缩或提交 step 并结束回合。一条 abort 都没有时先补写 `ModelCallAborted{attempt: 1, Crash}`，再按 `Crash` 询问。
+- 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态（`ProviderError` 触发的按开放 step 的水位线重做，与实时一致），再由尝试策略决定是否重试同一 step。
+- 若 frontier 落在两个 step 之间（上一 step 已 `StepCommitted`、回合未提交），按上一 step 的结果决定：有 `AssistantMessage` 则按 §4 的继续规则；没有则由尝试策略重放得出结束原因并写 `TurnCommitted`，不开新 step。
 - 工具完成后写 `StepCommitted`，再按 §4 的继续规则决定下一个 step 或 `TurnCommitted`。
 - open 的 spawn 工具按 `Safe` 重放；`spawn` / `await_completion` 吸收 R1–R3（[subagents.md](subagents.md) §9）。恢复不为 child 等待另设预收尾路径。
 
@@ -262,12 +262,33 @@ StepCommitted
 ## 7. 失败与重试
 
 - `ProviderError`（#11）提供 `retryable` 与规范化分类（含上下文窗口耗尽）。
-- 只在 `retryable && attempt < max_attempts && !cancelled` 时重试；每次失败写 `ModelCallAborted{attempt, kind: Transport}`。
+- 只在 `retryable && attempt < 预算 && !cancelled` 时重试；预算是 `max_attempts`，本 step 做过强制压缩时为 `max_attempts + 1`（C5 重试不占预算）。每次失败写 `ModelCallAborted{attempt, kind: Transport}`。
 - 不可重试错误：`ModelCallAborted{kind: Rejected}`，结束回合（`Failed`；上下文窗口耗尽时先强制压缩一次并重试同一 step，仍超限才 `ContextExhausted`；压缩调用失败则 `CompactionFailed`，见 [compaction.md](compaction.md)）。
 - 退避：指数 ×2，jitter，cap 30s；可被取消打断。
 - 每次 attempt 受 `request_timeout` 约束；超时按可重试 `Transport` 处理。
 - 部分流：不写 `AssistantMessage`；`partial` 仅作诊断，不投影（I9）。
 - 失败 attempt 的 usage 是 best-effort（`ProviderError.partial_usage` → `ModelCallAborted.usage`）；只进 `partial` 桶，不计入总量（[usage.md](usage.md)）。
+
+### 7.1 尝试策略
+
+实时路径与恢复路径的模型尝试决策只有一份：`crates/asterpath/src/agent/attempt.rs`（GLOSSARY「尝试策略」）。输入是本 step 的尝试历史（最近一次的编号、是否已强制压缩）与最新结果；输出是下一动作。
+
+| 最新结果 | 下一动作 |
+| --- | --- |
+| 成功 | 不经策略：写 `AssistantMessage`，进入工具管线 |
+| 可重试失败 / 崩溃 | `attempt < 预算` 则以 `attempt + 1` 重试（实时带退避），否则 `Failed` |
+| 拒绝 | `Failed` |
+| 上下文超限 | 本 step 未强制压缩过则强制压缩（水位线 = `StepStarted.seq`），否则 `ContextExhausted` |
+| 取消 | `Cancelled` |
+| 强制压缩 `Applied` / 不足 / 失败 | 以 `attempt + 1` 重试（不退避、不占预算）/ `ContextExhausted` / `CompactionFailed` |
+
+C5 重试每 step 至多一次，且不占 `max_attempts` 预算：即使超限发生在最后一次预算内尝试，压缩成功后仍重试一次。
+
+恢复按同一张表重放日志中的尝试历史。以下差异是有意的（崩溃点等价测试 `agent/tests/crash_points.rs` 逐条断言）：
+
+- **D1**：上下文超限写的是 `ModelCallAborted{Rejected}`，`AbortKind` 无法区分超限与其它拒绝。若崩溃在写完该 abort、尚未写 `CompactionStarted` 时，恢复按拒绝处理（`Failed`），不再强制压缩。新增 `AbortKind` 变体需等下一次 schema 升级。
+- **D3**：恢复不按已记录的 `backoff_ms` 退避，立即重试；恢复不得读 `recorded_at`（I4），重启本身已耗时。
+- **D4**：第 k>1 次尝试在途时崩溃，恢复不补记 `Crash`，以同一编号 k 重做（日志无法区分 k 是否已发出，保守）。只有一条 abort 都没有时补记 `Crash{1}` 并从 2 开始，即首次在途尝试计入预算。
 - **工具失败不重试**：`ToolResult{Failed}` 是模型可见结果，回合继续。超时、panic 的映射见 [tools.md](tools.md) §6。
 
 ## 8. 结束路径
