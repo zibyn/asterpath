@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AwaitSignal, ExecutionError, LogId, SessionId, SessionStore, SignalDelivery, SignalId,
     SignalPayload, WakeCause,
 };
-use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
+use asterpath_protocol::{SessionEvent, dedup, encode_entry};
 use futures_core::future::BoxFuture;
+
+use crate::scan::{backend, scan_decoded};
 use tokio::sync::Notify;
 
 /// Process-local wait identities. Not persisted.
@@ -76,29 +77,60 @@ impl Waits {
         self.log.append(entry).await.map_err(backend)
     }
 
-    async fn scan(&self, session: SessionId) -> Result<Vec<SessionEvent>, ExecutionError> {
-        let mut events = Vec::new();
-        for entry in scan_all(&*self.log, session).await.map_err(backend)? {
-            events.push(decode_entry(&entry).map_err(backend)?);
-        }
-        Ok(events)
-    }
-
     pub(crate) async fn find_signal(
         &self,
         session: SessionId,
         signal: SignalId,
     ) -> Result<Option<SignalPayload>, ExecutionError> {
-        Ok(self
-            .scan(session)
+        Ok(scan_decoded(&*self.log, session)
             .await?
             .into_iter()
-            .find_map(|event| match event {
+            .find_map(|(_, event)| match event {
                 SessionEvent::SignalReceived {
                     signal_id, payload, ..
                 } if signal_id == signal => Some(payload),
                 _ => None,
             }))
+    }
+
+    /// `Some(())` once the parent log records the child's completion.
+    async fn child_completed(
+        &self,
+        session: SessionId,
+        child: SessionId,
+    ) -> Result<Option<()>, ExecutionError> {
+        let completed = scan_decoded(&*self.log, session)
+            .await?
+            .iter()
+            .any(|(_, event)| {
+                matches!(
+                    event,
+                    SessionEvent::ChildSessionCompleted { child: done, .. } if *done == child
+                )
+            });
+        Ok(completed.then_some(()))
+    }
+
+    /// Re-check `ready` on every wake of `key`. The notifier is armed before
+    /// each check, so a wake between check and wait is not lost.
+    async fn wait_until<T, F>(
+        &self,
+        key: WaitKey,
+        mut ready: impl FnMut() -> F,
+    ) -> Result<T, ExecutionError>
+    where
+        F: Future<Output = Result<Option<T>, ExecutionError>>,
+    {
+        loop {
+            let notify = self.waiters.notifier(key);
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(value) = ready().await? {
+                return Ok(value);
+            }
+            notified.await;
+        }
     }
 }
 
@@ -107,19 +139,9 @@ impl Waits {
         &self,
         req: AwaitSignal,
     ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(async move {
-            let signal = req.signal;
-            loop {
-                let notify = self.waiters.notifier(WaitKey::Signal(signal));
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if let Some(payload) = self.find_signal(req.session, signal).await? {
-                    return Ok(payload);
-                }
-                notified.await;
-            }
-        })
+        Box::pin(self.wait_until(WaitKey::Signal(req.signal), move || {
+            self.find_signal(req.session, req.signal)
+        }))
     }
 
     pub(crate) fn deliver_signal(
@@ -150,33 +172,18 @@ impl Waits {
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
         Box::pin(async move {
             match cause {
-                WakeCause::Signal(signal) => loop {
-                    let notify = self.waiters.notifier(WaitKey::Signal(signal));
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    if self.find_signal(session, signal).await?.is_some() {
-                        return Ok(());
-                    }
-                    notified.await;
-                },
-                WakeCause::ChildCompleted(child) => loop {
-                    let notify = self.waiters.notifier(WaitKey::Child(child));
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    let completed = self.scan(session).await?.iter().any(|event| {
-                        matches!(
-                            event,
-                            SessionEvent::ChildSessionCompleted { child: done, .. }
-                                if *done == child
-                        )
-                    });
-                    if completed {
-                        return Ok(());
-                    }
-                    notified.await;
-                },
+                WakeCause::Signal(signal) => self
+                    .wait_until(WaitKey::Signal(signal), || {
+                        self.find_signal(session, signal)
+                    })
+                    .await
+                    .map(drop),
+                WakeCause::ChildCompleted(child) => {
+                    self.wait_until(WaitKey::Child(child), || {
+                        self.child_completed(session, child)
+                    })
+                    .await
+                }
             }
         })
     }
@@ -188,10 +195,6 @@ impl Waits {
         };
         self.waiters.wake(key);
     }
-}
-
-fn backend(error: impl std::fmt::Display) -> ExecutionError {
-    ExecutionError::Backend(error.to_string())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ mod commit;
 mod compaction;
 pub mod config;
 pub mod error;
+mod scan;
 mod scheduler;
 mod tools;
 mod views;
@@ -262,14 +263,17 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.store.append(entry).await?;
+        Ok(self.handle(session))
+    }
 
-        Ok(SessionHandle {
+    fn handle(&self, session: SessionId) -> SessionHandle {
+        SessionHandle {
             session,
             store: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
-        })
+        }
     }
 
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError> {
@@ -278,13 +282,7 @@ impl Asterpath {
         if self.store.frontier(id).await?.is_none() {
             return Err(AsterError::Agent(AgentError::NotFound { session: id }));
         }
-        Ok(SessionHandle {
-            session: id,
-            store: Arc::clone(&self.store),
-            agent: Arc::clone(&self.agent),
-            waits: Arc::clone(&self.waits),
-            cancellations: Arc::clone(&self.cancellations),
-        })
+        Ok(self.handle(id))
     }
 
     /// Release the engine. Nothing runs in the background, so there is

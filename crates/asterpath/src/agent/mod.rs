@@ -37,6 +37,7 @@ use asterpath_protocol::{
 };
 use futures_core::Stream;
 
+use crate::scan::scan_decoded;
 use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
@@ -180,7 +181,7 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let mut decoded = decode_entries(self.scan(session).await?, session)?;
+        let mut decoded = scan_decoded(&*self.log, session).await?;
         let config = decoded
             .iter()
             .find_map(|(_, event)| match event {
@@ -208,7 +209,7 @@ impl Agent {
                 .resolve_open_compaction(session, &facts, &config)
                 .await?
         {
-            decoded = decode_entries(self.scan(session).await?, session)?;
+            decoded = scan_decoded(&*self.log, session).await?;
             facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
             if let SessionState::TurnOpen { turn, step } = facts.state() {
                 if step.is_some()
@@ -261,7 +262,7 @@ impl Agent {
         )
         .await?;
 
-        let current = decode_entries(self.scan(session).await?, session)?;
+        let current = scan_decoded(&*self.log, session).await?;
         let max_attempts = config.turn.max_attempts.get();
         let Some(OpenStep {
             step,
@@ -355,7 +356,7 @@ impl Agent {
         let Some(parent) = facts.parent().map(|parent| parent.session) else {
             return Ok(false);
         };
-        let parent_decoded = decode_entries(self.scan(parent).await?, parent)?;
+        let parent_decoded = scan_decoded(&*self.log, parent).await?;
         Ok(parent_decoded.iter().any(|(_, event)| {
             matches!(
                 event,
@@ -883,7 +884,7 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
-        let decoded = decode_entries(self.scan(session).await?, session)?;
+        let decoded = scan_decoded(&*self.log, session).await?;
         let (items, stop_reason) = decoded
             .iter()
             .find_map(|(_, event)| match event {
@@ -975,7 +976,7 @@ impl Agent {
     }
 
     async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
-        let decoded = decode_entries(self.scan(session).await?, session)?;
+        let decoded = scan_decoded(&*self.log, session).await?;
         Ok(
             SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)))
                 .has_pending_input(),
@@ -1086,7 +1087,7 @@ impl Agent {
         session: SessionId,
     ) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
         Box::pin(async move {
-            let entries = decode_entries(self.scan(session).await?, session)?;
+            let entries = scan_decoded(&*self.log, session).await?;
             if !SessionFacts::fold_decoded(entries.iter().map(|(entry, event)| (entry, event)))
                 .is_idle()
             {
@@ -1587,22 +1588,6 @@ fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) 
     } else {
         StepOutcome::Turn(TurnEndReason::Completed)
     }
-}
-
-fn decode_entries(
-    entries: Vec<LogEntry>,
-    session: SessionId,
-) -> Result<Vec<(LogEntry, SessionEvent)>, AgentError> {
-    entries
-        .into_iter()
-        .map(|entry| {
-            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            })?;
-            Ok((entry, event))
-        })
-        .collect()
 }
 
 /// Exponential backoff with jitter, capped at `max_backoff`. The jitter is

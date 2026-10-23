@@ -5,12 +5,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
     ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, decode_entry, dedup,
-    encode_entry,
+    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup, encode_entry,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -23,6 +21,7 @@ use futures_util::StreamExt;
 use super::tool::SPAWN_TOOL_NAME;
 use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
 use crate::agent::Agent;
+use crate::scan::{backend, scan_decoded};
 use crate::waits::Waits;
 
 #[cfg(test)]
@@ -122,7 +121,7 @@ impl Scheduler {
         session: SessionId,
         tool_call: ToolCallId,
     ) -> Result<Option<LogId>, ExecutionError> {
-        let events = scan(&*self.log, session).await?;
+        let events = scan_decoded(&*self.log, session).await?;
         Ok(events.iter().find_map(|(entry, event)| match event {
             SessionEvent::ToolCallRequested { tool_call_id, .. } if *tool_call_id == tool_call => {
                 Some(entry.log_id)
@@ -152,9 +151,9 @@ impl Scheduler {
 impl Scheduler {
     pub(crate) fn spawn(&self, req: SpawnRequest) -> BoxFuture<'_, Result<ChildRef, SpawnError>> {
         Box::pin(async move {
-            let parent_events = scan(&*self.log, req.parent.session)
+            let parent_events = scan_decoded(&*self.log, req.parent.session)
                 .await
-                .map_err(SpawnError::Execution)?;
+                .map_err(|error| SpawnError::Execution(error.into()))?;
             let parent_config = session_config(&parent_events)
                 .ok_or(SpawnError::Execution(ExecutionError::NotFound {
                     session: req.parent.session,
@@ -305,9 +304,9 @@ impl Scheduler {
     ) -> BoxFuture<'a, Result<ChildOutcome, WaitError>> {
         let child = child.clone();
         Box::pin(async move {
-            let mut parent_events = scan(&*self.log, child.parent.session)
+            let mut parent_events = scan_decoded(&*self.log, child.parent.session)
                 .await
-                .map_err(WaitError::Execution)?;
+                .map_err(WaitError::from)?;
 
             // R3: a recorded outcome wins; the child is never queried again.
             if let Some(outcome) = find_completion(&parent_events, child.child) {
@@ -326,7 +325,7 @@ impl Scheduler {
             }
 
             // An unreadable child becomes a recorded `Lost`, never a hang.
-            if let Err(error) = scan(&*self.log, child.child).await {
+            if let Err(error) = scan_decoded(&*self.log, child.child).await {
                 return self.lost(&child, error.to_string()).await;
             }
 
@@ -340,9 +339,9 @@ impl Scheduler {
             )
             .await
             .map_err(WaitError::Execution)?;
-            let mut child_events = scan(&*self.log, child.child)
+            let mut child_events = scan_decoded(&*self.log, child.child)
                 .await
-                .map_err(WaitError::Execution)?;
+                .map_err(WaitError::from)?;
 
             if let Some(outcome) = child_outcome(&child_events) {
                 self.record_completion(&child, outcome.clone()).await?;
@@ -350,14 +349,14 @@ impl Scheduler {
             }
 
             loop {
-                parent_events = scan(&*self.log, child.parent.session)
+                parent_events = scan_decoded(&*self.log, child.parent.session)
                     .await
-                    .map_err(WaitError::Execution)?;
+                    .map_err(WaitError::from)?;
                 if let Some(outcome) = find_completion(&parent_events, child.child) {
                     return wait_outcome(&outcome);
                 }
 
-                child_events = match scan(&*self.log, child.child).await {
+                child_events = match scan_decoded(&*self.log, child.child).await {
                     Ok(events) => events,
                     Err(error) => return self.lost(&child, error.to_string()).await,
                 };
@@ -401,9 +400,9 @@ impl Scheduler {
                     None => {}
                     Some(Ok(())) => {
                         if child_outcome(
-                            &scan(&*self.log, child.child)
+                            &scan_decoded(&*self.log, child.child)
                                 .await
-                                .map_err(WaitError::Execution)?,
+                                .map_err(WaitError::from)?,
                         )
                         .is_none()
                         {
@@ -592,9 +591,9 @@ impl Scheduler {
         agent: &Agent,
     ) -> Result<Option<ChildOutcome>, WaitError> {
         self.drain_child(agent, child.child, grace).await;
-        let child_events = scan(&*self.log, child.child)
+        let child_events = scan_decoded(&*self.log, child.child)
             .await
-            .map_err(WaitError::Execution)?;
+            .map_err(WaitError::from)?;
         if let Some(outcome) = child_outcome(&child_events)
             // A `Cancelled{Host}` is the child reacting to our own drain, not a
             // terminal that beat the timeout.
@@ -621,9 +620,9 @@ impl Scheduler {
         child: ChildRef,
         agent: &Agent,
     ) -> Result<(), WaitError> {
-        let parent_events = scan(&*self.log, child.parent.session)
+        let parent_events = scan_decoded(&*self.log, child.parent.session)
             .await
-            .map_err(WaitError::Execution)?;
+            .map_err(WaitError::from)?;
         if find_completion(&parent_events, child.child).is_some() {
             return Ok(());
         }
@@ -634,9 +633,9 @@ impl Scheduler {
 
         self.drain_child(agent, child.child, grace).await;
 
-        let parent_events = scan(&*self.log, child.parent.session)
+        let parent_events = scan_decoded(&*self.log, child.parent.session)
             .await
-            .map_err(WaitError::Execution)?;
+            .map_err(WaitError::from)?;
         // A committed outcome (possibly Completed) is authoritative.
         if find_completion(&parent_events, child.child).is_some() {
             return Ok(());
@@ -656,7 +655,7 @@ impl Scheduler {
         &self,
         parent: ParentRef,
     ) -> Result<Option<ChildRef>, ExecutionError> {
-        let events = scan(&*self.log, parent.session).await?;
+        let events = scan_decoded(&*self.log, parent.session).await?;
         Ok(
             find_spawn(&events, parent.tool_call).map(|record| ChildRef {
                 parent,
@@ -695,7 +694,7 @@ impl Scheduler {
         parent: ParentRef,
         at: LogId,
     ) -> Result<Vec<Item>, ExecutionError> {
-        let entries = scan(&*self.log, parent.session).await?;
+        let entries = scan_decoded(&*self.log, parent.session).await?;
         let Some(at_seq) = entries
             .iter()
             .find(|(entry, _)| entry.log_id == at)
@@ -727,7 +726,7 @@ impl Scheduler {
         config: &ConfigSnapshot,
         context: &ContextPolicy,
     ) -> Result<(), ExecutionError> {
-        let events = scan(&*self.log, child).await?;
+        let events = scan_decoded(&*self.log, child).await?;
 
         match session_config(&events) {
             Some(existing) if existing != config => {
@@ -1049,20 +1048,4 @@ async fn drive_child(agent: &Agent, session: SessionId) -> Result<(), AgentError
         event?;
     }
     Ok(())
-}
-
-async fn scan(
-    log: &dyn SessionStore,
-    session: SessionId,
-) -> Result<Vec<(LogEntry, SessionEvent)>, ExecutionError> {
-    let mut events = Vec::new();
-    for entry in scan_all(log, session).await.map_err(backend)? {
-        let event = decode_entry(&entry).map_err(backend)?;
-        events.push((entry, event));
-    }
-    Ok(events)
-}
-
-fn backend(error: impl std::fmt::Display) -> ExecutionError {
-    ExecutionError::Backend(error.to_string())
 }

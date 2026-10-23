@@ -17,11 +17,13 @@ use asterpath_protocol::{
     WaitKind, decode_entry,
 };
 use asterpath_protocol::{
-    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, SignalId, StepId, StorageError,
-    Timestamp, ToolCallId, TurnId,
+    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, SignalId, StepId, Timestamp,
+    ToolCallId, TurnId,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
+
+use crate::scan::scan_decoded;
 
 /// Pull seam: folds one session's log per request.
 pub(crate) struct TracingQuery {
@@ -71,14 +73,9 @@ fn matches_filter(span: &Span, filter: &SpanFilter) -> bool {
 }
 
 async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<Span>, TraceError> {
-    let entries = scan(log, session).await?;
-    let mut decoded = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let event = decode_entry(&entry).map_err(|error| TraceError::Corrupt {
-            session,
-            detail: error.to_string(),
-        })?;
-        decoded.push((entry, event));
+    let decoded = scan_decoded(log, session).await?;
+    if decoded.is_empty() {
+        return Err(TraceError::NotFound { session });
     }
 
     let created = decoded.iter().find_map(|(entry, event)| match event {
@@ -100,17 +97,6 @@ async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<
     }
     folder.resolve_child_root(log).await;
     Ok(folder.finish())
-}
-
-async fn scan(log: &dyn SessionStore, session: SessionId) -> Result<Vec<LogEntry>, TraceError> {
-    let entries = scan_all(log, session).await.map_err(|error| match error {
-        StorageError::Corrupt { detail, .. } => TraceError::Corrupt { session, detail },
-        error => TraceError::Backend(error.to_string()),
-    })?;
-    if entries.is_empty() {
-        return Err(TraceError::NotFound { session });
-    }
-    Ok(entries)
 }
 
 #[derive(Clone, Copy)]
@@ -731,7 +717,7 @@ impl Folder {
             return;
         };
         self.spans[self.session_span].parent_trace = Some(TraceId::from_session(parent));
-        let Ok(entries) = scan(log, parent).await else {
+        let Ok(entries) = scan_all(log, parent).await else {
             return;
         };
         for entry in entries {

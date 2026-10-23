@@ -19,13 +19,14 @@ use asterpath_protocol::{
     ReplaySafety, SessionEvent, SessionFacts, SessionId, SessionStore, SignalPayload, StepId, Tool,
     ToolArgs, ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError,
     ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
-    TurnId, UsageLookup, approval_signal_id, approval_signal_name, dedup, scan_all, unique_bytes,
+    TurnId, UsageLookup, approval_signal_id, approval_signal_name, dedup, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
-use super::{EventSink, caught, decode_entries};
+use super::{EventSink, caught};
+use crate::scan::scan_decoded;
 use crate::scheduler::SPAWN_TOOL_NAME;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
@@ -260,7 +261,7 @@ impl ToolPipeline {
     /// One read of the log per step: this step's recorded intents and which
     /// of them are closed.
     async fn recorded(&self, step: &ToolStep<'_>) -> Result<Recorded, AgentError> {
-        let decoded = decode_entries(scan_all(&*self.log, step.session).await?, step.session)?;
+        let decoded = scan_decoded(&*self.log, step.session).await?;
         Ok(Recorded::of(&decoded, step.turn, step.step))
     }
 
@@ -370,7 +371,7 @@ impl ToolPipeline {
         step: &ToolStep<'_>,
         pending: &[ToolCallId],
     ) -> Result<(), AgentError> {
-        let decoded = decode_entries(scan_all(&*self.log, step.session).await?, step.session)?;
+        let decoded = scan_decoded(&*self.log, step.session).await?;
         let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
         let step_calls: HashSet<ToolCallId> = decoded
             .iter()
