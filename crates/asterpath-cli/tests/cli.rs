@@ -12,7 +12,7 @@ use asterpath_protocol::{
     SessionSpec, SubagentConfig, ToolSelection, TurnConfig, UserInput, encode_entry,
 };
 use asterpath_protocol::{InputId, TurnId};
-use common::{MockServer, bin};
+use common::{MockServer, Reply, bin};
 
 struct TestDir {
     path: PathBuf,
@@ -71,7 +71,7 @@ fn session_from_stderr(stderr: &str) -> String {
 
 #[test]
 fn run_prints_final_assistant_text_and_session_id() {
-    let server = MockServer::start(common::text_sse("Hello from the mock"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
     let dir = TestDir::new("run-ok");
     let config = dir.config(&config_body(&server, &dir.db()));
 
@@ -108,7 +108,7 @@ fn run_prints_final_assistant_text_and_session_id() {
 
 #[test]
 fn run_uses_the_model_flag_over_the_environment() {
-    let server = MockServer::start(common::text_sse("ok"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
     let dir = TestDir::new("model-precedence");
     let config = dir.config(&config_body(&server, &dir.db()));
 
@@ -130,16 +130,16 @@ fn run_uses_the_model_flag_over_the_environment() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert!(
-        requests[0].contains("\"model\":\"flag-model\""),
+        requests[0].body.contains("\"model\":\"flag-model\""),
         "flag model wins: {}",
-        requests[0]
+        requests[0].body
     );
-    assert!(!requests[0].contains("env-model"));
+    assert!(!requests[0].body.contains("env-model"));
 }
 
 #[test]
 fn run_fails_with_one_when_the_turn_does_not_complete() {
-    let server = MockServer::start(common::context_exceeded_sse("truncated"));
+    let server = MockServer::start(vec![Reply::sse(common::context_exceeded_sse("truncated"))]);
     let dir = TestDir::new("run-failed");
     let config = dir.config(&config_body(&server, &dir.db()));
 
@@ -374,7 +374,7 @@ fn resume_prints_idle_for_a_finished_session() {
 
 #[test]
 fn resume_continues_an_open_turn() {
-    let server = MockServer::start(common::text_sse("Resumed turn"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Resumed turn"))]);
     let (dir, session) = prepared_session("resume-open", &server, true);
     let config = dir.path.join("asterpath.toml");
 
@@ -396,7 +396,7 @@ fn resume_continues_an_open_turn() {
 
 #[test]
 fn resume_continues_pending_input() {
-    let server = MockServer::start(common::text_sse("Pending input ran"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Pending input ran"))]);
     let (dir, session) = prepared_session("resume-pending", &server, false);
     let config = dir.path.join("asterpath.toml");
 
@@ -642,7 +642,7 @@ fn prepared_session(name: &str, server: &MockServer, turn_started: bool) -> (Tes
 
 /// Run one successful turn and return the directory and session id.
 fn completed_session(name: &str) -> (TestDir, String) {
-    let server = MockServer::start(common::text_sse("Hello from the mock"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
     let dir = TestDir::new(name);
     let config = dir.config(&config_body(&server, &dir.db()));
     let output = bin()

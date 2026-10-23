@@ -5,7 +5,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{MockServer, bin};
+use common::{MockServer, Reply, bin};
 
 /// The `asterpath-mcp-fixture` binary, built on demand: `cargo test -p
 /// asterpath-cli` does not build another package's bins.
@@ -81,9 +81,12 @@ fn text(bytes: &[u8]) -> String {
 
 #[test]
 fn run_calls_a_configured_stdio_mcp_tool() {
-    let server = MockServer::start_sequence(vec![
-        common::tool_use_sse("fixture__echo", r#"{"text":"from-mcp"}"#),
-        common::text_sse("done"),
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse(
+            "fixture__echo",
+            r#"{"text":"from-mcp"}"#,
+        )),
+        Reply::sse(common::text_sse("done")),
     ]);
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("sessions.db");
@@ -99,14 +102,14 @@ fn run_calls_a_configured_stdio_mcp_tool() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "{requests:?}");
     assert!(
-        requests[0].contains("fixture__echo"),
+        requests[0].body.contains("fixture__echo"),
         "the MCP tool is offered: {}",
-        requests[0]
+        requests[0].body
     );
     assert!(
-        requests[1].contains("from-mcp"),
+        requests[1].body.contains("from-mcp"),
         "the tool result reaches the model: {}",
-        requests[1]
+        requests[1].body
     );
 }
 
@@ -244,13 +247,21 @@ fn full_access_runs_stdio_servers_without_a_sandbox_backend() {
 /// Two tool steps, the second reporting 500 input tokens; the threshold check
 /// before step three compacts when a 600-token window is configured. The
 /// summary call is the third model request.
-fn compaction_run(window: Option<u32>) -> (std::process::Output, String, Vec<String>) {
-    let server = MockServer::start_sequence(vec![
-        common::tool_use_sse("fixture__echo", r#"{"text":"one"}"#),
-        common::tool_use_sse("fixture__echo", r#"{"text":"two"}"#)
-            .replace("\"input_tokens\":5", "\"input_tokens\":500"),
-        common::text_sse("summary"),
-        common::text_sse("done"),
+fn compaction_run(
+    window: Option<u32>,
+) -> (
+    std::process::Output,
+    String,
+    Vec<asterpath_testing::http_mock::Recorded>,
+) {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("fixture__echo", r#"{"text":"one"}"#)),
+        Reply::sse(
+            common::tool_use_sse("fixture__echo", r#"{"text":"two"}"#)
+                .replace("\"input_tokens\":5", "\"input_tokens\":500"),
+        ),
+        Reply::sse(common::text_sse("summary")),
+        Reply::sse(common::text_sse("done")),
     ]);
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("sessions.db");

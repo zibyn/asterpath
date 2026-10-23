@@ -18,7 +18,7 @@ use asterpath_protocol::{
 use asterpath_protocol::{InputId, LogQuery, SessionStore};
 use asterpath_skills::{LoadSkillTool, SkillRoot, SkillRootLabel};
 use asterpath_testing::ScriptedProvider;
-use common::{MockServer, bin};
+use common::{MockServer, Reply, bin};
 use futures_util::StreamExt;
 use tempfile::TempDir;
 
@@ -100,7 +100,7 @@ fn run_appends_the_index_and_registers_load_skill() {
         "description: d\nallowed-tools: [x]",
         "body",
     );
-    let server = MockServer::start(common::text_sse("Hello"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
     let config = project.config(&server, "[skills]\n");
 
     let output = project
@@ -130,9 +130,17 @@ fn run_appends_the_index_and_registers_load_skill() {
         "the authority-field advisory belongs to `config check`: {stderr}"
     );
     let request = &server.requests()[0];
-    assert!(request.contains("## Skills"), "{request}");
-    assert!(request.contains("- demo: Demo skill."), "{request}");
-    assert!(request.contains("\"name\":\"load_skill\""), "{request}");
+    assert!(request.body.contains("## Skills"), "{}", request.body);
+    assert!(
+        request.body.contains("- demo: Demo skill."),
+        "{}",
+        request.body
+    );
+    assert!(
+        request.body.contains("\"name\":\"load_skill\""),
+        "{}",
+        request.body
+    );
 }
 
 #[test]
@@ -144,7 +152,7 @@ fn run_no_skills_omits_the_index_and_the_tool() {
         "description: Demo skill.",
         "# Demo\n\nBody.\n",
     );
-    let server = MockServer::start(common::text_sse("Hello"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
     let config = project.config(&server, "[skills]\n");
 
     let output = project
@@ -169,8 +177,8 @@ fn run_no_skills_omits_the_index_and_the_tool() {
         String::from_utf8_lossy(&output.stderr)
     );
     let request = &server.requests()[0];
-    assert!(!request.contains("## Skills"), "{request}");
-    assert!(!request.contains("load_skill"), "{request}");
+    assert!(!request.body.contains("## Skills"), "{}", request.body);
+    assert!(!request.body.contains("load_skill"), "{}", request.body);
 }
 
 #[test]
@@ -183,7 +191,7 @@ fn config_check_prints_skill_diagnostics() {
         "description: d\nallowed-tools: [x]",
         "body",
     );
-    let server = MockServer::start(common::text_sse("unused"));
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("unused"))]);
     let config = project.config(&server, "[skills]\n");
 
     let output = project
@@ -270,9 +278,9 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
     drop(handle);
     app.shutdown().await.expect("shutdown");
 
-    let server = MockServer::start_sequence(vec![
-        common::tool_use_sse("load_skill", r#"{"name":"demo"}"#),
-        common::text_sse("done"),
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("load_skill", r#"{"name":"demo"}"#)),
+        Reply::sse(common::text_sse("done")),
     ]);
     let config = project.config(
         &server,
@@ -309,14 +317,14 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "{requests:?}");
     assert!(
-        requests[1].contains("Body."),
+        requests[1].body.contains("Body."),
         "the loader ran on resume: {}",
-        requests[1]
+        requests[1].body
     );
     assert!(
-        !requests[1].contains("not found"),
+        !requests[1].body.contains("not found"),
         "the loader is registered: {}",
-        requests[1]
+        requests[1].body
     );
 
     // The executed result is in the log as an ordinary completed tool result.
