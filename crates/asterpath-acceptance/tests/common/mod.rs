@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use asterpath_protocol::SessionEvent;
-use asterpath_protocol::{EventLog, LogEntry, LogQuery, SessionId};
+use asterpath_protocol::{LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_storage_sqlite::SqliteStorage;
 use futures_util::StreamExt;
 use serde_json::Value;

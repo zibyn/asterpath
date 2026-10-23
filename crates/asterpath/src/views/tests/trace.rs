@@ -16,7 +16,7 @@ use asterpath_protocol::{
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId, StepId, ToolCallId, TurnId,
+    DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::InMemoryEventLog;
 use futures_util::StreamExt;
@@ -178,7 +178,7 @@ fn compaction_applied(from: LogId, to: LogId) -> SessionEvent {
 }
 
 async fn append(
-    log: &dyn EventLog,
+    log: &dyn SessionStore,
     session: SessionId,
     event: &SessionEvent,
     key: Option<DedupKey>,
@@ -187,7 +187,7 @@ async fn append(
     log.append(entry).await.expect("append")
 }
 
-async fn entries(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
+async fn entries(log: &dyn SessionStore, session: SessionId) -> Vec<LogEntry> {
     log.scan(LogQuery {
         session,
         after: None,
@@ -198,7 +198,7 @@ async fn entries(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
     .expect("scan")
 }
 
-async fn fold(log: &Arc<dyn EventLog>, session: SessionId) -> Vec<Span> {
+async fn fold(log: &Arc<dyn SessionStore>, session: SessionId) -> Vec<Span> {
     let query = TracingQuery::new(Arc::clone(log));
     let mut stream = query.spans(SpanFilter {
         session: Some(session),
@@ -224,7 +224,7 @@ fn all_of(spans: &[Span], kind: SpanKind) -> Vec<&Span> {
 
 #[tokio::test]
 async fn t2_hierarchy_is_session_turn_step_model_and_tool() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(1);
     let t = turn();
     let s1 = step(0x31);
@@ -382,7 +382,7 @@ async fn t2_hierarchy_is_session_turn_step_model_and_tool() {
 
 #[tokio::test]
 async fn t1_rebuilding_the_same_log_twice_is_identical() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(2);
     let t = turn();
     let s = step(0x51);
@@ -468,7 +468,7 @@ async fn t1_rebuilding_the_same_log_twice_is_identical() {
 
 #[tokio::test]
 async fn t3_retries_fold_into_one_model_call_with_attempts() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(3);
     let t = turn();
     let s = step(0x61);
@@ -560,7 +560,7 @@ async fn t3_retries_fold_into_one_model_call_with_attempts() {
 
 #[tokio::test]
 async fn t4_retry_exhaustion_marks_the_model_call_and_turn_error() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(4);
     let t = turn();
     let s = step(0x71);
@@ -635,7 +635,7 @@ async fn t4_retry_exhaustion_marks_the_model_call_and_turn_error() {
 
 #[tokio::test]
 async fn t5_tool_failure_does_not_fail_the_step_or_turn() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(5);
     let t = turn();
     let s = step(0x81);
@@ -717,7 +717,7 @@ async fn t5_tool_failure_does_not_fail_the_step_or_turn() {
 
 #[tokio::test]
 async fn t6_interrupted_tool_cancels_the_step_and_turn() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(6);
     let t = turn();
     let s = step(0x91);
@@ -806,7 +806,7 @@ async fn t6_interrupted_tool_cancels_the_step_and_turn() {
 
 #[tokio::test]
 async fn t7_approval_wait_is_a_child_span_with_its_deadline_and_cause() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(7);
     let t = turn();
     let s = step(0xa1);
@@ -919,7 +919,7 @@ async fn t7_approval_wait_is_a_child_span_with_its_deadline_and_cause() {
 
 #[tokio::test]
 async fn t8_resume_is_a_session_event() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(8);
     let t = turn();
     let s = step(0xb1);
@@ -1000,7 +1000,7 @@ async fn t8_resume_is_a_session_event() {
 
 #[tokio::test]
 async fn t9_subagent_links_parent_and_child_traces() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let parent = sid(9);
     let child = sid(10);
     let t = turn();
@@ -1198,7 +1198,7 @@ async fn t9_subagent_links_parent_and_child_traces() {
 
 #[tokio::test]
 async fn t10_recovered_tool_reuses_every_span_id_and_marks_replay() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(11);
     let t = turn();
     let s = step(0xd1);
@@ -1299,7 +1299,7 @@ async fn t10_recovered_tool_reuses_every_span_id_and_marks_replay() {
 
 #[tokio::test]
 async fn t11_recovered_model_stream_replays_the_attempt_in_the_same_span() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(12);
     let t = turn();
     let s = step(0xe1);
@@ -1395,7 +1395,7 @@ async fn t11_recovered_model_stream_replays_the_attempt_in_the_same_span() {
 
 #[tokio::test]
 async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(13);
     let t = turn();
     let s = step(0xf1);
@@ -1574,7 +1574,7 @@ async fn t12_compaction_parent_follows_the_open_step_turn_or_session() {
 #[tokio::test]
 async fn t13_spans_never_carry_content() {
     const SECRET: &str = "SECRET-PROMPT-COMPLETION-ARGS";
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(14);
     let t = turn();
     let s = step(0x11);
@@ -1686,7 +1686,7 @@ async fn t13_spans_never_carry_content() {
 
 #[tokio::test]
 async fn retired_or_unknown_session_is_not_found() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let query = TracingQuery::new(Arc::clone(&log));
     let mut stream = query.spans(SpanFilter {
         session: Some(sid(99)),
@@ -1702,7 +1702,7 @@ async fn retired_or_unknown_session_is_not_found() {
 
 #[tokio::test]
 async fn a_log_without_session_created_is_corrupt() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(15);
     append(
         &*log,
@@ -1729,7 +1729,7 @@ async fn a_log_without_session_created_is_corrupt() {
 
 #[tokio::test]
 async fn forced_compaction_retry_keeps_the_model_call_ok() {
-    let log: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(18);
     let t = turn();
     let s = step(0x13);

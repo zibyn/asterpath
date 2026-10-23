@@ -31,7 +31,7 @@ use asterpath_protocol::{
     approval_signal_name, decode_entry, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore,
     SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
 };
 use futures_core::Stream;
@@ -48,7 +48,7 @@ const DENIED_WITHOUT_REASON: &str = "tool call denied";
 
 /// The turn driver.
 pub(crate) struct Agent {
-    log: Arc<dyn EventLog>,
+    log: Arc<dyn SessionStore>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     tool_config: ToolConfig,
@@ -72,7 +72,7 @@ impl Agent {
     /// module never constructs them, so approval waits are real.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        log: Arc<dyn EventLog>,
+        log: Arc<dyn SessionStore>,
         providers: Arc<ProviderCatalog>,
         tools: Arc<ToolTable>,
         tool_config: ToolConfig,

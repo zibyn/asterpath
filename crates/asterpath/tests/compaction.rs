@@ -17,7 +17,7 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
     TurnEndReason, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{EventLog, InputId, LogEntry, LogId, LogQuery, SessionId};
+use asterpath_protocol::{InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -173,7 +173,7 @@ async fn facade(
     builder.build().await.expect("facade builds")
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -313,7 +313,7 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
             .all(|event| !matches!(event, AgentEvent::Idle { .. }))
     );
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
     assert_eq!(count(&entries, "CompactionAborted"), 0);
@@ -382,7 +382,7 @@ async fn c2_forced_compaction_with_one_complete_step_has_nothing_to_do() {
             ..
         }
     )));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     cleanup(&db);
@@ -429,7 +429,7 @@ async fn c5_forced_compaction_retries_the_same_step_once() {
         }
     )));
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "StepStarted"), 3);
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
@@ -509,7 +509,7 @@ async fn c5_second_context_exhaustion_ends_the_turn() {
             ..
         }
     )));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "StepStarted"), 3);
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
@@ -538,7 +538,7 @@ async fn c6_stop_reason_exhaustion_does_not_compress() {
             ..
         }
     )));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     cleanup(&db);
@@ -561,14 +561,14 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
         .expect("session");
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
-    let before = scan(asterpath.event_log(), handle.id()).await;
+    let before = scan(asterpath.store(), handle.id()).await;
 
     let result = handle.compact_now().await.expect("compact_now");
     assert!(matches!(
         result,
         asterpath_protocol::CompactResult::Applied(_)
     ));
-    let after = scan(asterpath.event_log(), handle.id()).await;
+    let after = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&after, "CompactionStarted"), 1);
     assert_eq!(count(&after, "CompactionApplied"), 1);
     assert_eq!(count(&after, "TurnStarted"), count(&before, "TurnStarted"));
@@ -587,18 +587,14 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
         },
     )
     .expect("encode");
-    asterpath
-        .event_log()
-        .append(entry)
-        .await
-        .expect("append turn");
-    let open = scan(asterpath.event_log(), handle.id()).await;
+    asterpath.store().append(entry).await.expect("append turn");
+    let open = scan(asterpath.store(), handle.id()).await;
     let error = handle.compact_now().await.expect_err("busy");
     assert!(matches!(
         error,
         asterpath::AsterError::Agent(AgentError::Busy { .. })
     ));
-    let unchanged = scan(asterpath.event_log(), handle.id()).await;
+    let unchanged = scan(asterpath.store(), handle.id()).await;
     assert_eq!(open.len(), unchanged.len());
     cleanup(&db);
 }
@@ -637,7 +633,7 @@ async fn c9_at_most_one_automatic_compaction_per_turn() {
         .expect("session");
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
     cleanup(&db);
@@ -680,7 +676,7 @@ async fn c13_missing_window_disables_every_path() {
 
     let result = handle.compact_now().await.expect("manual");
     assert_eq!(result, asterpath_protocol::CompactResult::NotConfigured);
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     cleanup(&db);
@@ -724,7 +720,7 @@ async fn c15_forced_summary_failure_maps_to_compaction_failed() {
             ..
         }
     )));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionAborted"), 1);
     let aborted = entries
@@ -776,7 +772,7 @@ async fn c15_forced_insufficient_maps_to_context_exhausted() {
             ..
         }
     )));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionAborted"), 1);
     let aborted = entries
@@ -820,7 +816,7 @@ async fn c16_without_a_compactor_nothing_is_written() {
     )));
     let result = handle.compact_now().await.expect("manual");
     assert_eq!(result, asterpath_protocol::CompactResult::NotConfigured);
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 0);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     cleanup(&db);
@@ -831,7 +827,7 @@ async fn seed_open_compaction(
     session: SessionId,
     trigger: CompactionTrigger,
 ) -> LogId {
-    let entries = scan(asterpath.event_log(), session).await;
+    let entries = scan(asterpath.store(), session).await;
     let frontier = entries.last().expect("frontier").log_id;
     let key = dedup::compaction(frontier);
     let started = SessionEvent::CompactionStarted {
@@ -841,7 +837,7 @@ async fn seed_open_compaction(
         turn: None,
     };
     asterpath
-        .event_log()
+        .store()
         .append(encode_entry(session, Some(key), &started).expect("encode"))
         .await
         .expect("append started");
@@ -872,7 +868,7 @@ async fn c3_open_compaction_is_redone_on_recovery() {
     while let Some(event) = stream.next().await {
         event.expect("drive succeeds");
     }
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
     assert_eq!(count(&entries, "CompactionAborted"), 0);
@@ -905,7 +901,7 @@ async fn c3_failed_redo_closes_with_an_abort() {
     while let Some(event) = stream.next().await {
         event.expect("drive succeeds");
     }
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionAborted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
@@ -933,7 +929,7 @@ async fn c3_without_a_compactor_the_intent_stays_open_and_idle() {
     while let Some(event) = stream.next().await {
         event.expect("drive succeeds");
     }
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 0);
     assert_eq!(count(&entries, "CompactionAborted"), 0);
@@ -968,7 +964,7 @@ async fn c4_committed_compaction_is_not_repeated() {
     while let Some(event) = stream.next().await {
         event.expect("drive succeeds");
     }
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     assert_eq!(count(&entries, "CompactionApplied"), 1);
     assert_eq!(
@@ -989,7 +985,7 @@ async fn c10_same_frontier_append_is_idempotent() {
         .await
         .expect("session");
     handle.submit_input(input(1, "go")).await.expect("input");
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let frontier = entries.last().expect("frontier").log_id;
     let key = dedup::compaction(frontier);
     let started = SessionEvent::CompactionStarted {
@@ -999,17 +995,17 @@ async fn c10_same_frontier_append_is_idempotent() {
         turn: None,
     };
     let first = asterpath
-        .event_log()
+        .store()
         .append(encode_entry(handle.id(), Some(key.clone()), &started).expect("encode"))
         .await
         .expect("append");
     let second = asterpath
-        .event_log()
+        .store()
         .append(encode_entry(handle.id(), Some(key), &started).expect("encode"))
         .await
         .expect("append");
     assert_eq!(first, second);
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&entries, "CompactionStarted"), 1);
     cleanup(&db);
 }
@@ -1033,7 +1029,7 @@ async fn c11_summary_usage_is_recorded_on_the_applied_event_only() {
     drive_all(&handle).await;
     handle.compact_now().await.expect("manual");
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let mut summary_usage = None;
     let mut last_usage = None;
     for entry in &entries {

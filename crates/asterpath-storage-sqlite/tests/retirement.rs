@@ -1,17 +1,17 @@
-//! Session retirement (G8, R1-R9): atomic tombstone + deletes, frontier CAS,
-//! idempotence across reopen, and invisibility through the read surface.
+//! SQLite-specific retirement (G8, R2, R3, R9): the atomic tombstone and
+//! deletes, idempotence across reopen and the raw rows left behind. The
+//! backend-neutral cases (CAS, idle, children, precedence) are in the shared
+//! `session_store_contract`.
 
 mod common;
 
-use std::sync::Arc;
-
 use asterpath_protocol::{
-    CompactionTrigger, ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef,
-    ProviderId, SessionEvent, dedup,
+    ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent,
+    dedup,
 };
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId,
-    SessionRetirement, Storage, StorageError, TurnId,
+    DedupKey, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore,
+    StorageError, TurnId,
 };
 use asterpath_storage_sqlite::open;
 use common::TempDir;
@@ -52,23 +52,8 @@ fn session_created(parent: Option<SessionId>) -> SessionEvent {
     }
 }
 
-fn turn_started() -> SessionEvent {
-    SessionEvent::TurnStarted {
-        turn_id: TurnId::from_bytes([2; 16]),
-    }
-}
-
 fn input_recorded() -> SessionEvent {
     SessionEvent::InputRecorded { input: vec![] }
-}
-
-fn compaction_started(frontier: LogId) -> SessionEvent {
-    SessionEvent::CompactionStarted {
-        trigger: CompactionTrigger::Manual,
-        replaces_from: LogId::from_i64(1),
-        caused_by: frontier,
-        turn: None,
-    }
 }
 
 fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) -> NewEntry {
@@ -81,7 +66,7 @@ fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) 
 }
 
 fn append(
-    storage: &dyn EventLog,
+    storage: &dyn SessionStore,
     session: SessionId,
     event: &SessionEvent,
     key: Option<DedupKey>,
@@ -89,7 +74,7 @@ fn append(
     block_on(storage.append(entry(session, event, key))).expect("append")
 }
 
-fn create(storage: &dyn EventLog, session: SessionId, parent: Option<SessionId>) -> LogId {
+fn create(storage: &dyn SessionStore, session: SessionId, parent: Option<SessionId>) -> LogId {
     append(
         storage,
         session,
@@ -98,11 +83,11 @@ fn create(storage: &dyn EventLog, session: SessionId, parent: Option<SessionId>)
     )
 }
 
-fn frontier(storage: &dyn EventLog, session: SessionId) -> Option<LogId> {
+fn frontier(storage: &dyn SessionStore, session: SessionId) -> Option<LogId> {
     block_on(storage.frontier(session)).expect("frontier")
 }
 
-fn scan(storage: &dyn EventLog, session: SessionId) -> Vec<Result<LogEntry, StorageError>> {
+fn scan(storage: &dyn SessionStore, session: SessionId) -> Vec<Result<LogEntry, StorageError>> {
     block_on(
         storage
             .scan(LogQuery {
@@ -114,12 +99,12 @@ fn scan(storage: &dyn EventLog, session: SessionId) -> Vec<Result<LogEntry, Stor
     )
 }
 
-fn retire(storage: &dyn SessionRetirement, session: SessionId, frontier: LogId) {
+fn retire(storage: &dyn SessionStore, session: SessionId, frontier: LogId) {
     block_on(storage.retire(session, frontier)).expect("retire succeeds");
 }
 
 fn retire_error(
-    storage: &dyn SessionRetirement,
+    storage: &dyn SessionStore,
     session: SessionId,
     frontier: LogId,
 ) -> RetirementError {
@@ -191,215 +176,6 @@ fn retire_hides_the_session_and_retries_idempotently_across_reopen() {
 }
 
 // ---------------------------------------------------------------------------
-// R1: the frontier is a CAS. A concurrent append makes retirement fail and is
-// never lost.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn frontier_cas_sees_a_concurrent_append_and_loses_nothing() {
-    let dir = TempDir::new("retire-cas");
-    let db = dir.db();
-    let target = session(0xb1);
-    let storage = open(&db).expect("open");
-    create(storage.as_ref(), target, None);
-    let captured = frontier(storage.as_ref(), target).expect("frontier");
-
-    let appender = Arc::clone(&storage);
-    let appended = std::thread::spawn(move || {
-        append(
-            appender.as_ref(),
-            target,
-            &input_recorded(),
-            Some(DedupKey::new("late")),
-        )
-    })
-    .join()
-    .expect("append thread");
-    assert!(appended > captured);
-
-    let error = retire_error(storage.as_ref(), target, captured);
-    assert!(
-        matches!(
-            error,
-            RetirementError::FrontierMoved {
-                expected,
-                actual: Some(actual),
-            } if expected == captured && actual == appended
-        ),
-        "got {error:?}"
-    );
-    assert_eq!(
-        scan(storage.as_ref(), target).len(),
-        2,
-        "the record appended after the export is not lost"
-    );
-    assert_eq!(frontier(storage.as_ref(), target), Some(appended));
-
-    drop(storage);
-    let conn = rusqlite::Connection::open(&db).expect("raw open");
-    assert_eq!(count(&conn, "retired_sessions"), 0);
-}
-
-// ---------------------------------------------------------------------------
-// R4: non-idle sessions are rejected before the frontier check, and nothing is
-// touched.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn non_idle_session_is_rejected_before_the_frontier_check() {
-    let dir = TempDir::new("retire-not-idle");
-    let db = dir.db();
-    let target = session(0xb2);
-    let storage = open(&db).expect("open");
-    create(storage.as_ref(), target, None);
-    append(storage.as_ref(), target, &turn_started(), None);
-    let current = frontier(storage.as_ref(), target).expect("frontier");
-
-    // A deliberately wrong expected frontier proves NotIdle takes precedence.
-    let error = retire_error(
-        storage.as_ref(),
-        target,
-        LogId::from_i64(current.as_i64() + 100),
-    );
-    assert!(matches!(error, RetirementError::NotIdle), "got {error:?}");
-
-    assert_eq!(scan(storage.as_ref(), target).len(), 2);
-    assert_eq!(frontier(storage.as_ref(), target), Some(current));
-    drop(storage);
-
-    let conn = rusqlite::Connection::open(&db).expect("raw open");
-    assert_eq!(count(&conn, "retired_sessions"), 0);
-    assert_eq!(count(&conn, "sessions"), 1);
-    assert_eq!(count(&conn, "open_intents"), 1);
-}
-
-// ---------------------------------------------------------------------------
-// R5: live children block the parent; bottom-up retirement works.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn live_children_block_parent_retirement_until_retired_bottom_up() {
-    let dir = TempDir::new("retire-children");
-    let db = dir.db();
-    let parent = session(0xb3);
-    let child = session(0xb4);
-    let storage = open(&db).expect("open");
-    create(storage.as_ref(), parent, None);
-    create(storage.as_ref(), child, Some(parent));
-    let parent_frontier = frontier(storage.as_ref(), parent).expect("parent frontier");
-    let child_frontier = frontier(storage.as_ref(), child).expect("child frontier");
-
-    let error = retire_error(storage.as_ref(), parent, parent_frontier);
-    assert!(
-        matches!(error, RetirementError::HasChildren),
-        "got {error:?}"
-    );
-    assert_eq!(scan(storage.as_ref(), parent).len(), 1);
-    assert_eq!(scan(storage.as_ref(), child).len(), 1);
-
-    retire(storage.as_ref(), child, child_frontier);
-    retire(storage.as_ref(), parent, parent_frontier);
-    assert!(frontier(storage.as_ref(), parent).is_none());
-    assert!(frontier(storage.as_ref(), child).is_none());
-}
-
-// ---------------------------------------------------------------------------
-// R6: a non-idle parent blocks the child.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn non_idle_parent_blocks_child_retirement() {
-    let dir = TempDir::new("retire-parent-busy");
-    let db = dir.db();
-    let parent = session(0xb5);
-    let child = session(0xb6);
-    let storage = open(&db).expect("open");
-    create(storage.as_ref(), parent, None);
-    append(storage.as_ref(), parent, &turn_started(), None);
-    create(storage.as_ref(), child, Some(parent));
-    let child_frontier = frontier(storage.as_ref(), child).expect("child frontier");
-
-    let error = retire_error(storage.as_ref(), child, child_frontier);
-    assert!(
-        matches!(error, RetirementError::ParentNotIdle),
-        "got {error:?}"
-    );
-    assert_eq!(scan(storage.as_ref(), child).len(), 1, "child untouched");
-}
-
-// ---------------------------------------------------------------------------
-// Exact error precedence from retention.md §5.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn retirement_error_precedence_matches_the_contract() {
-    let dir = TempDir::new("retire-precedence");
-    let db = dir.db();
-    let storage = open(&db).expect("open");
-
-    // Neither tombstone nor live session: NotFound.
-    let error = retire_error(storage.as_ref(), session(0xbf), LogId::from_i64(9));
-    assert!(matches!(error, RetirementError::NotFound), "got {error:?}");
-
-    // Live session + moved frontier + live child: FrontierMoved beats HasChildren.
-    let parent = session(0xc0);
-    let child = session(0xc1);
-    create(storage.as_ref(), parent, None);
-    let exported = frontier(storage.as_ref(), parent).expect("frontier");
-    append(storage.as_ref(), parent, &input_recorded(), None);
-    create(storage.as_ref(), child, Some(parent));
-    let error = retire_error(storage.as_ref(), parent, exported);
-    assert!(
-        matches!(
-            error,
-            RetirementError::FrontierMoved {
-                actual: Some(_),
-                ..
-            }
-        ),
-        "got {error:?}"
-    );
-
-    // Idle session with a live child and a non-idle parent: HasChildren beats
-    // ParentNotIdle.
-    let grandparent = session(0xc2);
-    let middle = session(0xc3);
-    let leaf = session(0xc4);
-    create(storage.as_ref(), grandparent, None);
-    append(storage.as_ref(), grandparent, &turn_started(), None);
-    create(storage.as_ref(), middle, Some(grandparent));
-    create(storage.as_ref(), leaf, Some(middle));
-    let middle_frontier = frontier(storage.as_ref(), middle).expect("frontier");
-    let error = retire_error(storage.as_ref(), middle, middle_frontier);
-    assert!(
-        matches!(error, RetirementError::HasChildren),
-        "got {error:?}"
-    );
-
-    // A tombstone outranks the live-session checks: a different expected
-    // frontier reports what was actually retired.
-    let done = session(0xc5);
-    create(storage.as_ref(), done, None);
-    let done_frontier = frontier(storage.as_ref(), done).expect("frontier");
-    retire(storage.as_ref(), done, done_frontier);
-    let error = retire_error(
-        storage.as_ref(),
-        done,
-        LogId::from_i64(done_frontier.as_i64() + 1),
-    );
-    assert!(
-        matches!(
-            error,
-            RetirementError::FrontierMoved {
-                actual: Some(actual),
-                ..
-            } if actual == done_frontier
-        ),
-        "got {error:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // G8: every write in the retirement transaction rolls back together.
 // ---------------------------------------------------------------------------
 
@@ -417,7 +193,7 @@ fn a_failing_delete_rolls_back_the_whole_retirement() {
         let injected = rusqlite::Connection::open(&db).expect("raw open");
         injected
             .execute_batch(
-                "CREATE TRIGGER fail_pending_delete BEFORE DELETE ON pending_inputs \
+                "CREATE TRIGGER fail_sessions_delete BEFORE DELETE ON sessions \
                  BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .expect("inject failing delete");
@@ -434,7 +210,6 @@ fn a_failing_delete_rolls_back_the_whole_retirement() {
     assert_eq!(count(&conn, "retired_sessions"), 0, "no tombstone");
     assert_eq!(count(&conn, "log"), 2, "log rows survive");
     assert_eq!(count(&conn, "sessions"), 1, "session row survives");
-    assert_eq!(count(&conn, "pending_inputs"), 1, "derived rows survive");
     drop(conn);
 
     let storage = open(&db).expect("reopen");
@@ -442,11 +217,11 @@ fn a_failing_delete_rolls_back_the_whole_retirement() {
 }
 
 // ---------------------------------------------------------------------------
-// R9: no pending-input rows survive; no wake is produced.
+// R9: nothing of the session survives; it is no longer listed.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn retirement_leaves_no_wakeable_pending_rows() {
+fn retirement_leaves_no_rows_behind() {
     let dir = TempDir::new("retire-rows");
     let db = dir.db();
     let target = session(0xb8);
@@ -458,39 +233,13 @@ fn retirement_leaves_no_wakeable_pending_rows() {
     retire(storage.as_ref(), target, captured);
 
     assert!(
-        block_on(storage.wakeable(1_000))
-            .expect("wakeable")
-            .is_empty(),
-        "a retired session is never wakeable"
+        block_on(storage.sessions()).expect("sessions").is_empty(),
+        "a retired session is never listed, so never woken"
     );
     drop(storage);
 
     let conn = rusqlite::Connection::open(&db).expect("raw open");
-    for table in ["log", "open_intents", "pending_inputs", "sessions"] {
+    for table in ["log", "sessions"] {
         assert_eq!(count(&conn, table), 0, "{table} must be empty");
     }
-}
-
-// ---------------------------------------------------------------------------
-// An unclosed compaction intent does not make the session non-idle.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn an_open_compaction_intent_still_counts_as_idle() {
-    let dir = TempDir::new("retire-compaction");
-    let db = dir.db();
-    let target = session(0xb9);
-    let storage = open(&db).expect("open");
-    create(storage.as_ref(), target, None);
-    let intent_frontier = LogId::from_i64(1);
-    append(
-        storage.as_ref(),
-        target,
-        &compaction_started(intent_frontier),
-        Some(dedup::compaction(intent_frontier)),
-    );
-    let captured = frontier(storage.as_ref(), target).expect("frontier");
-
-    retire(storage.as_ref(), target, captured);
-    assert!(frontier(storage.as_ref(), target).is_none());
 }

@@ -17,7 +17,7 @@ use asterpath_protocol::{
     SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
     ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
-use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -234,7 +234,7 @@ impl ApprovalPolicy for AlwaysAsk {
     }
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -345,7 +345,7 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
     // The finished stream still holds the single-flight guard until dropped.
     drop(stream);
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -366,7 +366,7 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
     let before = entries.len();
     let replay = drive_all(&handle).await;
     assert!(matches!(replay.as_slice(), [AgentEvent::Idle { .. }]));
-    assert_eq!(scan(asterpath.event_log(), handle.id()).await.len(), before);
+    assert_eq!(scan(asterpath.store(), handle.id()).await.len(), before);
     assert_eq!(provider.calls(), 1);
     assert!(matches!(
         handle.state().await.unwrap(),
@@ -381,7 +381,7 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnStarted { .. }))
     );
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         turn_reasons(&entries),
         vec![TurnEndReason::Cancelled, TurnEndReason::Completed]
@@ -428,7 +428,7 @@ async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
         }
     }
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         tool_results(&entries),
         vec![(ToolResultStatus::Interrupted, None, false)]
@@ -489,7 +489,7 @@ async fn cancel_with_grace_keeps_a_tool_result_that_returns_in_time() {
         }
     }
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         tool_results(&entries),
         vec![(ToolResultStatus::Completed, None, true)]
@@ -531,7 +531,7 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
         }
     }
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "cancel skips the tool");
     assert_eq!(
         tool_results(&entries),
@@ -575,7 +575,7 @@ async fn idempotent_cancel_during_a_tool_and_idle_cancel_is_a_no_op() {
     // Idle: no active turn, so cancel writes nothing.
     handle.cancel().await.unwrap();
     handle.cancel().await.unwrap();
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(kinds(&entries), ["SessionCreated"]);
 
     handle.submit_input(input(1, "go")).await.unwrap();
@@ -589,7 +589,7 @@ async fn idempotent_cancel_during_a_tool_and_idle_cancel_is_a_no_op() {
         }
     }
 
-    let decoded = decoded(&scan(asterpath.event_log(), handle.id()).await);
+    let decoded = decoded(&scan(asterpath.store(), handle.id()).await);
     let committed: Vec<_> = decoded
         .iter()
         .filter(|event| matches!(event, SessionEvent::TurnCommitted { .. }))
@@ -657,7 +657,7 @@ async fn steering_enters_the_next_step_projection_in_seq_order() {
         "steering stays in the same turn"
     );
     assert_eq!(
-        turn_reasons(&scan(asterpath.event_log(), handle.id()).await),
+        turn_reasons(&scan(asterpath.store(), handle.id()).await),
         vec![TurnEndReason::Completed]
     );
 
@@ -749,7 +749,7 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
     });
     assert!(contains_steer, "steering is visible to the next step");
     assert_eq!(
-        turn_reasons(&scan(asterpath.event_log(), handle.id()).await),
+        turn_reasons(&scan(asterpath.store(), handle.id()).await),
         vec![TurnEndReason::Completed]
     );
 
@@ -789,7 +789,7 @@ async fn max_steps_per_turn_ends_with_max_steps_exceeded() {
     handle.submit_input(input(1, "go")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         turn_reasons(&entries),
         vec![TurnEndReason::MaxStepsExceeded]
@@ -822,7 +822,7 @@ async fn context_window_stop_reason_and_provider_error_map_to_context_exhausted(
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
     drive_all(&handle).await;
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         turn_reasons(&entries),
         vec![TurnEndReason::ContextExhausted]
@@ -847,7 +847,7 @@ async fn context_window_stop_reason_and_provider_error_map_to_context_exhausted(
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
     drive_all(&handle).await;
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         turn_reasons(&entries),
         vec![TurnEndReason::ContextExhausted]
@@ -897,7 +897,7 @@ async fn cancel_interrupts_the_retry_backoff_sleep() {
     .await
     .expect("cancel interrupts the backoff sleep");
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         abort_kinds(&entries),
         vec![(1, AbortKind::Transport), (2, AbortKind::Cancelled)],

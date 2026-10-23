@@ -21,7 +21,7 @@ use asterpath_protocol::{
     approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    ApprovalGate, DedupKey, EventLog, InputId, LogEntry, LogId, LogQuery, SessionId,
+    ApprovalGate, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore,
     SignalDelivery, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
@@ -232,7 +232,7 @@ struct Harness {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agent_with<L: EventLog + 'static>(
+fn agent_with<L: SessionStore + 'static>(
     log: Arc<L>,
     provider: Arc<ScriptedProvider>,
     tools: Vec<Arc<dyn Tool>>,
@@ -242,7 +242,7 @@ fn agent_with<L: EventLog + 'static>(
     clock: Arc<ManualClock>,
     hooks: Option<Arc<dyn Hooks>>,
 ) -> Agent {
-    let log: Arc<dyn EventLog> = log;
+    let log: Arc<dyn SessionStore> = log;
     let registry = tool_table(tools);
     let executor = executor.unwrap_or_else(|| Arc::new(Waits::new(Arc::clone(&log))));
     let provider: Arc<dyn Provider> = provider;
@@ -1762,7 +1762,7 @@ struct CorruptParentLog {
     corrupt: LogEntry,
 }
 
-impl EventLog for CorruptParentLog {
+impl SessionStore for CorruptParentLog {
     fn append(
         &self,
         entry: asterpath_protocol::NewEntry,
@@ -1786,5 +1786,24 @@ impl EventLog for CorruptParentLog {
         session: SessionId,
     ) -> BoxFuture<'_, Result<Option<LogId>, asterpath_protocol::StorageError>> {
         self.inner.frontier(session)
+    }
+
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, asterpath_protocol::StorageError>> {
+        self.inner.sessions()
+    }
+
+    fn parent(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'_, Result<Option<SessionId>, asterpath_protocol::StorageError>> {
+        self.inner.parent(session)
+    }
+
+    fn children(
+        &self,
+        session: SessionId,
+    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath_protocol::StorageError>>
+    {
+        self.inner.children(session)
     }
 }

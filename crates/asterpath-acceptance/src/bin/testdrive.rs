@@ -22,7 +22,7 @@ use asterpath_protocol::{
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig, TurnEndReason,
     UserInput, decode_entry,
 };
-use asterpath_protocol::{Clock, EventLog, InputId, SessionCatalog, SessionId, Storage};
+use asterpath_protocol::{InputId, SessionId, SessionStore};
 use asterpath_sandbox::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
@@ -423,12 +423,8 @@ fn marker(event: &str) {
     emit(json!({"event": event}));
 }
 
-fn now(clock: &ManualClock) -> i64 {
-    clock.now()
-}
-
 async fn scan(
-    log: Arc<dyn EventLog>,
+    log: Arc<dyn SessionStore>,
     session: SessionId,
 ) -> Result<Vec<asterpath_protocol::LogEntry>, String> {
     scan_all(&*log, session)
@@ -489,16 +485,11 @@ async fn assemble(
     if !args.failpoints.is_empty() {
         let backend =
             asterpath_storage_sqlite::open(&args.db).map_err(|error| error.to_string())?;
-        let mut log: Arc<dyn EventLog> = backend.clone();
+        let mut log: Arc<dyn SessionStore> = backend;
         for failpoint in args.failpoints.iter().filter(|fp| fp.point.is_append()) {
             log = Arc::new(FailpointEventLog::new(log, failpoint.clone()));
         }
-        let storage: Arc<dyn Storage> = backend.clone();
-        let catalog: Arc<dyn SessionCatalog> = backend;
-        builder = builder
-            .event_log(log)
-            .storage(storage)
-            .session_catalog(catalog);
+        builder = builder.store(log);
     } else {
         builder = builder.database(&args.db);
     }
@@ -652,10 +643,8 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
             .map_err(|error| error.to_string())?;
         handle
     } else {
-        let clock = ManualClock::new();
         let wakeable = asterpath
-            .storage()
-            .wakeable(now(&clock))
+            .wakeable()
             .await
             .map_err(|error| error.to_string())?;
         emit(
@@ -677,7 +666,7 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
                 session
             }
         };
-        let entries = scan(asterpath.event_log(), session).await?;
+        let entries = scan(asterpath.store(), session).await?;
         let committed_attempts = entries
             .iter()
             .filter_map(|entry| decode_entry(entry).ok())
@@ -775,11 +764,13 @@ fn reason_name(reason: &TurnEndReason) -> String {
 
 async fn inspect(args: &Args) -> Result<i32, String> {
     let backend = asterpath_storage_sqlite::open(&args.db).map_err(|error| error.to_string())?;
-    let storage: Arc<dyn Storage> = backend.clone();
-    let log: Arc<dyn EventLog> = backend;
-    let clock = ManualClock::new();
-    let wakeable = storage
-        .wakeable(now(&clock))
+    let asterpath = Asterpath::builder()
+        .store(backend)
+        .build()
+        .await
+        .map_err(|error| error.to_string())?;
+    let wakeable = asterpath
+        .wakeable()
         .await
         .map_err(|error| error.to_string())?;
     emit(
@@ -787,7 +778,7 @@ async fn inspect(args: &Args) -> Result<i32, String> {
     );
     if let Some(hex) = &args.session {
         let bytes = parse_session_id(hex)?;
-        let entries = scan(log, bytes).await?;
+        let entries = scan(asterpath.store(), bytes).await?;
         for entry in &entries {
             let kind = decode_entry(entry)
                 .map(|event| event.kind())

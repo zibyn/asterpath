@@ -1,20 +1,14 @@
 //! The in-memory backend runs the same backend-neutral suites as SQLite.
 
 use asterpath_protocol::{
-    ConfigSnapshot, EventLog, ModelId, ModelSpec, ParentRef, ProviderId, SessionCatalog,
-    SessionEvent, SessionId, ToolCallId, TurnId, encode_entry, scan_all,
+    ConfigSnapshot, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent, SessionId,
+    SessionStore, ToolCallId, TurnId, encode_entry, scan_all,
 };
-use asterpath_testing::{InMemoryEventLog, MemoryBackend, event_log_contract, storage_contract};
-use futures_util::StreamExt;
+use asterpath_testing::{InMemoryEventLog, MemoryBackend, session_store_contract};
 
-#[test]
-fn in_memory_backend_satisfies_the_shared_event_log_contract() {
-    event_log_contract(&MemoryBackend::new());
-}
-
-#[test]
-fn in_memory_backend_satisfies_the_shared_storage_contract() {
-    storage_contract(&MemoryBackend::new());
+#[tokio::test]
+async fn in_memory_backend_satisfies_the_shared_session_store_contract() {
+    session_store_contract(&MemoryBackend::new()).await;
 }
 
 fn created(parent: Option<SessionId>) -> SessionEvent {
@@ -38,37 +32,6 @@ fn created(parent: Option<SessionId>) -> SessionEvent {
             tool_call: ToolCallId::from_bytes([8; 16]),
         }),
     }
-}
-
-#[tokio::test]
-async fn in_memory_log_is_a_session_catalog_over_session_created_parents() {
-    let root = SessionId::from_bytes([1; 16]);
-    let first = SessionId::from_bytes([3; 16]);
-    let second = SessionId::from_bytes([2; 16]);
-    let log = InMemoryEventLog::new();
-    for (session, parent) in [(root, None), (first, Some(root)), (second, Some(root))] {
-        log.append(encode_entry(session, None, &created(parent)).unwrap())
-            .await
-            .unwrap();
-    }
-
-    assert_eq!(log.parent(root).await.unwrap(), None);
-    assert_eq!(log.parent(first).await.unwrap(), Some(root));
-    assert_eq!(
-        log.parent(SessionId::from_bytes([7; 16])).await.unwrap(),
-        None
-    );
-    let children: Vec<SessionId> = log
-        .children(root)
-        .map(|child| child.unwrap())
-        .collect()
-        .await;
-    assert_eq!(
-        children,
-        vec![second, first],
-        "ordered by session id, like SQLite"
-    );
-    assert!(log.children(first).next().await.is_none());
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AwaitSignal, EventLog, ExecutionError, LogId, SessionId, SignalDelivery, SignalId,
+    AwaitSignal, ExecutionError, LogId, SessionId, SessionStore, SignalDelivery, SignalId,
     SignalPayload, WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
@@ -54,12 +54,12 @@ impl Waiters {
 
 /// Approval and child-completion waits backed by the event log.
 pub(crate) struct Waits {
-    log: Arc<dyn EventLog>,
+    log: Arc<dyn SessionStore>,
     waiters: Waiters,
 }
 
 impl Waits {
-    pub(crate) fn new(log: Arc<dyn EventLog>) -> Self {
+    pub(crate) fn new(log: Arc<dyn SessionStore>) -> Self {
         Self {
             log,
             waiters: Waiters::default(),

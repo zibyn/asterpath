@@ -603,7 +603,7 @@ fn task_text(parts: &[Part]) -> String {
 /// The facade holds the writer lock, so scenario (c) reads through its log
 /// instead of opening a second connection.
 async fn committed(
-    log: &dyn asterpath_protocol::EventLog,
+    log: &dyn asterpath_protocol::SessionStore,
     session: SessionId,
 ) -> Vec<asterpath_protocol::LogEntry> {
     let mut stream = log.scan(asterpath_protocol::LogQuery {
@@ -668,7 +668,7 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
         .await
         .expect("reopen the acceptance database");
 
-    let log = asterpath.event_log();
+    let log = asterpath.store();
     let entries = committed(log.as_ref(), parent).await;
     let events: Vec<SessionEvent> = entries
         .iter()
@@ -801,7 +801,7 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
 
     // --- child logs: one clean turn each ----------------------------------
 
-    let catalog = asterpath.session_catalog();
+    let catalog = asterpath.store();
     let mut child_stream = catalog.children(parent);
     let mut catalog_children = Vec::new();
     while let Some(child) = child_stream.next().await {

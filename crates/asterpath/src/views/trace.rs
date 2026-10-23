@@ -1,7 +1,7 @@
 //! Native execution tracing: a deterministic projection of the event log.
 //!
 //! There is no trace sink, no trace table and no push channel: [`TracingQuery`]
-//! folds the injected [`EventLog`] on demand. Live export is the host's own
+//! folds the injected [`SessionStore`] on demand. Live export is the host's own
 //! incremental fold over `Hooks::on_record`. `recorded_at` only feeds timings
 //! and statuses here, never recovery or projection.
 
@@ -17,7 +17,7 @@ use asterpath_protocol::{
     WaitKind, decode_entry,
 };
 use asterpath_protocol::{
-    EventLog, Fnv, LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, StorageError,
+    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, SignalId, StepId, StorageError,
     Timestamp, ToolCallId, TurnId,
 };
 use futures_core::stream::BoxStream;
@@ -25,11 +25,11 @@ use futures_util::{StreamExt, stream};
 
 /// Pull seam: folds one session's log per request.
 pub(crate) struct TracingQuery {
-    log: Arc<dyn EventLog>,
+    log: Arc<dyn SessionStore>,
 }
 
 impl TracingQuery {
-    pub(crate) fn new(log: Arc<dyn EventLog>) -> Self {
+    pub(crate) fn new(log: Arc<dyn SessionStore>) -> Self {
         Self { log }
     }
 }
@@ -70,7 +70,7 @@ fn matches_filter(span: &Span, filter: &SpanFilter) -> bool {
         && (!filter.open_only || span.ended_at.is_none())
 }
 
-async fn fold_session(log: &dyn EventLog, session: SessionId) -> Result<Vec<Span>, TraceError> {
+async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<Span>, TraceError> {
     let entries = scan(log, session).await?;
     let mut decoded = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -102,7 +102,7 @@ async fn fold_session(log: &dyn EventLog, session: SessionId) -> Result<Vec<Span
     Ok(folder.finish())
 }
 
-async fn scan(log: &dyn EventLog, session: SessionId) -> Result<Vec<LogEntry>, TraceError> {
+async fn scan(log: &dyn SessionStore, session: SessionId) -> Result<Vec<LogEntry>, TraceError> {
     let entries = scan_all(log, session).await.map_err(|error| match error {
         StorageError::Corrupt { detail, .. } => TraceError::Corrupt { session, detail },
         error => TraceError::Backend(error.to_string()),
@@ -726,7 +726,7 @@ impl Folder {
             .find(|index| self.spans[*index].ended_at.is_none())
     }
 
-    async fn resolve_child_root(&mut self, log: &dyn EventLog) {
+    async fn resolve_child_root(&mut self, log: &dyn SessionStore) {
         let Some(parent) = self.parent_session else {
             return;
         };

@@ -15,7 +15,7 @@ use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, Provider, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, Tool, ToolSelection, TurnConfig, UserInput,
 };
-use asterpath_protocol::{EventLog, InputId, LogQuery};
+use asterpath_protocol::{InputId, LogQuery, SessionStore};
 use asterpath_skills::{LoadSkillTool, SkillRoot, SkillRootLabel};
 use asterpath_testing::ScriptedProvider;
 use common::{MockServer, bin};

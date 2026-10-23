@@ -11,7 +11,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asterpath_protocol::{EventLog, LogEntry, LogId, LogQuery, NewEntry, StorageError};
+use asterpath_protocol::{
+    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore, StorageError,
+};
 use asterpath_protocol::{Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -120,15 +122,15 @@ impl Failpoint {
     }
 }
 
-/// `EventLog` decorated with one append failpoint.
+/// `SessionStore` decorated with one append failpoint.
 pub struct FailpointEventLog {
-    inner: Arc<dyn EventLog>,
+    inner: Arc<dyn SessionStore>,
     failpoint: Failpoint,
     hits: AtomicUsize,
 }
 
 impl FailpointEventLog {
-    pub fn new(inner: Arc<dyn EventLog>, failpoint: Failpoint) -> Self {
+    pub fn new(inner: Arc<dyn SessionStore>, failpoint: Failpoint) -> Self {
         assert!(
             failpoint.point.is_append(),
             "{} is not an append failpoint",
@@ -142,7 +144,7 @@ impl FailpointEventLog {
     }
 }
 
-impl EventLog for FailpointEventLog {
+impl SessionStore for FailpointEventLog {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         Box::pin(async move {
             if self.failpoint.point == Point::AppendBeforeCommit && self.failpoint.hit(&self.hits) {
@@ -160,11 +162,28 @@ impl EventLog for FailpointEventLog {
         self.inner.scan(query)
     }
 
-    fn frontier(
-        &self,
-        session: asterpath_protocol::SessionId,
-    ) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
+    fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
+    }
+
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        self.inner.sessions()
+    }
+
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        self.inner.parent(session)
+    }
+
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
+        self.inner.children(session)
+    }
+
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        self.inner.retire(session, expected_frontier)
     }
 }
 

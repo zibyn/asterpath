@@ -15,7 +15,7 @@ use asterpath_protocol::{
     RunRequest, RunTrigger, SessionEvent, StopReason, SubagentConfig, Tool, ToolConfig,
     ToolDescriptor, TurnConfig, Usage, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{ApprovalGate, DedupKey, EventLog, LogId, SessionId, StepId, TurnId};
+use asterpath_protocol::{ApprovalGate, DedupKey, LogId, SessionId, SessionStore, StepId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;

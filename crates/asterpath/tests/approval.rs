@@ -17,7 +17,7 @@ use asterpath_protocol::{
     ToolName, ToolOutput, ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id,
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
-use asterpath_protocol::{DedupKey, EventLog, LogEntry, LogQuery, SessionId, ToolCallId};
+use asterpath_protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -161,7 +161,7 @@ fn echo_tool(calls: Arc<Mutex<Vec<ToolArgs>>>) -> Arc<dyn Tool> {
     }))
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -257,7 +257,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
     assert_eq!(request.tool.as_str(), "echo");
 
     // Still suspended: no result recorded while waiting.
-    let before = scan(asterpath.event_log(), handle.id()).await;
+    let before = scan(asterpath.store(), handle.id()).await;
     assert!(tool_results(&before).is_empty());
     assert!(calls.lock().unwrap().is_empty());
 
@@ -270,7 +270,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         event.expect("drive");
     }
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
     assert_eq!(
@@ -285,7 +285,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .approve(request.tool_call_id, ApprovalDecision::Allow)
         .await
         .expect("duplicate approve");
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(kind_count(&entries, "SignalReceived"), 1);
 
     asterpath.shutdown().await.unwrap();
@@ -337,7 +337,7 @@ async fn ask_with_open_gate_deny_records_denied_with_reason() {
         event.expect("drive");
     }
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
@@ -377,7 +377,7 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
             .any(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
     );
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
@@ -420,7 +420,7 @@ async fn recorded_decision_is_reused_without_reprompting() {
     let turn = asterpath_protocol::TurnId::from_bytes([1; 16]);
     let step = asterpath_protocol::StepId::from_bytes([2; 16]);
     let call = ToolCallId::from_bytes([3; 16]);
-    let log = asterpath.event_log();
+    let log = asterpath.store();
     append(
         &log,
         session,
@@ -488,7 +488,7 @@ async fn recorded_decision_is_reused_without_reprompting() {
             .any(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
-    let entries = scan(asterpath.event_log(), session).await;
+    let entries = scan(asterpath.store(), session).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
     assert_eq!(
@@ -536,7 +536,7 @@ async fn cancel_before_deadline_wins_over_timeout() {
 
     drive_events(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1, "exactly one terminal record");
     assert_eq!(
@@ -586,7 +586,7 @@ async fn real_result_within_grace_beats_cancellation() {
 
     drive_events(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results.len(), 1);
     assert_eq!(
@@ -646,7 +646,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
             .iter()
             .any(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
     );
-    let entries = scan(asterpath.event_log(), denied.id()).await;
+    let entries = scan(asterpath.store(), denied.id()).await;
     let results = tool_results(&entries);
     assert_eq!(results[0].0, asterpath_protocol::ToolResultStatus::Failed);
     assert!(calls.lock().unwrap().is_empty());
@@ -673,7 +673,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
     while let Some(event) = stream.next().await {
         event.expect("drive");
     }
-    let entries = scan(asterpath.event_log(), allowed.id()).await;
+    let entries = scan(asterpath.store(), allowed.id()).await;
     let results = tool_results(&entries);
     assert_eq!(
         results[0].0,
@@ -686,7 +686,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
 }
 
 async fn append(
-    log: &Arc<dyn EventLog>,
+    log: &Arc<dyn SessionStore>,
     session: SessionId,
     event: SessionEvent,
     key: Option<DedupKey>,

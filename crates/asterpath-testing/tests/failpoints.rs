@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asterpath_protocol::{EventLog, LogQuery, SessionId};
 use asterpath_protocol::{
     JsonString, Parallelism, Part, Provenance, Provider, ReplaySafety, SessionEvent, SideEffect,
     Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
 };
+use asterpath_protocol::{LogQuery, SessionId, SessionStore};
 use asterpath_testing::{
     Failpoint, FailpointEventLog, FailpointTool, Fixture, InMemoryEventLog, Point, ScriptedProvider,
 };
@@ -36,7 +36,7 @@ fn canonical_point_names_round_trip() {
     assert!(Point::parse("clock:advance").is_none(), "not a decorator");
 }
 
-async fn append(log: &dyn EventLog, text: &str) {
+async fn append(log: &dyn SessionStore, text: &str) {
     let event = SessionEvent::InputRecorded {
         input: vec![Part::Text {
             text: text.to_owned(),
@@ -81,7 +81,7 @@ async fn event_log_delegates_everything_until_the_occurrence() {
 #[tokio::test]
 #[should_panic(expected = "tool:before_effect is not an append failpoint")]
 async fn event_log_rejects_a_tool_domain_point() {
-    let inner: Arc<dyn EventLog> = Arc::new(InMemoryEventLog::new());
+    let inner: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let _ = FailpointEventLog::new(inner, Failpoint::panic(Point::ToolBeforeEffect));
 }
 

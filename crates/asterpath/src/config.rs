@@ -5,9 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath_protocol::{
-    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, Storage, SystemClock,
-};
+use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SystemClock};
 use asterpath_protocol::{
     ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec, Provider, Tool,
     ToolConfig,
@@ -24,12 +22,9 @@ pub struct AsterpathConfig {
     /// Optional compaction capability. `None` (the M0 default) makes every
     /// compaction path report `NotConfigured`.
     pub compactor: Option<Arc<dyn Compactor>>,
-    /// Overrides the `sqlite` feature; must be paired with `storage`.
-    pub event_log: Option<Arc<dyn EventLog>>,
-    pub storage: Option<Arc<dyn Storage>>,
-    pub session_catalog: Option<Arc<dyn SessionCatalog>>,
-    /// Optional: injected storage may not implement retirement.
-    pub session_retirement: Option<Arc<dyn SessionRetirement>>,
+    /// Overrides the `sqlite` feature. An injected store may keep the
+    /// default `Unsupported` retirement.
+    pub store: Option<Arc<dyn SessionStore>>,
     pub clock: Arc<dyn Clock>,
     /// Defaults to the built-in policy over [`Self::gate`].
     pub approval: Arc<dyn ApprovalPolicy>,
@@ -51,10 +46,7 @@ impl Default for AsterpathConfig {
             tools: Vec::new(),
             tool: ToolConfig::default(),
             compactor: None,
-            event_log: None,
-            storage: None,
-            session_catalog: None,
-            session_retirement: None,
+            store: None,
             clock: Arc::new(SystemClock),
             approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
             gate,
@@ -131,26 +123,8 @@ impl AsterpathBuilder {
     }
 
     #[must_use]
-    pub fn event_log(mut self, event_log: Arc<dyn EventLog>) -> Self {
-        self.config.event_log = Some(event_log);
-        self
-    }
-
-    #[must_use]
-    pub fn storage(mut self, storage: Arc<dyn Storage>) -> Self {
-        self.config.storage = Some(storage);
-        self
-    }
-
-    #[must_use]
-    pub fn session_catalog(mut self, catalog: Arc<dyn SessionCatalog>) -> Self {
-        self.config.session_catalog = Some(catalog);
-        self
-    }
-
-    #[must_use]
-    pub fn session_retirement(mut self, retirement: Arc<dyn SessionRetirement>) -> Self {
-        self.config.session_retirement = Some(retirement);
+    pub fn store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.config.store = Some(store);
         self
     }
 

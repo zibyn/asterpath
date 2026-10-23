@@ -1,16 +1,15 @@
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry,
-    RetirementError, SessionCatalog, SessionId, SessionRetirement, SignalId, SignalName, Storage,
-    StorageError, SystemClock, Timestamp,
+    ApprovalGate, AwaitSignal, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
+    RetirementError, SessionId, SessionStore, SignalId, SignalName, StorageError, SystemClock,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::StreamExt;
 use futures_util::stream;
+use futures_util::{FutureExt, StreamExt};
 
-struct DummyLog;
+struct DummyStore;
 
-impl EventLog for DummyLog {
+impl SessionStore for DummyStore {
     fn append(&self, _entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         Box::pin(async { Ok(LogId::from_i64(1)) })
     }
@@ -22,19 +21,11 @@ impl EventLog for DummyLog {
     fn frontier(&self, _session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         Box::pin(async { Ok(None) })
     }
-}
 
-struct DummyStorage;
-
-impl Storage for DummyStorage {
-    fn wakeable(&self, _now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
-}
 
-struct DummyCatalog;
-
-impl SessionCatalog for DummyCatalog {
     fn parent(
         &self,
         _session: SessionId,
@@ -47,24 +38,9 @@ impl SessionCatalog for DummyCatalog {
     }
 }
 
-struct DummyRetirement;
-
-impl SessionRetirement for DummyRetirement {
-    fn retire(
-        &self,
-        _session: SessionId,
-        _expected_frontier: LogId,
-    ) -> BoxFuture<'_, Result<(), RetirementError>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 #[test]
 fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
-    let _: &dyn EventLog = &DummyLog;
-    let _: &dyn Storage = &DummyStorage;
-    let _: &dyn SessionCatalog = &DummyCatalog;
-    let _: &dyn SessionRetirement = &DummyRetirement;
+    let _: &dyn SessionStore = &DummyStore;
 
     let session = SessionId::from_bytes([7; 16]);
     let _new = NewEntry {
@@ -92,6 +68,16 @@ fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
         signal: SignalId::from_bytes([3; 16]),
         name: SignalName::new("tool.approval.c1"),
     };
+}
+
+#[test]
+fn retirement_defaults_to_unsupported() {
+    let error = DummyStore
+        .retire(SessionId::from_bytes([1; 16]), LogId::from_i64(1))
+        .now_or_never()
+        .expect("ready")
+        .expect_err("default retire");
+    assert!(matches!(error, RetirementError::Unsupported));
 }
 
 #[test]

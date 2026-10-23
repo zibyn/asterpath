@@ -22,8 +22,8 @@ use asterpath_protocol::{
     ToolContext, ToolError,
 };
 use asterpath_protocol::{
-    Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionCatalog, SessionId, StorageError,
-    SystemClock, Timestamp, ToolCallId, TurnId,
+    Clock, DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StorageError, SystemClock,
+    Timestamp, ToolCallId, TurnId,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_core::future::BoxFuture;
@@ -77,7 +77,7 @@ fn parent_ref(session: SessionId) -> asterpath_protocol::ParentRef {
     }
 }
 
-async fn append(log: &dyn EventLog, session: SessionId, event: SessionEvent) -> LogId {
+async fn append(log: &dyn SessionStore, session: SessionId, event: SessionEvent) -> LogId {
     let entry = encode_entry(session, None, &event).expect("encodes");
     log.append(entry).await.expect("appends")
 }
@@ -90,7 +90,7 @@ fn encoded(
     encode_entry(session, key, event).expect("encodes")
 }
 
-async fn kinds(log: &dyn EventLog, session: SessionId) -> Vec<&'static str> {
+async fn kinds(log: &dyn SessionStore, session: SessionId) -> Vec<&'static str> {
     events(log, session)
         .await
         .into_iter()
@@ -98,7 +98,7 @@ async fn kinds(log: &dyn EventLog, session: SessionId) -> Vec<&'static str> {
         .collect()
 }
 
-async fn events(log: &dyn EventLog, session: SessionId) -> Vec<SessionEvent> {
+async fn events(log: &dyn SessionStore, session: SessionId) -> Vec<SessionEvent> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -112,18 +112,15 @@ async fn events(log: &dyn EventLog, session: SessionId) -> Vec<SessionEvent> {
     events
 }
 
-/// The scheduler and a real agent over `log`, which is also the session
-/// catalog. The agent's provider has no script; tests that drive a child
+/// The scheduler and a real agent over the store `log`. The agent's provider has no script; tests that drive a child
 /// build their own with [`agent_for`].
-fn new_scheduler<L: EventLog + SessionCatalog + 'static>(
+fn new_scheduler<L: SessionStore + 'static>(
     log: Arc<L>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
 ) -> (Arc<Scheduler>, Agent) {
-    let catalog: Arc<dyn SessionCatalog> = log.clone();
-    let log: Arc<dyn EventLog> = log;
+    let log: Arc<dyn SessionStore> = log;
     let scheduler = Arc::new(Scheduler::new(
         Arc::clone(&log),
-        catalog,
         Arc::new(Waits::new(Arc::clone(&log))),
         aliases,
     ));
@@ -131,15 +128,13 @@ fn new_scheduler<L: EventLog + SessionCatalog + 'static>(
     (scheduler, agent)
 }
 
-fn new_scheduler_with<L: EventLog + SessionCatalog + 'static>(
+fn new_scheduler_with<L: SessionStore + 'static>(
     log: Arc<L>,
     clock: Arc<dyn Clock>,
 ) -> (Arc<Scheduler>, Agent) {
-    let catalog: Arc<dyn SessionCatalog> = log.clone();
-    let log: Arc<dyn EventLog> = log;
+    let log: Arc<dyn SessionStore> = log;
     let scheduler = Arc::new(Scheduler::with_runtime(
         Arc::clone(&log),
-        catalog,
         Arc::new(Waits::new(Arc::clone(&log))),
         BTreeMap::new(),
         clock,
@@ -153,7 +148,7 @@ fn new_scheduler_with<L: EventLog + SessionCatalog + 'static>(
 /// The real agent that drives children of `scheduler`, sharing its
 /// cancellation registry.
 fn agent_for(
-    log: Arc<dyn EventLog>,
+    log: Arc<dyn SessionStore>,
     scheduler: &Arc<Scheduler>,
     provider: Arc<ScriptedProvider>,
 ) -> Agent {
@@ -978,7 +973,7 @@ struct PoisonLog {
     parent: SessionId,
 }
 
-impl EventLog for PoisonLog {
+impl SessionStore for PoisonLog {
     fn append(
         &self,
         entry: asterpath_protocol::NewEntry,
@@ -1003,9 +998,11 @@ impl EventLog for PoisonLog {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
     }
-}
 
-impl SessionCatalog for PoisonLog {
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        self.inner.sessions()
+    }
+
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
     }
@@ -1080,7 +1077,7 @@ fn fork_parent_ref() -> asterpath_protocol::ParentRef {
 }
 
 async fn append_keyed(
-    log: &dyn EventLog,
+    log: &dyn SessionStore,
     session: SessionId,
     event: SessionEvent,
     key: DedupKey,
@@ -1091,7 +1088,7 @@ async fn append_keyed(
 
 /// Parent history before the spawn step, then the spawn step itself
 /// (assistant message and sibling tool result) that the fork must not see.
-async fn seed_fork_parent(log: &dyn EventLog, subagents: &SubagentConfig) -> (LogId, LogId) {
+async fn seed_fork_parent(log: &dyn SessionStore, subagents: &SubagentConfig) -> (LogId, LogId) {
     append(
         log,
         PARENT,
@@ -1691,7 +1688,7 @@ fn request_for(
     SpawnRequest::new(parent, caused_by, vec![text("task")])
 }
 
-async fn spawned_calls(log: &dyn EventLog, parent: SessionId) -> Vec<ToolCallId> {
+async fn spawned_calls(log: &dyn SessionStore, parent: SessionId) -> Vec<ToolCallId> {
     events(log, parent)
         .await
         .into_iter()
@@ -2023,7 +2020,7 @@ struct CompletesInGrace {
     child: SessionId,
 }
 
-impl EventLog for CompletesInGrace {
+impl SessionStore for CompletesInGrace {
     fn append(
         &self,
         entry: asterpath_protocol::NewEntry,
@@ -2054,9 +2051,11 @@ impl EventLog for CompletesInGrace {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
     }
-}
 
-impl SessionCatalog for CompletesInGrace {
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        self.inner.sessions()
+    }
+
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
     }
@@ -2172,7 +2171,7 @@ fn spawn_with_deadline(
     }
 }
 
-async fn completions(log: &dyn EventLog, parent: SessionId) -> Vec<ChildOutcome> {
+async fn completions(log: &dyn SessionStore, parent: SessionId) -> Vec<ChildOutcome> {
     events(log, parent)
         .await
         .into_iter()
@@ -2185,7 +2184,7 @@ async fn completions(log: &dyn EventLog, parent: SessionId) -> Vec<ChildOutcome>
 
 /// An agent whose child never reaches a terminal, however long it is driven:
 /// the model stream opens and never ends.
-fn hanging_agent(log: Arc<dyn EventLog>, scheduler: &Arc<Scheduler>) -> Agent {
+fn hanging_agent(log: Arc<dyn SessionStore>, scheduler: &Arc<Scheduler>) -> Agent {
     agent_for(
         log,
         scheduler,

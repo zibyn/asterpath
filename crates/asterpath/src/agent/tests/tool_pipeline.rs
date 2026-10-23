@@ -16,7 +16,7 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName, ToolOutput, ToolResultStatus,
     ToolResultView, TurnConfig, TurnEndReason, Usage, decode_entry, encode_entry,
 };
-use asterpath_protocol::{ApprovalGate, EventLog, LogQuery, SessionId, ToolCallId, TurnId};
+use asterpath_protocol::{ApprovalGate, LogQuery, SessionId, SessionStore, ToolCallId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;

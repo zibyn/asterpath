@@ -20,7 +20,7 @@ use asterpath_protocol::{
     ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath_protocol::{
-    ApprovalGate, EventLog, InputId, LogEntry, LogQuery, SessionId, ToolCallId,
+    ApprovalGate, InputId, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId,
 };
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
@@ -156,7 +156,7 @@ async fn open(config: AsterpathConfig) -> Asterpath {
         .expect("facade builds")
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -235,7 +235,7 @@ fn spawn_result(entries: &[LogEntry]) -> (ToolResultStatus, Vec<Part>) {
 async fn wait_for_child(asterpath: &Asterpath, parent: SessionId) -> SessionId {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let entries = scan(asterpath.event_log(), parent).await;
+            let entries = scan(asterpath.store(), parent).await;
             if let Some((child, _)) = decoded(&entries).into_iter().find_map(|event| match event {
                 SessionEvent::ChildSessionSpawned { child, config, .. } => Some((child, config)),
                 _ => None,
@@ -252,7 +252,7 @@ async fn wait_for_child(asterpath: &Asterpath, parent: SessionId) -> SessionId {
 async fn wait_for_intent(asterpath: &Asterpath, session: SessionId, name: &str) -> ToolCallId {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let entries = scan(asterpath.event_log(), session).await;
+            let entries = scan(asterpath.store(), session).await;
             if let Some(call) = decoded(&entries).into_iter().find_map(|event| match event {
                 SessionEvent::ToolCallRequested {
                     tool_call_id,
@@ -288,7 +288,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
-    let parent_entries = scan(asterpath.event_log(), handle.id()).await;
+    let parent_entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&parent_entries),
         [
@@ -321,7 +321,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     assert_eq!(spawn_tool.provenance, Provenance::InProcess);
     assert_eq!(spawn_tool.timeout, None);
 
-    let child_entries = scan(asterpath.event_log(), child).await;
+    let child_entries = scan(asterpath.store(), child).await;
     assert_eq!(
         kinds(&child_entries),
         [
@@ -435,7 +435,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
-    let parent_entries = scan(asterpath.event_log(), handle.id()).await;
+    let parent_entries = scan(asterpath.store(), handle.id()).await;
     let (status, output) = spawn_result(&parent_entries);
     assert_eq!(
         status,
@@ -539,7 +539,7 @@ async fn child_approval_is_scoped_to_the_child_session() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let child_entries = scan(asterpath.event_log(), child).await;
+    let child_entries = scan(asterpath.store(), child).await;
     assert!(
         !decoded(&child_entries).iter().any(|event| matches!(
             event,
@@ -566,7 +566,7 @@ async fn child_approval_is_scoped_to_the_child_session() {
         })
     ));
 
-    let parent_entries = scan(asterpath.event_log(), parent).await;
+    let parent_entries = scan(asterpath.store(), parent).await;
     let (status, output) = spawn_result(&parent_entries);
     assert_eq!(status, ToolResultStatus::Completed);
     assert_eq!(output, vec![text("child done")]);
@@ -624,7 +624,7 @@ async fn child_approval_wait_survives_a_restart() {
         })
     ));
 
-    let parent_entries = scan(reopened.event_log(), parent).await;
+    let parent_entries = scan(reopened.store(), parent).await;
     assert_eq!(
         parent_entries
             .iter()
@@ -847,7 +847,7 @@ async fn wait_for(
 ) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let events = decoded(&scan(asterpath.event_log(), session).await);
+            let events = decoded(&scan(asterpath.store(), session).await);
             if predicate(&events) {
                 return;
             }
@@ -888,7 +888,7 @@ async fn fan_out_partial_failure_keeps_siblings_independent() {
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(spawned(&entries).len(), 3);
     let outcomes = completions(&entries);
     assert_eq!(outcomes.len(), 3);
@@ -990,7 +990,7 @@ async fn the_ninth_spawn_queues_until_a_slot_is_released() {
                 == 9
     })
     .await;
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     let calls = requested(&entries);
     let admitted = spawned(&entries);
     assert_eq!(admitted.len(), 8, "the ninth call is queued");
@@ -1010,7 +1010,7 @@ async fn the_ninth_spawn_queues_until_a_slot_is_released() {
             == 9
     })
     .await;
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     let admitted = spawned(&entries);
     assert_eq!(admitted.len(), 9);
     assert_eq!(admitted[8], calls[8], "admission is FIFO by seq");
@@ -1027,7 +1027,7 @@ async fn the_ninth_spawn_queues_until_a_slot_is_released() {
             ..
         })
     ));
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     assert_eq!(completions(&entries).len(), 9);
 
     asterpath.shutdown().await.unwrap();
@@ -1095,7 +1095,7 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
         .expect("delivers cancellation")
         .expect("driver task");
 
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     let events = decoded(&entries);
     let admitted = spawned(&entries);
     assert_eq!(admitted.len(), 1, "the queued spawn creates no child");
@@ -1132,7 +1132,7 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
 
     // The child got the cancellation and closed its own turn.
     let child = spawned_children(&entries)[0];
-    let child_events = decoded(&scan(asterpath.event_log(), child).await);
+    let child_events = decoded(&scan(asterpath.store(), child).await);
     assert!(matches!(
         child_events.last(),
         Some(SessionEvent::TurnCommitted {
@@ -1195,7 +1195,7 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
         .expect("delivers cancellation")
         .expect("driver task");
 
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Cancelled {
@@ -1261,7 +1261,7 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
         .await
         .expect("timeout closes the wait");
 
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     let events = decoded(&entries);
     let position = |kind: &str| {
         events
@@ -1299,7 +1299,7 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
     ));
 
     let children = spawned_children(&entries);
-    let child_events = decoded(&scan(asterpath.event_log(), children[0]).await);
+    let child_events = decoded(&scan(asterpath.store(), children[0]).await);
     assert!(matches!(
         child_events.last(),
         Some(SessionEvent::TurnCommitted {
@@ -1336,7 +1336,7 @@ async fn a_child_completing_before_its_deadline_wins() {
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     assert_eq!(
         completions(&entries),
         vec![ChildOutcome::Completed {
@@ -1407,7 +1407,7 @@ async fn the_facade_global_live_child_limit_queues_spawns() {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     assert_eq!(spawned(&entries).len(), 2, "the third spawn is queued");
 
     quota.release(3);
@@ -1415,7 +1415,7 @@ async fn the_facade_global_live_child_limit_queues_spawns() {
         .await
         .expect("drive finishes")
         .expect("driver task");
-    let entries = scan(asterpath.event_log(), parent).await;
+    let entries = scan(asterpath.store(), parent).await;
     assert_eq!(completions(&entries).len(), 3);
 
     asterpath.shutdown().await.unwrap();

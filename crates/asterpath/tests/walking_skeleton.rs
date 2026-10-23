@@ -16,7 +16,7 @@ use asterpath_protocol::{
     StopReason, SubagentConfig, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath_protocol::{Clock, EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_protocol::{Clock, InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 
@@ -100,7 +100,7 @@ async fn open(db: &Path, providers: Vec<Arc<dyn Provider>>) -> Asterpath {
         .expect("facade builds")
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -172,7 +172,7 @@ async fn one_turn_without_tools_commits_the_expected_sequence() {
     ));
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -325,7 +325,7 @@ async fn dropping_the_stream_does_not_cancel_or_close_the_session() {
     drop(stream);
 
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert!(matches!(
         decoded(&entries).last(),
         Some(SessionEvent::TurnCommitted {
@@ -372,7 +372,7 @@ async fn retryable_failures_retry_the_same_step_with_partial_usage_kept_diagnost
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -434,7 +434,7 @@ async fn non_retryable_rejection_ends_the_turn_failed() {
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -485,7 +485,7 @@ async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved(
         handle.submit_input(input(1, "hi")).await.unwrap();
         drive_all(&handle).await;
 
-        let entries = scan(asterpath.event_log(), handle.id()).await;
+        let entries = scan(asterpath.store(), handle.id()).await;
         let all = decoded(&entries);
         assert!(matches!(
             all.last(),
@@ -521,7 +521,7 @@ async fn pause_turn_continues_the_turn_and_other_stop_reasons_complete() {
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -559,7 +559,7 @@ async fn pause_turn_continues_the_turn_and_other_stop_reasons_complete() {
     let handle = asterpath.create_session(spec("p")).await.unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert!(matches!(
         decoded(&entries).last(),
         Some(SessionEvent::TurnCommitted {
@@ -620,7 +620,7 @@ async fn capability_mismatch_is_rejected_before_the_response_is_used() {
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -662,7 +662,7 @@ async fn submit_input_records_but_never_starts_a_turn() {
     let first = handle.submit_input(input(7, "hi")).await.unwrap();
     let duplicate = handle.submit_input(input(7, "hi")).await.unwrap();
     assert_eq!(first, duplicate);
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(kinds(&entries), ["SessionCreated", "InputRecorded"]);
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
     assert!(provider.requests().is_empty());
@@ -699,7 +699,7 @@ async fn manual_clock_ids_are_deterministic_and_unique() {
     // the injected timestamp, and the counter half keeps them unique.
     let stamp = (clock.now() as u64) ^ u64::from(std::process::id()).rotate_left(17);
     let expected = stamp.to_le_bytes();
-    let events = decoded(&scan(asterpath.event_log(), first.id()).await);
+    let events = decoded(&scan(asterpath.store(), first.id()).await);
     let turn = events
         .iter()
         .find_map(|event| match event {

@@ -13,7 +13,7 @@ use asterpath_protocol::{
     ToolErrorKind, ToolName, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage,
     UserInput,
 };
-use asterpath_protocol::{EventLog, InputId, LogQuery, SessionId};
+use asterpath_protocol::{InputId, LogQuery, SessionId, SessionStore};
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillRoot, SkillRootLabel, SkillSummary, discover,
     render_index,

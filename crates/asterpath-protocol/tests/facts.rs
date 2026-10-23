@@ -480,16 +480,37 @@ fn open_intents_list_what_is_still_open() {
 }
 
 #[test]
-fn the_per_event_delta_is_stateless_and_covers_pending_input() {
-    let delta = IntentDelta::of(&input(), None);
-    assert_eq!(delta.pending_input, Some(true));
-    assert!(delta.opened.is_empty() && delta.closed.is_empty());
-
-    let delta = IntentDelta::of(&step_started(1, 1), None);
-    assert_eq!(delta.pending_input, Some(false));
-    assert_eq!(delta.opened, vec![OpenIntent::Step(step(1))]);
-
-    let delta = IntentDelta::of(&result(3), None);
-    assert_eq!(delta.closed, vec![OpenIntent::Tool(call(3))]);
-    assert_eq!(delta.pending_input, None);
+fn wakeable_is_an_open_non_compaction_intent_or_pending_input() {
+    let compaction = || {
+        (
+            compaction_started(CompactionTrigger::Manual),
+            Some(dedup::compaction(LogId::from_i64(4))),
+        )
+    };
+    let cases: Vec<(&str, Vec<Keyed>, bool)> = vec![
+        ("empty log", vec![], false),
+        ("created only", plain(vec![created(None)]), false),
+        ("pending input", plain(vec![created(None), input()]), true),
+        ("open turn", plain(vec![turn_started(1)]), true),
+        (
+            "committed turn",
+            plain(vec![turn_started(1), turn_committed(1)]),
+            false,
+        ),
+        ("only a dangling compaction", vec![compaction()], false),
+        (
+            "steering input after the step started",
+            plain(vec![
+                turn_started(1),
+                step_started(1, 1),
+                step_committed(1, 1),
+                turn_committed(1),
+                input(),
+            ]),
+            true,
+        ),
+    ];
+    for (name, events, wakeable) in cases {
+        assert_eq!(fold(&events).is_wakeable(), wakeable, "{name}");
+    }
 }

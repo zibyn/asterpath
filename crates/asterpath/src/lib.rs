@@ -46,10 +46,7 @@ use asterpath_protocol::{
     SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
-use asterpath_protocol::{
-    ApprovalGate, Clock, EventLog, SessionCatalog, SessionRetirement, SignalDelivery, Storage,
-    unique_bytes,
-};
+use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SignalDelivery, unique_bytes};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -61,10 +58,8 @@ pub use asterpath_provider_openai as openai;
 
 /// The assembled framework.
 pub struct Asterpath {
-    event_log: Arc<dyn EventLog>,
-    storage: Arc<dyn Storage>,
-    session_catalog: Arc<dyn SessionCatalog>,
-    session_retirement: Option<Arc<dyn SessionRetirement>>,
+    /// The backend behind the single append entry.
+    store: Arc<dyn SessionStore>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
@@ -124,60 +119,31 @@ impl Asterpath {
             }
         }
 
-        let event_log;
-        let storage;
-        let session_catalog;
-        let session_retirement;
-
-        match (config.event_log, config.storage) {
-            (Some(log), Some(store)) => {
-                event_log = log;
-                storage = store;
-                session_catalog = config.session_catalog.ok_or_else(|| AsterError::Config {
-                    message: "session_catalog is required when event_log and storage are injected"
-                        .to_owned(),
-                })?;
-                session_retirement = config.session_retirement;
-            }
-            (None, None) => {
-                #[cfg(feature = "sqlite")]
-                {
-                    if config.database.as_os_str().is_empty() {
-                        return Err(AsterError::Config {
-                            message: "database path is required for the sqlite backend".to_owned(),
-                        });
-                    }
-                    let backend = asterpath_storage_sqlite::open(&config.database)?;
-                    event_log = backend.clone();
-                    storage = backend.clone();
-                    session_retirement = Some(Arc::clone(&backend) as Arc<dyn SessionRetirement>);
-                    session_catalog = backend;
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
+        let backend: Arc<dyn SessionStore> = match config.store {
+            Some(store) => store,
+            #[cfg(feature = "sqlite")]
+            None => {
+                if config.database.as_os_str().is_empty() {
                     return Err(AsterError::Config {
-                        message:
-                            "event_log and storage must be injected without the sqlite feature"
-                                .to_owned(),
+                        message: "database path is required for the sqlite backend".to_owned(),
                     });
                 }
+                asterpath_storage_sqlite::open(&config.database)?
             }
-            _ => {
+            #[cfg(not(feature = "sqlite"))]
+            None => {
                 return Err(AsterError::Config {
-                    message: "event_log and storage must be injected together".to_owned(),
+                    message: "a store must be injected without the sqlite feature".to_owned(),
                 });
             }
-        }
+        };
 
         // Projections read the backend; every write goes through the one
         // append entry so hooks see it.
-        let trace = TracingQuery::new(Arc::clone(&event_log));
-        let usage = Arc::new(UsageService::new(
-            Arc::clone(&event_log),
-            Arc::clone(&session_catalog),
-        ));
-        let event_log: Arc<dyn EventLog> =
-            Arc::new(commit::CommitLog::new(event_log, config.hooks.clone()));
+        let trace = TracingQuery::new(Arc::clone(&backend));
+        let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
+        let event_log: Arc<dyn SessionStore> =
+            Arc::new(commit::CommitLog::new(backend, config.hooks.clone()));
 
         let executor = Arc::new(Waits::new(Arc::clone(&event_log)));
         let cancellations = Arc::new(CancellationRegistry::new());
@@ -186,7 +152,6 @@ impl Asterpath {
         // so nothing points back at the agent.
         let scheduler = Arc::new(Scheduler::with_runtime(
             Arc::clone(&event_log),
-            Arc::clone(&session_catalog),
             Arc::clone(&executor),
             config.model_aliases.clone(),
             Arc::clone(&config.clock),
@@ -230,10 +195,7 @@ impl Asterpath {
         );
 
         Ok(Self {
-            event_log,
-            storage,
-            session_catalog,
-            session_retirement,
+            store: event_log,
             providers,
             tools,
             agent,
@@ -298,11 +260,11 @@ impl Asterpath {
         .map_err(|error| AsterError::Config {
             message: error.to_string(),
         })?;
-        self.event_log.append(entry).await?;
+        self.store.append(entry).await?;
 
         Ok(SessionHandle {
             session,
-            event_log: Arc::clone(&self.event_log),
+            event_log: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
@@ -312,12 +274,12 @@ impl Asterpath {
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError> {
         // Unknown and retired sessions are indistinguishable: both have no
         // committed frontier (retention.md §9).
-        if self.event_log.frontier(id).await?.is_none() {
+        if self.store.frontier(id).await?.is_none() {
             return Err(AsterError::Agent(AgentError::NotFound { session: id }));
         }
         Ok(SessionHandle {
             session: id,
-            event_log: Arc::clone(&self.event_log),
+            event_log: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
             executor: Arc::clone(&self.executor),
             cancellations: Arc::clone(&self.cancellations),
@@ -330,27 +292,38 @@ impl Asterpath {
         Ok(())
     }
 
-    pub fn event_log(&self) -> Arc<dyn EventLog> {
-        Arc::clone(&self.event_log)
+    /// The session store. Appends made here reach the `on_record` hooks;
+    /// retirement is `store().retire(...)` (`Unsupported` when the injected
+    /// store has none).
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        Arc::clone(&self.store)
     }
 
-    pub fn storage(&self) -> Arc<dyn Storage> {
-        Arc::clone(&self.storage)
-    }
-
-    pub fn session_catalog(&self) -> Arc<dyn SessionCatalog> {
-        Arc::clone(&self.session_catalog)
+    /// Sessions with unfinished work (ADR-0023): a non-compaction intent is
+    /// open or an input waits for its step. Retired sessions are never
+    /// listed. The host decides when to drive them.
+    pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
+        // shortcut: 启动时全量折叠，会话量大时在 sqlite 模块内部加索引
+        let mut wakeable = Vec::new();
+        for session in self.store.sessions().await? {
+            let entries = scan_all(&*self.store, session).await?;
+            let facts = SessionFacts::fold(&entries).map_err(|error| {
+                AsterError::Agent(AgentError::Corrupt {
+                    session,
+                    detail: error.to_string(),
+                })
+            })?;
+            if facts.is_wakeable() {
+                wakeable.push(session);
+            }
+        }
+        Ok(wakeable)
     }
 
     /// Committed usage of `scope`'s session; `SessionSubtree` also reports
     /// its descendants. A pure fold over the event log.
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError> {
         self.usage.totals(totals_filter(scope)).await
-    }
-
-    /// `None` when the injected backend does not implement retirement.
-    pub fn session_retirement(&self) -> Option<Arc<dyn SessionRetirement>> {
-        self.session_retirement.clone()
     }
 
     /// Register an RAII endpoint here while the host can answer approvals.
@@ -387,7 +360,7 @@ fn totals_filter(scope: UsageScope) -> UsageFilter {
 #[derive(Clone)]
 pub struct SessionHandle {
     session: SessionId,
-    event_log: Arc<dyn EventLog>,
+    event_log: Arc<dyn SessionStore>,
     agent: Arc<Agent>,
     executor: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,

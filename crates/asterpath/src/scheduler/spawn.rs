@@ -13,8 +13,8 @@ use asterpath_protocol::{
     encode_entry,
 };
 use asterpath_protocol::{
-    Clock, EventLog, ExecutionError, LogEntry, LogId, SessionCatalog, SessionId, Timestamp,
-    ToolCallId, WakeCause, unique_bytes,
+    Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
+    WakeCause, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -32,8 +32,7 @@ const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("no
 const MAX_PARENT_CHAIN: u8 = 64;
 
 pub(crate) struct Scheduler {
-    log: Arc<dyn EventLog>,
-    catalog: Arc<dyn SessionCatalog>,
+    log: Arc<dyn SessionStore>,
     executor: Arc<Waits>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
@@ -65,14 +64,12 @@ struct ParentAdmission {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(
-        log: Arc<dyn EventLog>,
-        catalog: Arc<dyn SessionCatalog>,
+        log: Arc<dyn SessionStore>,
         executor: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
     ) -> Self {
         Self::with_runtime(
             log,
-            catalog,
             executor,
             aliases,
             Arc::new(asterpath_protocol::SystemClock),
@@ -84,8 +81,7 @@ impl Scheduler {
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
     pub(crate) fn with_runtime(
-        log: Arc<dyn EventLog>,
-        catalog: Arc<dyn SessionCatalog>,
+        log: Arc<dyn SessionStore>,
         executor: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
@@ -94,7 +90,6 @@ impl Scheduler {
     ) -> Self {
         Self {
             log,
-            catalog,
             executor,
             aliases,
             clock,
@@ -140,7 +135,7 @@ impl Scheduler {
         let mut depth = 0u8;
         let mut current = session;
         loop {
-            match self.catalog.parent(current).await.map_err(backend)? {
+            match self.log.parent(current).await.map_err(backend)? {
                 Some(parent) => {
                     depth = depth.saturating_add(1);
                     if depth > MAX_PARENT_CHAIN {
@@ -1064,7 +1059,7 @@ fn fold_facts(events: &[(LogEntry, SessionEvent)]) -> SessionFacts {
 }
 
 async fn scan(
-    log: &dyn EventLog,
+    log: &dyn SessionStore,
     session: SessionId,
 ) -> Result<Vec<(LogEntry, SessionEvent)>, ExecutionError> {
     let mut events = Vec::new();

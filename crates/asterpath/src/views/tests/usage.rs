@@ -12,8 +12,8 @@ use asterpath_protocol::{
     encode_entry,
 };
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, StepId,
-    StorageError, Timestamp, TurnId,
+    DedupKey, LogEntry, LogId, LogQuery, NewEntry, SessionId, SessionStore, StepId, StorageError,
+    Timestamp, TurnId,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -104,6 +104,7 @@ fn committed(step: StepId) -> SessionEvent {
 #[derive(Default)]
 struct TestLog {
     inner: Mutex<Inner>,
+    children: Mutex<HashMap<SessionId, Vec<SessionId>>>,
 }
 
 #[derive(Default)]
@@ -114,6 +115,13 @@ struct Inner {
 }
 
 impl TestLog {
+    fn set_children(&self, parent: SessionId, children: &[SessionId]) {
+        self.children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(parent, children.to_vec());
+    }
+
     fn push(&self, session: SessionId, event: &SessionEvent, key: Option<DedupKey>) -> LogId {
         let at = self.next_time();
         self.push_at(session, event, key, at)
@@ -167,7 +175,7 @@ impl TestLog {
     }
 }
 
-impl EventLog for TestLog {
+impl SessionStore for TestLog {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         let at = self.next_time();
         let log_id = self.insert(entry, at);
@@ -204,22 +212,11 @@ impl EventLog for TestLog {
             .max();
         Box::pin(async move { Ok(frontier) })
     }
-}
 
-#[derive(Default)]
-struct TreeCatalog {
-    children: HashMap<SessionId, Vec<SessionId>>,
-}
-
-impl TreeCatalog {
-    fn parent_of(children: &[SessionId]) -> Self {
-        let mut catalog = Self::default();
-        catalog.children.insert(ROOT, children.to_vec());
-        catalog
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
-}
 
-impl SessionCatalog for TreeCatalog {
     fn parent(
         &self,
         _session: SessionId,
@@ -227,9 +224,12 @@ impl SessionCatalog for TreeCatalog {
         Box::pin(async { Ok(None) })
     }
 
+    /// A tree set by the test; it may list a child with no log (U16).
     fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
         futures_util::stream::iter(
             self.children
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(&session)
                 .cloned()
                 .unwrap_or_default()
@@ -241,7 +241,7 @@ impl SessionCatalog for TreeCatalog {
 }
 
 fn service(log: Arc<TestLog>) -> UsageService {
-    UsageService::new(log, Arc::new(TreeCatalog::default()))
+    UsageService::new(log)
 }
 
 fn filter(scope: UsageScope) -> UsageFilter {
@@ -605,7 +605,8 @@ async fn u8_tree_own_descendants_and_fork_do_not_inherit() {
         &assistant("m", TURN, STEP_A, usage(30, 0)),
         Some(dedup::assistant_message(TURN, STEP_A)),
     );
-    let service = UsageService::new(log, Arc::new(TreeCatalog::parent_of(&[CHILD_A, CHILD_B])));
+    log.set_children(ROOT, &[CHILD_A, CHILD_B]);
+    let service = UsageService::new(log);
 
     let own = totals(&service, filter(UsageScope::Session(ROOT))).await;
     assert_eq!(own.own.model_calls, usage(10, 0));
@@ -706,7 +707,7 @@ async fn u12_totals_reconcile_with_trace_usage_sums() {
         }
     }
 
-    let service = UsageService::new(log, Arc::new(TreeCatalog::default()));
+    let service = UsageService::new(log);
     let report = totals(&service, filter(UsageScope::Session(ROOT))).await;
     assert_eq!(report.own.total(), trace);
     assert_eq!(report.own.partial, usage(999, 0));
@@ -836,7 +837,8 @@ async fn u16_subtree_sums_only_surviving_logs_and_missing_root_is_not_found() {
         &assistant("m", TURN, STEP_A, usage(30, 0)),
         Some(dedup::assistant_message(TURN, STEP_A)),
     );
-    let service = UsageService::new(log, Arc::new(TreeCatalog::parent_of(&[CHILD_A, CHILD_B])));
+    log.set_children(ROOT, &[CHILD_A, CHILD_B]);
+    let service = UsageService::new(log);
 
     let subtree = totals(&service, filter(UsageScope::SessionSubtree(ROOT))).await;
     assert_eq!(subtree.own.model_calls, usage(10, 0));

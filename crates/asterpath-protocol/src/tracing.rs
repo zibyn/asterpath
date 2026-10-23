@@ -1,7 +1,7 @@
 //! Native execution tracing contract: the value model of a deterministic
 //! projection over one session's event log.
 //!
-//! A trace is not stored separately. `TraceQuery` folds the injected `EventLog`
+//! A trace is not stored separately. `TraceQuery` folds the injected `SessionStore`
 //! on demand; `TraceTap` pushes the same lifecycle from the engine append entry.
 //! Content never enters a span: only `Span.log_range` references the log.
 

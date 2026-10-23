@@ -7,7 +7,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
-use asterpath_protocol::{EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionId, StorageError};
+use asterpath_protocol::{
+    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore, StorageError,
+};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -17,7 +19,7 @@ use futures_util::lock::Mutex as AsyncMutex;
 type Cursor = Arc<AsyncMutex<Option<Option<LogId>>>>;
 
 pub(crate) struct CommitLog {
-    inner: Arc<dyn EventLog>,
+    inner: Arc<dyn SessionStore>,
     hooks: Vec<Arc<dyn Hooks>>,
     // shortcut: one cursor per session touched by this process, never evicted;
     // evict on retirement if long-lived hosts touch very many sessions.
@@ -25,7 +27,7 @@ pub(crate) struct CommitLog {
 }
 
 impl CommitLog {
-    pub(crate) fn new(inner: Arc<dyn EventLog>, hooks: Vec<Arc<dyn Hooks>>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn SessionStore>, hooks: Vec<Arc<dyn Hooks>>) -> Self {
         Self {
             inner,
             hooks,
@@ -106,7 +108,7 @@ impl CommitLog {
     }
 }
 
-impl EventLog for CommitLog {
+impl SessionStore for CommitLog {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         // No hooks, no observation work (#74).
         if self.hooks.is_empty() {
@@ -121,5 +123,25 @@ impl EventLog for CommitLog {
 
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
+    }
+
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        self.inner.sessions()
+    }
+
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        self.inner.parent(session)
+    }
+
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
+        self.inner.children(session)
+    }
+
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        self.inner.retire(session, expected_frontier)
     }
 }

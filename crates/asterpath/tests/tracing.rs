@@ -12,7 +12,7 @@ use asterpath_protocol::{
     SessionSpec, SpanKind, SpanStatus, StopReason, SubagentConfig, ToolSelection, TraceError,
     TurnConfig, Usage, UserInput,
 };
-use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 
@@ -63,7 +63,7 @@ fn response() -> Vec<Item> {
     }]
 }
 
-async fn scan(log: &Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: &Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     log.scan(LogQuery {
         session,
         after: None,
@@ -104,7 +104,7 @@ async fn trace_folds_the_session_without_touching_the_log() {
     }
     drop(drive);
 
-    let log = framework.event_log();
+    let log = framework.store();
     let before = scan(&log, session).await;
     let spans = framework.trace(session).await.expect("trace");
     assert_eq!(
@@ -160,11 +160,10 @@ async fn retired_sessions_disappear_from_the_trace() {
     }
     drop(drive);
 
-    let log = framework.event_log();
+    let log = framework.store();
     let frontier = log.frontier(session).await.expect("frontier").expect("log");
     framework
-        .session_retirement()
-        .expect("sqlite retirement")
+        .store()
         .retire(session, frontier)
         .await
         .expect("retire");

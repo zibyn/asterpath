@@ -631,11 +631,7 @@ fn prepared_session(name: &str, server: &MockServer, turn_started: bool) -> (Tes
                 },
             )
             .expect("encode turn");
-            asterpath
-                .event_log()
-                .append(entry)
-                .await
-                .expect("append turn");
+            asterpath.store().append(entry).await.expect("append turn");
         }
         let session = handle.id().to_hex();
         asterpath.shutdown().await.expect("shutdown");

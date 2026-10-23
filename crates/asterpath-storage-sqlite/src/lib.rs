@@ -1,11 +1,11 @@
 //! SQLite backend: one file holds every session, and one module implements
-//! `EventLog`, `Storage` and `SessionCatalog`.
+//! `SessionStore`.
 //!
-//! A single writer connection owns the file: `EventLog::append` writes the log
-//! row and its derived index rows in one transaction. The process takes a
+//! A single writer connection owns the file: `append` writes the log row and
+//! its `sessions` catalog row in one transaction. The process takes a
 //! non-blocking `flock` at open, so a second process gets `WriterBusy`.
-//! `SessionRetirement` writes the tombstone and deletes the log and every
-//! derived row in one immediate transaction.
+//! `retire` folds the session facts, writes the tombstone and deletes the
+//! log and catalog row in one immediate transaction.
 
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io;
@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_protocol::{
-    Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, RetirementError,
-    SessionCatalog, SessionId, SessionRetirement, Storage, StorageError, SystemClock, Timestamp,
+    Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore,
+    StorageError, SystemClock,
 };
-use asterpath_protocol::{IntentDelta, OpenIntent, SessionEvent, decode_payload};
+use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -25,7 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 /// Physical schema version tracked in `PRAGMA user_version`.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
 
 /// Durability of committed appends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,12 +48,6 @@ CREATE TABLE sessions (
     parent_id   BLOB,
     created_at  INTEGER NOT NULL
 );
-CREATE TABLE open_intents (
-    session_id BLOB NOT NULL,
-    kind       TEXT NOT NULL,
-    ref_id     BLOB NOT NULL,
-    PRIMARY KEY (session_id, kind, ref_id)
-);
 CREATE TABLE log (
     log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      BLOB    NOT NULL,
@@ -66,24 +60,21 @@ CREATE TABLE log (
     UNIQUE (session_id, seq),
     UNIQUE (session_id, event_kind, dedup_key)
 );
-CREATE TABLE timers (
-    timer_id    BLOB    PRIMARY KEY,
-    session_id  BLOB    NOT NULL,
-    deadline    INTEGER NOT NULL,
-    fired_at    INTEGER
-);
-CREATE INDEX timers_due ON timers (deadline) WHERE fired_at IS NULL;
-CREATE TABLE pending_inputs (
-    session_id BLOB NOT NULL,
-    input_id   BLOB NOT NULL,
-    PRIMARY KEY (session_id, input_id)
-);
 CREATE TABLE retired_sessions (
     session_id   BLOB    PRIMARY KEY,
     parent_id    BLOB,
     last_log_id  INTEGER NOT NULL,
     retired_at   INTEGER NOT NULL
 );
+";
+
+/// v2 (ADR-0023): wake discovery folds session facts, so the derived wake
+/// tables go. The log is untouched.
+const MIGRATE_V2: &str = "
+DROP TABLE IF EXISTS open_intents;
+DROP INDEX IF EXISTS timers_due;
+DROP TABLE IF EXISTS timers;
+DROP TABLE IF EXISTS pending_inputs;
 ";
 
 /// Open the database with the production defaults.
@@ -130,7 +121,7 @@ impl SqliteStorage {
 
         // Decode inside the transaction and before dedup: a bad payload is a
         // hard error, and the decoded event yields the `event_kind`
-        // discriminator plus the derived-index input.
+        // discriminator and the catalog row.
         let event = decode_payload(&entry.payload, entry.schema_version)
             .map_err(|error| StorageError::InvalidEntry(error.to_string()))?;
         let kind = event.kind().to_owned();
@@ -174,7 +165,17 @@ impl SqliteStorage {
         )
         .map_err(backend)?;
         let log_id = LogId::from_i64(tx.last_insert_rowid());
-        apply_derived(&tx, &entry, &event, log_id, recorded_at)?;
+        if let SessionEvent::SessionCreated { parent, .. } = &event {
+            let parent = parent
+                .as_ref()
+                .map(|parent| parent.session.as_bytes().to_vec());
+            tx.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params![entry.session.as_bytes(), parent, recorded_at],
+            )
+            .map_err(backend)?;
+        }
         tx.commit().map_err(backend)?;
         Ok(log_id)
     }
@@ -280,7 +281,7 @@ impl SqliteStorage {
             return Err(RetirementError::NotFound);
         };
 
-        if has_open_intent(&tx, session.as_bytes())? {
+        if !is_idle(&tx, session)? {
             return Err(RetirementError::NotIdle);
         }
 
@@ -315,7 +316,7 @@ impl SqliteStorage {
 
         if let Some(parent_bytes) = parent.as_deref() {
             let parent = session_from_blob(parent_bytes.to_vec())?;
-            if has_open_intent(&tx, parent.as_bytes())? {
+            if !is_idle(&tx, parent)? {
                 return Err(RetirementError::ParentNotIdle);
             }
         }
@@ -338,16 +339,6 @@ impl SqliteStorage {
         )
         .map_err(backend)?;
         tx.execute(
-            "DELETE FROM open_intents WHERE session_id = ?1",
-            [session.as_bytes()],
-        )
-        .map_err(backend)?;
-        tx.execute(
-            "DELETE FROM pending_inputs WHERE session_id = ?1",
-            [session.as_bytes()],
-        )
-        .map_err(backend)?;
-        tx.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             [session.as_bytes()],
         )
@@ -356,25 +347,20 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn wakeable_sync(&self) -> Result<Vec<SessionId>, StorageError> {
+    fn sessions_sync(&self) -> Result<Vec<SessionId>, StorageError> {
         let conn = self.conn();
         let mut statement = conn
             .prepare(
-                "SELECT session_id FROM ( \
-                     SELECT session_id FROM open_intents WHERE kind <> 'compaction' \
-                     UNION SELECT session_id FROM pending_inputs \
-                 ) WHERE session_id NOT IN (SELECT session_id FROM retired_sessions) \
-                 ORDER BY 1",
+                "SELECT session_id FROM sessions \
+                 WHERE session_id NOT IN (SELECT session_id FROM retired_sessions) \
+                 ORDER BY session_id",
             )
             .map_err(backend)?;
         let rows = statement
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(backend)?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            sessions.push(session_from_blob(row.map_err(backend)?)?);
-        }
-        Ok(sessions)
+        rows.map(|row| row.map_err(backend).and_then(session_from_blob))
+            .collect()
     }
 
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
@@ -413,7 +399,7 @@ impl SqliteStorage {
     }
 }
 
-impl EventLog for SqliteStorage {
+impl SessionStore for SqliteStorage {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         Box::pin(async move { self.append_sync(entry) })
     }
@@ -425,31 +411,25 @@ impl EventLog for SqliteStorage {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         Box::pin(async move { self.frontier_sync(session) })
     }
-}
 
-impl SessionRetirement for SqliteStorage {
-    fn retire(
-        &self,
-        session: SessionId,
-        expected_frontier: LogId,
-    ) -> BoxFuture<'_, Result<(), RetirementError>> {
-        Box::pin(async move { self.retire_sync(session, expected_frontier) })
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        Box::pin(async move { self.sessions_sync() })
     }
-}
 
-impl Storage for SqliteStorage {
-    fn wakeable(&self, _now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        Box::pin(async move { self.wakeable_sync() })
-    }
-}
-
-impl SessionCatalog for SqliteStorage {
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         Box::pin(async move { self.parent_sync(session) })
     }
 
     fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
         stream::iter(self.children_sync(session)).boxed()
+    }
+
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        Box::pin(async move { self.retire_sync(session, expected_frontier) })
     }
 }
 
@@ -535,6 +515,7 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
     while version < SUPPORTED_SCHEMA_VERSION {
         match version {
             0 => migrate_v1(conn)?,
+            1 => migrate_v2(conn)?,
             _ => {
                 return Err(StorageError::Backend(format!(
                     "no migration from schema version {version}"
@@ -549,85 +530,15 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
 fn migrate_v1(conn: &Connection) -> Result<(), StorageError> {
     let tx = conn.unchecked_transaction().map_err(backend)?;
     tx.execute_batch(SCHEMA_V1).map_err(backend)?;
-    tx.pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
-        .map_err(backend)?;
+    tx.pragma_update(None, "user_version", 1).map_err(backend)?;
     tx.commit().map_err(backend)
 }
 
-fn apply_derived(
-    tx: &Transaction<'_>,
-    entry: &NewEntry,
-    event: &SessionEvent,
-    log_id: LogId,
-    recorded_at: Timestamp,
-) -> Result<(), StorageError> {
-    let session = entry.session.as_bytes();
-
-    let delta = IntentDelta::of(event, entry.dedup_key.as_ref());
-    for intent in delta.opened {
-        let (kind, ref_id) = intent_row(intent);
-        tx.execute(
-            "INSERT OR IGNORE INTO open_intents (session_id, kind, ref_id) VALUES (?1, ?2, ?3)",
-            params![session, kind, ref_id],
-        )
-        .map_err(backend)?;
-    }
-    for intent in delta.closed {
-        let (kind, ref_id) = intent_row(intent);
-        tx.execute(
-            "DELETE FROM open_intents WHERE session_id = ?1 AND kind = ?2 AND ref_id = ?3",
-            params![session, kind, ref_id],
-        )
-        .map_err(backend)?;
-    }
-
-    match event {
-        SessionEvent::SessionCreated { parent, .. } => {
-            let parent = parent
-                .as_ref()
-                .map(|parent| parent.session.as_bytes().to_vec());
-            tx.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
-                params![session, parent, recorded_at],
-            )
-            .map_err(backend)?;
-        }
-        SessionEvent::InputRecorded { .. } => {
-            // The caller's dedup key is the input id; an unkeyed input still
-            // wakes, identified by its log id.
-            let input_id = entry
-                .dedup_key
-                .as_ref()
-                .map(|key| key.as_str().as_bytes().to_vec())
-                .unwrap_or_else(|| log_id.as_i64().to_be_bytes().to_vec());
-            tx.execute(
-                "INSERT OR IGNORE INTO pending_inputs (session_id, input_id) VALUES (?1, ?2)",
-                params![session, input_id],
-            )
-            .map_err(backend)?;
-        }
-        SessionEvent::StepStarted { .. } => {
-            tx.execute(
-                "DELETE FROM pending_inputs WHERE session_id = ?1",
-                [session],
-            )
-            .map_err(backend)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn intent_row(intent: OpenIntent) -> (&'static str, Vec<u8>) {
-    match intent {
-        OpenIntent::Turn(id) => ("turn", id.as_bytes().to_vec()),
-        OpenIntent::Step(id) => ("step", id.as_bytes().to_vec()),
-        OpenIntent::Tool(id) => ("tool", id.as_bytes().to_vec()),
-        OpenIntent::Child(id) => ("child", id.as_bytes().to_vec()),
-        OpenIntent::Compaction(id) => ("compaction", id.as_i64().to_be_bytes().to_vec()),
-        _ => unreachable!("unknown open intent variant"),
-    }
+fn migrate_v2(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction().map_err(backend)?;
+    tx.execute_batch(MIGRATE_V2).map_err(backend)?;
+    tx.pragma_update(None, "user_version", 2).map_err(backend)?;
+    tx.commit().map_err(backend)
 }
 
 type RawEntry = (i64, Vec<u8>, i64, i64, i64, Option<String>, String);
@@ -672,17 +583,36 @@ fn session_from_blob(bytes: Vec<u8>) -> Result<SessionId, StorageError> {
     Ok(SessionId::from_bytes(bytes))
 }
 
-/// `idle` is the absence of a non-compaction open intent (storage.md §5).
-fn has_open_intent(tx: &Transaction<'_>, session: &[u8]) -> Result<bool, StorageError> {
-    let found: i64 = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM open_intents \
-             WHERE session_id = ?1 AND kind <> 'compaction')",
-            [session],
-            |row| row.get(0),
+/// Session facts over the session's committed log, read inside `tx`
+/// (storage.md §5): idle is the absence of a non-compaction open intent.
+fn is_idle(tx: &Transaction<'_>, session: SessionId) -> Result<bool, StorageError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT log_id, session_id, seq, recorded_at, schema_version, dedup_key, payload \
+             FROM log WHERE session_id = ?1 ORDER BY seq ASC",
         )
         .map_err(backend)?;
-    Ok(found != 0)
+    let rows = statement
+        .query_map([session.as_bytes()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .map_err(backend)?;
+    let entries = rows
+        .map(|row| row.map_err(backend).and_then(|row| to_entry(session, row)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
+        session: Some(session),
+        detail: error.to_string(),
+    })?;
+    Ok(facts.is_idle())
 }
 
 fn backend(error: impl std::fmt::Display) -> StorageError {

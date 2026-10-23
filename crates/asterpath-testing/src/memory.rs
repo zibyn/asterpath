@@ -1,25 +1,24 @@
-//! In-memory `EventLog` and `Storage` backend.
+//! In-memory `SessionStore` backend.
 //!
 //! **This backend does not satisfy G1.** There is no persistence, no fsync and
 //! no crash prefix guarantee; everything is lost with the process. It exists to
-//! run the backend-neutral contract suites. The log is also its own
-//! `SessionCatalog` (parents come from `SessionCreated`). It does not implement
-//! `SessionRetirement`.
+//! run the backend-neutral contract suites. Like SQLite, its session table
+//! comes from `SessionCreated`, and retirement writes a tombstone.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    Clock, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId, Storage,
-    StorageError, SystemClock, Timestamp,
+    Clock, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore,
+    StorageError, SystemClock,
 };
-use asterpath_protocol::{SessionEvent, SessionFacts, decode_entry, decode_payload};
+use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::stream;
 
-use crate::contract::{BackendFactory, BackendHandle};
+use crate::contract::StoreFactory;
 
 #[derive(Default)]
 struct State {
@@ -27,6 +26,71 @@ struct State {
     next_log_id: i64,
     session_seq: HashMap<SessionId, u64>,
     dedup: HashMap<(SessionId, String, Option<String>), LogId>,
+    /// Live sessions and their parents, like SQLite's `sessions` table.
+    sessions: BTreeMap<SessionId, Option<SessionId>>,
+    /// Retired sessions and their last log id.
+    retired: HashMap<SessionId, LogId>,
+}
+
+impl State {
+    fn log_of(&self, session: SessionId) -> Vec<LogEntry> {
+        if self.retired.contains_key(&session) {
+            return Vec::new();
+        }
+        let mut entries: Vec<LogEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.session == session)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|entry| entry.seq);
+        entries
+    }
+
+    fn is_idle(&self, session: SessionId) -> Result<bool, StorageError> {
+        let facts =
+            SessionFacts::fold(&self.log_of(session)).map_err(|error| StorageError::Corrupt {
+                session: Some(session),
+                detail: error.to_string(),
+            })?;
+        Ok(facts.is_idle())
+    }
+
+    /// The check order is the contract in retention.md §5, as in SQLite.
+    fn retire(&mut self, session: SessionId, expected: LogId) -> Result<(), RetirementError> {
+        if let Some(last) = self.retired.get(&session) {
+            return if *last == expected {
+                Ok(())
+            } else {
+                Err(RetirementError::FrontierMoved {
+                    expected,
+                    actual: Some(*last),
+                })
+            };
+        }
+        let Some(parent) = self.sessions.get(&session).copied() else {
+            return Err(RetirementError::NotFound);
+        };
+        if !self.is_idle(session)? {
+            return Err(RetirementError::NotIdle);
+        }
+        let actual = self.log_of(session).last().map(|entry| entry.log_id);
+        if actual != Some(expected) {
+            return Err(RetirementError::FrontierMoved { expected, actual });
+        }
+        if self.sessions.values().any(|p| *p == Some(session)) {
+            return Err(RetirementError::HasChildren);
+        }
+        if let Some(parent) = parent
+            && !self.is_idle(parent)?
+        {
+            return Err(RetirementError::ParentNotIdle);
+        }
+        self.retired.insert(session, expected);
+        self.sessions.remove(&session);
+        self.entries.retain(|entry| entry.session != session);
+        Ok(())
+    }
 }
 
 /// Append-only, per-session in-memory event log with idempotent appends,
@@ -54,10 +118,6 @@ impl InMemoryEventLog {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn snapshot(&self) -> Vec<LogEntry> {
-        self.state().entries.clone()
-    }
-
     fn append_sync(&self, entry: NewEntry) -> Result<LogId, StorageError> {
         // Decode before dedup so an unknown variant / bad payload is rejected
         // at append time, exactly like the SQLite write path.
@@ -82,6 +142,11 @@ impl InMemoryEventLog {
         *seq += 1;
         let seq = *seq;
 
+        if let SessionEvent::SessionCreated { parent, .. } = &event {
+            state
+                .sessions
+                .insert(entry.session, parent.as_ref().map(|parent| parent.session));
+        }
         let log_entry = LogEntry {
             log_id,
             session: entry.session,
@@ -99,7 +164,7 @@ impl InMemoryEventLog {
     }
 }
 
-impl EventLog for InMemoryEventLog {
+impl SessionStore for InMemoryEventLog {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
         let result = self.append_sync(entry);
         Box::pin(async move { result })
@@ -107,12 +172,11 @@ impl EventLog for InMemoryEventLog {
 
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
         let mut entries: Vec<LogEntry> = self
-            .snapshot()
+            .state()
+            .log_of(query.session)
             .into_iter()
-            .filter(|entry| entry.session == query.session)
             .filter(|entry| query.after.is_none_or(|after| entry.log_id > after))
             .collect();
-        entries.sort_by_key(|entry| entry.seq);
         if let Some(limit) = query.limit {
             entries.truncate(limit);
         }
@@ -121,109 +185,49 @@ impl EventLog for InMemoryEventLog {
 
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         let frontier = self
-            .snapshot()
-            .into_iter()
-            .filter(|entry| entry.session == session)
-            .max_by_key(|entry| entry.seq)
+            .state()
+            .log_of(session)
+            .last()
             .map(|entry| entry.log_id);
         Box::pin(async move { Ok(frontier) })
     }
-}
 
-impl InMemoryEventLog {
-    /// The parent recorded in `session`'s `SessionCreated`, if any.
-    fn parent_of(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
-        let Some(first) = self
-            .snapshot()
-            .into_iter()
-            .filter(|entry| entry.session == session)
-            .min_by_key(|entry| entry.seq)
-        else {
-            return Ok(None);
-        };
-        match decode_entry(&first).map_err(|error| StorageError::Corrupt {
-            session: Some(session),
-            detail: error.to_string(),
-        })? {
-            SessionEvent::SessionCreated { parent, .. } => Ok(parent.map(|parent| parent.session)),
-            _ => Ok(None),
-        }
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+        let sessions = self.state().sessions.keys().copied().collect();
+        Box::pin(async move { Ok(sessions) })
     }
-}
 
-/// Like SQLite's `sessions.parent_id`: the tree comes from `SessionCreated`.
-impl SessionCatalog for InMemoryEventLog {
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
-        let parent = self.parent_of(session);
-        Box::pin(async move { parent })
+        let parent = self.state().sessions.get(&session).copied().flatten();
+        Box::pin(async move { Ok(parent) })
     }
 
     fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        let mut sessions: Vec<SessionId> = self
-            .snapshot()
-            .into_iter()
-            .map(|entry| entry.session)
+        let children: Vec<SessionId> = self
+            .state()
+            .sessions
+            .iter()
+            .filter(|(_, parent)| **parent == Some(session))
+            .map(|(child, _)| *child)
             .collect();
-        sessions.sort();
-        sessions.dedup();
-        let children: Vec<Result<SessionId, StorageError>> = sessions
-            .into_iter()
-            .filter_map(|candidate| match self.parent_of(candidate) {
-                Ok(Some(parent)) if parent == session => Some(Ok(candidate)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect();
-        stream::iter(children).boxed()
+        stream::iter(children.into_iter().map(Ok)).boxed()
     }
-}
 
-/// Read-only wake discovery derived on demand from the log.
-pub struct InMemoryStorage {
-    log: Arc<InMemoryEventLog>,
-}
-
-impl InMemoryStorage {
-    pub fn new(log: Arc<InMemoryEventLog>) -> Self {
-        Self { log }
-    }
-}
-
-impl Storage for InMemoryStorage {
-    fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        let result = self.wakeable_sync(now);
+    /// Idle check, frontier CAS, delete and tombstone under one lock.
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        let result = self.state().retire(session, expected_frontier);
         Box::pin(async move { result })
     }
 }
 
-impl InMemoryStorage {
-    fn wakeable_sync(&self, _now: Timestamp) -> Result<Vec<SessionId>, StorageError> {
-        let mut by_session: HashMap<SessionId, Vec<LogEntry>> = HashMap::new();
-        for entry in self.log.snapshot() {
-            by_session.entry(entry.session).or_default().push(entry);
-        }
-
-        let mut wakeable = Vec::new();
-        for (session, mut entries) in by_session {
-            entries.sort_by_key(|entry| entry.seq);
-            let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
-                session: Some(session),
-                detail: error.to_string(),
-            })?;
-            if !facts.is_idle() || facts.has_pending_input() {
-                wakeable.push(session);
-            }
-        }
-        wakeable.sort();
-        Ok(wakeable)
-    }
-}
-
-/// A factory over one shared in-memory log. `open` returns fresh handles to the
-/// same backend, mirroring "reopen the same database" in the contract suites.
+/// A factory over one shared in-memory store.
 #[derive(Default)]
 pub struct MemoryBackend {
-    log: Arc<InMemoryEventLog>,
+    store: Arc<InMemoryEventLog>,
 }
 
 impl MemoryBackend {
@@ -232,11 +236,8 @@ impl MemoryBackend {
     }
 }
 
-impl BackendFactory for MemoryBackend {
-    fn open(&self) -> BackendHandle {
-        BackendHandle {
-            log: self.log.clone(),
-            storage: Arc::new(InMemoryStorage::new(self.log.clone())),
-        }
+impl StoreFactory for MemoryBackend {
+    fn open(&self) -> Arc<dyn SessionStore> {
+        self.store.clone()
     }
 }

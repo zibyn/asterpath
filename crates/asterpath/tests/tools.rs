@@ -14,7 +14,7 @@ use asterpath_protocol::{
     ToolOutput, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath_protocol::{EventLog, InputId, LogEntry, LogQuery, SessionId};
+use asterpath_protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -116,7 +116,7 @@ fn tool_call(name: &str) -> Item {
     }
 }
 
-async fn scan(log: Arc<dyn EventLog>, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: Arc<dyn SessionStore>, session: SessionId) -> Vec<LogEntry> {
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -186,7 +186,7 @@ async fn two_step_turn_with_a_tool_call_matches_l1_and_projects_the_result() {
     handle.submit_input(input("go")).await.unwrap();
     let live = drive_all(&handle).await;
 
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(
         kinds(&entries),
         [
@@ -295,7 +295,7 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
         .create_session(spec(ToolSelection::Names(vec![ToolName::new("beta")])))
         .await
         .unwrap();
-    let entries = scan(asterpath.event_log(), handle.id()).await;
+    let entries = scan(asterpath.store(), handle.id()).await;
     let snapshot = entries
         .first()
         .map(|entry| decode_entry(entry).unwrap())
@@ -310,7 +310,7 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
         .create_session(spec(ToolSelection::All))
         .await
         .unwrap();
-    let entries = scan(asterpath.event_log(), all.id()).await;
+    let entries = scan(asterpath.store(), all.id()).await;
     let snapshot = entries
         .first()
         .map(|entry| decode_entry(entry).unwrap())

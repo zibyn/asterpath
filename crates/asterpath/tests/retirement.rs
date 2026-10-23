@@ -1,4 +1,4 @@
-//! Facade wiring for the optional retirement seam (retention.md §3, §9).
+//! Facade wiring for retirement through the one store (retention.md §3, §9).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,9 @@ use asterpath_protocol::{
     AgentError, CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionSpec,
     SubagentConfig, ToolSelection, TurnConfig,
 };
+use asterpath_protocol::{LogId, RetirementError, SessionStore};
 use asterpath_protocol::{LogQuery, SessionId};
-use asterpath_testing::{InMemoryEventLog, InMemoryStorage, ScriptedProvider};
+use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -51,7 +52,7 @@ fn spec(provider: &str) -> SessionSpec {
 }
 
 async fn scan_len(asterpath: &Asterpath, session: SessionId) -> usize {
-    let log = asterpath.event_log();
+    let log = asterpath.store();
     let mut entries = log.scan(LogQuery {
         session,
         after: None,
@@ -80,11 +81,9 @@ async fn sqlite_exposes_retirement_and_hides_the_retired_session() {
         .expect("create session");
     let session = handle.id();
 
-    let retirement = asterpath
-        .session_retirement()
-        .expect("the sqlite backend provides retirement");
+    let retirement = asterpath.store();
     let frontier = asterpath
-        .event_log()
+        .store()
         .frontier(session)
         .await
         .expect("frontier")
@@ -93,7 +92,7 @@ async fn sqlite_exposes_retirement_and_hides_the_retired_session() {
 
     assert!(
         asterpath
-            .event_log()
+            .store()
             .frontier(session)
             .await
             .expect("frontier")
@@ -133,22 +132,89 @@ async fn open_session_reports_unknown_sessions_as_not_found() {
     cleanup(&db);
 }
 
+/// A store with only the log and catalog keeps the default retirement.
+struct NoRetirement(asterpath_testing::InMemoryEventLog);
+
+impl SessionStore for NoRetirement {
+    fn append(
+        &self,
+        entry: asterpath_protocol::NewEntry,
+    ) -> futures_core::future::BoxFuture<'_, Result<LogId, asterpath_protocol::StorageError>> {
+        self.0.append(entry)
+    }
+
+    fn scan(
+        &self,
+        query: LogQuery,
+    ) -> futures_core::stream::BoxStream<
+        '_,
+        Result<asterpath_protocol::LogEntry, asterpath_protocol::StorageError>,
+    > {
+        self.0.scan(query)
+    }
+
+    fn frontier(
+        &self,
+        session: SessionId,
+    ) -> futures_core::future::BoxFuture<'_, Result<Option<LogId>, asterpath_protocol::StorageError>>
+    {
+        self.0.frontier(session)
+    }
+
+    fn sessions(
+        &self,
+    ) -> futures_core::future::BoxFuture<'_, Result<Vec<SessionId>, asterpath_protocol::StorageError>>
+    {
+        self.0.sessions()
+    }
+
+    fn parent(
+        &self,
+        session: SessionId,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Option<SessionId>, asterpath_protocol::StorageError>,
+    > {
+        self.0.parent(session)
+    }
+
+    fn children(
+        &self,
+        session: SessionId,
+    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath_protocol::StorageError>>
+    {
+        self.0.children(session)
+    }
+}
+
 #[tokio::test]
-async fn injected_backend_without_retirement_returns_none() {
-    let log = Arc::new(InMemoryEventLog::new());
-    let storage = Arc::new(InMemoryStorage::new(Arc::clone(&log)));
+async fn injected_store_without_retirement_reports_unsupported() {
     let asterpath = Asterpath::builder()
         .providers(vec![Arc::new(ScriptedProvider::new("p"))])
-        .event_log(Arc::clone(&log) as Arc<dyn asterpath_protocol::EventLog>)
-        .storage(storage)
-        .session_catalog(log)
+        .store(Arc::new(NoRetirement(Default::default())))
         .build()
         .await
-        .expect("facade builds with injected storage");
+        .expect("facade builds with an injected store");
+    let session = asterpath
+        .create_session(spec("p"))
+        .await
+        .expect("create session")
+        .id();
+    let frontier = asterpath
+        .store()
+        .frontier(session)
+        .await
+        .expect("frontier")
+        .expect("session exists");
 
+    let error = asterpath
+        .store()
+        .retire(session, frontier)
+        .await
+        .expect_err("no retirement");
     assert!(
-        asterpath.session_retirement().is_none(),
-        "custom storage may legitimately not implement retirement"
+        matches!(error, RetirementError::Unsupported),
+        "custom stores may legitimately not implement retirement: {error:?}"
     );
 
     asterpath.shutdown().await.expect("shutdown");

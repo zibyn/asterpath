@@ -19,8 +19,8 @@ use crate::decode::{LogDecodeError, decode_entry};
 use crate::dedup::compaction_frontier;
 use crate::event::SessionEvent;
 
-/// One open intent, as `inspect` lists them and backends encode them as
-/// `(kind, ref_id)`; compactions use the frontier log id from their dedup key.
+/// One open intent, as `inspect` lists them; compactions use the frontier log
+/// id from their dedup key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum OpenIntent {
@@ -29,61 +29,6 @@ pub enum OpenIntent {
     Tool(ToolCallId),
     Child(SessionId),
     Compaction(LogId),
-}
-
-/// What one event opens and closes, read from that event alone.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct IntentDelta {
-    pub opened: Vec<OpenIntent>,
-    pub closed: Vec<OpenIntent>,
-    /// `Some(true)` sets pending input, `Some(false)` clears it.
-    pub pending_input: Option<bool>,
-}
-
-impl IntentDelta {
-    /// Stateless: the same event always yields the same delta. Compaction keys
-    /// that do not encode a frontier log id produce no row.
-    pub fn of(event: &SessionEvent, dedup_key: Option<&DedupKey>) -> Self {
-        let mut delta = Self::default();
-        let compaction = || dedup_key.and_then(compaction_frontier);
-        match event {
-            SessionEvent::InputRecorded { .. } => delta.pending_input = Some(true),
-            SessionEvent::TurnStarted { turn_id } => delta.opened.push(OpenIntent::Turn(*turn_id)),
-            SessionEvent::TurnCommitted { turn_id, .. } => {
-                delta.closed.push(OpenIntent::Turn(*turn_id))
-            }
-            SessionEvent::StepStarted { step_id, .. } => {
-                delta.opened.push(OpenIntent::Step(*step_id));
-                delta.pending_input = Some(false);
-            }
-            SessionEvent::StepCommitted { step_id, .. } => {
-                delta.closed.push(OpenIntent::Step(*step_id))
-            }
-            SessionEvent::ToolCallRequested { tool_call_id, .. } => {
-                delta.opened.push(OpenIntent::Tool(*tool_call_id))
-            }
-            SessionEvent::ToolResult { tool_call_id, .. } => {
-                delta.closed.push(OpenIntent::Tool(*tool_call_id))
-            }
-            SessionEvent::ChildSessionSpawned { child, .. } => {
-                delta.opened.push(OpenIntent::Child(*child))
-            }
-            SessionEvent::ChildSessionCompleted { child, .. } => {
-                delta.closed.push(OpenIntent::Child(*child))
-            }
-            SessionEvent::CompactionStarted { .. } => delta
-                .opened
-                .extend(compaction().map(OpenIntent::Compaction)),
-            SessionEvent::CompactionApplied { .. } | SessionEvent::CompactionAborted { .. } => {
-                delta
-                    .closed
-                    .extend(compaction().map(OpenIntent::Compaction))
-            }
-            _ => {}
-        }
-        delta
-    }
 }
 
 /// The open step and the seq of its `StepStarted` (the projection waterline).
@@ -254,6 +199,12 @@ impl SessionFacts {
             && self.steps.is_empty()
             && self.tools.is_empty()
             && self.children.is_empty()
+    }
+
+    /// Wake discovery (ADR-0023): a non-compaction intent is open or an input
+    /// waits for its step.
+    pub fn is_wakeable(&self) -> bool {
+        !self.is_idle() || self.pending_input
     }
 
     /// Classify the session state.

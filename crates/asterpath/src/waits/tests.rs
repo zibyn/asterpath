@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::waits::Waits;
 use asterpath_protocol::{
-    AwaitSignal, EventLog, LogQuery, SessionId, SignalDelivery, SignalId, SignalName, ToolCallId,
-    WakeCause,
+    AwaitSignal, LogQuery, SessionId, SessionStore, SignalDelivery, SignalId, SignalName,
+    ToolCallId, WakeCause,
 };
 use asterpath_protocol::{SessionEvent, decode_entry};
 use asterpath_testing::InMemoryEventLog;

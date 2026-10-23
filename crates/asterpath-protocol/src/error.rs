@@ -48,6 +48,8 @@ pub enum RetirementError {
     HasChildren,
     #[error("parent session is not idle")]
     ParentNotIdle,
+    #[error("the store does not implement retirement")]
+    Unsupported,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }

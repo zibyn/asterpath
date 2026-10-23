@@ -40,9 +40,8 @@ pub use config::{
     SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, EventLog, LogEntry, LogQuery, NewEntry,
-    SessionCatalog, SessionRetirement, SignalDelivery, SignalName, SignalPayload, Storage,
-    WakeCause, scan_all,
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, LogEntry, LogQuery, NewEntry,
+    SessionStore, SignalDelivery, SignalName, SignalPayload, WakeCause, scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
@@ -53,8 +52,8 @@ pub use event::{
     ToolResultStatus, TurnEndReason,
 };
 pub use facts::{
-    IntentDelta, OpenChild, OpenCompaction, OpenIntent, OpenStep, OpenTool, SessionFacts,
-    SessionState, StepState,
+    OpenChild, OpenCompaction, OpenIntent, OpenStep, OpenTool, SessionFacts, SessionState,
+    StepState,
 };
 pub use hash::Fnv;
 pub use hooks::{

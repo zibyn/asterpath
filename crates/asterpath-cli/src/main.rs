@@ -17,7 +17,7 @@ use asterpath_protocol::{
     decode_entry, history,
 };
 use asterpath_protocol::{
-    Clock, EventLog, InputId, LogEntry, SessionId, SystemClock, unique_bytes,
+    Clock, InputId, LogEntry, SessionId, SessionStore, SystemClock, unique_bytes,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
@@ -292,7 +292,7 @@ async fn inspect(args: SessionArgs) -> CliResult<()> {
     }
     let asterpath = bare(&settings).await?;
 
-    let entries = scan(asterpath.event_log(), session)
+    let entries = scan(asterpath.store(), session)
         .await
         .map_err(CliError::run)?;
     if entries.is_empty() {
@@ -513,7 +513,7 @@ fn prompt_decision<R: BufRead, W: Write>(
 }
 
 async fn final_text(asterpath: &Asterpath, handle: &SessionHandle) -> CliResult<Option<String>> {
-    let entries = scan(asterpath.event_log(), handle.id())
+    let entries = scan(asterpath.store(), handle.id())
         .await
         .map_err(CliError::run)?;
     Ok(final_assistant_text(&entries))
@@ -531,7 +531,7 @@ async fn session_snapshot(
         let _ = asterpath.shutdown().await;
         return Err(aster_error(error));
     }
-    let entries = scan(asterpath.event_log(), session)
+    let entries = scan(asterpath.store(), session)
         .await
         .map_err(CliError::run)?;
     let snapshot = entries
@@ -645,7 +645,10 @@ async fn bare(settings: &config::Settings) -> CliResult<Asterpath> {
         .map_err(aster_error)
 }
 
-async fn scan(event_log: Arc<dyn EventLog>, session: SessionId) -> Result<Vec<LogEntry>, String> {
+async fn scan(
+    event_log: Arc<dyn SessionStore>,
+    session: SessionId,
+) -> Result<Vec<LogEntry>, String> {
     scan_all(&*event_log, session)
         .await
         .map_err(|error| error.to_string())
@@ -1040,7 +1043,7 @@ mod tests {
     }
 
     async fn signal_count(asterpath: &Asterpath, session: SessionId) -> usize {
-        scan(asterpath.event_log(), session)
+        scan(asterpath.store(), session)
             .await
             .unwrap()
             .iter()
@@ -1049,7 +1052,7 @@ mod tests {
     }
 
     async fn tool_result_values(asterpath: &Asterpath, session: SessionId) -> Vec<String> {
-        scan(asterpath.event_log(), session)
+        scan(asterpath.store(), session)
             .await
             .unwrap()
             .iter()

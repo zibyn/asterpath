@@ -19,8 +19,7 @@ use asterpath_protocol::{
     approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    Clock, DedupKey, EventLog, InputId, LogEntry, LogQuery, SessionId, StepId, SystemClock,
-    ToolCallId, TurnId,
+    DedupKey, InputId, LogEntry, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::ScriptedProvider;
 use common::{Scenario, Testdrive, markers, scan, session_id};
@@ -190,11 +189,11 @@ async fn append(
     key: Option<DedupKey>,
 ) {
     let entry = encode_entry(session, key, &event).expect("encode");
-    asterpath.event_log().append(entry).await.expect("append");
+    asterpath.store().append(entry).await.expect("append");
 }
 
 async fn scan_session(asterpath: &Asterpath, session: SessionId) -> Vec<LogEntry> {
-    let log = asterpath.event_log();
+    let log = asterpath.store();
     let mut stream = log.scan(LogQuery {
         session,
         after: None,
@@ -325,7 +324,7 @@ fn testdrive_rejects_unknown_failpoints_with_exit_code_two() {
 async fn s5_same_key_appends_once_and_returns_the_same_log_id() {
     let (_dir, db) = temp_db("s5");
     let backend = asterpath_storage_sqlite::open(&db).expect("open");
-    let log: Arc<dyn EventLog> = backend;
+    let log: Arc<dyn SessionStore> = backend;
     let session = SessionId::from_bytes([5; 16]);
     let event = SessionEvent::InputRecorded {
         input: vec![text("go")],
@@ -359,18 +358,14 @@ async fn s18_input_submitted_before_a_crash_is_projected_exactly_once() {
     asterpath.shutdown().await.expect("shutdown");
     drop(handle);
 
-    // The process is gone: only the committed log and derived indexes remain.
+    // The process is gone: only the committed log remains.
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         final_items(),
         StopReason::EndTurn,
         Usage::default(),
     ));
     let asterpath = build(&db, Arc::clone(&provider), Vec::new(), None).await;
-    let wakeable = asterpath
-        .storage()
-        .wakeable(SystemClock.now())
-        .await
-        .expect("wakeable");
+    let wakeable = asterpath.wakeable().await.expect("wakeable");
     assert_eq!(wakeable, vec![session], "pending input wakes the session");
 
     let handle = asterpath.open_session(session).await.expect("open");
@@ -419,7 +414,7 @@ async fn unclosed_compaction_stays_open_without_making_the_session_busy() {
     let handle = asterpath.create_session(spec()).await.expect("create");
     let session = handle.id();
     let frontier = asterpath
-        .event_log()
+        .store()
         .frontier(session)
         .await
         .expect("frontier")
@@ -447,8 +442,7 @@ async fn unclosed_compaction_stays_open_without_making_the_session_busy() {
     ));
     assert!(
         !asterpath
-            .storage()
-            .wakeable(SystemClock.now())
+            .wakeable()
             .await
             .expect("wakeable")
             .contains(&session),

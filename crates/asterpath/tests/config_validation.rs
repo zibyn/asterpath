@@ -9,12 +9,8 @@ use asterpath_protocol::{
     SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
     TransportKind,
 };
-use asterpath_testing::{BackendFactory, BackendHandle, MemoryBackend, ScriptedProvider};
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
-
-fn backend() -> BackendHandle {
-    MemoryBackend::new().open()
-}
 
 struct DummyTool(ToolDescriptor);
 
@@ -46,25 +42,12 @@ fn alias(provider: &str) -> BTreeMap<ModelAlias, ModelSpec> {
 }
 
 #[tokio::test]
-async fn event_log_without_storage_is_a_config_error() {
-    let backend = backend();
-    let error = Asterpath::builder()
-        .event_log(backend.log)
+async fn an_injected_store_needs_no_database() {
+    Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
         .build()
         .await
-        .unwrap_err();
-    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
-}
-
-#[tokio::test]
-async fn storage_without_event_log_is_a_config_error() {
-    let backend = backend();
-    let error = Asterpath::builder()
-        .storage(backend.storage)
-        .build()
-        .await
-        .unwrap_err();
-    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+        .expect("an injected store replaces the sqlite backend");
 }
 
 #[cfg(feature = "sqlite")]

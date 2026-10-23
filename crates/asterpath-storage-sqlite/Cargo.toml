@@ -15,3 +15,4 @@ serde_json = "1"
 [dev-dependencies]
 asterpath-testing = { path = "../asterpath-testing" }
 futures-executor = "0.3"
+tokio = { version = "1", features = ["macros", "rt"] }

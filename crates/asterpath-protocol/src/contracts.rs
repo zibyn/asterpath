@@ -82,17 +82,40 @@ pub struct LogQuery {
     pub limit: Option<usize>,
 }
 
-/// Append-only, per-session event log contract.
-pub trait EventLog: Send + Sync {
+/// The one storage adapter (ADR-0023): the append-only per-session event log
+/// plus the session catalog (`sessions` / `parent` / `children`) and optional
+/// whole-session retirement. Retired sessions are invisible to every read.
+pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
+
+    /// Every session that has a `SessionCreated` and is not retired,
+    /// children included, ordered by id.
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
+    /// The parent recorded in `SessionCreated`; `None` for a root or unknown
+    /// session.
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
+    /// Live children of `session`, ordered by id.
+    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>>;
+
+    /// Write the tombstone and delete the session's log and catalog row.
+    /// `expected_frontier` must equal the current last log id. Backends
+    /// without retirement keep the default `Unsupported`.
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        let _ = (session, expected_frontier);
+        Box::pin(async { Err(RetirementError::Unsupported) })
+    }
 }
 
 /// Every committed record of `session`, in `seq` order: the one whole-session
 /// read shared by the engine and its hosts.
 pub async fn scan_all(
-    log: &dyn EventLog,
+    log: &dyn SessionStore,
     session: SessionId,
 ) -> Result<Vec<LogEntry>, StorageError> {
     let mut stream = log.scan(LogQuery {
@@ -105,31 +128,6 @@ pub async fn scan_all(
         entries.push(entry?);
     }
     Ok(entries)
-}
-
-/// Wake discovery contract: read-only, no queue and no lease.
-pub trait Storage: Send + Sync {
-    /// Sessions that need to be driven: non-compaction open intents or
-    /// pending inputs.
-    fn wakeable(&self, now: Timestamp) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
-}
-
-/// Read-only view of the session tree.
-pub trait SessionCatalog: Send + Sync {
-    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
-
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>>;
-}
-
-/// Optional whole-session retirement capability.
-pub trait SessionRetirement: Send + Sync {
-    /// Write the tombstone and delete the log and every derived row.
-    /// `expected_frontier` must equal the current last log id.
-    fn retire(
-        &self,
-        session: SessionId,
-        expected_frontier: LogId,
-    ) -> BoxFuture<'_, Result<(), RetirementError>>;
 }
 
 pub type SignalPayload = serde_json::Value;

@@ -16,8 +16,8 @@ use asterpath_protocol::{
     dedup,
 };
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogId, LogQuery, NewEntry, SessionCatalog, SessionId,
-    StorageError, ToolCallId, TurnId,
+    DedupKey, LogEntry, LogId, LogQuery, NewEntry, SessionId, SessionStore, StorageError,
+    ToolCallId, TurnId,
 };
 use asterpath_storage_sqlite::open;
 use common::TempDir;
@@ -51,11 +51,11 @@ fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) 
     }
 }
 
-fn append(storage: &dyn EventLog, entry: NewEntry) -> Result<LogId, StorageError> {
+fn append(storage: &dyn SessionStore, entry: NewEntry) -> Result<LogId, StorageError> {
     block_on(storage.append(entry))
 }
 
-fn scan(storage: &dyn EventLog, session: SessionId) -> Vec<Result<LogEntry, StorageError>> {
+fn scan(storage: &dyn SessionStore, session: SessionId) -> Vec<Result<LogEntry, StorageError>> {
     block_on(
         storage
             .scan(LogQuery {
@@ -208,12 +208,12 @@ fn higher_schema_version_is_rejected() {
     let db = dir.db();
     {
         let conn = rusqlite::Connection::open(&db).expect("raw open");
-        conn.pragma_update(None, "user_version", 2)
+        conn.pragma_update(None, "user_version", 3)
             .expect("set user_version");
     }
     match open(&db) {
         Err(StorageError::SchemaTooNew { found, supported }) => {
-            assert_eq!((found, supported), (2, 1));
+            assert_eq!((found, supported), (3, 2));
         }
         Ok(_) => panic!("expected SchemaTooNew, got a successful open"),
         Err(other) => panic!("expected SchemaTooNew, got {other}"),
@@ -332,7 +332,7 @@ fn corrupt_payload_is_reported_and_not_repaired() {
 }
 
 // ---------------------------------------------------------------------------
-// SessionCatalog.
+// Session catalog.
 // ---------------------------------------------------------------------------
 
 fn config() -> ConfigSnapshot {
@@ -417,9 +417,110 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
         None,
         "retired sessions are invisible"
     );
+    assert_eq!(
+        block_on(storage.sessions()).expect("sessions"),
+        vec![parent, child],
+        "sessions() hides tombstoned rows"
+    );
     let children: Vec<SessionId> = block_on(storage.children(parent).collect::<Vec<_>>())
         .into_iter()
         .map(|result| result.expect("child"))
         .collect();
     assert_eq!(children, vec![child]);
+}
+
+// ---------------------------------------------------------------------------
+// Migration v1 -> v2: the derived wake tables are dropped (ADR-0023).
+// ---------------------------------------------------------------------------
+
+/// The v1 physical schema as shipped, with its three derived tables.
+const SCHEMA_V1: &str = "
+CREATE TABLE sessions (session_id BLOB PRIMARY KEY, parent_id BLOB, created_at INTEGER NOT NULL);
+CREATE TABLE open_intents (session_id BLOB NOT NULL, kind TEXT NOT NULL, ref_id BLOB NOT NULL,
+    PRIMARY KEY (session_id, kind, ref_id));
+CREATE TABLE log (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id BLOB NOT NULL, seq INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL, schema_version INTEGER NOT NULL, event_kind TEXT NOT NULL,
+    dedup_key TEXT, payload TEXT NOT NULL,
+    UNIQUE (session_id, seq), UNIQUE (session_id, event_kind, dedup_key));
+CREATE TABLE timers (timer_id BLOB PRIMARY KEY, session_id BLOB NOT NULL,
+    deadline INTEGER NOT NULL, fired_at INTEGER);
+CREATE INDEX timers_due ON timers (deadline) WHERE fired_at IS NULL;
+CREATE TABLE pending_inputs (session_id BLOB NOT NULL, input_id BLOB NOT NULL,
+    PRIMARY KEY (session_id, input_id));
+CREATE TABLE retired_sessions (session_id BLOB PRIMARY KEY, parent_id BLOB,
+    last_log_id INTEGER NOT NULL, retired_at INTEGER NOT NULL);
+PRAGMA user_version = 1;
+";
+
+fn tables(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut statement = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("list tables");
+    statement
+        .query_map([], |row| row.get(0))
+        .expect("query tables")
+        .map(|name| name.expect("table name"))
+        .collect()
+}
+
+#[test]
+fn a_v1_database_migrates_to_v2_and_keeps_its_log() {
+    let dir = TempDir::new("migrate-v2");
+    let db = dir.db();
+    let target = session(0xd0);
+    let created = serde_json::to_string(&session_created(None)).expect("serialize");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("raw open");
+        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
+        conn.execute(
+            "INSERT INTO log (session_id, seq, recorded_at, schema_version, event_kind, \
+             dedup_key, payload) VALUES (?1, 1, 0, ?2, 'SessionCreated', NULL, ?3)",
+            rusqlite::params![target.as_bytes(), LOG_SCHEMA_VERSION, created],
+        )
+        .expect("v1 log row");
+        conn.execute(
+            "INSERT INTO sessions (session_id, parent_id, created_at) VALUES (?1, NULL, 0)",
+            [target.as_bytes()],
+        )
+        .expect("v1 sessions row");
+        conn.execute(
+            "INSERT INTO pending_inputs (session_id, input_id) VALUES (?1, x'00')",
+            [target.as_bytes()],
+        )
+        .expect("v1 derived row");
+    }
+
+    let storage = open(&db).expect("open migrates");
+    let entries = scan(storage.as_ref(), target);
+    assert_eq!(entries.len(), 1, "the log survives the migration");
+    assert!(entries[0].is_ok());
+    assert_eq!(
+        block_on(storage.sessions()).expect("sessions"),
+        vec![target]
+    );
+    drop(storage);
+
+    let conn = rusqlite::Connection::open(&db).expect("raw open");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user_version");
+    assert_eq!(version, 2);
+    assert_eq!(
+        tables(&conn),
+        vec!["log", "retired_sessions", "sessions", "sqlite_sequence"],
+        "open_intents, timers and pending_inputs are gone"
+    );
+}
+
+#[test]
+fn a_new_database_is_created_at_v2() {
+    let dir = TempDir::new("fresh-v2");
+    let db = dir.db();
+    drop(open(&db).expect("open"));
+    let conn = rusqlite::Connection::open(&db).expect("raw open");
+    assert_eq!(
+        tables(&conn),
+        vec!["log", "retired_sessions", "sessions", "sqlite_sequence"]
+    );
 }

@@ -3,14 +3,14 @@
 //! Usage is never stored separately. This module reads the three terminal
 //! records that carry it (`AssistantMessage`, `CompactionApplied`,
 //! `ModelCallAborted`) and folds them into buckets. Descendants come from the
-//! injected `SessionCatalog`; a subtree report keeps `own` and `descendants`
+//! store's session catalog; a subtree report keeps `own` and `descendants`
 //! apart so nothing is double-counted.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogQuery, SessionCatalog, SessionId, StepId, StorageError, TurnId,
+    DedupKey, LogEntry, LogQuery, SessionId, SessionStore, StepId, StorageError, TurnId,
 };
 use asterpath_protocol::{
     Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageRecord, UsageReport, UsageScope,
@@ -19,15 +19,14 @@ use asterpath_protocol::{
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
 
-/// Read-side implementation over one `EventLog` and the session tree.
+/// Read-side implementation over one `SessionStore` and the session tree.
 pub(crate) struct UsageService {
-    log: Arc<dyn EventLog>,
-    catalog: Arc<dyn SessionCatalog>,
+    log: Arc<dyn SessionStore>,
 }
 
 impl UsageService {
-    pub(crate) fn new(log: Arc<dyn EventLog>, catalog: Arc<dyn SessionCatalog>) -> Self {
-        Self { log, catalog }
+    pub(crate) fn new(log: Arc<dyn SessionStore>) -> Self {
+        Self { log }
     }
 
     async fn live(&self, session: SessionId) -> Result<bool, UsageError> {
@@ -57,7 +56,7 @@ impl UsageService {
         let mut sessions = vec![root];
         let mut queue = VecDeque::from([root]);
         while let Some(parent) = queue.pop_front() {
-            let mut children = self.catalog.children(parent);
+            let mut children = self.log.children(parent);
             while let Some(child) = children.next().await {
                 let child = child.map_err(|error| UsageError::Backend(error.to_string()))?;
                 if self.live(child).await? {

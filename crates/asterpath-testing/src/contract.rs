@@ -1,42 +1,43 @@
-//! Backend-neutral event log contract suite (G2, G3, G4).
+//! Backend-neutral `SessionStore` contract suite: the log (G2, G3, G4, G6),
+//! the session catalog and retirement (G8, R1-R7).
 //!
-//! The suite only depends on core/protocol types, so every backend runs the
-//! same assertions. G1, `Corrupt`, retirement and backend-specific behaviour
-//! are deliberately not here.
+//! The suite only depends on protocol types, so every backend runs the same
+//! assertions. G1, `Corrupt` and backend-specific behaviour are not here.
+//! Wake discovery is a session-facts fold in the facade (ADR-0023), so it is
+//! tested there, not per backend.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
-    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, Part, Provenance, ProviderId, ReplaySafety,
-    SessionEvent, SessionFacts, ToolName, ToolResultStatus, Usage, dedup,
+    JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, Part, Provenance, ProviderId,
+    ReplaySafety, SessionEvent, ToolName, ToolResultStatus, Usage, dedup,
 };
 use asterpath_protocol::{
-    DedupKey, EventLog, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, SessionId, SignalId,
-    SignalName, StepId, Storage, StorageError, Timestamp, ToolCallId, TurnId,
+    DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, RetirementError, SessionId,
+    SessionStore, SignalId, SignalName, StepId, StorageError, ToolCallId, TurnId,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-pub struct BackendHandle {
-    pub log: Arc<dyn EventLog>,
-    pub storage: Arc<dyn Storage>,
+pub trait StoreFactory {
+    /// A handle to the backend under test.
+    fn open(&self) -> Arc<dyn SessionStore>;
 }
 
-pub trait BackendFactory {
-    /// A new handle to semantically the same backend (reopening it).
-    fn open(&self) -> BackendHandle;
-}
-
-/// Run the shared event log contract against a backend.
-pub fn event_log_contract(factory: &impl BackendFactory) {
-    let backend = factory.open();
-    idempotent_append(backend.log.as_ref());
-    shared_dedup_key_pairs(backend.log.as_ref());
-    monotonic_seq(backend.log.as_ref());
-    cursor_scan(backend.log.as_ref());
-    hard_errors(backend.log.as_ref());
+/// Run the shared store contract against a backend. Retirement cases are
+/// skipped when the backend keeps the default `Unsupported`.
+pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
+    let store = factory.open();
+    let store = store.as_ref();
+    idempotent_append(store).await;
+    shared_dedup_key_pairs(store).await;
+    monotonic_seq(store).await;
+    cursor_scan(store).await;
+    independent_streams(store).await;
+    hard_errors(store).await;
+    catalog(store).await;
+    retirement(store).await;
 }
 
 fn session(byte: u8) -> SessionId {
@@ -205,8 +206,8 @@ fn entry_for(
     }
 }
 
-fn append(
-    log: &dyn EventLog,
+async fn append(
+    log: &dyn SessionStore,
     session: SessionId,
     event: &SessionEvent,
     dedup_key: Option<DedupKey>,
@@ -215,14 +216,15 @@ fn append(
         log,
         entry_for(session, LOG_SCHEMA_VERSION, event, dedup_key),
     )
+    .await
     .expect("append should succeed")
 }
 
-fn append_raw(log: &dyn EventLog, entry: NewEntry) -> Result<LogId, StorageError> {
-    futures::executor::block_on(log.append(entry))
+async fn append_raw(log: &dyn SessionStore, entry: NewEntry) -> Result<LogId, StorageError> {
+    log.append(entry).await
 }
 
-fn scan(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
+async fn scan(log: &dyn SessionStore, session: SessionId) -> Vec<LogEntry> {
     scan_query(
         log,
         LogQuery {
@@ -231,53 +233,58 @@ fn scan(log: &dyn EventLog, session: SessionId) -> Vec<LogEntry> {
             limit: None,
         },
     )
+    .await
 }
 
-fn scan_query(log: &dyn EventLog, query: LogQuery) -> Vec<LogEntry> {
-    let stream = log.scan(query);
-    let results: Vec<Result<LogEntry, StorageError>> =
-        futures::executor::block_on(stream.collect());
+async fn scan_query(log: &dyn SessionStore, query: LogQuery) -> Vec<LogEntry> {
+    let results: Vec<Result<LogEntry, StorageError>> = log.scan(query).collect().await;
     results
         .into_iter()
         .map(|result| result.expect("scan should succeed"))
         .collect()
 }
 
-fn frontier(log: &dyn EventLog, session: SessionId) -> Option<LogId> {
-    futures::executor::block_on(log.frontier(session)).expect("frontier should succeed")
+async fn frontier(log: &dyn SessionStore, session: SessionId) -> Option<LogId> {
+    log.frontier(session)
+        .await
+        .expect("frontier should succeed")
 }
 
-fn idempotent_append(log: &dyn EventLog) {
+async fn idempotent_append(log: &dyn SessionStore) {
     let session = session(10);
     let call_id = call(10);
     let requested = tool_call_requested(call_id);
     let result = tool_result(call_id);
     let key = dedup::tool_call(call_id);
 
-    let first = append(log, session, &requested, Some(key.clone()));
-    let second = append(log, session, &requested, Some(key.clone()));
+    let first = append(log, session, &requested, Some(key.clone())).await;
+    let second = append(log, session, &requested, Some(key.clone())).await;
     assert_eq!(
         first, second,
         "G2: duplicate append returns the original LogId"
     );
     assert_eq!(
-        scan(log, session).len(),
+        scan(log, session).await.len(),
         1,
         "G2: duplicate append writes nothing"
     );
 
     // Same key, different event kind: both records land.
-    let result_id = append(log, session, &result, Some(key));
+    let result_id = append(log, session, &result, Some(key)).await;
     assert_ne!(first, result_id, "G2: event kind is part of the identity");
-    assert_eq!(scan(log, session).len(), 2, "G2: shared key types coexist");
+    assert_eq!(
+        scan(log, session).await.len(),
+        2,
+        "G2: shared key types coexist"
+    );
 
     // Different key, same event kind: a new record lands.
-    let other = append(log, session, &requested, Some(DedupKey::new("other")));
+    let other = append(log, session, &requested, Some(DedupKey::new("other"))).await;
     assert_ne!(other, first);
-    assert_eq!(scan(log, session).len(), 3);
+    assert_eq!(scan(log, session).await.len(), 3);
 }
 
-fn shared_dedup_key_pairs(log: &dyn EventLog) {
+async fn shared_dedup_key_pairs(log: &dyn SessionStore) {
     let call_id = call(20);
     let child = session(21);
     let groups: Vec<(SessionId, DedupKey, Vec<SessionEvent>)> = vec![
@@ -313,10 +320,10 @@ fn shared_dedup_key_pairs(log: &dyn EventLog) {
     ];
 
     for (session, key, events) in groups {
-        let first_pass: Vec<LogId> = events
-            .iter()
-            .map(|event| append(log, session, event, Some(key.clone())))
-            .collect();
+        let mut first_pass = Vec::new();
+        for event in &events {
+            first_pass.push(append(log, session, event, Some(key.clone())).await);
+        }
         let mut unique = first_pass.clone();
         unique.sort_by_key(|id| id.as_i64());
         unique.dedup();
@@ -325,21 +332,21 @@ fn shared_dedup_key_pairs(log: &dyn EventLog) {
             events.len(),
             "G2/S12: every event kind under one shared key lands"
         );
-        assert_eq!(scan(log, session).len(), events.len());
+        assert_eq!(scan(log, session).await.len(), events.len());
 
-        let second_pass: Vec<LogId> = events
-            .iter()
-            .map(|event| append(log, session, event, Some(key.clone())))
-            .collect();
+        let mut second_pass = Vec::new();
+        for event in &events {
+            second_pass.push(append(log, session, event, Some(key.clone())).await);
+        }
         assert_eq!(
             first_pass, second_pass,
             "G2: replaying a shared-key group is idempotent per event kind"
         );
-        assert_eq!(scan(log, session).len(), events.len());
+        assert_eq!(scan(log, session).await.len(), events.len());
     }
 }
 
-fn monotonic_seq(log: &dyn EventLog) {
+async fn monotonic_seq(log: &dyn SessionStore) {
     let sid = session(30);
     for index in 0..5 {
         append(
@@ -347,9 +354,10 @@ fn monotonic_seq(log: &dyn EventLog) {
             sid,
             &input_recorded(),
             Some(DedupKey::new(format!("input-{index}"))),
-        );
+        )
+        .await;
     }
-    let entries = scan(log, sid);
+    let entries = scan(log, sid).await;
     let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq).collect();
     assert_eq!(
         seqs,
@@ -364,26 +372,28 @@ fn monotonic_seq(log: &dyn EventLog) {
     );
 
     let other = session(31);
-    append(log, other, &input_recorded(), None);
+    append(log, other, &input_recorded(), None).await;
     assert_eq!(
-        scan(log, other)[0].seq,
+        scan(log, other).await[0].seq,
         1,
         "G3: seq is per session, not global"
     );
 }
 
-fn cursor_scan(log: &dyn EventLog) {
+async fn cursor_scan(log: &dyn SessionStore) {
     let sid = session(40);
-    let ids: Vec<LogId> = (0..4)
-        .map(|index| {
+    let mut ids = Vec::new();
+    for index in 0..4 {
+        ids.push(
             append(
                 log,
                 sid,
                 &input_recorded(),
                 Some(DedupKey::new(format!("cursor-{index}"))),
             )
-        })
-        .collect();
+            .await,
+        );
+    }
 
     let after = scan_query(
         log,
@@ -392,7 +402,8 @@ fn cursor_scan(log: &dyn EventLog) {
             after: Some(ids[1]),
             limit: None,
         },
-    );
+    )
+    .await;
     assert_eq!(after.len(), 2, "G4: the cursor is exclusive");
     assert_eq!(
         after.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
@@ -407,7 +418,8 @@ fn cursor_scan(log: &dyn EventLog) {
             after: None,
             limit: Some(2),
         },
-    );
+    )
+    .await;
     assert_eq!(limited.len(), 2, "G4: limit is bounded");
     assert_eq!(limited[0].seq, 1);
 
@@ -418,297 +430,51 @@ fn cursor_scan(log: &dyn EventLog) {
             after: Some(ids[3]),
             limit: None,
         },
-    );
+    )
+    .await;
     assert!(empty.is_empty(), "G4: no records after the last id");
 
     assert_eq!(
-        frontier(log, sid),
+        frontier(log, sid).await,
         Some(ids[3]),
         "G4: frontier is the last LogId"
     );
-    assert_eq!(frontier(log, session(99)), None);
+    assert_eq!(frontier(log, session(99)).await, None);
 }
 
-fn turn_with(byte: u8) -> TurnId {
-    TurnId::from_bytes([byte; 16])
-}
-
-fn step_with(byte: u8) -> StepId {
-    StepId::from_bytes([byte; 16])
-}
-
-fn turn_started_with(turn_id: TurnId) -> SessionEvent {
-    SessionEvent::TurnStarted { turn_id }
-}
-
-fn turn_committed_with(turn_id: TurnId) -> SessionEvent {
-    SessionEvent::TurnCommitted {
-        turn_id,
-        reason: asterpath_protocol::TurnEndReason::Completed,
-    }
-}
-
-fn step_started_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
-    SessionEvent::StepStarted { turn_id, step_id }
-}
-
-fn step_committed_with(turn_id: TurnId, step_id: StepId) -> SessionEvent {
-    SessionEvent::StepCommitted { turn_id, step_id }
-}
-
-fn signal_received_with(signal_id: SignalId, name: &str) -> SessionEvent {
-    SessionEvent::SignalReceived {
-        signal_id,
-        name: SignalName::new(name),
-        payload: json!({}),
-    }
-}
-
-/// Append an event and remember the session as part of this contract run.
-fn append_in(
-    log: &dyn EventLog,
-    sessions: &mut BTreeSet<SessionId>,
-    session: SessionId,
-    event: &SessionEvent,
-    dedup_key: Option<DedupKey>,
-) -> LogId {
-    sessions.insert(session);
-    append(log, session, event, dedup_key)
-}
-
-/// Backend-neutral storage suite (G5, G6, G7 plus pending-input
-/// semantics). The expected wake set is derived by folding the visible log, so
-/// a materialized index that disagrees with the log fails here.
-pub fn storage_contract(factory: &impl BackendFactory) {
-    let backend = factory.open();
-    let log = backend.log.as_ref();
-    let storage = backend.storage.as_ref();
-    let now: Timestamp = 1_000;
-    let mut sessions = BTreeSet::new();
-
-    // An open turn makes the session wakeable; committing it clears that.
-    let s_turn = session(0x60);
-    let turn = turn_with(1);
-    append_in(log, &mut sessions, s_turn, &turn_started_with(turn), None);
-    assert!(
-        block_on(storage.wakeable(now))
-            .expect("wakeable")
-            .contains(&s_turn),
-        "G5: an open turn is wakeable"
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_turn,
-        &turn_committed_with(turn),
-        Some(dedup::turn_committed(turn)),
-    );
-
-    // Pending input is retained until StepStarted, and reported once.
-    let s_input = session(0x61);
-    append_in(
-        log,
-        &mut sessions,
-        s_input,
-        &input_recorded(),
-        Some(DedupKey::new("input-61")),
-    );
-    for _ in 0..2 {
-        let wakeable = block_on(storage.wakeable(now)).expect("wakeable");
-        assert!(
-            wakeable.contains(&s_input),
-            "G5: pending input wakes until a step starts"
-        );
-        assert_eq!(
-            wakeable.iter().filter(|s| **s == s_input).count(),
-            1,
-            "G5: a session appears at most once per call"
-        );
-    }
-    let input_turn = turn_with(2);
-    let input_step = step_with(2);
-    append_in(
-        log,
-        &mut sessions,
-        s_input,
-        &step_started_with(input_turn, input_step),
-        None,
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_input,
-        &step_committed_with(input_turn, input_step),
-        Some(dedup::step_committed(input_step)),
-    );
-
-    // Children: an open spawn wakes; completion closes it.
-    let s_child = session(0x66);
-    let child = session(0x67);
-    let spawned = append_in(
-        log,
-        &mut sessions,
-        s_child,
-        &child_spawned(child),
-        Some(dedup::child_session(child)),
-    );
-    let repeated = append_in(
-        log,
-        &mut sessions,
-        s_child,
-        &child_spawned(child),
-        Some(dedup::child_session(child)),
-    );
-    assert_eq!(
-        repeated, spawned,
-        "G5: repeating drive returns the original LogId"
-    );
-    assert!(
-        block_on(storage.wakeable(now))
-            .expect("wakeable")
-            .contains(&s_child),
-        "G5: an open child spawn is wakeable"
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_child,
-        &child_completed(child),
-        Some(dedup::child_session(child)),
-    );
-
-    // Only a dangling compaction intent leaves the session idle.
-    let s_compaction = session(0x68);
-    let compaction_key = dedup::compaction(LogId::from_i64(1));
-    append_in(
-        log,
-        &mut sessions,
-        s_compaction,
-        &compaction_started(),
-        Some(compaction_key.clone()),
-    );
-    assert!(
-        !block_on(storage.wakeable(now))
-            .expect("wakeable")
-            .contains(&s_compaction),
-        "G5: compaction alone does not make a session wakeable"
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_compaction,
-        &compaction_applied(),
-        Some(compaction_key),
-    );
-
-    // Approval closes nothing: SignalReceived leaves the tool intent open.
-    let s_approval = session(0x69);
-    let approval_call = call(9);
-    append_in(
-        log,
-        &mut sessions,
-        s_approval,
-        &tool_call_requested(approval_call),
-        Some(dedup::tool_call(approval_call)),
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_approval,
-        &signal_received_with(
-            SignalId::from_bytes(*approval_call.as_bytes()),
-            "tool.approval",
-        ),
-        Some(dedup::tool_call(approval_call)),
-    );
-    assert!(
-        block_on(storage.wakeable(now))
-            .expect("wakeable")
-            .contains(&s_approval),
-        "G5: an approval decision does not close the open tool intent"
-    );
-    append_in(
-        log,
-        &mut sessions,
-        s_approval,
-        &tool_result(approval_call),
-        Some(dedup::tool_result(approval_call)),
-    );
-
-    // G6: each session stream is independent.
+async fn independent_streams(log: &dyn SessionStore) {
     let stream_a = session(0x70);
     let stream_b = session(0x71);
-    let turn_a = turn_with(7);
-    let turn_b = turn_with(8);
-    append_in(
+    let turn_a = TurnId::from_bytes([7; 16]);
+    let turn_b = TurnId::from_bytes([8; 16]);
+    append(log, stream_a, &turn_started(turn_a), None).await;
+    append(log, stream_b, &turn_started(turn_b), None).await;
+    append(
         log,
-        &mut sessions,
         stream_a,
-        &turn_started_with(turn_a),
-        None,
-    );
-    append_in(
-        log,
-        &mut sessions,
-        stream_b,
-        &turn_started_with(turn_b),
-        None,
-    );
-    append_in(
-        log,
-        &mut sessions,
-        stream_a,
-        &turn_committed_with(turn_a),
+        &turn_committed(turn_a),
         Some(dedup::turn_committed(turn_a)),
-    );
+    )
+    .await;
+    let seqs = |entries: Vec<LogEntry>| entries.iter().map(|entry| entry.seq).collect::<Vec<_>>();
     assert_eq!(
-        scan(log, stream_a)
-            .iter()
-            .map(|entry| entry.seq)
-            .collect::<Vec<_>>(),
+        seqs(scan(log, stream_a).await),
         vec![1, 2],
         "G6: another stream does not create holes or delay visibility"
     );
     assert_eq!(
-        scan(log, stream_b)
-            .iter()
-            .map(|entry| entry.seq)
-            .collect::<Vec<_>>(),
+        seqs(scan(log, stream_b).await),
         vec![1],
         "G6: each stream allocates its own seq"
     );
     assert_eq!(
-        frontier(log, stream_a),
-        scan(log, stream_a).last().map(|entry| entry.log_id),
+        frontier(log, stream_a).await,
+        scan(log, stream_a).await.last().map(|entry| entry.log_id),
         "G6: frontier is per stream"
     );
-
-    // G5/G7: the materialized wake index must equal the log fold.
-    let expected_wakeable = expected_wakeable(log, &sessions);
-    let wakeable = block_on(storage.wakeable(now)).expect("wakeable");
-    assert_eq!(
-        wakeable, expected_wakeable,
-        "G5/G7: wakeable must match the open-intent and pending-input fold"
-    );
 }
 
-fn expected_wakeable(log: &dyn EventLog, sessions: &BTreeSet<SessionId>) -> Vec<SessionId> {
-    let mut wakeable = Vec::new();
-    for &session in sessions {
-        let entries = scan(log, session);
-        let facts = SessionFacts::fold(&entries).expect("fold session facts");
-        if !facts.is_idle() || facts.has_pending_input() {
-            wakeable.push(session);
-        }
-    }
-    wakeable
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    futures::executor::block_on(future)
-}
-
-fn hard_errors(log: &dyn EventLog) {
+async fn hard_errors(log: &dyn SessionStore) {
     let session = session(50);
     let cases: Vec<(Value, u16)> = vec![
         (json!({"NoSuchEvent": {}}), LOG_SCHEMA_VERSION),
@@ -729,6 +495,7 @@ fn hard_errors(log: &dyn EventLog) {
                 payload,
             },
         )
+        .await
         .expect_err("bad payload must be a hard error");
         assert!(
             matches!(error, StorageError::InvalidEntry(_)),
@@ -736,7 +503,7 @@ fn hard_errors(log: &dyn EventLog) {
         );
     }
     assert_eq!(
-        scan(log, session).len(),
+        scan(log, session).await.len(),
         0,
         "rejected appends write nothing"
     );
@@ -750,7 +517,214 @@ fn hard_errors(log: &dyn EventLog) {
             dedup_key: None,
             payload: json!({"InputRecorded": {"input": [], "extra_field": true}}),
         },
-    );
+    )
+    .await;
     assert!(accepted.is_ok(), "unknown fields are ignored");
-    assert_eq!(scan(log, session).len(), 1);
+    assert_eq!(scan(log, session).await.len(), 1);
+}
+
+fn turn_started(turn_id: TurnId) -> SessionEvent {
+    SessionEvent::TurnStarted { turn_id }
+}
+
+fn turn_committed(turn_id: TurnId) -> SessionEvent {
+    SessionEvent::TurnCommitted {
+        turn_id,
+        reason: asterpath_protocol::TurnEndReason::Completed,
+    }
+}
+
+fn created_under(parent: Option<SessionId>) -> SessionEvent {
+    SessionEvent::SessionCreated {
+        config: config(),
+        parent: parent.map(|session| ParentRef {
+            session,
+            turn: turn(),
+            tool_call: call(1),
+        }),
+    }
+}
+
+async fn create(log: &dyn SessionStore, session: SessionId, parent: Option<SessionId>) -> LogId {
+    append(
+        log,
+        session,
+        &created_under(parent),
+        Some(dedup::session_created(session)),
+    )
+    .await
+}
+
+async fn sessions(log: &dyn SessionStore) -> Vec<SessionId> {
+    log.sessions().await.expect("sessions should succeed")
+}
+
+async fn children(log: &dyn SessionStore, session: SessionId) -> Vec<SessionId> {
+    let results: Vec<Result<SessionId, StorageError>> = log.children(session).collect().await;
+    results
+        .into_iter()
+        .map(|result| result.expect("children should succeed"))
+        .collect()
+}
+
+async fn parent(log: &dyn SessionStore, session: SessionId) -> Option<SessionId> {
+    log.parent(session).await.expect("parent should succeed")
+}
+
+/// The catalog follows `SessionCreated`: every created session (children
+/// included) is listed once, in id order; the tree matches each parent ref.
+async fn catalog(log: &dyn SessionStore) {
+    let root = session(0x81);
+    let late = session(0x83);
+    let early = session(0x82);
+    let unknown = session(0x8f);
+    create(log, root, None).await;
+    create(log, late, Some(root)).await;
+    create(log, early, Some(root)).await;
+    // A replayed SessionCreated does not list the session twice.
+    create(log, root, None).await;
+
+    let listed = sessions(log).await;
+    for session in [root, early, late] {
+        assert_eq!(
+            listed.iter().filter(|listed| **listed == session).count(),
+            1,
+            "sessions() lists every created session once, children included"
+        );
+    }
+    assert!(!listed.contains(&unknown));
+    assert!(
+        listed.windows(2).all(|pair| pair[0] < pair[1]),
+        "sessions() is ordered by id"
+    );
+
+    assert_eq!(parent(log, root).await, None);
+    assert_eq!(parent(log, late).await, Some(root));
+    assert_eq!(parent(log, unknown).await, None);
+    assert_eq!(
+        children(log, root).await,
+        vec![early, late],
+        "children are ordered by id"
+    );
+    assert!(children(log, late).await.is_empty());
+}
+
+async fn retire(
+    log: &dyn SessionStore,
+    session: SessionId,
+    expected: LogId,
+) -> Result<(), RetirementError> {
+    log.retire(session, expected).await
+}
+
+async fn retirement(log: &dyn SessionStore) {
+    // Neither tombstone nor live session: NotFound (or Unsupported).
+    match retire(log, session(0x9f), LogId::from_i64(9)).await {
+        Err(RetirementError::Unsupported) => return,
+        Err(RetirementError::NotFound) => {}
+        other => panic!("expected NotFound for an unknown session, got {other:?}"),
+    }
+
+    // R2/R3/R7: retiring hides the session everywhere; a retry with the
+    // same frontier is a success; a different frontier reports the tombstone.
+    let parent_id = session(0x90);
+    let target = session(0x91);
+    create(log, parent_id, None).await;
+    create(log, target, Some(parent_id)).await;
+    let captured = frontier(log, target).await.expect("frontier");
+    retire(log, target, captured).await.expect("retire");
+    assert!(frontier(log, target).await.is_none());
+    assert!(scan(log, target).await.is_empty());
+    assert!(!sessions(log).await.contains(&target));
+    assert_eq!(parent(log, target).await, None);
+    assert!(children(log, parent_id).await.is_empty());
+    retire(log, target, captured)
+        .await
+        .expect("same-frontier retry is idempotent");
+    let moved = LogId::from_i64(captured.as_i64() + 1);
+    assert!(
+        matches!(
+            retire(log, target, moved).await,
+            Err(RetirementError::FrontierMoved { actual: Some(actual), .. }) if actual == captured
+        ),
+        "the tombstone outranks the live-session checks"
+    );
+
+    // R1: the frontier is a compare-and-set; the late record is not lost.
+    let cas = session(0x92);
+    create(log, cas, None).await;
+    let exported = frontier(log, cas).await.expect("frontier");
+    let late = append(log, cas, &input_recorded(), Some(DedupKey::new("late"))).await;
+    assert!(
+        matches!(
+            retire(log, cas, exported).await,
+            Err(RetirementError::FrontierMoved { expected, actual: Some(actual) })
+                if expected == exported && actual == late
+        ),
+        "R1: a concurrent append fails the CAS"
+    );
+    assert_eq!(scan(log, cas).await.len(), 2, "R1: nothing is lost");
+
+    // R4: NotIdle is checked before the frontier, and touches nothing.
+    let busy = session(0x93);
+    create(log, busy, None).await;
+    append(log, busy, &turn_started(turn()), None).await;
+    let current = frontier(log, busy).await.expect("frontier");
+    assert!(matches!(
+        retire(log, busy, LogId::from_i64(current.as_i64() + 100)).await,
+        Err(RetirementError::NotIdle)
+    ));
+    assert_eq!(frontier(log, busy).await, Some(current));
+
+    // An open compaction intent alone still counts as idle.
+    let compacting = session(0x94);
+    create(log, compacting, None).await;
+    append(
+        log,
+        compacting,
+        &compaction_started(),
+        Some(dedup::compaction(LogId::from_i64(1))),
+    )
+    .await;
+    let current = frontier(log, compacting).await.expect("frontier");
+    retire(log, compacting, current)
+        .await
+        .expect("a dangling compaction does not block retirement");
+
+    // R5: live children block the parent until retired bottom-up.
+    let top = session(0x95);
+    let leaf = session(0x96);
+    create(log, top, None).await;
+    create(log, leaf, Some(top)).await;
+    let top_frontier = frontier(log, top).await.expect("frontier");
+    let leaf_frontier = frontier(log, leaf).await.expect("frontier");
+    assert!(matches!(
+        retire(log, top, top_frontier).await,
+        Err(RetirementError::HasChildren)
+    ));
+    retire(log, leaf, leaf_frontier).await.expect("leaf");
+    retire(log, top, top_frontier).await.expect("top");
+
+    // R6: a non-idle parent blocks the child; HasChildren outranks it.
+    let busy_parent = session(0x97);
+    let middle = session(0x98);
+    let grandchild = session(0x99);
+    create(log, busy_parent, None).await;
+    append(log, busy_parent, &turn_started(turn()), None).await;
+    create(log, middle, Some(busy_parent)).await;
+    create(log, grandchild, Some(middle)).await;
+    let middle_frontier = frontier(log, middle).await.expect("frontier");
+    assert!(matches!(
+        retire(log, middle, middle_frontier).await,
+        Err(RetirementError::HasChildren)
+    ));
+    let grandchild_frontier = frontier(log, grandchild).await.expect("frontier");
+    retire(log, grandchild, grandchild_frontier)
+        .await
+        .expect("an idle grandchild under an idle middle");
+    assert!(matches!(
+        retire(log, middle, middle_frontier).await,
+        Err(RetirementError::ParentNotIdle)
+    ));
+    assert_eq!(scan(log, middle).await.len(), 1, "the child is untouched");
 }
