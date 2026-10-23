@@ -1,15 +1,15 @@
-//! Agent loop: multi-step turns, the fixed tool pipeline, log-derived state and
-//! crash recovery.
+//! Agent loop: multi-step turns, model calls, log-derived state and crash
+//! recovery. A step's tool calls go to the `pipeline` module.
 //!
 //! One driver per session; model-attempt retries inside one step; the
-//! `StepStarted.seq` projection waterline; parallel/exclusive tool scheduling
-//! scoped to a step. Recovery reads only the committed prefix and handles open
-//! intents; completed history is never replayed from the session head.
+//! `StepStarted.seq` projection waterline. Recovery reads only the committed
+//! prefix and handles open intents; completed history is never replayed from
+//! the session head.
 
 // The public error enums are fixed by packaging.md §3.4–3.5.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,47 +18,39 @@ use std::time::Duration;
 
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, CancelReason, CancelRegistration, CancelToken, CancellationRegistry,
-    ChildOutcome, CompactPlan, CompactResult, CompactSummary, CompactionAbortReason,
-    CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger, Compactor,
-    ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, NO_APPROVAL_ENDPOINT, OpenStep,
-    Parallelism, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorKind,
-    ReplaySafety, ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx,
-    StopReason, StreamEvent, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
-    ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus,
-    ToolResultView, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, approval_signal_id,
-    approval_signal_name, decode_entry, dedup,
+    AbortKind, AgentError, AgentEvent, ApprovalPolicy, CancelReason, CancelRegistration,
+    CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
+    CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
+    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, OpenStep,
+    ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorKind, ResumeReason, RunRequest,
+    SessionEvent, SessionFacts, SessionState, StepCtx, StopReason, StreamEvent, ToolConfig,
+    ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, decode_entry,
+    dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, EventLog, LogEntry, LogId, LogQuery, SessionId,
-    SignalPayload, StepId, Timestamp, ToolCallId, TurnId, unique_bytes,
+    ApprovalGate, Clock, DedupKey, EventLog, LogEntry, LogId, SessionId, StepId, Timestamp, TurnId,
+    unique_bytes,
 };
 use futures_core::Stream;
 
-use crate::scheduler::{SPAWN_TOOL_NAME, Scheduler};
+use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt, stream};
-
-const DENIED_WITHOUT_REASON: &str = "tool call denied";
+use pipeline::{SpawnFn, ToolOutcome, ToolPipeline, ToolStep};
 
 /// The turn driver.
 pub(crate) struct Agent {
     log: Arc<dyn EventLog>,
     providers: Arc<ProviderCatalog>,
-    tools: Arc<ToolTable>,
-    tool_config: ToolConfig,
-    approval: Arc<dyn ApprovalPolicy>,
-    gate: Arc<ApprovalGate>,
-    executor: Arc<Waits>,
+    pipeline: ToolPipeline,
     clock: Arc<dyn Clock>,
-    /// Host hooks, called in registration order (ADR-0025).
+    /// Host hooks, called in registration order (ADR-0025). The pipeline
+    /// holds the same list for the tool hooks.
     hooks: Vec<Arc<dyn Hooks>>,
-    /// Backs `StepCtx::usage` / `ToolCallCtx::usage`.
+    /// Backs `StepCtx::usage`.
     usage: Option<UsageLookup>,
     compactor: Option<Arc<dyn Compactor>>,
     busy: Arc<Mutex<HashSet<SessionId>>>,
@@ -82,13 +74,17 @@ impl Agent {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
+            pipeline: ToolPipeline::new(
+                Arc::clone(&log),
+                tools,
+                tool_config,
+                approval,
+                gate,
+                executor,
+                Arc::clone(&clock),
+            ),
             log,
             providers,
-            tools,
-            tool_config,
-            approval,
-            gate,
-            executor,
             clock,
             hooks: Vec::new(),
             usage: None,
@@ -114,6 +110,7 @@ impl Agent {
         hooks: Vec<Arc<dyn Hooks>>,
         usage: Option<UsageLookup>,
     ) -> Self {
+        self.pipeline = self.pipeline.with_hooks(hooks.clone(), usage.clone());
         self.hooks = hooks;
         self.usage = usage;
         self
@@ -394,13 +391,16 @@ impl Agent {
         .await?;
 
         for (tool_call_id, _) in facts.open_tools() {
-            self.append_tool_result(
+            self.append(
                 session,
-                tool_call_id,
-                ToolResultStatus::Interrupted,
-                None,
-                None,
-                false,
+                SessionEvent::ToolResult {
+                    tool_call_id,
+                    status: ToolResultStatus::Interrupted,
+                    output: None,
+                    error: None,
+                    truncated: false,
+                },
+                Some(dedup::tool_result(tool_call_id)),
             )
             .await?;
         }
@@ -714,23 +714,10 @@ impl Agent {
                 )
                 .await?;
 
-                let calls = tool_calls(&items);
-                let had_calls = !calls.is_empty();
+                let had_calls = has_tool_calls(&items);
                 if had_calls {
-                    let decoded = decode_entries(self.scan(session).await?, session)?;
-                    let existing = existing_step(&decoded, turn, step);
                     let outcome = self
-                        .execute_tool_calls(
-                            session,
-                            turn,
-                            step,
-                            &existing,
-                            calls,
-                            cancel,
-                            config.turn.cancel_grace,
-                            false,
-                            events,
-                        )
+                        .run_tools(session, config, turn, step, &items, false, cancel, events)
                         .await?;
                     if outcome == ToolOutcome::Cancelled {
                         self.commit_step(session, turn, step).await?;
@@ -914,22 +901,10 @@ impl Agent {
                 detail: "open step has no AssistantMessage".to_owned(),
             })?;
 
-        let existing = existing_step(&decoded, turn, step);
-        let calls = tool_calls(&items);
-        let had_calls = !calls.is_empty();
+        let had_calls = has_tool_calls(&items);
         if had_calls {
             let outcome = self
-                .execute_tool_calls(
-                    session,
-                    turn,
-                    step,
-                    &existing,
-                    calls,
-                    cancel,
-                    config.turn.cancel_grace,
-                    true,
-                    events,
-                )
+                .run_tools(session, config, turn, step, &items, true, cancel, events)
                 .await?;
             if outcome == ToolOutcome::Cancelled {
                 self.commit_step(session, turn, step).await?;
@@ -945,739 +920,38 @@ impl Agent {
         Ok(step_outcome(&stop_reason, had_calls, pending_input))
     }
 
-    /// The fixed pipeline: `before_tool`, intent, registry, approval, scheduling,
-    /// invocation, truncation, `after_tool`, result.
+    /// Hand this step's tool calls to the pipeline; `spawn_agent` calls are
+    /// routed to the scheduler, which drives children with this agent.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_tool_calls(
+    async fn run_tools(
         &self,
         session: SessionId,
+        config: &ConfigSnapshot,
         turn: TurnId,
         step: StepId,
-        existing: &ExistingStep,
-        calls: Vec<CallItem>,
-        cancel: &CancelToken,
-        cancel_grace: Duration,
+        items: &[Item],
         recovering: bool,
+        cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolOutcome, AgentError> {
-        let lock = Arc::new(tokio::sync::RwLock::new(()));
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.tool_config.max_parallel_calls.get(),
-        ));
-        let budget = Arc::new(Mutex::new(self.tool_config.max_output_bytes_per_step));
-        let mut runnable: Vec<Runnable> = Vec::new();
-        let mut cancelled = cancel.is_cancelled();
-
-        for call in calls {
-            if let Some(intent) = existing.intents.get(&call.provider_call_id) {
-                if existing.results.contains(&intent.tool_call_id) {
-                    continue;
-                }
-                // A tool that was absent when its intent was recorded never
-                // enters approval and is never rerun.
-                if intent.provenance == Provenance::Unknown {
-                    self.not_found(session, intent.tool_call_id, &intent.name)
-                        .await?;
-                    continue;
-                }
-                if cancelled {
-                    self.interrupt(session, turn, step, intent.tool_call_id, events)
-                        .await?;
-                    continue;
-                }
-                match self.tools.get(&intent.name) {
-                    None => {
-                        self.not_found(session, intent.tool_call_id, &intent.name)
-                            .await?;
-                    }
-                    Some(tool) => {
-                        let descriptor = tool.descriptor().clone();
-                        match self
-                            .decide_approval(
-                                session,
-                                turn,
-                                step,
-                                intent.tool_call_id,
-                                &intent.name,
-                                &intent.args,
-                                &descriptor,
-                                intent.replay,
-                                recovering,
-                                cancel,
-                                events,
-                            )
-                            .await?
-                        {
-                            ToolDecision::Allow => {
-                                if cancel.is_cancelled() {
-                                    cancelled = true;
-                                    self.interrupt(
-                                        session,
-                                        turn,
-                                        step,
-                                        intent.tool_call_id,
-                                        events,
-                                    )
-                                    .await?;
-                                } else {
-                                    runnable.push(Runnable {
-                                        tool,
-                                        descriptor,
-                                        tool_call_id: intent.tool_call_id,
-                                        provider_call_id: call.provider_call_id.clone(),
-                                        name: intent.name.clone(),
-                                        args: intent.args.clone(),
-                                    });
-                                }
-                            }
-                            ToolDecision::Interrupt => {
-                                self.interrupt(session, turn, step, intent.tool_call_id, events)
-                                    .await?;
-                            }
-                            ToolDecision::Deny(reason) => {
-                                self.deny(session, intent.tool_call_id, reason).await?
-                            }
-                            ToolDecision::Cancelled => {
-                                cancelled = true;
-                                self.interrupt(session, turn, step, intent.tool_call_id, events)
-                                    .await?;
-                            }
-                        }
-                    }
-                }
-                continue;
+        let spawn;
+        let spawn: Option<&SpawnFn<'_>> = match &self.scheduler {
+            Some(scheduler) => {
+                spawn = move |args, ctx| scheduler.run_spawn_tool(self, args, ctx);
+                Some(&spawn)
             }
-
-            // No recorded intent: `before_tool` runs for this call only.
-            let tool_call_id = ToolCallId::from_bytes(self.fresh_id());
-            let mut args = call.raw_args;
-            let tool = self.tools.get(&call.name);
-            let descriptor = tool.as_ref().map(|tool| tool.descriptor().clone());
-            let (replay, provenance) = match &descriptor {
-                Some(descriptor) => (descriptor.replay, descriptor.provenance),
-                None => (ReplaySafety::Unsafe, Provenance::Unknown),
-            };
-            let ctx = ToolCallCtx::new(
-                session,
-                turn,
-                step,
-                tool_call_id,
-                call.provider_call_id.clone(),
-                call.name.clone(),
-                provenance,
-                replay,
-                self.usage.clone(),
-            );
-            let failure = self.before_tool(&ctx, &mut args).await;
-            self.append(
-                session,
-                SessionEvent::ToolCallRequested {
-                    turn_id: turn,
-                    step_id: step,
-                    tool_call_id,
-                    provider_call_id: call.provider_call_id,
-                    name: call.name.clone(),
-                    raw_args: args.clone(),
-                    replay,
-                    provenance,
-                },
-                Some(dedup::tool_call(tool_call_id)),
-            )
-            .await?;
-
-            if cancelled {
-                self.interrupt(session, turn, step, tool_call_id, events)
-                    .await?;
-                continue;
-            }
-
-            match (failure, descriptor, tool) {
-                (Some(PreFailure::Denied(reason)), _, _) => {
-                    self.deny(session, tool_call_id, reason).await?;
-                }
-                (Some(PreFailure::Internal(message)), _, _) => {
-                    self.append_tool_result(
-                        session,
-                        tool_call_id,
-                        ToolResultStatus::Failed,
-                        None,
-                        Some(ToolErrorInfo {
-                            kind: ToolErrorKind::Internal,
-                            message,
-                        }),
-                        false,
-                    )
-                    .await?;
-                }
-                (None, None, _) => {
-                    self.append_tool_result(
-                        session,
-                        tool_call_id,
-                        ToolResultStatus::Failed,
-                        None,
-                        Some(ToolErrorInfo {
-                            kind: ToolErrorKind::NotFound,
-                            message: format!("tool {} is not registered", call.name),
-                        }),
-                        false,
-                    )
-                    .await?;
-                }
-                (None, Some(descriptor), Some(tool)) => {
-                    match self
-                        .decide_approval(
-                            session,
-                            turn,
-                            step,
-                            tool_call_id,
-                            &call.name,
-                            &args,
-                            &descriptor,
-                            descriptor.replay,
-                            false,
-                            cancel,
-                            events,
-                        )
-                        .await?
-                    {
-                        ToolDecision::Allow => {
-                            if cancel.is_cancelled() {
-                                cancelled = true;
-                                self.interrupt(session, turn, step, tool_call_id, events)
-                                    .await?;
-                            } else {
-                                runnable.push(Runnable {
-                                    tool,
-                                    descriptor,
-                                    tool_call_id,
-                                    provider_call_id: ctx.provider_call_id.clone(),
-                                    name: call.name,
-                                    args,
-                                });
-                            }
-                        }
-                        ToolDecision::Interrupt => {
-                            // Only recovery returns this; a fresh call has no
-                            // recorded effect to protect.
-                            unreachable!("fresh intents always execute or deny")
-                        }
-                        ToolDecision::Deny(reason) => {
-                            self.deny(session, tool_call_id, reason).await?
-                        }
-                        ToolDecision::Cancelled => {
-                            cancelled = true;
-                            self.interrupt(session, turn, step, tool_call_id, events)
-                                .await?;
-                        }
-                    }
-                }
-                (None, Some(_), None) => unreachable!("descriptor comes from the registry entry"),
-            }
-        }
-
-        if cancelled {
-            // Calls that passed approval but never started are interrupted too.
-            let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
-            self.finish_cancelled_step(session, turn, step, &pending, events)
-                .await?;
-            return Ok(ToolOutcome::Cancelled);
-        }
-        if runnable.is_empty() {
-            return Ok(ToolOutcome::Done);
-        }
-
-        let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
-        let mut futures: FuturesUnordered<BoxFuture<'_, Result<(), AgentError>>> =
-            FuturesUnordered::new();
-        for item in runnable {
-            futures.push(self.execute_one(
-                session,
-                turn,
-                step,
-                item,
-                Arc::clone(&semaphore),
-                Arc::clone(&lock),
-                Arc::clone(&budget),
-                cancel,
-                events,
-            ));
-        }
-
-        let mut failure = None;
-        let token = cancel.clone();
-        let cancel_wait = token.cancelled();
-        tokio::pin!(cancel_wait);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut cancel_wait => break,
-                result = futures.next() => match result {
-                    Some(Ok(())) => {}
-                    Some(Err(error)) => {
-                        failure.get_or_insert(error);
-                    }
-                    None => return match failure {
-                        Some(error) => Err(error),
-                        None => Ok(ToolOutcome::Done),
-                    },
-                }
-            }
-        }
-
-        // Cancellation grace: in-flight tools may return a real result.
-        if !cancel_grace.is_zero() {
-            let deadline = tokio::time::sleep(cancel_grace);
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut deadline => break,
-                    result = futures.next() => match result {
-                        Some(Ok(())) => {}
-                        Some(Err(error)) => {
-                            failure.get_or_insert(error);
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        drop(futures);
-
-        self.finish_cancelled_step(session, turn, step, &pending, events)
-            .await?;
-        Ok(ToolOutcome::Cancelled)
-    }
-
-    /// Interrupt every call of this step that has no recorded result, then close
-    /// the step's open waits. Reading the log (not driver memory) makes a real
-    /// result that landed while its future was dropped still win.
-    async fn finish_cancelled_step(
-        &self,
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        pending: &[ToolCallId],
-        events: &EventSink,
-    ) -> Result<(), AgentError> {
-        let decoded = decode_entries(self.scan(session).await?, session)?;
-        let facts = fold_facts(&decoded);
-        let step_calls: HashSet<ToolCallId> = decoded
-            .iter()
-            .filter_map(|(_, event)| match event {
-                SessionEvent::ToolCallRequested {
-                    turn_id,
-                    step_id,
-                    tool_call_id,
-                    ..
-                } if *turn_id == turn && *step_id == step => Some(*tool_call_id),
-                _ => None,
-            })
-            .collect();
-        // #41/#48: a spawn owned by this step is a wait to close even when its
-        // tool future was dropped before the scheduler wrote the terminal.
-        // Dedup by child id makes a racing write a no-op.
-        let owned_children = facts
-            .open_children()
-            .filter(|(_, child)| step_calls.contains(&child.parent_tool_call));
-        for (child, _) in owned_children {
-            self.append(
-                session,
-                SessionEvent::ChildSessionCompleted {
-                    child,
-                    outcome: ChildOutcome::Cancelled {
-                        reason: CancelReason::Parent,
-                    },
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await?;
-        }
-        // Every pending call has a recorded intent; an open one has no result.
-        for tool_call_id in pending {
-            if facts.open_tool(*tool_call_id).is_some() {
-                self.interrupt(session, turn, step, *tool_call_id, events)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// One interrupted `ToolResult`; the dedup key makes a racing real result win.
-    async fn interrupt(
-        &self,
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        tool_call_id: ToolCallId,
-        events: &EventSink,
-    ) -> Result<(), AgentError> {
-        self.append_tool_result(
-            session,
-            tool_call_id,
-            ToolResultStatus::Interrupted,
-            None,
-            None,
-            false,
-        )
-        .await?;
-        events.push(Ok(AgentEvent::ToolFinished {
-            turn,
-            step,
-            call: tool_call_id,
-            status: ToolResultStatus::Interrupted,
-        }));
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn execute_one<'a>(
-        &'a self,
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        item: Runnable,
-        semaphore: Arc<tokio::sync::Semaphore>,
-        lock: Arc<tokio::sync::RwLock<()>>,
-        budget: Arc<Mutex<usize>>,
-        turn_cancel: &'a CancelToken,
-        events: &'a EventSink,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        Box::pin(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("the semaphore is never closed");
-            let _guard = match item.descriptor.parallelism {
-                Parallelism::Parallel => StepLockGuard::Read(lock.read().await),
-                Parallelism::Exclusive => StepLockGuard::Write(lock.write().await),
-            };
-
-            events.push(Ok(AgentEvent::ToolStarted {
-                turn,
-                step,
-                call: item.tool_call_id,
-                tool: item.name.clone(),
-            }));
-
-            // A child of the turn token: the turn broadcasts to every tool, and
-            // a per-call timeout cancels only this call.
-            let cancel = turn_cancel.child();
-            let context = ToolContext::new(session, turn, step, item.tool_call_id, cancel.clone());
-            let timeout = item
-                .descriptor
-                .timeout
-                .or(match item.descriptor.provenance {
-                    Provenance::External { .. } => self.tool_config.external_timeout,
-                    _ => None,
-                });
-            let tool = item.tool;
-            let call = match &self.scheduler {
-                Some(scheduler) if tool.descriptor().name.as_str() == SPAWN_TOOL_NAME => {
-                    scheduler.run_spawn_tool(self, item.args, context)
-                }
-                _ => tool.invoke(item.args, context),
-            };
-            let invocation = invoke_tool(
-                call,
-                cancel,
-                turn_cancel.clone(),
-                timeout,
-                self.tool_config.kill_grace,
-            )
-            .await;
-
-            let (mut status, mut output, mut error, mut truncated) = match invocation {
-                Invocation::Returned(Ok(output)) => (
-                    ToolResultStatus::Completed,
-                    Some(output.content),
-                    None,
-                    false,
-                ),
-                Invocation::Returned(Err(error)) => (
-                    ToolResultStatus::Failed,
-                    None,
-                    Some(ToolErrorInfo {
-                        kind: error.kind(),
-                        message: error.message().to_owned(),
-                    }),
-                    false,
-                ),
-                Invocation::Panic => (
-                    ToolResultStatus::Failed,
-                    None,
-                    Some(ToolErrorInfo {
-                        kind: ToolErrorKind::Panic,
-                        message: "tool panicked".to_owned(),
-                    }),
-                    false,
-                ),
-                Invocation::Cancelled => (ToolResultStatus::Interrupted, None, None, false),
-                Invocation::Timeout => (
-                    ToolResultStatus::Failed,
-                    None,
-                    Some(ToolErrorInfo {
-                        kind: ToolErrorKind::Timeout,
-                        message: "tool call timed out".to_owned(),
-                    }),
-                    false,
-                ),
-            };
-
-            if status == ToolResultStatus::Completed {
-                let limit = item
-                    .descriptor
-                    .max_output_bytes
-                    .unwrap_or(self.tool_config.max_output_bytes);
-                let (parts, was_truncated) =
-                    truncate_output(output.take().unwrap_or_default(), limit, &budget);
-                output = Some(parts);
-                truncated = was_truncated;
-            }
-
-            if !self.hooks.is_empty() {
-                let ctx = ToolCallCtx::new(
-                    session,
-                    turn,
-                    step,
-                    item.tool_call_id,
-                    item.provider_call_id.clone(),
-                    item.name.clone(),
-                    item.descriptor.provenance,
-                    item.descriptor.replay,
-                    self.usage.clone(),
-                );
-                let mut view = ToolResultView::new(
-                    status,
-                    output.clone().unwrap_or_default(),
-                    error.clone(),
-                    truncated,
-                );
-                match self.after_tool(&ctx, &mut view).await {
-                    Ok(()) => {
-                        // Status is not an after_tool concern; only content and
-                        // the model-visible error message are rewritable.
-                        if status == ToolResultStatus::Completed {
-                            output = Some(view.output);
-                            truncated = view.truncated;
-                        }
-                        if status == ToolResultStatus::Failed {
-                            error = view.error;
-                        }
-                    }
-                    Err(failure) => {
-                        status = ToolResultStatus::Failed;
-                        output = None;
-                        error = Some(ToolErrorInfo {
-                            kind: ToolErrorKind::Internal,
-                            message: failure.message,
-                        });
-                        truncated = false;
-                    }
-                }
-            }
-
-            self.append_tool_result(session, item.tool_call_id, status, output, error, truncated)
-                .await?;
-            events.push(Ok(AgentEvent::ToolFinished {
-                turn,
-                step,
-                call: item.tool_call_id,
-                status,
-            }));
-
-            drop(_guard);
-            Ok(())
-        })
-    }
-
-    /// Host `before_tool` hooks in order: rewrites pass along, the first
-    /// `Deny` short-circuits, and an error or panic fails the call.
-    async fn before_tool(&self, ctx: &ToolCallCtx, args: &mut ToolArgs) -> Option<PreFailure> {
-        for hook in &self.hooks {
-            match caught(|| hook.before_tool(ctx, args)).await {
-                Ok(ToolGate::Deny { reason }) => {
-                    return Some(PreFailure::Denied(
-                        reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => return Some(PreFailure::Internal(error.message)),
-            }
-        }
-        None
-    }
-
-    /// Host `after_tool` hooks in order; the first error or panic wins.
-    async fn after_tool(
-        &self,
-        ctx: &ToolCallCtx,
-        view: &mut ToolResultView,
-    ) -> Result<(), HookError> {
-        for hook in &self.hooks {
-            caught(|| hook.after_tool(ctx, view)).await?;
-        }
-        Ok(())
-    }
-
-    /// A recorded approval signal wins over the current policy and is never
-    /// re-prompted. `Ask` without a live endpoint fails closed.
-    #[allow(clippy::too_many_arguments)]
-    async fn decide_approval(
-        &self,
-        session: SessionId,
-        turn: TurnId,
-        step: StepId,
-        tool_call_id: ToolCallId,
-        name: &ToolName,
-        args: &ToolArgs,
-        descriptor: &ToolDescriptor,
-        replay: ReplaySafety,
-        recovering: bool,
-        cancel: &CancelToken,
-        events: &EventSink,
-    ) -> Result<ToolDecision, AgentError> {
-        if let Some(payload) = self.recorded_approval(session, tool_call_id).await? {
-            return approval_decision(session, payload);
-        }
-
-        let request = ApprovalRequest::new(
+            None => None,
+        };
+        let step = ToolStep {
             session,
             turn,
             step,
-            tool_call_id,
-            name.clone(),
-            args.clone(),
-            descriptor.replay,
-            descriptor.side_effect,
-            descriptor.provenance,
-        );
-        match self.approval.classify(&request) {
-            // A recorded decision above always wins. Without one, recovery
-            // never reruns an unsafe tool.
-            ApprovalVerdict::Allow if recovering && replay == ReplaySafety::Unsafe => {
-                Ok(ToolDecision::Interrupt)
-            }
-            ApprovalVerdict::Allow => Ok(ToolDecision::Allow),
-            ApprovalVerdict::Deny { reason } => Ok(ToolDecision::Deny(
-                reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
-            )),
-            ApprovalVerdict::Ask => {
-                if !self.gate.is_open() {
-                    return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
-                }
-                events.push(Ok(AgentEvent::ApprovalRequested(request)));
-                let wait = self.executor.await_signal(AwaitSignal {
-                    session,
-                    signal: approval_signal_id(tool_call_id),
-                    name: approval_signal_name(tool_call_id),
-                });
-                tokio::pin!(wait);
-                let token = cancel.clone();
-                let cancel_wait = token.cancelled();
-                tokio::pin!(cancel_wait);
-                let payload = tokio::select! {
-                    biased;
-                    // The interrupted ToolResult closes this call's intent.
-                    _ = &mut cancel_wait => return Ok(ToolDecision::Cancelled),
-                    payload = &mut wait => payload?,
-                };
-                approval_decision(session, payload)
-            }
-            _ => Ok(ToolDecision::Deny(DENIED_WITHOUT_REASON.to_owned())),
-        }
-    }
-
-    async fn recorded_approval(
-        &self,
-        session: SessionId,
-        tool_call_id: ToolCallId,
-    ) -> Result<Option<SignalPayload>, AgentError> {
-        let signal = approval_signal_id(tool_call_id);
-        let mut stream = self.log.scan(LogQuery {
-            session,
-            after: None,
-            limit: None,
-        });
-        while let Some(entry) = stream.next().await {
-            let event = decode_entry(&entry?).map_err(|error| AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            })?;
-            if let SessionEvent::SignalReceived {
-                signal_id, payload, ..
-            } = event
-                && signal_id == signal
-            {
-                return Ok(Some(payload));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn deny(
-        &self,
-        session: SessionId,
-        tool_call_id: ToolCallId,
-        message: String,
-    ) -> Result<(), AgentError> {
-        self.append_tool_result(
-            session,
-            tool_call_id,
-            ToolResultStatus::Failed,
-            None,
-            Some(ToolErrorInfo {
-                kind: ToolErrorKind::Denied,
-                message,
-            }),
-            false,
-        )
-        .await
-    }
-
-    /// The model-visible terminal for a tool that is not in the registry.
-    async fn not_found(
-        &self,
-        session: SessionId,
-        tool_call_id: ToolCallId,
-        name: &ToolName,
-    ) -> Result<(), AgentError> {
-        self.append_tool_result(
-            session,
-            tool_call_id,
-            ToolResultStatus::Failed,
-            None,
-            Some(ToolErrorInfo {
-                kind: ToolErrorKind::NotFound,
-                message: format!("tool {name} is not registered"),
-            }),
-            false,
-        )
-        .await
-    }
-
-    async fn append_tool_result(
-        &self,
-        session: SessionId,
-        tool_call_id: ToolCallId,
-        status: ToolResultStatus,
-        output: Option<Vec<asterpath_protocol::Part>>,
-        error: Option<ToolErrorInfo>,
-        truncated: bool,
-    ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::ToolResult {
-                tool_call_id,
-                status,
-                output,
-                error,
-                truncated,
-            },
-            Some(dedup::tool_result(tool_call_id)),
-        )
-        .await
-        .map(|_| ())
+            recovering,
+            cancel_grace: config.turn.cancel_grace,
+            events,
+            spawn,
+        };
+        self.pipeline.run(&step, items, cancel).await
     }
 
     async fn commit_step(
@@ -2053,95 +1327,11 @@ impl Agent {
     }
 }
 
-struct CallItem {
-    provider_call_id: String,
-    name: ToolName,
-    raw_args: ToolArgs,
-}
-
-struct RecordedIntent {
-    tool_call_id: ToolCallId,
-    name: ToolName,
-    args: ToolArgs,
-    replay: ReplaySafety,
-    provenance: Provenance,
-}
-
-#[derive(Default)]
-struct ExistingStep {
-    intents: HashMap<String, RecordedIntent>,
-    results: HashSet<ToolCallId>,
-}
-
-struct Runnable {
-    provider_call_id: String,
-    tool: Arc<dyn Tool>,
-    descriptor: ToolDescriptor,
-    tool_call_id: ToolCallId,
-    name: ToolName,
-    args: ToolArgs,
-}
-
-enum PreFailure {
-    Denied(String),
-    Internal(String),
-}
-
-enum ToolDecision {
-    Allow,
-    Deny(String),
-    /// Recovery: the intent is recorded but the tool is unsafe to rerun.
-    Interrupt,
-    Cancelled,
-}
-
-fn approval_decision(
-    session: SessionId,
-    payload: SignalPayload,
-) -> Result<ToolDecision, AgentError> {
-    match serde_json::from_value::<ApprovalDecision>(payload) {
-        Ok(ApprovalDecision::Allow) => Ok(ToolDecision::Allow),
-        Ok(ApprovalDecision::Deny { reason }) => Ok(ToolDecision::Deny(
-            reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
-        )),
-        Ok(_) => Err(AgentError::Corrupt {
-            session,
-            detail: "unknown approval decision".to_owned(),
-        }),
-        Err(error) => Err(AgentError::Corrupt {
-            session,
-            detail: format!("invalid approval decision: {error}"),
-        }),
-    }
-}
-
-enum Invocation {
-    Returned(Result<ToolOutput, ToolError>),
-    Panic,
-    /// The turn's cancel token was already set when the deadline expired.
-    Cancelled,
-    Timeout,
-}
-
-// The guard variants exist only to hold a lock until end of scope.
-#[allow(dead_code)]
-enum StepLockGuard<'a> {
-    Read(tokio::sync::RwLockReadGuard<'a, ()>),
-    Write(tokio::sync::RwLockWriteGuard<'a, ()>),
-}
-
 enum StepOutcome {
     /// `pause_turn`, tool calls or pending input: continue the same turn.
     Continue,
     Turn(TurnEndReason),
 }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ToolOutcome {
-    Done,
-    Cancelled,
-}
-
 enum GateOutcome {
     Continue,
     Stop(String),
@@ -2256,182 +1446,6 @@ async fn caught<'a, T>(
     }
 }
 
-/// Invoke one tool with pipeline-owned deadline and panic containment.
-async fn invoke_tool(
-    call: BoxFuture<'_, Result<ToolOutput, ToolError>>,
-    cancel: CancelToken,
-    turn_cancel: CancelToken,
-    timeout: Option<Duration>,
-    kill_grace: Duration,
-) -> Invocation {
-    let future = AssertUnwindSafe(call).catch_unwind();
-    tokio::pin!(future);
-
-    let Some(limit) = timeout else {
-        return match future.await {
-            Ok(result) => Invocation::Returned(result),
-            Err(_) => Invocation::Panic,
-        };
-    };
-
-    let deadline = tokio::time::sleep(limit);
-    tokio::pin!(deadline);
-    let cancel_wait = turn_cancel.cancelled();
-    tokio::pin!(cancel_wait);
-
-    tokio::select! {
-        biased;
-        // Turn cancellation takes over the deadline: await the tool ourselves;
-        // the supervisor's grace drops it if it never settles.
-        _ = &mut cancel_wait => match future.as_mut().await {
-            Ok(result) => Invocation::Returned(result),
-            Err(_) => Invocation::Panic,
-        },
-        result = &mut future => match result {
-            Ok(result) => Invocation::Returned(result),
-            Err(_) => Invocation::Panic,
-        },
-        _ = &mut deadline => {
-            let already_cancelled = cancel.is_cancelled();
-            cancel.cancel();
-            match tokio::time::timeout(kill_grace, future.as_mut()).await {
-                Ok(Ok(result)) => Invocation::Returned(result),
-                Ok(Err(_)) => Invocation::Panic,
-                Err(_) if already_cancelled || turn_cancel.is_cancelled() => {
-                    Invocation::Cancelled
-                }
-                Err(_) => Invocation::Timeout,
-            }
-        }
-    }
-}
-
-/// Truncate model-visible content to `call_limit`, bounded by the step budget.
-/// Text is cut at a UTF-8 boundary; non-text parts are kept whole or dropped.
-fn truncate_output(
-    parts: Vec<asterpath_protocol::Part>,
-    call_limit: usize,
-    budget: &Mutex<usize>,
-) -> (Vec<asterpath_protocol::Part>, bool) {
-    let mut remaining = budget.lock().unwrap_or_else(PoisonError::into_inner);
-    let limit = call_limit.min(*remaining);
-    let total: usize = parts.iter().map(part_bytes).sum();
-    if total <= limit {
-        *remaining = remaining.saturating_sub(total);
-        return (parts, false);
-    }
-
-    let mut kept = Vec::new();
-    let mut used = 0usize;
-    let mut full = false;
-    for part in parts {
-        if full {
-            break;
-        }
-        let size = part_bytes(&part);
-        if used + size <= limit {
-            used += size;
-            kept.push(part);
-            continue;
-        }
-        // A non-text part is never split; it is skipped so later parts that
-        // still fit may be kept. A text part fills the remaining room and stops.
-        if let asterpath_protocol::Part::Text { text } = part {
-            let room = limit.saturating_sub(used);
-            let cut = floor_char_boundary(&text, room);
-            if cut > 0 {
-                let kept_text = text[..cut].to_owned();
-                used += kept_text.len();
-                kept.push(asterpath_protocol::Part::Text { text: kept_text });
-            }
-            full = true;
-        }
-    }
-
-    let omitted = total.saturating_sub(used);
-    let suffix = format!("[output truncated: {omitted} bytes omitted]");
-    used += suffix.len();
-    kept.push(asterpath_protocol::Part::Text { text: suffix });
-    *remaining = remaining.saturating_sub(used);
-    (kept, true)
-}
-
-fn part_bytes(part: &asterpath_protocol::Part) -> usize {
-    match part {
-        asterpath_protocol::Part::Text { text } => text.len(),
-        other => serde_json::to_vec(other)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0),
-    }
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn tool_calls(items: &[Item]) -> Vec<CallItem> {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            Item::ToolCall {
-                call_id,
-                name,
-                raw_args,
-                ..
-            } => Some(CallItem {
-                provider_call_id: call_id.clone(),
-                name: name.clone(),
-                raw_args: raw_args.clone(),
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
-fn existing_step(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> ExistingStep {
-    let mut existing = ExistingStep::default();
-    for (_, event) in decoded {
-        match event {
-            SessionEvent::ToolCallRequested {
-                turn_id,
-                step_id,
-                tool_call_id,
-                provider_call_id,
-                name,
-                raw_args,
-                replay,
-                provenance,
-            } if *turn_id == turn && *step_id == step => {
-                existing.intents.insert(
-                    provider_call_id.clone(),
-                    RecordedIntent {
-                        tool_call_id: *tool_call_id,
-                        name: name.clone(),
-                        args: raw_args.clone(),
-                        replay: *replay,
-                        provenance: *provenance,
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-    let facts = fold_facts(decoded);
-    existing.results = existing
-        .intents
-        .values()
-        .map(|intent| intent.tool_call_id)
-        .filter(|id| facts.open_tool(*id).is_none())
-        .collect();
-    existing
-}
-
 /// The open step of `turn`, with its `StepStarted.seq` waterline.
 fn open_step(facts: &SessionFacts, turn: TurnId) -> Option<OpenStep> {
     facts.open_step().filter(|open| open.turn == turn)
@@ -2502,6 +1516,12 @@ fn compaction_after_last_abort(
     })
 }
 
+fn has_tool_calls(items: &[Item]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, Item::ToolCall { .. }))
+}
+
 fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {
     if matches!(stop_reason, StopReason::ContextWindowExceeded) {
         return StepOutcome::Turn(TurnEndReason::ContextExhausted);
@@ -2545,6 +1565,8 @@ fn backoff(config: &TurnConfig, attempt: u32, now: Timestamp) -> Duration {
     let jitter = Duration::from_nanos(seed % (jitter_max.as_nanos() as u64 + 1));
     (capped + jitter).min(config.max_backoff)
 }
+
+mod pipeline;
 
 #[cfg(test)]
 mod tests;

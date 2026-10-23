@@ -11,6 +11,7 @@ pub mod http_mock;
 pub mod memory;
 pub mod provider_contract;
 pub mod scripted;
+pub mod tool;
 
 pub use clock::ManualClock;
 pub use contract::{BackendFactory, BackendHandle, event_log_contract, storage_contract};
@@ -19,3 +20,4 @@ pub use fake_sandbox::{FakeSandboxProvider, RecordedSpawnRequest};
 pub use memory::{InMemoryEventLog, InMemoryStorage, MemoryBackend};
 pub use provider_contract::{ProviderWire, provider_contract};
 pub use scripted::{Fixture, FixtureStep, ScriptedProvider, ScriptedStep};
+pub use tool::{TestTool, ToolCalls};

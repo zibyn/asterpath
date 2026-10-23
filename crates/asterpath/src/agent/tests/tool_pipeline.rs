@@ -5,23 +5,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::agent::Agent;
-use crate::tools::ToolTable;
-use crate::waits::Waits;
-use asterpath_protocol::{
-    AgentEvent, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Gate, HookError, Hooks,
-    Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCatalog,
-    ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent,
-    SideEffect, StepCtx, StopReason, SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolConfig,
-    ToolContext, ToolDescriptor, ToolError, ToolGate, ToolName, ToolOutput, ToolResultStatus,
-    ToolResultView, TurnConfig, TurnEndReason, Usage, decode_entry, encode_entry,
+use super::support::{
+    agent, append, assistant_text, config, decoded, descriptor, drive, model, text, tool_call,
+    tool_table,
 };
-use asterpath_protocol::{ApprovalGate, EventLog, LogQuery, SessionId, ToolCallId, TurnId};
-use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
+use asterpath_protocol::{
+    AgentEvent, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, Parallelism, Part,
+    Provenance, ReplaySafety, SessionEvent, StepCtx, StopReason, Tool, ToolArgs, ToolCallCtx,
+    ToolConfig, ToolDescriptor, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
+    TurnEndReason, Usage,
+};
+use asterpath_protocol::{ToolCallId, TurnId};
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider, TestTool};
 use futures_core::future::BoxFuture;
-use futures_util::StreamExt;
-
-const SESSION: SessionId = SessionId::from_bytes([9; 16]);
 
 // --- host hooks -----------------------------------------------------------
 
@@ -80,99 +76,7 @@ impl Hooks for RedactOutput {
 
 // --- tools and registry ---------------------------------------------------
 
-type InvokeFn = Arc<
-    dyn Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync,
->;
-
-struct TestTool {
-    descriptor: ToolDescriptor,
-    calls: Arc<Mutex<Vec<ToolArgs>>>,
-    invoke: InvokeFn,
-}
-
-impl TestTool {
-    fn new(
-        descriptor: ToolDescriptor,
-        calls: Arc<Mutex<Vec<ToolArgs>>>,
-        invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            descriptor,
-            calls,
-            invoke: Arc::new(invoke),
-        })
-    }
-
-    fn echo(descriptor: ToolDescriptor) -> (Arc<Self>, Arc<Mutex<Vec<ToolArgs>>>) {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let tool = Self::new(descriptor, Arc::clone(&calls), |args, _ctx| {
-            Box::pin(async move { Ok(ToolOutput::new(vec![text(args.as_str())])) })
-        });
-        (tool, calls)
-    }
-
-    fn text(descriptor: ToolDescriptor, value: &str) -> Arc<Self> {
-        let value = value.to_owned();
-        Self::new(
-            descriptor,
-            Arc::new(Mutex::new(Vec::new())),
-            move |_args, _ctx| {
-                let value = value.clone();
-                Box::pin(async move { Ok(ToolOutput::new(vec![text(&value)])) })
-            },
-        )
-    }
-}
-
-impl Tool for TestTool {
-    fn descriptor(&self) -> &ToolDescriptor {
-        &self.descriptor
-    }
-
-    fn invoke(
-        &self,
-        args: ToolArgs,
-        ctx: ToolContext,
-    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        self.calls.lock().unwrap().push(args.clone());
-        (self.invoke)(args, ctx)
-    }
-}
-
-fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
-    let table = Arc::new(ToolTable::new());
-    for tool in tools {
-        table.register(tool);
-    }
-    table
-}
-
 // --- fixtures -------------------------------------------------------------
-
-fn text(value: &str) -> Part {
-    Part::Text {
-        text: value.to_owned(),
-    }
-}
-
-fn descriptor(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-    }
-}
 
 fn tool_config() -> ToolConfig {
     ToolConfig {
@@ -180,48 +84,6 @@ fn tool_config() -> ToolConfig {
         kill_grace: Duration::ZERO,
         ..ToolConfig::default()
     }
-}
-
-fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
-    ConfigSnapshot {
-        model: ModelSpec {
-            provider: ProviderId::new("p"),
-            model: ModelId::new("m"),
-            context_window: None,
-        },
-        system: Vec::new(),
-        tools,
-        request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
-        },
-        compaction: CompactionConfig::default(),
-        subagents: SubagentConfig::default(),
-    }
-}
-
-fn tool_call(call_id: &str, name: &str, args: &str) -> Item {
-    Item::ToolCall {
-        call_id: call_id.to_owned(),
-        provider_item_id: None,
-        name: ToolName::new(name),
-        raw_args: JsonString::new(args),
-        raw: None,
-    }
-}
-
-fn assistant_text(value: &str) -> Vec<Item> {
-    vec![Item::Message {
-        role: Role::Assistant,
-        parts: vec![text(value)],
-    }]
-}
-
-async fn append(log: &InMemoryEventLog, event: SessionEvent) {
-    let entry = encode_entry(SESSION, None, &event).expect("encodes");
-    log.append(entry).await.expect("appends");
 }
 
 async fn new_log(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
@@ -232,6 +94,7 @@ async fn new_log(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
             config,
             parent: None,
         },
+        None,
     )
     .await;
     append(
@@ -239,6 +102,7 @@ async fn new_log(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
         SessionEvent::InputRecorded {
             input: vec![text("go")],
         },
+        None,
     )
     .await;
     log
@@ -250,57 +114,6 @@ fn provider(first: Vec<Item>, stop: StopReason, second: Vec<Item>) -> Arc<Script
             .respond(first, stop, Usage::default())
             .respond(second, StopReason::EndTurn, Usage::default()),
     )
-}
-
-fn agent(
-    log: Arc<InMemoryEventLog>,
-    provider: Arc<ScriptedProvider>,
-    registry: Arc<ToolTable>,
-    tool_config: ToolConfig,
-    hooks: Vec<Arc<dyn Hooks>>,
-) -> Agent {
-    let provider: Arc<dyn Provider> = provider;
-    let gate = Arc::new(ApprovalGate::new());
-    let waits = Arc::new(Waits::new(log.clone()));
-    Agent::new(
-        log,
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        registry,
-        tool_config,
-        Arc::new(DefaultApprovalPolicy::new(gate.clone())),
-        gate,
-        waits,
-        Arc::new(asterpath_testing::ManualClock::new()),
-    )
-    .with_hooks(hooks, None)
-}
-
-async fn drive(agent: &Agent) -> Vec<AgentEvent> {
-    let mut stream = agent.run(RunRequest {
-        session: SESSION,
-        trigger: RunTrigger::Resume,
-    });
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event.expect("drive"));
-    }
-    events
-}
-
-async fn decoded(log: &InMemoryEventLog) -> Vec<SessionEvent> {
-    let mut stream = log.scan(LogQuery {
-        session: SESSION,
-        after: None,
-        limit: None,
-    });
-    let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        entries.push(entry.expect("scan"));
-    }
-    entries
-        .iter()
-        .map(|entry| decode_entry(entry).expect("decodes"))
-        .collect()
 }
 
 fn intents(events: &[SessionEvent]) -> Vec<(ToolCallId, String, JsonString, Provenance)> {
@@ -539,7 +352,7 @@ async fn oversized_output_is_truncated_at_a_utf8_boundary() {
     let long = "é".repeat(500);
     let mut descriptor = descriptor("long");
     descriptor.max_output_bytes = Some(10);
-    let tool = TestTool::text(descriptor.clone(), &long);
+    let (tool, _) = TestTool::text(descriptor.clone(), &long);
     let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor])).await;
     let provider = provider(
@@ -578,7 +391,7 @@ async fn oversized_output_is_truncated_at_a_utf8_boundary() {
 
 #[tokio::test]
 async fn the_step_cap_truncates_later_completions() {
-    let tool = TestTool::text(descriptor("fixed"), &"a".repeat(100));
+    let (tool, _) = TestTool::text(descriptor("fixed"), &"a".repeat(100));
     let registry = tool_table(vec![tool]);
     let log = new_log(config(vec![descriptor("fixed")])).await;
     let provider = provider(
@@ -916,13 +729,14 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
     let step = asterpath_protocol::StepId::from_bytes([3; 16]);
     let recorded = ToolCallId::from_bytes([4; 16]);
     let log = new_log(config(vec![descriptor("echo")])).await;
-    append(&log, SessionEvent::TurnStarted { turn_id: turn }).await;
+    append(&log, SessionEvent::TurnStarted { turn_id: turn }, None).await;
     append(
         &log,
         SessionEvent::StepStarted {
             turn_id: turn,
             step_id: step,
         },
+        None,
     )
     .await;
     append(
@@ -935,10 +749,11 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
                 tool_call("provider-b", "echo", r#"{"n":1}"#),
             ],
             raw: None,
-            model: config(Vec::new()).model,
+            model: model(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
         },
+        None,
     )
     .await;
     append(
@@ -953,6 +768,7 @@ async fn resume_does_not_rerun_pre_execute_for_recorded_intents() {
             replay: ReplaySafety::Safe,
             provenance: Provenance::InProcess,
         },
+        None,
     )
     .await;
 
@@ -1227,13 +1043,14 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
         ..descriptor("danger")
     };
     let log = new_log(config(vec![descriptor("echo"), danger.clone()])).await;
-    append(&log, SessionEvent::TurnStarted { turn_id: turn }).await;
+    append(&log, SessionEvent::TurnStarted { turn_id: turn }, None).await;
     append(
         &log,
         SessionEvent::StepStarted {
             turn_id: turn,
             step_id: step,
         },
+        None,
     )
     .await;
     append(
@@ -1246,10 +1063,11 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
                 tool_call("provider-b", "echo", "{}"),
             ],
             raw: None,
-            model: config(Vec::new()).model,
+            model: model(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
         },
+        None,
     )
     .await;
     append(
@@ -1264,6 +1082,7 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
             replay: ReplaySafety::Unsafe,
             provenance: Provenance::InProcess,
         },
+        None,
     )
     .await;
 

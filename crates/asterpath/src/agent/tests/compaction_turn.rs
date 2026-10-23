@@ -3,24 +3,19 @@
 //! (ADR-0025), covered by the facade tests.
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use super::support::{self, SESSION, append, drive, model, text, tool_table};
 use crate::agent::Agent;
-use crate::tools::ToolTable;
-use crate::waits::Waits;
 use asterpath_protocol::{
-    AgentEvent, CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionJob,
-    CompactionOutcome, ConfigSnapshot, DefaultApprovalPolicy, InputTokens, Item, ModelId,
-    ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderId, RequestConfig, Role,
-    RunRequest, RunTrigger, SessionEvent, StopReason, SubagentConfig, Tool, ToolConfig,
-    ToolDescriptor, TurnConfig, Usage, decode_entry, dedup, encode_entry,
+    CompactPlan, CompactSummary, CompactionError, CompactionJob, CompactionOutcome, ConfigSnapshot,
+    InputTokens, Item, ModelSpec, OutputTokens, Role, SessionEvent, StopReason, Tool, ToolConfig,
+    ToolDescriptor, Usage, decode_entry, dedup,
 };
-use asterpath_protocol::{ApprovalGate, DedupKey, EventLog, LogId, SessionId, StepId, TurnId};
-use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
+use asterpath_protocol::{EventLog, LogId, StepId, TurnId};
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
 
-const SESSION: SessionId = SessionId::from_bytes([9; 16]);
 const TURN: TurnId = TurnId::from_bytes([1; 16]);
 const STEP: StepId = StepId::from_bytes([2; 16]);
 
@@ -38,34 +33,43 @@ fn usage(input: u64, output: u64) -> Usage {
     }
 }
 
-fn text(value: &str) -> Part {
-    Part::Text {
-        text: value.to_owned(),
-    }
-}
-
-fn model() -> ModelSpec {
-    ModelSpec {
-        provider: ProviderId::new("p"),
-        model: ModelId::new("model-1"),
-        context_window: Some(200_000),
-    }
-}
-
+/// The shared config with a context window, so threshold compaction can run.
 fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
     ConfigSnapshot {
-        model: model(),
-        system: vec![text("be helpful")],
-        tools,
-        request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        model: ModelSpec {
+            context_window: Some(200_000),
+            ..model()
         },
-        compaction: CompactionConfig::default(),
-        subagents: SubagentConfig::default(),
+        ..support::config(tools)
     }
+}
+
+fn agent(
+    log: Arc<InMemoryEventLog>,
+    provider: Arc<ScriptedProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+    compactor: Option<Arc<dyn asterpath_protocol::Compactor>>,
+) -> Agent {
+    support::agent(
+        log,
+        provider,
+        tool_table(tools),
+        ToolConfig::default(),
+        Vec::new(),
+    )
+    .with_compactor(compactor)
+}
+
+async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {
+    append(
+        log,
+        SessionEvent::SessionCreated {
+            config,
+            parent: None,
+        },
+        Some(dedup::session_created(SESSION)),
+    )
+    .await;
 }
 
 fn assistant(text_value: &str) -> Item {
@@ -76,14 +80,6 @@ fn assistant(text_value: &str) -> Item {
 }
 
 // --- tools and executor ---------------------------------------------------
-
-fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
-    let table = Arc::new(ToolTable::new());
-    for tool in tools {
-        table.register(tool);
-    }
-    table
-}
 
 struct AlwaysCompact;
 
@@ -127,42 +123,6 @@ impl asterpath_protocol::Compactor for AlwaysCompact {
 
 // --- harness --------------------------------------------------------------
 
-fn agent(
-    log: Arc<InMemoryEventLog>,
-    provider: Arc<ScriptedProvider>,
-    tools: Vec<Arc<dyn Tool>>,
-    compactor: Option<Arc<dyn asterpath_protocol::Compactor>>,
-) -> Agent {
-    let registry = tool_table(tools);
-    let waits = Arc::new(Waits::new(log.clone()));
-    let gate = Arc::new(ApprovalGate::new());
-    let provider: Arc<dyn Provider> = provider;
-    Agent::new(
-        log,
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        registry,
-        ToolConfig::default(),
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
-        gate,
-        waits,
-        Arc::new(ManualClock::new()),
-    )
-    .with_compactor(compactor)
-}
-
-async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {
-    let entry = encode_entry(
-        SESSION,
-        Some(dedup::session_created(SESSION)),
-        &SessionEvent::SessionCreated {
-            config,
-            parent: None,
-        },
-    )
-    .expect("encode");
-    log.append(entry).await.expect("append");
-}
-
 async fn submit_input(log: &Arc<InMemoryEventLog>) {
     let input = asterpath_protocol::InputId::from_bytes([4; 16]);
     append(
@@ -173,23 +133,6 @@ async fn submit_input(log: &Arc<InMemoryEventLog>) {
         Some(dedup::input_recorded(input)),
     )
     .await;
-}
-
-async fn append(log: &Arc<InMemoryEventLog>, event: SessionEvent, key: Option<DedupKey>) -> LogId {
-    let entry = encode_entry(SESSION, key, &event).expect("encode");
-    log.append(entry).await.expect("append")
-}
-
-async fn drive(agent: &Agent) -> Vec<AgentEvent> {
-    let mut stream = agent.run(RunRequest {
-        session: SESSION,
-        trigger: RunTrigger::Resume,
-    });
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event.expect("drive"));
-    }
-    events
 }
 
 #[tokio::test]
