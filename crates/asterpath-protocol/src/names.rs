@@ -1,0 +1,172 @@
+//! Shared tool and plugin name rules.
+//!
+//! In-process tools use bare names; external tools are exposed as
+//! `<plugin_id>__<sanitized_tool_name>` and `__` is reserved for that namespace.
+
+use crate::ids::ToolName;
+
+/// Why a tool or plugin name was rejected.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ToolNameError {
+    #[error("tool name must be 1-64 characters of [A-Za-z0-9_-]")]
+    InvalidToolName,
+    #[error("tool name must not contain `__`")]
+    ReservedSeparator,
+    #[error("tool name exceeds 64 characters")]
+    TooLong,
+    #[error("plugin id must be 1-32 characters of [a-z0-9-]")]
+    InvalidPluginId,
+}
+
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+/// Validates a bare, in-process tool name: `[A-Za-z0-9_-]{1,64}` without `__`.
+pub fn validate_tool_name(name: &str) -> Result<(), ToolNameError> {
+    if name.is_empty() || name.len() > 64 || !name.bytes().all(is_name_byte) {
+        return Err(ToolNameError::InvalidToolName);
+    }
+    if name.contains("__") {
+        return Err(ToolNameError::ReservedSeparator);
+    }
+    Ok(())
+}
+
+/// Validates a plugin id: `[a-z0-9-]{1,32}`.
+pub fn validate_plugin_id(id: &str) -> Result<(), ToolNameError> {
+    let valid = !id.is_empty()
+        && id.len() <= 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(ToolNameError::InvalidPluginId)
+    }
+}
+
+/// Replaces every character outside `[A-Za-z0-9_-]` with `_`, keeping case.
+pub fn sanitize_tool_name(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Composes the externally visible name `<plugin_id>__<sanitized raw name>`.
+pub fn external_tool_name(plugin_id: &str, raw: &str) -> Result<ToolName, ToolNameError> {
+    validate_plugin_id(plugin_id)?;
+    let sanitized = sanitize_tool_name(raw);
+    if sanitized.is_empty() {
+        return Err(ToolNameError::InvalidToolName);
+    }
+    let name = format!("{plugin_id}__{sanitized}");
+    if name.len() > 64 {
+        return Err(ToolNameError::TooLong);
+    }
+    Ok(ToolName::new(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_bare_names() {
+        for name in [
+            "t",
+            "tool",
+            "read_file",
+            "shell-2",
+            "A",
+            "x".repeat(64).as_str(),
+        ] {
+            assert!(validate_tool_name(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_bare_names() {
+        assert_eq!(validate_tool_name(""), Err(ToolNameError::InvalidToolName));
+        assert_eq!(
+            validate_tool_name("a b"),
+            Err(ToolNameError::InvalidToolName)
+        );
+        assert_eq!(
+            validate_tool_name("a.b"),
+            Err(ToolNameError::InvalidToolName)
+        );
+        assert_eq!(validate_tool_name("é"), Err(ToolNameError::InvalidToolName));
+        assert_eq!(
+            validate_tool_name(&"x".repeat(65)),
+            Err(ToolNameError::InvalidToolName)
+        );
+        assert_eq!(
+            validate_tool_name("a__b"),
+            Err(ToolNameError::ReservedSeparator)
+        );
+    }
+
+    #[test]
+    fn validates_plugin_ids() {
+        for id in ["a", "weather-2", "0", &"a".repeat(32)] {
+            assert!(validate_plugin_id(id).is_ok(), "{id}");
+        }
+        for id in [
+            "",
+            "Weather",
+            "under_score",
+            "space id",
+            &"a".repeat(33),
+            "dot.id",
+        ] {
+            assert_eq!(
+                validate_plugin_id(id),
+                Err(ToolNameError::InvalidPluginId),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_replaces_every_invalid_character() {
+        assert_eq!(sanitize_tool_name("a.b/c d"), "a_b_c_d");
+        assert_eq!(sanitize_tool_name("A_b-2"), "A_b-2");
+        assert_eq!(sanitize_tool_name("é"), "_");
+        assert_eq!(sanitize_tool_name(""), "");
+    }
+
+    #[test]
+    fn composes_external_names() {
+        assert_eq!(
+            external_tool_name("weather", "get.forecast").unwrap(),
+            ToolName::new("weather__get_forecast")
+        );
+        assert_eq!(
+            external_tool_name("weather", "ünicode").unwrap(),
+            ToolName::new("weather___nicode")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_sanitized_component_and_oversize_names() {
+        assert_eq!(
+            external_tool_name("weather", ""),
+            Err(ToolNameError::InvalidToolName)
+        );
+        let raw = "x".repeat(59);
+        assert_eq!(
+            external_tool_name("0123456789", &raw),
+            Err(ToolNameError::TooLong)
+        );
+        assert!(external_tool_name("0123456789", &"x".repeat(49)).is_ok());
+    }
+}

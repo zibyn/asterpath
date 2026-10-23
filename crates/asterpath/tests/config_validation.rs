@@ -4,11 +4,32 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath};
-use asterpath_protocol::{ModelAlias, ModelId, ModelSpec, Provider, ProviderId, TurnConfig};
+use asterpath_protocol::{
+    ModelAlias, ModelId, ModelSpec, Parallelism, Provenance, Provider, ProviderId, ReplaySafety,
+    SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    TurnConfig,
+};
 use asterpath_testing::{BackendFactory, BackendHandle, MemoryBackend, ScriptedProvider};
+use futures_core::future::BoxFuture;
 
 fn backend() -> BackendHandle {
     MemoryBackend::new().open()
+}
+
+struct DummyTool(ToolDescriptor);
+
+impl Tool for DummyTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.0
+    }
+
+    fn invoke(
+        &self,
+        _args: ToolArgs,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        Box::pin(async { Ok(ToolOutput::new(Vec::new())) })
+    }
 }
 
 fn alias(provider: &str) -> BTreeMap<ModelAlias, ModelSpec> {
@@ -64,6 +85,28 @@ async fn zero_max_steps_is_a_build_time_config_error() {
         .await
         .unwrap_err();
     assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn p8_in_process_tool_names_must_not_contain_the_external_separator() {
+    let tool = Arc::new(DummyTool(ToolDescriptor {
+        name: ToolName::new("a__b"),
+        description: String::new(),
+        schema: serde_json::json!({"type": "object"}),
+        parallelism: Parallelism::Parallel,
+        replay: ReplaySafety::Safe,
+        side_effect: SideEffect::ReadOnly,
+        provenance: Provenance::InProcess,
+        timeout: None,
+        max_output_bytes: None,
+    }));
+    let error = Asterpath::builder()
+        .tools(vec![tool])
+        .build()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+    assert!(error.to_string().contains("a__b"), "{error}");
 }
 
 #[tokio::test]
