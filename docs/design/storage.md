@@ -84,7 +84,7 @@ pub enum StorageError {
 
 这套信封是 core 的唯一形状（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
-`Storage` 不提供公开 `enqueue`，也没有租约或 ack：唤醒是只读查询，由 `open_intents` 与 `pending_inputs` 派生。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。`WakeCause` 仍属 core 的 `DurableExecutor`（module-contracts.md §3.4），存储不再需要它。
+`Storage` 不提供公开 `enqueue`，也没有租约或 ack：唤醒是只读查询，由 `open_intents` 与 `pending_inputs` 派生。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。`WakeCause` 属于引擎的持久等待（module-contracts.md §3.4），存储不需要它。
 
 ## 4. SQLite schema
 

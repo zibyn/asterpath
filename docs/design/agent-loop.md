@@ -26,7 +26,7 @@
 
 **回合**：
 
-- 由输入驱动。`InputRecorded` 到达即落盘；驱动方调用 `AgentRunner::run` 时，session 空闲则写 `TurnStarted` 开始新回合，已有回合则把输入作为 steering 并入当前回合。
+- 由输入驱动。`InputRecorded` 到达即落盘；驱动方调用 `SessionHandle::drive`（引擎 agent 的 `run`）时，session 空闲则写 `TurnStarted` 开始新回合，已有回合则把输入作为 steering 并入当前回合。
 - 包含零或多个 step。零 step 的回合只可能由 pre-step gate 或压缩路径（失败 / 仍超窗）结束。
 - 由 `TurnCommitted { reason }` 结束；之后 session 回到 Idle。
 
@@ -349,6 +349,6 @@ pub struct TurnConfig {
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
 - **#13**：已定。token 聚合、`partial` 桶与实时观察（`on_record` + `usage_of`）见 [usage.md](usage.md)。
-- **#15**：已定。`AgentRunner::run` / `SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
-- **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、`DurableExecutor` 接缝见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#15**：已定。`SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名（agent 是引擎内部类型，ADR-0026）与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
+- **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、持久等待见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#27**：已定。`Compactor` 契约、未装配时的 `NotConfigured` 路径见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。

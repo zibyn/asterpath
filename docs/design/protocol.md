@@ -386,7 +386,7 @@ pub enum StopReason {
 
 ### 6.1 Compactor 契约（#27）
 
-压缩是**可选能力模块**：`asterpath-agent` 只依赖本节的 trait，默认实现 `asterpath-compaction` 由组装根注入；`None` 表示压缩不可用。摘要调用独立构造请求，不继承 `RequestConfig`（[compaction.md](compaction.md) §4）。
+压缩是**可选能力模块**：引擎的 agent 只依赖本节的 trait，默认实现 `asterpath::DefaultCompactor` 由宿主经 `AsterpathConfig.compactor` 注入；`None` 表示压缩不可用。摘要调用独立构造请求，不继承 `RequestConfig`（[compaction.md](compaction.md) §4）。
 
 ```rust
 pub trait Compactor: Send + Sync {

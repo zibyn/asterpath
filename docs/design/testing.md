@@ -121,7 +121,7 @@ impl Clock for ManualClock { /* 读 AtomicI64 */ }
 
 ## 4. 后端中立契约套件
 
-`asterpath-testing` 提供共享套件；套件代码只依赖 core/protocol。in-memory 后端在 `asterpath-testing` 自己的测试里实现 `BackendFactory` 并运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入模块间零依赖（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
+`asterpath-testing` 提供共享套件；套件代码只依赖 protocol。in-memory 后端在 `asterpath-testing` 自己的测试里实现 `BackendFactory` 并运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入依赖规则（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
 
 ```rust
 pub struct BackendHandle {
@@ -205,9 +205,11 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它不实�
 | `ScriptedProvider` 回放 | `asterpath-testing` | 只读 fixture，不依赖具体模块 |
 | 契约测试数据 | `asterpath-testing` 内的 Rust builder | 不进 JSON |
 | 各 crate 单测数据 | 各 crate `#[cfg(test)]` | 就近构造，不共享 |
+| 引擎内部类型的测试 | `crates/asterpath/src/<mod>/tests`（`#[cfg(test)] mod tests;`） | agent / scheduler / waits / tools / views / compaction；用真实组件 + `asterpath-testing` 的 in-memory 后端，没有引擎 trait 的替身 |
+| 经 facade 的测试 | `crates/asterpath/tests/` | 只 `use asterpath::...`（加 `asterpath-testing` 的适配器替身） |
 
-- **#6 的 L 场景与 #17 的 R 场景复用** `asterpath-acceptance` 的同一 fixture 与 `testdrive` 场景，不在 `agent` / `scheduler` crate 内另写一套。
-- 会组装真实模块的 fixture 一律放 `asterpath-acceptance`（`asterpath-testing` 不得依赖 facade 或模块）。
+- **#6 的 L 场景与 #17 的 R 场景复用** `asterpath-acceptance` 的同一 fixture 与 `testdrive` 场景，不在引擎的 `agent` / `scheduler` 模块内另写一套。
+- 会组装真实模块的 fixture 一律放 `asterpath-acceptance`（`asterpath-testing` 不得依赖 facade）。
 - fixture 是测试输入，不是规范；断言以 [acceptance.md](../spec/acceptance.md) 为准。
 
 ## 8. 留给下游

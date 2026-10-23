@@ -25,13 +25,13 @@
 ## 2. 归属与调用点
 
 ```text
-asterpath-agent（loop） --投影 + 配置--> Compactor（protocol trait）
-                                          └── asterpath-compaction（默认实现）
+asterpath::agent（loop） --投影 + 配置--> Compactor（protocol trait）
+                                           └── asterpath::compaction::DefaultCompactor（默认实现）
                                                 └── ProviderCatalog（摘要调用）
 ```
 
-- `Compactor` 放在 `asterpath-protocol`，完整契约见 [protocol.md](protocol.md) §6.1；默认实现是新模块 `asterpath-compaction`。
-- `asterpath-agent` **只依赖 trait**，默认实现由组装根注入；`compactor: None` 表示压缩不可用。M0 不装配 `asterpath-compaction`。
+- `Compactor` 放在 `asterpath-protocol`，完整契约见 [protocol.md](protocol.md) §6.1；默认实现 `DefaultCompactor` 在引擎内部模块 `compaction`，由 facade 再导出为 `asterpath::DefaultCompactor`（ADR-0026）。
+- agent **只依赖 trait**，默认实现由宿主经 `AsterpathConfig.compactor` 注入；`compactor: None` 表示压缩不可用。M0 不装配 `DefaultCompactor`。
 - **Compactor 只读不写**：`plan` 接收 agent 传入的投影、算出切点与估算；`compact` 调用摘要模型并返回 `CompactionOutcome`。agent 负责写 `CompactionStarted` 与终态，使 append 与 dedup key 只有一个写入点。
 - Compactor 在构造时注入 `ProviderCatalog`，不自行发现 provider，也不读事件日志。
 - 内核不含窗口、阈值、摘要提示词或保留规则。
@@ -152,7 +152,7 @@ project(entries):
 
 ### 手动压缩
 
-- `SessionHandle::compact_now() -> Result<CompactResult, AsterError>` 委托 `AgentRunner::compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，宿主先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
+- `SessionHandle::compact_now() -> Result<CompactResult, AsterError>` 委托引擎 agent 的 `compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，宿主先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
 - 成功路径写 `CompactionStarted{trigger: Manual}` + `CompactionApplied` 两条事件，不写回合记录；无可删前缀返回 `NothingToDo`，未配置窗口或未装配 Compactor 返回 `NotConfigured`。
 - 摘要调用失败追加 `CompactionAborted{SummaryFailed}` 并返回 `Err(AsterError::Agent(AgentError::Compaction(..)))`；压后仍超窗追加 `CompactionAborted{Insufficient}` 并返回 `Ok(CompactResult::Insufficient)`，不改投影。
 - `NotConfigured` / `NothingToDo` / `Insufficient` 都是状态，不是错误；只有真正失败才是 `Err`。

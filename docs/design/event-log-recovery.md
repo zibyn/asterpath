@@ -49,7 +49,7 @@ pub struct ParentRef {
 - `SessionId` 就是流身份，不再有 `StreamId` 枚举。
 - 子智能体是**独立子 session**：独立日志、独立恢复与取消单位。
 - 父流记 `ChildSessionSpawned`，记录父子关系；子流首条 `SessionCreated` 的 `parent` 指回父会话、turn 与 tool call。
-- 子会话创建时，父流写 `ChildSessionSpawned`（携带子配置与上下文策略）；子结束时父流写终态 `ChildSessionCompleted`（幂等，key = child id）。二者在正常运行时由 scheduler 写，恢复时由 spawn 工具重放经 `SubagentSpawner` 代写（#17）。
+- 子会话创建时，父流写 `ChildSessionSpawned`（携带子配置与上下文策略）；子结束时父流写终态 `ChildSessionCompleted`（幂等，key = child id）。二者在正常运行时由 scheduler 写，恢复时由 spawn 工具重放经引擎的 `Scheduler` 代写（#17）。
 - 父子之间没有原子性。关闭顺序、孤儿处理、结果形状见 [subagents.md](subagents.md)。
 - 等待（审批、子会话完成）是 session 事件；不引入 activity / workflow 概念，也没有通用持久 timer / signal。
 
@@ -132,7 +132,7 @@ pub enum TurnEndReason {
 - `ChildSessionSpawned.deadline` 是 spawn 超时的绝对截止时间（`spawn 时的注入时钟 + timeout`），与 spawn 同一次 append 写入；`None` 表示不限时。计时起点是 spawn 记录，排队不计。
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
-- `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-core` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
+- `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-protocol` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
 - `SignalReceived` 只承载审批决定；等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
 - 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0014](../adr/0014-subagent-scheduling-api.md)）；存储投递归 #5。
 
@@ -304,6 +304,6 @@ recover(session):
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
-- **#17**：已定。子等待恢复委托给 spawn 工具重放；`DurableExecutor` 接缝与 spawner API 见 [subagents.md](subagents.md) §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#17**：已定。子等待恢复委托给 spawn 工具重放；持久等待与调度见 [subagents.md](subagents.md) §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#12**：已定。trace 是日志的确定性投影；`recorded_at`、`CompactionStarted` 的追踪挂接见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 - **#16**：已定。插件清单、加载、版本协商与外部能力边界见 [plugins.md](plugins.md)；v1 不做插件发现。`Provenance` 新增 `Unknown`，只用于工具不存在的请求记录。

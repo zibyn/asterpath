@@ -47,7 +47,7 @@
 ### 3.2 外部插件
 
 - host 构造一组 `PluginManifest`，交给 `asterpath-plugin-host`。
-- 插件宿主启动或连接插件、完成握手与能力发现，把每个工具注册进 `ToolRegistry`，来源为 `Provenance::External { transport }`。
+- 插件宿主启动或连接插件、完成握手与能力发现，加载结果是 `Vec<Arc<dyn Tool>>`（`PluginHost::tools()`，由宿主交给 `AsterpathConfig.tools`），来源为 `Provenance::External { transport }`。
 - 一个插件可以提供多个工具。
 - 插件宿主自己不发现插件；清单从哪来（文件、代码、数据库）由 host 决定。
 
@@ -156,10 +156,10 @@ pub struct PluginTimeouts {
 ### 6.1 名称规则
 
 - **进程内工具**：裸名，字符集 `[A-Za-z0-9_-]`、长度 1–64；`__` 保留，出现在进程内工具名里是注册错误。
-- **外部工具**：`<plugin_id>__<sanitized_tool_name>`；模型与 `ToolRegistry` 只看到合成名。
+- **外部工具**：`<plugin_id>__<sanitized_tool_name>`；模型与引擎工具表只看到合成名。
 - **sanitize**：把 `[A-Za-z0-9_-]` 之外的每个字符替换为 `_`，保留大小写；不做截断。
 - 合成名长度必须 1–64；超长或 sanitize 后为空 = 该插件加载失败。
-- 合成名在 `ToolRegistry` 中全局唯一；重复注册是错误，不是覆盖。
+- 合成名在插件宿主加载的工具中全局唯一；重复是错误，不是覆盖（引擎工具表对重名保留先注册者）。
 
 ### 6.2 冲突判定
 
@@ -176,7 +176,7 @@ pub struct PluginTimeouts {
 
 ### 7.1 合约 crate
 
-- 整个 workspace 锁同一版本；`asterpath-core` / `asterpath-protocol` 在 major 内保证源码兼容。
+- 整个 workspace 锁同一版本；`asterpath` / `asterpath-protocol` 在 major 内保证源码兼容。
 - 1.0 之前 breaking 用 minor 版本，并写迁移说明；嵌入方用 caret。
 - module crate 不承诺独立兼容：必须与合约 crate 同一 workspace 版本。没有 ABI 承诺。
 - 公共稳定面最终由 [#15](https://github.com/zibyn/asterpath/issues/15) 收敛。

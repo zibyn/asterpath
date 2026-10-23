@@ -8,6 +8,7 @@
 **2026-10-23 重审候选 4 修订**: facade 只提供 `usage(session, scope)` 与 `trace(session)`，不提供 `trace_updates()`。
 **2026-10-23 重审候选 5 修订**: 新增适配器同类 crate `asterpath-http`（依赖 protocol 与 reqwest，提供 `SseDecoder`、通用 HTTP 状态分类、retry-after、request-id），供两个 provider 与 plugin-host 共用；不属于稳定面；合并后 crate 数为 14。
 **2026-10-23 ADR-0027 修订**: `asterpath-plugin-host` 与 `asterpath-sandbox` 由 `asterpath-mcp` 取代（`SandboxProvider` 移入 protocol），crate 数为 13，见 [ADR-0027](0027-mcp-is-a-tool-source-not-a-plugin-host.md)。
+**2026-10-23 #79 实现注**: `usage(session, scope)` 落为 `usage(scope: UsageScope)`（`UsageScope` 自带会话）返回 `UsageReport`；`trace(session)` 返回 `Vec<Span>`。
 
 ## Context
 

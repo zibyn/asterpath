@@ -4,7 +4,9 @@
 >
 > 对齐：[#3 事件日志与检查点恢复](event-log-recovery.md)、[#6 Agent loop](agent-loop.md)、[#8 子智能体](subagents.md)、[#9 上下文压缩](compaction.md)、[#11 协议模型](protocol.md)、[#14 OTel GenAI 研究](../research/otel-genai-conventions.md)。
 >
-> 相关 ADR：[0011 追踪是事件日志的确定性投影](../adr/0011-native-tracing.md)。
+> 相关 ADR：[0011 追踪是事件日志的确定性投影](../adr/0011-native-tracing.md)；查询形状见 [0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)。
+>
+> **2026-10-23 #79 修订**：查询是 facade 方法 `Asterpath::trace(session)`，直接返回 `Vec<Span>`；`TraceQuery` / `TraceTap` trait、`SpanUpdate` 与实时推送删除。实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。折叠在引擎内部模块 `views::trace`。
 >
 > 本票对已关闭票的修订（已同步到对应文件）：
 >
@@ -23,7 +25,7 @@
 - **一个逻辑模型调用一个 span**，所有 transport attempt 折叠为 span event；等待（approval / child）是独立 span。
 - **身份确定**：`TraceId = SessionId`，`SpanId` 由开启该 span 的日志记录确定性派生。重建得到相同 ID；恢复复用已存在的开启记录，不产生重复 span。
 - **恢复不新建 trace**：`StreamResumed` 记为 session span 上的 `resume` event；跨恢复的 span 标 `replay`。
-- **查询 pull + 导出 push**：`TraceQuery` 按需从 `EventLog` 折叠；`TraceTap` 实时发出 span 生命周期。类型在 `asterpath-protocol`，实现在 `asterpath-tracing`。
+- **只有 pull 查询**：`Asterpath::trace(session)` 按需从 `EventLog` 折叠该会话的全部 span。值类型在 `asterpath-protocol`，折叠在引擎内部（`views::trace`）。没有推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠（ADR-0026）。
 - **内容永不进 trace**：span 只带 `log_range` 引用。采样、过滤、格式、内容捕获与脱敏由 exporter/host 决定，默认关闭内容。
 
 ## 2. 类型（`asterpath-protocol`）
@@ -120,11 +122,9 @@ pub struct CompactionAttrs {
     pub model: Option<ModelSpec>,
     pub usage: Option<Usage>,
 }
-
-pub enum SpanUpdate { Started(Span), Ended(Span) }
 ```
 
-- `SpanId = hash(session, opening_log_id, kind)` 的前 8 字节；哈希算法是 `asterpath-tracing` 的内部细节，同一构建内固定即可。
+- `SpanId = hash(session, opening_log_id, kind)` 的前 8 字节；哈希算法是引擎 `views::trace` 的内部细节，同一构建内固定即可。
 - `SpanId` 只由**开启记录**决定：`SessionCreated` / `TurnStarted` / `StepStarted` / `ToolCallRequested`（tool_call 与审批等待共用）/ `ChildSessionSpawned` / `CompactionStarted`。终态记录改变 `ended_at`、`status`、`log_range.last`，不改变 ID。
 - 排序：`(started_at, opening_log_id)`。
 
@@ -251,12 +251,9 @@ pub struct SpanFilter {              // 全部 Option，AND 组合
     pub limit: Option<usize>,
 }
 
-pub trait TraceQuery: Send + Sync {
-    fn spans(&self, filter: SpanFilter) -> BoxStream<'_, Result<Span, TraceError>>;
-}
-
-pub trait TraceTap: Send + Sync {
-    fn subscribe(&self) -> BoxStream<'_, Result<SpanUpdate, TraceError>>;
+// asterpath（facade）
+impl Asterpath {
+    pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError>;
 }
 
 #[non_exhaustive]
@@ -267,10 +264,10 @@ pub enum TraceError {
 }
 ```
 
-- `TraceQuery` 从注入的 `EventLog` 流式折叠，内存有界；没有 trace 表，也不需要额外索引。
-- 日志被退役后，该会话的 span 一并消失：`TraceQuery` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
+- `trace(session)` 从注入的 `EventLog` 折叠该会话；没有 trace 表，也不需要额外索引。`SpanFilter` 是引擎内部按 turn / step / kind 等收窄的同一折叠，facade 只按会话查询。
+- 日志被退役后，该会话的 span 一并消失：`trace(session)` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
-- `TraceTap` 由引擎的单一 append 入口在每次提交后直接驱动（ADR-0025，不经钩子也不经事件总线），向 exporter 发 `Started` / `Ended`：每条开启记录发 `Started`，只有终态记录发 `Ended`。session span 永不发 `Ended`；frontier 上的 span 在其后续 append 关闭时才发 `Ended`。它不改变日志，也不参与恢复。
+- 实时导出：宿主在 `Hooks::on_record` 上按本文的开启 / 终态规则自行增量折叠（每条开启记录开 span，只有终态记录关 span；session span 不关）。框架不维护推送状态，trace 不改变日志，也不参与恢复。
 - **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `EventLog` 读取权限，并自行脱敏。默认导出不含内容。
 - **采样、过滤、格式、批量、重试**：全归 exporter。内核与 tracing 模块不做 head sampling。
 - 导出格式（OTLP/JSON/其他）与 `gen_ai.*` 映射只在 exporter 中出现；核心类型不使用字符串属性名。

@@ -102,8 +102,8 @@
 - 每个子会话日志：`SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`。
 - 父日志：恰两条 `ChildSessionCompleted`；两个 spawn 工具结果都是 `Completed`；恰一条 `TurnCommitted(Completed)`。
 - 父的第二次模型请求包含两个子任务总结，不含子会话完整 transcript。
-- `UsageQuery`：父 `Session` scope 的 `own` 等于父自身模型调用之和；`SessionSubtree` 的 `descendants` 等于两个子会话之和；`total` 不重复计数。
-- `TraceQuery`：父 trace 有两个 `subagent` span，分别挂到对应的 spawn tool span；子 trace 根 span 的 `parent_trace` / `parent_span` 指回父；恢复不产生重复 span，重放标记存在。
+- `Asterpath::usage(scope)`：父 `Session` scope 的 `own` 等于父自身模型调用之和；`SessionSubtree` 的 `descendants` 等于两个子会话之和；`total` 不重复计数。
+- `Asterpath::trace(session)`：父 trace 有两个 `subagent` span，分别挂到对应的 spawn tool span；子 trace 根 span 的 `parent_trace` / `parent_span` 指回父；恢复不产生重复 span，重放标记存在。
 
 ## 6. 与 #19 的边界
 

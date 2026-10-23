@@ -37,7 +37,7 @@
 
 | 层 | 负责 | 不负责 |
 | --- | --- | --- |
-| `asterpath-core` | `SessionRetirement` trait、`RetirementError` | 策略、文件格式、调度、导出 |
+| `asterpath-protocol` | `SessionRetirement` trait、`RetirementError` | 策略、文件格式、调度、导出 |
 | `asterpath-storage-sqlite` | 退役事务、墓碑、派发行清理 | 何时退役、归档落盘、恢复 |
 | 宿主 / 未来扩展模块 | 保留策略、导出与 JSONL、重试、恢复 | 直接写 SQLite、绕过写者锁 |
 
@@ -49,7 +49,7 @@
 ## 4. 合约
 
 ```rust
-// asterpath-core
+// asterpath-protocol
 
 pub trait SessionRetirement: Send + Sync {
     /// 退役整条会话：写墓碑，删除日志与全部派生行。
@@ -153,9 +153,9 @@ CREATE TABLE retired_sessions (
 | `EventLog::scan` | 空流（未知 session 与空 session 不可区分） |
 | `EventLog::frontier` | `None` |
 | `Storage::wakeable` | 不返回该会话 |
-| `UsageQuery` | `UsageError::NotFound { session }` |
-| `UsageQuery::SessionSubtree` | 根退役 → `NotFound`；存活根只汇总存活后代 |
-| `TraceQuery` | `TraceError::NotFound { session }` |
+| `Asterpath::usage(scope)` | `UsageError::NotFound { session }` |
+| `usage(SessionSubtree)` | 根退役 → `NotFound`；存活根只汇总存活后代 |
+| `Asterpath::trace(session)` | `TraceError::NotFound { session }` |
 | `SessionCatalog::parent` | 退役 id 返回 `None`（与根会话不可区分） |
 | `SessionCatalog::children` | 不返回退役子会话 |
 
