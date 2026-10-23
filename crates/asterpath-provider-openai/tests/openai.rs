@@ -1,9 +1,7 @@
-mod support;
-
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use support::mock::{MockResponse, MockServer};
+use asterpath_testing::http_mock::{MockServer, Reply as MockResponse};
 
 use asterpath_protocol::{
     ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, Provider,
@@ -45,7 +43,7 @@ fn spec(model: &str) -> ModelSpec {
 }
 
 fn provider(server: &MockServer) -> OpenAiProvider {
-    OpenAiProvider::new("test-key").with_base_url(server.base_url())
+    OpenAiProvider::new("test-key").with_base_url(format!("{}/v1", server.base_url()))
 }
 
 fn request(items: Vec<Item>) -> ModelRequest {
@@ -280,7 +278,7 @@ async fn request_always_disables_server_state_and_maps_system_to_instructions() 
     let events = collect(&provider, request(vec![user_text("hello")])).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
 
-    let body: Value = serde_json::from_str(&server.request_bodies()[0]).expect("request json");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
     assert_eq!(body["store"], json!(false));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert!(body.get("previous_response_id").is_none());
@@ -344,7 +342,7 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
     let events = collect(&provider, request).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
 
-    let body: Value = serde_json::from_str(&server.request_bodies()[0]).expect("request json");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
     assert_eq!(
         body["tool_choice"],
         json!({"type": "function", "name": "get_weather"})
@@ -461,7 +459,7 @@ async fn function_call_results_pair_and_arguments_stay_verbatim() {
     assert_eq!(response_ended(&events).0, StopReason::ToolUse);
 
     let _ = collect(&provider(&server), followup).await;
-    let body: Value = serde_json::from_str(&server.request_bodies()[1]).expect("request json");
+    let body: Value = serde_json::from_str(&server.requests()[1].body).expect("request json");
     assert_eq!(body["input"][1]["type"], json!("function_call"));
     assert_eq!(body["input"][1]["call_id"], json!("call_1"));
     assert_eq!(body["input"][1]["arguments"], json!(raw_args));
@@ -516,7 +514,7 @@ async fn encrypted_reasoning_replays_byte_for_byte_for_matching_binding() {
     let events = collect(&provider, request(vec![user_text("again"), replay])).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
 
-    let body = &server.request_bodies()[1];
+    let body = &server.requests()[1].body;
     assert!(
         body.contains(raw_item),
         "raw reasoning should be spliced byte-for-byte, got {body}"
@@ -551,7 +549,7 @@ async fn reasoning_is_dropped_and_traced_when_binding_does_not_match() {
         .await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         assert!(
-            !server.request_bodies()[0].contains(raw_item),
+            !server.requests()[0].body.contains(raw_item),
             "mismatched reasoning must not be replayed"
         );
         let marks = sink.marks();
@@ -781,7 +779,7 @@ async fn tool_result_images_render_as_text_and_are_traced() {
     )
     .await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
-    let body: Value = serde_json::from_str(&server.request_bodies()[0]).expect("request json");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
     assert_eq!(
         body["input"][1]["output"],
         json!("[tool error] ok[image omitted: image/png]")
@@ -833,7 +831,7 @@ async fn compaction_renders_as_a_user_text_message() {
     )
     .await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
-    let body: Value = serde_json::from_str(&server.request_bodies()[0]).expect("request json");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
     assert_eq!(
         body["input"][0],
         json!({
@@ -860,7 +858,7 @@ async fn provider_opaque_and_server_tools_replay_only_for_the_same_provider() {
         raw: raw_data("openai", "openai.opaque", raw),
     };
     let _ = collect(&provider, request(vec![same])).await;
-    assert!(server.request_bodies()[0].contains(raw));
+    assert!(server.requests()[0].body.contains(raw));
 
     let other = Item::ServerToolCall {
         provider: ProviderId::new("other"),
@@ -869,7 +867,7 @@ async fn provider_opaque_and_server_tools_replay_only_for_the_same_provider() {
         raw: raw_data("other", "other.server_tool_call", raw),
     };
     let _ = collect(&provider, request(vec![other])).await;
-    assert!(!server.request_bodies()[1].contains(raw));
+    assert!(!server.requests()[1].body.contains(raw));
     let marks = sink.marks();
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0].name, TraceMark::DROPPED_ITEMS);
@@ -927,8 +925,8 @@ async fn identical_requests_render_identical_bytes() {
     let provider = provider(&server);
     let _ = collect(&provider, request(vec![user_text("same")])).await;
     let _ = collect(&provider, request(vec![user_text("same")])).await;
-    let bodies = server.request_bodies();
-    assert_eq!(bodies[0], bodies[1]);
+    let bodies = server.requests();
+    assert_eq!(bodies[0].body, bodies[1].body);
 }
 
 #[tokio::test]

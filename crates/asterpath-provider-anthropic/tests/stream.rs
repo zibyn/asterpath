@@ -94,7 +94,7 @@ fn happy_sse() -> String {
 
 #[tokio::test]
 async fn normalizes_the_full_stream_into_s1_to_s10() {
-    let server = MockServer::start(vec![Reply::sse(happy_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(happy_sse())]);
     let events = ok(drain(&provider(&server), base_request()).await);
 
     assert_eq!(
@@ -324,7 +324,7 @@ async fn maps_server_tools_and_unknown_blocks_to_raw_items() {
         ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
-    let server = MockServer::start(vec![Reply::sse(body)]).await;
+    let server = MockServer::start(vec![Reply::sse(body)]);
     let events = ok(drain(&provider(&server), base_request()).await);
     let items: Vec<&Item> = events
         .iter()
@@ -388,7 +388,7 @@ async fn missing_usage_fields_are_zero() {
         ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
-    let server = MockServer::start(vec![Reply::sse(body)]).await;
+    let server = MockServer::start(vec![Reply::sse(body)]);
     let events = ok(drain(&provider(&server), base_request()).await);
     match events.last() {
         Some(StreamEvent::ResponseEnded { usage, .. }) => {
@@ -436,7 +436,7 @@ async fn stop_reasons_map_from_anthropic_labels() {
             ]))
         })
         .collect();
-    let server = MockServer::start(replies).await;
+    let server = MockServer::start(replies);
     let provider = provider(&server);
     for (_, expected) in cases {
         let events = ok(drain(&provider, base_request()).await);
@@ -474,7 +474,7 @@ async fn refusal_stop_reason_coexists_with_visible_content() {
         ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
-    let server = MockServer::start(vec![Reply::sse(body)]).await;
+    let server = MockServer::start(vec![Reply::sse(body)]);
     let events = ok(drain(&provider(&server), base_request()).await);
     assert_eq!(
         events
@@ -520,7 +520,7 @@ async fn a_stream_without_message_stop_is_a_transport_truncation() {
             r#"{"type":"content_block_stop","index":0}"#,
         ),
     ]);
-    let server = MockServer::start(vec![Reply::sse(body)]).await;
+    let server = MockServer::start(vec![Reply::sse(body)]);
     let events = drain(&provider(&server), base_request()).await;
     assert!(
         !events
@@ -548,7 +548,7 @@ async fn a_stream_without_message_stop_is_a_transport_truncation() {
 #[tokio::test]
 async fn a_connection_cut_mid_stream_is_a_transport_truncation() {
     let body = happy_sse();
-    let server = MockServer::start(vec![Reply::truncated_sse(body, 500)]).await;
+    let server = MockServer::start(vec![Reply::truncated_sse(body, 500)]);
     let events = drain(&provider(&server), base_request()).await;
     assert!(
         !events
@@ -622,7 +622,7 @@ async fn stream_protocol_violations_are_reported_without_a_terminal_event() {
         ]),
     ];
     for body in cases {
-        let server = MockServer::start(vec![Reply::sse(body)]).await;
+        let server = MockServer::start(vec![Reply::sse(body)]);
         let events = drain(&provider(&server), base_request()).await;
         assert!(
             !events
@@ -648,7 +648,7 @@ async fn an_sse_error_event_is_classified_with_partial_usage() {
             r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         ),
     ]);
-    let server = MockServer::start(vec![Reply::sse(body)]).await;
+    let server = MockServer::start(vec![Reply::sse(body)]);
     let events = drain(&provider(&server), base_request()).await;
     assert!(
         !events
@@ -696,7 +696,7 @@ async fn http_error_responses_map_to_normalized_kinds() {
             reply
         })
         .collect();
-    let server = MockServer::start(replies).await;
+    let server = MockServer::start(replies);
     let provider = provider(&server);
     for (status, retry, kind, retryable, has_retry_after) in cases {
         let events = drain(&provider, base_request()).await;
@@ -729,8 +729,7 @@ async fn context_window_messages_map_to_context_exceeded() {
     let server = MockServer::start(vec![Reply::json(
         400,
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
-    )])
-    .await;
+    )]);
     let events = drain(&provider(&server), base_request()).await;
     let error = first_error(events);
     assert_eq!(error.kind, ProviderErrorKind::ContextExceeded);
@@ -740,7 +739,7 @@ async fn context_window_messages_map_to_context_exceeded() {
 
 #[tokio::test]
 async fn a_closed_connection_is_a_retryable_transport_error() {
-    let server = MockServer::start(vec![Reply::close()]).await;
+    let server = MockServer::start(vec![Reply::close()]);
     let events = drain(&provider(&server), base_request()).await;
     assert_eq!(events.len(), 1);
     let error = first_error(events);
@@ -750,7 +749,7 @@ async fn a_closed_connection_is_a_retryable_transport_error() {
 
 #[tokio::test]
 async fn an_empty_200_body_is_a_truncated_stream() {
-    let server = MockServer::start(vec![Reply::sse("")]).await;
+    let server = MockServer::start(vec![Reply::sse("")]);
     let events = drain(&provider(&server), base_request()).await;
     let error = first_error(events);
     assert_eq!(error.kind, ProviderErrorKind::Transport);
@@ -759,7 +758,7 @@ async fn an_empty_200_body_is_a_truncated_stream() {
 
 #[tokio::test]
 async fn empty_response_is_a_valid_end_turn() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let events = ok(drain(&provider(&server), base_request()).await);
     assert!(matches!(
         events.first(),

@@ -420,8 +420,10 @@ async fn b1_both_providers_produce_the_same_normalized_history() {
     )
     .expect("parse scenario (b) fixture");
 
-    let anthropic = common::mock::MockServer::start(common::mock::anthropic_replies(&fixture));
-    let openai = common::mock::MockServer::start(common::mock::openai_replies(&fixture));
+    let anthropic =
+        asterpath_testing::http_mock::MockServer::start(common::mock::anthropic_replies(&fixture));
+    let openai =
+        asterpath_testing::http_mock::MockServer::start(common::mock::openai_replies(&fixture));
 
     let dir = tempfile::tempdir().expect("temp dir");
     let anthropic_db = dir.path().join("anthropic.sqlite");
@@ -458,12 +460,20 @@ async fn b1_both_providers_produce_the_same_normalized_history() {
 
     // Each side spoke its own wire protocol, one request per scripted step.
     assert_eq!(
-        anthropic.paths(),
+        anthropic
+            .requests()
+            .iter()
+            .map(|r| r.path().to_owned())
+            .collect::<Vec<_>>(),
         vec!["/v1/messages".to_owned(); 2],
         "Anthropic Messages endpoint"
     );
     assert_eq!(
-        openai.paths(),
+        openai
+            .requests()
+            .iter()
+            .map(|r| r.path().to_owned())
+            .collect::<Vec<_>>(),
         vec!["/v1/responses".to_owned(); 2],
         "OpenAI Responses endpoint"
     );

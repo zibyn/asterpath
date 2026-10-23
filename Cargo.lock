@@ -231,6 +231,7 @@ dependencies = [
  "asterpath-core",
  "asterpath-http",
  "asterpath-protocol",
+ "asterpath-testing",
  "bytes",
  "futures-core",
  "futures-util",
@@ -245,6 +246,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-http",
  "asterpath-protocol",
+ "asterpath-testing",
  "futures-core",
  "futures-util",
  "reqwest",

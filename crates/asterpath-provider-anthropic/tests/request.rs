@@ -39,7 +39,7 @@ async fn one_request(
 
 #[tokio::test]
 async fn renders_system_tools_sampling_tool_choice_and_thinking() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
     request.system = vec![text("be helpful"), text("be terse")];
     request.items = vec![user_message(vec![text("hi")])];
@@ -126,8 +126,7 @@ async fn renders_every_tool_choice_variant() {
         Reply::sse(empty_sse()),
         Reply::sse(empty_sse()),
         Reply::sse(empty_sse()),
-    ])
-    .await;
+    ]);
     let provider = provider(&server);
     for choice in [
         ToolChoice::Auto,
@@ -156,7 +155,7 @@ async fn renders_every_tool_choice_variant() {
 
 #[tokio::test]
 async fn renders_tool_calls_and_merges_consecutive_results_before_text() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
     request.items = vec![
         assistant_message(vec![text("thinking aloud")]),
@@ -221,7 +220,7 @@ async fn renders_tool_calls_and_merges_consecutive_results_before_text() {
 
 #[tokio::test]
 async fn renders_images_and_refusals() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
     request.items = vec![
         user_message(vec![
@@ -259,7 +258,7 @@ async fn renders_images_and_refusals() {
 
 #[tokio::test]
 async fn tool_result_images_render_natively() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
     request.items = vec![Item::ToolResult {
         call_id: "toolu_a".to_owned(),
@@ -294,7 +293,7 @@ async fn tool_result_images_render_natively() {
 
 #[tokio::test]
 async fn unsupported_request_fields_fail_before_any_http() {
-    let server = MockServer::start(Vec::new()).await;
+    let server = MockServer::start(Vec::new());
 
     let mut seed = base_request();
     seed.sampling = Some(SamplingParams {
@@ -339,7 +338,7 @@ async fn unsupported_request_fields_fail_before_any_http() {
 
 #[tokio::test]
 async fn the_same_log_renders_byte_identical_requests() {
-    let server = MockServer::start(vec![Reply::sse(empty_sse()), Reply::sse(empty_sse())]).await;
+    let server = MockServer::start(vec![Reply::sse(empty_sse()), Reply::sse(empty_sse())]);
     let provider = provider(&server);
     let mut request = base_request();
     request.items = vec![user_message(vec![text("hi")])];
@@ -407,8 +406,7 @@ async fn reasoning_raw_json_is_replayed_byte_for_byte() {
         Reply::sse(empty_sse()),
         Reply::sse(empty_sse()),
         Reply::sse(empty_sse()),
-    ])
-    .await;
+    ]);
     let provider = provider(&server);
     let events = drain(&provider, base_request()).await;
     let produced = events

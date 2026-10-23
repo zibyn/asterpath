@@ -1,120 +1,14 @@
-//! Loopback HTTP servers that replay each provider's wire protocol.
+//! Each provider's wire rendering of a scenario fixture, served by the shared
+//! loopback mock server.
 //!
 //! Both builders consume the same [`Fixture`] (the single source for scenario
 //! (b)) and render its canonical items into Anthropic Messages / OpenAI
-//! Responses SSE. The server is a one-reply-per-connection FIFO: the scenario
-//! makes exactly one model request per scripted step.
-
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
+//! Responses SSE, one reply per scripted step.
 
 use asterpath_protocol::{Item, Part, StopReason};
 use asterpath_testing::Fixture;
+use asterpath_testing::http_mock::Reply;
 use serde_json::{Value, json};
-
-pub struct MockServer {
-    addr: SocketAddr,
-    requests: Arc<Mutex<Vec<String>>>,
-}
-
-impl MockServer {
-    pub fn start(replies: Vec<String>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let addr = listener.local_addr().expect("mock address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&requests);
-        thread::spawn(move || {
-            for reply in replies {
-                let Ok((mut socket, _)) = listener.accept() else {
-                    return;
-                };
-                let raw = read_request(&mut socket);
-                captured
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(String::from_utf8_lossy(&raw).into_owned());
-                write_response(&mut socket, &reply);
-            }
-        });
-        Self { addr, requests }
-    }
-
-    pub fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    /// Requests in arrival order, request line plus body.
-    pub fn requests(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Request-targets in arrival order (the first token of the request line).
-    pub fn paths(&self) -> Vec<String> {
-        self.requests()
-            .iter()
-            .filter_map(|raw| raw.lines().next())
-            .filter_map(|line| line.split_whitespace().nth(1))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    pub fn bodies(&self) -> Vec<Value> {
-        self.requests()
-            .iter()
-            .map(|raw| {
-                raw.split_once("\r\n\r\n")
-                    .map(|(_, body)| body)
-                    .unwrap_or("")
-            })
-            .map(|body| serde_json::from_str(body).unwrap_or(Value::Null))
-            .collect()
-    }
-}
-
-fn read_request(socket: &mut TcpStream) -> Vec<u8> {
-    let mut data = Vec::new();
-    let mut buf = [0u8; 8192];
-    let mut body_start = None;
-    while let Ok(read) = socket.read(&mut buf) {
-        if read == 0 {
-            break;
-        }
-        data.extend_from_slice(&buf[..read]);
-        if body_start.is_none() {
-            body_start = data
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|position| position + 4);
-        }
-        if let Some(start) = body_start {
-            let head = String::from_utf8_lossy(&data[..start]).to_lowercase();
-            let length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if data.len() >= start + length {
-                break;
-            }
-        }
-    }
-    data
-}
-
-fn write_response(socket: &mut TcpStream, body: &str) {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = socket.write_all(head.as_bytes());
-    let _ = socket.write_all(body.as_bytes());
-    let _ = socket.flush();
-}
 
 fn sse(body: &mut String, event: &str, data: Value) {
     body.push_str("event: ");
@@ -147,7 +41,7 @@ fn anthropic_stop(reason: &StopReason) -> &'static str {
 }
 
 /// Anthropic Messages SSE for every scripted step.
-pub fn anthropic_replies(fixture: &Fixture) -> Vec<String> {
+pub fn anthropic_replies(fixture: &Fixture) -> Vec<Reply> {
     fixture
         .steps
         .iter()
@@ -251,13 +145,13 @@ pub fn anthropic_replies(fixture: &Fixture) -> Vec<String> {
                 }),
             );
             sse(&mut body, "message_stop", json!({"type": "message_stop"}));
-            body
+            Reply::sse(body)
         })
         .collect()
 }
 
 /// OpenAI Responses SSE for every scripted step.
-pub fn openai_replies(fixture: &Fixture) -> Vec<String> {
+pub fn openai_replies(fixture: &Fixture) -> Vec<Reply> {
     fixture
         .steps
         .iter()
@@ -373,7 +267,7 @@ pub fn openai_replies(fixture: &Fixture) -> Vec<String> {
                     },
                 },
             }));
-            body
+            Reply::sse(body)
         })
         .collect()
 }

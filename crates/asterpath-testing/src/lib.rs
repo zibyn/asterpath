@@ -7,6 +7,7 @@ pub mod clock;
 pub mod contract;
 pub mod failpoint;
 pub mod fake_sandbox;
+pub mod http_mock;
 pub mod memory;
 pub mod scripted;
 

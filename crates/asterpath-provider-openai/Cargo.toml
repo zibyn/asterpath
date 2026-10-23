@@ -14,4 +14,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
 [dev-dependencies]
+asterpath-testing = { path = "../asterpath-testing" }
 tokio = { version = "1", features = ["macros", "rt"] }
