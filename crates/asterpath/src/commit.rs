@@ -15,15 +15,22 @@ use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::lock::Mutex as AsyncMutex;
 
-/// Last record shown to `on_record` per session; `None` until first used.
-type Cursor = Arc<AsyncMutex<Option<Option<LogId>>>>;
+/// Last record shown to `on_record` for one session.
+#[derive(Clone, Copy, Default)]
+enum Cursor {
+    /// This process has not appended to the session yet.
+    #[default]
+    Unset,
+    /// Records up to this id were shown; `None` when the log was empty.
+    At(Option<LogId>),
+}
 
 pub(crate) struct CommitLog {
     inner: Arc<dyn SessionStore>,
     hooks: Vec<Arc<dyn Hooks>>,
     // shortcut: one cursor per session touched by this process, never evicted;
     // evict on retirement if long-lived hosts touch very many sessions.
-    cursors: Mutex<HashMap<SessionId, Cursor>>,
+    cursors: Mutex<HashMap<SessionId, Arc<AsyncMutex<Cursor>>>>,
 }
 
 impl CommitLog {
@@ -35,7 +42,7 @@ impl CommitLog {
         }
     }
 
-    fn cursor(&self, session: SessionId) -> Cursor {
+    fn cursor(&self, session: SessionId) -> Arc<AsyncMutex<Cursor>> {
         Arc::clone(
             self.cursors
                 .lock()
@@ -53,12 +60,12 @@ impl CommitLog {
         let cursor = self.cursor(session);
         let mut cursor = cursor.lock().await;
         let after = match *cursor {
-            Some(after) => after,
+            Cursor::At(after) => after,
             // First write this process makes: only records from here on.
-            None => self.inner.frontier(session).await?,
+            Cursor::Unset => self.inner.frontier(session).await?,
         };
         let log_id = self.inner.append(entry).await?;
-        *cursor = Some(after);
+        *cursor = Cursor::At(after);
         if after.is_some_and(|after| log_id <= after) {
             return Ok(log_id);
         }
@@ -73,7 +80,7 @@ impl CommitLog {
             // turn it into an error for the writer.
             match entry {
                 Ok(entry) => {
-                    *cursor = Some(Some(entry.log_id));
+                    *cursor = Cursor::At(Some(entry.log_id));
                     self.show(&entry);
                 }
                 Err(error) => {

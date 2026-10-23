@@ -58,7 +58,8 @@ pub use asterpath_provider_openai as openai;
 
 /// The assembled framework.
 pub struct Asterpath {
-    /// The backend behind the single append entry.
+    /// The single append entry: the backend wrapped in `CommitLog`, so every
+    /// append reaches the hooks.
     store: Arc<dyn SessionStore>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
@@ -142,16 +143,16 @@ impl Asterpath {
         // append entry so hooks see it.
         let trace = TracingQuery::new(Arc::clone(&backend));
         let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
-        let event_log: Arc<dyn SessionStore> =
+        let store: Arc<dyn SessionStore> =
             Arc::new(commit::CommitLog::new(backend, config.hooks.clone()));
 
-        let waits = Arc::new(Waits::new(Arc::clone(&event_log)));
+        let waits = Arc::new(Waits::new(Arc::clone(&store)));
         let cancellations = Arc::new(CancellationRegistry::new());
 
         // The agent owns the scheduler and passes itself to drive children,
         // so nothing points back at the agent.
         let scheduler = Arc::new(Scheduler::new(
-            Arc::clone(&event_log),
+            Arc::clone(&store),
             Arc::clone(&waits),
             config.model_aliases.clone(),
             Arc::clone(&config.clock),
@@ -179,7 +180,7 @@ impl Asterpath {
         });
         let agent = Arc::new(
             Agent::new(
-                Arc::clone(&event_log),
+                Arc::clone(&store),
                 Arc::clone(&providers),
                 Arc::clone(&tools),
                 config.tool.clone(),
@@ -195,7 +196,7 @@ impl Asterpath {
         );
 
         Ok(Self {
-            store: event_log,
+            store,
             providers,
             tools,
             agent,
@@ -264,7 +265,7 @@ impl Asterpath {
 
         Ok(SessionHandle {
             session,
-            event_log: Arc::clone(&self.store),
+            store: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
@@ -279,7 +280,7 @@ impl Asterpath {
         }
         Ok(SessionHandle {
             session: id,
-            event_log: Arc::clone(&self.store),
+            store: Arc::clone(&self.store),
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
@@ -360,7 +361,7 @@ fn totals_filter(scope: UsageScope) -> UsageFilter {
 #[derive(Clone)]
 pub struct SessionHandle {
     session: SessionId,
-    event_log: Arc<dyn SessionStore>,
+    store: Arc<dyn SessionStore>,
     agent: Arc<Agent>,
     waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
@@ -390,7 +391,7 @@ impl SessionHandle {
         .map_err(|error| AsterError::Config {
             message: error.to_string(),
         })?;
-        self.event_log.append(entry).await?;
+        self.store.append(entry).await?;
         Ok(input.id)
     }
 
@@ -432,7 +433,7 @@ impl SessionHandle {
 
     /// The session facts folded from the log, not driver memory.
     pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
-        let entries = scan_all(&*self.event_log, self.session).await?;
+        let entries = scan_all(&*self.store, self.session).await?;
         SessionFacts::fold(&entries).map_err(|error| {
             AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
                 session: self.session,
