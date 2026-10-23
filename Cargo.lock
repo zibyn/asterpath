@@ -168,6 +168,10 @@ dependencies = [
 [[package]]
 name = "asterpath-mcp-fixture"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "asterpath-plugin-host"
