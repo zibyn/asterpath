@@ -3,96 +3,37 @@
 //! Each test fabricates the exact log a `SIGKILL` would leave behind, opens a
 //! fresh agent over that log and asserts the terminal records it appends.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::support::{
+    self, SESSION, append, config, descriptor, drive, model, scan, text, tool_call, tool_table,
+};
 use crate::agent::Agent;
-use crate::tools::ToolTable;
 use crate::waits::Waits;
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, CancelReason, ChildOutcome, CompactionConfig, ConfigSnapshot, ContextPolicy,
-    DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ModelId, ModelSpec, Parallelism,
-    ParentRef, Part, Provenance, Provider, ProviderCatalog, ProviderId, ReplaySafety,
-    RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect, StopReason,
-    SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolConfig, ToolContext, ToolDescriptor,
-    ToolError, ToolGate, ToolName, ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
+    ApprovalVerdict, CancelReason, ChildOutcome, ConfigSnapshot, ContextPolicy,
+    DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ParentRef, Provenance, ReplaySafety,
+    Role, RunRequest, RunTrigger, SessionEvent, StopReason, Tool, ToolArgs, ToolCallCtx,
+    ToolConfig, ToolDescriptor, ToolGate, ToolName, ToolResultStatus, TurnEndReason, Usage,
     approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
     ApprovalGate, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore,
     SignalDelivery, StepId, ToolCallId, TurnId,
 };
-use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
+use asterpath_testing::TestTool;
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider, ToolCalls};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
-
-const SESSION: SessionId = SessionId::from_bytes([9; 16]);
-
-fn text(value: &str) -> Part {
-    Part::Text {
-        text: value.to_owned(),
-    }
-}
-
-fn model() -> ModelSpec {
-    ModelSpec {
-        provider: ProviderId::new("p"),
-        model: ModelId::new("model-1"),
-        context_window: None,
-    }
-}
-
-fn descriptor(name: &str, replay: ReplaySafety) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-    }
-}
-
-fn turn_config() -> TurnConfig {
-    TurnConfig {
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-        ..TurnConfig::default()
-    }
-}
-
-fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
-    ConfigSnapshot {
-        model: model(),
-        system: vec![text("be helpful")],
-        tools,
-        request: RequestConfig::default(),
-        turn: turn_config(),
-        compaction: CompactionConfig::default(),
-        subagents: SubagentConfig::default(),
-    }
-}
-
-fn tool_call(call_id: &str, name: &str) -> Item {
-    Item::ToolCall {
-        call_id: call_id.to_owned(),
-        provider_item_id: None,
-        name: ToolName::new(name),
-        raw_args: JsonString::new("{}"),
-        raw: None,
-    }
-}
 
 fn assistant(call_id: &str, name: &str) -> SessionEvent {
     SessionEvent::AssistantMessage {
         turn_id: TURN,
         step_id: STEP,
-        items: vec![tool_call(call_id, name)],
+        items: vec![tool_call(call_id, name, "{}")],
         raw: None,
         model: model(),
         usage: Usage::default(),
@@ -106,7 +47,7 @@ const CALL: ToolCallId = ToolCallId::from_bytes([3; 16]);
 
 async fn seed(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
     let log = Arc::new(InMemoryEventLog::new());
-    append_event(
+    append(
         &log,
         SessionEvent::SessionCreated {
             config,
@@ -118,18 +59,9 @@ async fn seed(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
     log
 }
 
-async fn append_event(
-    log: &Arc<InMemoryEventLog>,
-    event: SessionEvent,
-    key: Option<DedupKey>,
-) -> LogId {
-    let entry = encode_entry(SESSION, key, &event).expect("encode");
-    log.append(entry).await.expect("append")
-}
-
 async fn open_turn(log: &Arc<InMemoryEventLog>) {
-    append_event(log, SessionEvent::TurnStarted { turn_id: TURN }, None).await;
-    append_event(
+    append(log, SessionEvent::TurnStarted { turn_id: TURN }, None).await;
+    append(
         log,
         SessionEvent::StepStarted {
             turn_id: TURN,
@@ -158,59 +90,10 @@ fn intent(
     }
 }
 
-type InvokeFn = Arc<
-    dyn Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync,
->;
-
-struct TestTool {
-    descriptor: ToolDescriptor,
-    calls: Arc<Mutex<Vec<ToolArgs>>>,
-    invoke: InvokeFn,
-}
-
-impl TestTool {
-    fn build(
-        name: &str,
-        replay: ReplaySafety,
-        calls: Arc<Mutex<Vec<ToolArgs>>>,
-        invoke: impl Fn(ToolArgs, ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Arc<dyn Tool> {
-        Arc::new(Self {
-            descriptor: descriptor(name, replay),
-            calls,
-            invoke: Arc::new(invoke),
-        })
-    }
-}
-
-impl Tool for TestTool {
-    fn descriptor(&self) -> &ToolDescriptor {
-        &self.descriptor
-    }
-
-    fn invoke(
-        &self,
-        args: ToolArgs,
-        ctx: ToolContext,
-    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        self.calls.lock().unwrap().push(args.clone());
-        (self.invoke)(args, ctx)
-    }
-}
-
-fn echo(name: &str, replay: ReplaySafety) -> (Arc<dyn Tool>, Arc<Mutex<Vec<ToolArgs>>>) {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let tool = TestTool::build(name, replay, Arc::clone(&calls), |_args, _ctx| {
-        Box::pin(async { Ok(ToolOutput::new(vec![text("tool done")])) })
-    });
+fn echo(name: &str, replay: ReplaySafety) -> (Arc<dyn Tool>, ToolCalls) {
+    let (tool, calls) = TestTool::text(described(name, replay), "tool done");
     (tool, calls)
 }
-
 struct AlwaysAsk;
 
 impl ApprovalPolicy for AlwaysAsk {
@@ -219,19 +102,14 @@ impl ApprovalPolicy for AlwaysAsk {
     }
 }
 
-fn tool_table(tools: Vec<Arc<dyn Tool>>) -> Arc<ToolTable> {
-    let table = Arc::new(ToolTable::new());
-    for tool in tools {
-        table.register(tool);
+fn described(name: &str, replay: ReplaySafety) -> ToolDescriptor {
+    ToolDescriptor {
+        replay,
+        ..descriptor(name)
     }
-    table
 }
 
-struct Harness {
-    agent: Agent,
-}
-
-#[allow(clippy::too_many_arguments)]
+/// `support::agent_with` with the default tool config and an optional hook.
 fn agent_with<L: SessionStore + 'static>(
     log: Arc<L>,
     provider: Arc<ScriptedProvider>,
@@ -239,24 +117,22 @@ fn agent_with<L: SessionStore + 'static>(
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
     executor: Option<Arc<Waits>>,
-    clock: Arc<ManualClock>,
     hooks: Option<Arc<dyn Hooks>>,
 ) -> Agent {
-    let log: Arc<dyn SessionStore> = log;
-    let registry = tool_table(tools);
-    let executor = executor.unwrap_or_else(|| Arc::new(Waits::new(Arc::clone(&log))));
-    let provider: Arc<dyn Provider> = provider;
-    Agent::new(
+    support::agent_with(
         log,
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        registry,
+        provider,
+        tool_table(tools),
         ToolConfig::default(),
         approval,
         gate,
         executor,
-        clock,
     )
     .with_hooks(hooks.into_iter().collect(), None)
+}
+
+struct Harness {
+    agent: Agent,
 }
 
 fn harness(
@@ -265,7 +141,6 @@ fn harness(
     tools: Vec<Arc<dyn Tool>>,
 ) -> Harness {
     let gate = Arc::new(ApprovalGate::new());
-    let clock = Arc::new(ManualClock::new());
     let agent = agent_with(
         Arc::clone(&log),
         Arc::clone(&provider),
@@ -273,35 +148,9 @@ fn harness(
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
         None,
-        clock,
         None,
     );
     Harness { agent }
-}
-
-async fn drive(agent: &Agent) -> Vec<AgentEvent> {
-    let mut stream = agent.run(RunRequest {
-        session: SESSION,
-        trigger: RunTrigger::Resume,
-    });
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event.expect("drive"));
-    }
-    events
-}
-
-async fn scan(log: &Arc<InMemoryEventLog>) -> Vec<LogEntry> {
-    let mut stream = log.scan(LogQuery {
-        session: SESSION,
-        after: None,
-        limit: None,
-    });
-    let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        entries.push(entry.expect("scan"));
-    }
-    entries
 }
 
 fn events(entries: &[LogEntry]) -> Vec<SessionEvent> {
@@ -377,15 +226,15 @@ fn completed() -> Vec<Item> {
 #[tokio::test]
 async fn assistant_message_prefix_skips_the_model_and_finishes_a_safe_tool() {
     let (tool, calls) = echo("echo", ReplaySafety::Safe);
-    let log = seed(config(vec![descriptor("echo", ReplaySafety::Safe)])).await;
+    let log = seed(config(vec![described("echo", ReplaySafety::Safe)])).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "echo"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         intent(CALL, "c1", "echo", ReplaySafety::Safe),
         Some(dedup::tool_call(CALL)),
@@ -432,19 +281,15 @@ async fn assistant_message_prefix_skips_the_model_and_finishes_a_safe_tool() {
 #[tokio::test]
 async fn assistant_message_prefix_does_not_rerun_an_unsafe_tool() {
     let (tool, calls) = echo("side_effect", ReplaySafety::Unsafe);
-    let log = seed(config(vec![descriptor(
-        "side_effect",
-        ReplaySafety::Unsafe,
-    )]))
-    .await;
+    let log = seed(config(vec![described("side_effect", ReplaySafety::Unsafe)])).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "side_effect"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         intent(CALL, "c1", "side_effect", ReplaySafety::Unsafe),
         Some(dedup::tool_call(CALL)),
@@ -483,7 +328,7 @@ async fn usage_survives_the_recovered_step() {
             reasoning: 0,
         },
     };
-    append_event(
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
@@ -551,7 +396,7 @@ async fn step_without_an_abort_gets_a_crash_abort_and_retries() {
 async fn transport_abort_retries_without_adding_a_crash_abort() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::ModelCallAborted {
             turn_id: TURN,
@@ -587,7 +432,7 @@ async fn recovered_transport_exhaustion_fails_without_another_call() {
     open_turn(&log).await;
     // The last committed attempt already consumed every retry.
     let max = config(Vec::new()).turn.max_attempts.get();
-    append_event(
+    append(
         &log,
         SessionEvent::ModelCallAborted {
             turn_id: TURN,
@@ -626,7 +471,7 @@ async fn recovered_transport_exhaustion_fails_without_another_call() {
 async fn recovered_forced_compaction_retries_the_same_step() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::ModelCallAborted {
             turn_id: TURN,
@@ -643,7 +488,7 @@ async fn recovered_forced_compaction_retries_the_same_step() {
     .await;
     // The forced compaction landed before the crash.
     let caused_by = LogId::from_i64(4);
-    append_event(
+    append(
         &log,
         SessionEvent::CompactionStarted {
             trigger: asterpath_protocol::CompactionTrigger::ProviderError,
@@ -654,7 +499,7 @@ async fn recovered_forced_compaction_retries_the_same_step() {
         Some(dedup::compaction(caused_by)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::CompactionApplied {
             first_kept: LogId::from_i64(2),
@@ -695,7 +540,7 @@ async fn recovered_forced_compaction_retries_the_same_step() {
 async fn cancelled_abort_finishes_the_turn_without_calling_the_model() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::ModelCallAborted {
             turn_id: TURN,
@@ -727,7 +572,7 @@ async fn cancelled_abort_finishes_the_turn_without_calling_the_model() {
 async fn rejected_abort_finishes_the_turn_failed() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::ModelCallAborted {
             turn_id: TURN,
@@ -770,7 +615,7 @@ async fn stream_resumed_points_at_the_last_committed_record() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
     // AssistantMessage with no tool calls only needs the step terminal.
-    append_event(
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
@@ -807,13 +652,13 @@ async fn stream_resumed_points_at_the_last_committed_record() {
 async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "ghost"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::ToolCallRequested {
             turn_id: TURN,
@@ -830,7 +675,6 @@ async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
     .await;
 
     let gate = Arc::new(ApprovalGate::new());
-    let clock = Arc::new(ManualClock::new());
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -843,7 +687,6 @@ async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
         None,
-        clock,
         None,
     );
     let events = drive(&agent).await;
@@ -870,13 +713,16 @@ async fn missing_batch_intent_is_filled_by_provider_call_id_without_crossing() {
     let (alpha, alpha_calls) = echo("alpha", ReplaySafety::Safe);
     let (beta, beta_calls) = echo("beta", ReplaySafety::Safe);
     let log = seed(config(vec![
-        descriptor("alpha", ReplaySafety::Safe),
-        descriptor("beta", ReplaySafety::Safe),
+        described("alpha", ReplaySafety::Safe),
+        described("beta", ReplaySafety::Safe),
     ]))
     .await;
     open_turn(&log).await;
-    let items = vec![tool_call("c1", "alpha"), tool_call("c2", "beta")];
-    append_event(
+    let items = vec![
+        tool_call("c1", "alpha", "{}"),
+        tool_call("c2", "beta", "{}"),
+    ];
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
@@ -891,7 +737,7 @@ async fn missing_batch_intent_is_filled_by_provider_call_id_without_crossing() {
     )
     .await;
     let first = ToolCallId::from_bytes([10; 16]);
-    append_event(
+    append(
         &log,
         intent(first, "c1", "alpha", ReplaySafety::Safe),
         Some(dedup::tool_call(first)),
@@ -968,17 +814,20 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
     let (alpha, alpha_calls) = echo("alpha", ReplaySafety::Safe);
     let (beta, beta_calls) = echo("beta", ReplaySafety::Safe);
     let log = seed(config(vec![
-        descriptor("alpha", ReplaySafety::Safe),
-        descriptor("beta", ReplaySafety::Safe),
+        described("alpha", ReplaySafety::Safe),
+        described("beta", ReplaySafety::Safe),
     ]))
     .await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
             step_id: STEP,
-            items: vec![tool_call("c1", "alpha"), tool_call("c2", "beta")],
+            items: vec![
+                tool_call("c1", "alpha", "{}"),
+                tool_call("c2", "beta", "{}"),
+            ],
             raw: None,
             model: model(),
             usage: Usage::default(),
@@ -989,7 +838,7 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
     .await;
     // The recorded intent keeps its effective args; pre-execute must not rerun.
     let first = ToolCallId::from_bytes([10; 16]);
-    append_event(
+    append(
         &log,
         SessionEvent::ToolCallRequested {
             turn_id: TURN,
@@ -1012,7 +861,6 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
     });
 
     let gate = Arc::new(ApprovalGate::new());
-    let clock = Arc::new(ManualClock::new());
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -1025,7 +873,6 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
         None,
-        clock,
         Some(hooks),
     );
     let _ = drive(&agent).await;
@@ -1054,15 +901,15 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
 #[tokio::test]
 async fn recorded_allow_executes_without_reprompting_on_recovery() {
     let (tool, calls) = echo("guarded", ReplaySafety::Unsafe);
-    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Unsafe)])).await;
+    let log = seed(config(vec![described("guarded", ReplaySafety::Unsafe)])).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "guarded"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::ToolCallRequested {
             turn_id: TURN,
@@ -1079,7 +926,7 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
         Some(dedup::tool_call(CALL)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::SignalReceived {
             signal_id: approval_signal_id(CALL),
@@ -1091,7 +938,6 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
     .await;
 
     let gate = Arc::new(ApprovalGate::new());
-    let clock = Arc::new(ManualClock::new());
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -1104,7 +950,6 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
         Arc::new(AlwaysAsk),
         gate,
         None,
-        clock,
         None,
     );
     let events = drive(&agent).await;
@@ -1126,15 +971,15 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
 #[tokio::test]
 async fn undecided_ask_resuspends_then_executes_after_delivery() {
     let (tool, calls) = echo("guarded", ReplaySafety::Safe);
-    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Safe)])).await;
+    let log = seed(config(vec![described("guarded", ReplaySafety::Safe)])).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "guarded"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::ToolCallRequested {
             turn_id: TURN,
@@ -1154,7 +999,6 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
 
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register();
-    let clock = Arc::new(ManualClock::new());
     let executor = Arc::new(Waits::new(log.clone()));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
@@ -1168,7 +1012,6 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
         Some(executor.clone()),
-        clock,
         None,
     );
 
@@ -1214,15 +1057,15 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
 #[tokio::test]
 async fn undecided_ask_with_a_closed_gate_denies() {
     let (tool, calls) = echo("guarded", ReplaySafety::Safe);
-    let log = seed(config(vec![descriptor("guarded", ReplaySafety::Safe)])).await;
+    let log = seed(config(vec![described("guarded", ReplaySafety::Safe)])).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         assistant("c1", "guarded"),
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         intent(CALL, "c1", "guarded", ReplaySafety::Safe),
         Some(dedup::tool_call(CALL)),
@@ -1230,7 +1073,6 @@ async fn undecided_ask_with_a_closed_gate_denies() {
     .await;
 
     let gate = Arc::new(ApprovalGate::new());
-    let clock = Arc::new(ManualClock::new());
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
@@ -1243,7 +1085,6 @@ async fn undecided_ask_with_a_closed_gate_denies() {
         Arc::new(AlwaysAsk),
         gate,
         None,
-        clock,
         None,
     );
     let _ = drive(&agent).await;
@@ -1262,7 +1103,7 @@ async fn undecided_ask_with_a_closed_gate_denies() {
 async fn unclosed_compaction_keeps_the_session_idle_and_untouched() {
     let log = seed(config(Vec::new())).await;
     let frontier = log.frontier(SESSION).await.unwrap().unwrap();
-    append_event(
+    append(
         &log,
         SessionEvent::CompactionStarted {
             trigger: asterpath_protocol::CompactionTrigger::Manual,
@@ -1293,7 +1134,7 @@ async fn no_tool_call_after_assistant_message_commits_without_model_or_rerun() {
     // Sanity: an open step whose tools are all terminal simply commits.
     let log = seed(config(Vec::new())).await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
@@ -1499,13 +1340,13 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
     )
     .await;
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         intent(CALL, "c1", "echo", ReplaySafety::Unsafe),
         Some(dedup::tool_call(CALL)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::ChildSessionSpawned {
             child: GRANDCHILD,
@@ -1537,7 +1378,6 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
         None,
-        Arc::new(ManualClock::new()),
         None,
     );
     let agent_events = drive(&agent).await;
@@ -1598,7 +1438,7 @@ async fn orphan_child_with_a_committed_turn_stays_idle() {
     let log = seed(config(Vec::new())).await;
     // The child already finished its turn; only the parent completion is new.
     open_turn(&log).await;
-    append_event(
+    append(
         &log,
         SessionEvent::AssistantMessage {
             turn_id: TURN,
@@ -1612,7 +1452,7 @@ async fn orphan_child_with_a_committed_turn_stays_idle() {
         Some(dedup::assistant_message(TURN, STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::StepCommitted {
             turn_id: TURN,
@@ -1621,7 +1461,7 @@ async fn orphan_child_with_a_committed_turn_stays_idle() {
         Some(dedup::step_committed(STEP)),
     )
     .await;
-    append_event(
+    append(
         &log,
         SessionEvent::TurnCommitted {
             turn_id: TURN,
@@ -1746,7 +1586,6 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
         Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
         gate,
         None,
-        Arc::new(ManualClock::new()),
         None,
     );
     let mut stream = agent.run(RunRequest {

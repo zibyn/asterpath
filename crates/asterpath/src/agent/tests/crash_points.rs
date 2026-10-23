@@ -16,58 +16,30 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::support::{self, SESSION, append, decoded, drive, model, text, tool_table};
 use crate::agent::Agent;
-use crate::tools::ToolTable;
-use crate::waits::Waits;
 use asterpath_protocol::{
-    AbortKind, CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionInput,
-    CompactionJob, CompactionOutcome, CompactionTrigger, Compactor, ConfigSnapshot,
-    DefaultApprovalPolicy, Item, ModelId, ModelSpec, Part, ProjectedOrigin, Provider,
-    ProviderCatalog, ProviderError, ProviderErrorKind, ProviderId, RequestConfig, Role, RunRequest,
-    RunTrigger, SessionEvent, StopReason, SubagentConfig, ToolConfig, TurnConfig, TurnEndReason,
-    Usage, decode_entry, dedup, encode_entry,
+    AbortKind, CompactPlan, CompactSummary, CompactionError, CompactionInput, CompactionJob,
+    CompactionOutcome, CompactionTrigger, Compactor, ConfigSnapshot, Item, ProjectedOrigin,
+    ProviderError, ProviderErrorKind, Role, SessionEvent, StopReason, ToolConfig, TurnConfig,
+    TurnEndReason, Usage, dedup,
 };
-use asterpath_protocol::{
-    ApprovalGate, DedupKey, InputId, LogEntry, LogId, LogIdRange, LogQuery, SessionId,
-    SessionStore, StepId, TurnId,
-};
-use asterpath_testing::{
-    Failpoint, FailpointEventLog, InMemoryEventLog, ManualClock, Point, ScriptedProvider,
-};
+use asterpath_protocol::{InputId, LogId, LogIdRange, SessionStore, StepId, TurnId};
+use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
 use futures_core::future::BoxFuture;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt;
 
-const SESSION: SessionId = SessionId::from_bytes([9; 16]);
 const MAX_ATTEMPTS: u32 = 3;
-
-fn text(value: &str) -> Part {
-    Part::Text {
-        text: value.to_owned(),
-    }
-}
-
-fn model() -> ModelSpec {
-    ModelSpec {
-        provider: ProviderId::new("p"),
-        model: ModelId::new("model-1"),
-        context_window: None,
-    }
-}
 
 fn config(backoff: Duration) -> ConfigSnapshot {
     ConfigSnapshot {
-        model: model(),
-        system: vec![text("be helpful")],
-        tools: Vec::new(),
-        request: RequestConfig::default(),
         turn: TurnConfig {
             max_attempts: MAX_ATTEMPTS.try_into().expect("non-zero"),
             initial_backoff: backoff,
             max_backoff: backoff,
             ..TurnConfig::default()
         },
-        compaction: CompactionConfig::default(),
-        subagents: SubagentConfig::default(),
+        ..support::config(Vec::new())
     }
 }
 
@@ -209,24 +181,14 @@ fn agent(
     provider: Arc<ScriptedProvider>,
     compactor: Arc<ForcedCompactor>,
 ) -> Agent {
-    let gate = Arc::new(ApprovalGate::new());
-    let provider: Arc<dyn Provider> = provider;
-    Agent::new(
-        Arc::clone(&log),
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        Arc::new(ToolTable::new()),
+    support::agent(
+        log,
+        provider,
+        tool_table(Vec::new()),
         ToolConfig::default(),
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
-        gate,
-        Arc::new(Waits::new(log)),
-        Arc::new(ManualClock::new()),
+        Vec::new(),
     )
     .with_compactor(Some(compactor))
-}
-
-async fn append(log: &InMemoryEventLog, event: SessionEvent, key: Option<DedupKey>) -> LogId {
-    let entry = encode_entry(SESSION, key, &event).expect("encode");
-    log.append(entry).await.expect("append")
 }
 
 async fn input(log: &InMemoryEventLog, id: u8) -> LogId {
@@ -254,30 +216,6 @@ async fn seeded(backoff: Duration) -> Arc<InMemoryEventLog> {
     .await;
     input(&log, 4).await;
     log
-}
-
-async fn drive(agent: &Agent) {
-    let mut stream = agent.run(RunRequest {
-        session: SESSION,
-        trigger: RunTrigger::Resume,
-    });
-    while let Some(event) = stream.next().await {
-        event.expect("drive");
-    }
-}
-
-async fn scan(log: &InMemoryEventLog) -> Vec<SessionEvent> {
-    let mut stream = log.scan(LogQuery {
-        session: SESSION,
-        after: None,
-        limit: None,
-    });
-    let mut events = Vec::new();
-    while let Some(entry) = stream.next().await {
-        let entry: LogEntry = entry.expect("scan");
-        events.push(decode_entry(&entry).expect("decode"));
-    }
-    events
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -329,14 +267,14 @@ fn answered_calls(events: &[SessionEvent]) -> usize {
 
 async fn live(scenario: &Scenario) -> (Outcome, usize) {
     let log = seeded(Duration::ZERO).await;
-    let before = scan(&log).await.len();
+    let before = decoded(&log).await.len();
     let agent = agent(
         log.clone(),
         scenario.provider(),
         ForcedCompactor::new(scenario.forced),
     );
     drive(&agent).await;
-    let events = scan(&log).await;
+    let events = decoded(&log).await;
     (outcome(&events), events.len() - before)
 }
 
@@ -404,7 +342,7 @@ async fn crash_then_recover(
         scenario.name
     );
     drop(first);
-    let crashed = scan(&log).await;
+    let crashed = decoded(&log).await;
 
     let recovering = scenario.provider();
     recovering.skip(answered_calls(&crashed));
@@ -414,7 +352,7 @@ async fn crash_then_recover(
         ForcedCompactor::new(scenario.forced),
     );
     drive(&second).await;
-    (crashed, outcome(&scan(&log).await))
+    (crashed, outcome(&decoded(&log).await))
 }
 
 async fn assert_crash_points_match_live(scenario: Scenario) {
@@ -598,7 +536,7 @@ async fn recovery_does_not_wait_out_a_recorded_backoff() {
         .await
         .expect("no backoff sleep on recovery");
 
-    let outcome = outcome(&scan(&log).await);
+    let outcome = outcome(&decoded(&log).await);
     assert_eq!(outcome.reasons, vec![TurnEndReason::Completed]);
     assert_eq!(outcome.attempts, vec![1]);
 }
@@ -628,7 +566,7 @@ async fn redone_forced_compaction_uses_the_step_watermark() {
     let agent = agent(log.clone(), provider, Arc::clone(&compactor));
     drive(&agent).await;
 
-    let outcome = outcome(&scan(&log).await);
+    let outcome = outcome(&decoded(&log).await);
     assert_eq!(outcome.compactions, 1);
     assert_eq!(outcome.attempts, vec![1]);
     let inputs = compactor.inputs.lock().unwrap();
