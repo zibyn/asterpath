@@ -5,7 +5,7 @@
 > 本文件是 v1 spec 的"模块契约"章节草稿；最终 crate 打包由 #15 收敛。
 >
 > **2026-10-22 范围调整**：不做通用工作流引擎（[ADR-0003](../adr/0003-single-session-stream-topology.md)）。模块图中的 `asterpath-workflow` 已移除，编排相关表述以本文件为准已更新；#10 出界，调度 API 原型见 #17。
-> **2026-10-22 #32 修订 / 2026-10-23 M5 范围**：`asterpath-plugin-host` 与 MCP adapter 归 M5（post-v1，进行中），不进 v1 workspace；模块契约本身不变。
+> **2026-10-22 #32 修订 / 2026-10-23 M5 范围**：`asterpath-mcp`（原 `asterpath-plugin-host`）与 MCP adapter 归 M5（post-v1，进行中），不进 v1 workspace；模块契约本身不变。
 > **2026-10-23 #78 修订**（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：模块宿主、服务注册表、类型化事件总线与 `Module` trait 已删除。扩展点是 protocol 的 `Hooks`（§3.1）；facade 直接构造内部组件。下文 §3.1–§3.3、§5 已按此改写。
 > **2026-10-23 #79 修订**（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)）：引擎合并为 `asterpath` 一个 crate，`asterpath-core` 并入 `asterpath-protocol`。公开 trait 只剩适配器与钩子（§3、§4）；`AgentRunner`、`DurableExecutor`、`SubagentSpawner`、`ToolRegistry`、`UsageQuery`、`TraceQuery`、`TraceTap` 改为引擎内部具体类型。下文 §1–§9 已按此改写。
 
@@ -35,7 +35,7 @@ adapters (depend on protocol and listed peers only)
   asterpath-provider-anthropic, asterpath-provider-openai   Provider
   asterpath-storage-sqlite                                  EventLog + Storage + SessionCatalog + SessionRetirement
   asterpath-http                                            shared SSE / HTTP plumbing
-  asterpath-plugin-host (+ asterpath-sandbox, -sandbox-linux)  external tools (M5; #80 → asterpath-mcp)
+  asterpath-mcp (+ asterpath-sandbox-linux)  MCP tool source (M5; ADR-0027)
   asterpath-skills                                          load_skill tool (M6)
   asterpath-testing                                         in-memory backend, scripted provider, contract suites
         │
@@ -211,11 +211,11 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | trait | 实现在 | 注入点 |
 | --- | --- | --- |
 | `Provider` | 两个 provider crate、`ScriptedProvider` | `AsterpathConfig.providers` |
-| `Tool` | 宿主、`asterpath-skills`、plugin-host 的外部工具 | `AsterpathConfig.tools` |
+| `Tool` | 宿主、`asterpath-skills`、`asterpath-mcp` 的外部工具 | `AsterpathConfig.tools` |
 | `EventLog` / `Storage` / `SessionCatalog` / `SessionRetirement` | `asterpath-storage-sqlite`、`asterpath-testing` 的 in-memory 后端 | `sqlite` feature 或 `AsterpathConfig.event_log` 等 |
 | `Compactor` | 引擎的 `DefaultCompactor`（facade 再导出） | `AsterpathConfig.compactor` |
 | `ApprovalPolicy` | 内置 `DefaultApprovalPolicy` 或宿主 | `AsterpathConfig.approval` |
-| `SandboxProvider` | `asterpath-sandbox-linux`（#80 起 trait 在 protocol） | plugin-host |
+| `SandboxProvider` | `asterpath-sandbox-linux`、testing 的 fake（trait 在 protocol，ADR-0027） | `asterpath-mcp`、宿主 spawn 型工具 |
 | `Clock` | `SystemClock`、`ManualClock` | `AsterpathConfig.clock` |
 | `Hooks` | 宿主 | `AsterpathConfig.hooks` |
 
@@ -265,7 +265,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | 角色 | crate | 允许的 workspace 依赖 |
 | --- | --- | --- |
 | protocol | `asterpath-protocol` | 无；且不声明 feature |
-| adapter | provider、sqlite、http、plugin-host、sandbox、sandbox-linux、skills、testing | `asterpath-protocol` 与白名单列出的同类适配器 |
+| adapter | provider、sqlite、http、mcp、sandbox-linux、skills、testing | `asterpath-protocol` 与白名单列出的同类适配器 |
 | engine | `asterpath` | `asterpath-protocol` 与它再导出 / 按 feature 装配的适配器 |
 | app | `asterpath-cli`、`asterpath-acceptance` | 任意 workspace 成员 |
 | tool | `xtask`、`asterpath-mcp-fixture` | 白名单所列（当前无） |
@@ -292,7 +292,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | #13 token 统计 | 已定。查询是 facade 方法 `usage(scope)`，`usage_of` 与 `SessionCatalog` 在 protocol（实时观察走 `Hooks::on_record`）；见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md) |
 | #15 打包 | 已定。最终 crate 列表、稳定面、公共驱动 API、参考 CLI 与验收设计见 [packaging.md](packaging.md)、[acceptance.md](../spec/acceptance.md) 与 [ADR-0015](../adr/0015-packaging-and-stability.md) |
 | #16 插件清单 | 已定。插件清单、加载与版本协商见 [plugins.md](plugins.md)；发现与分发出界 |
-| #21 沙箱 | 已定。接缝在 `asterpath-sandbox`（#80 起移入 protocol）；protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |
+| #21 沙箱 | 已定。接缝在 `asterpath-protocol`（ADR-0027；原 `asterpath-sandbox`）；protocol 只增加 `ToolError::Denied`；见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md) |
 
 ## 9. 明确留给下游的点
 
