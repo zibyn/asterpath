@@ -293,7 +293,7 @@ async fn find(
                 here.truncate(PICKER_SIZE);
                 pick(&here, io::stdin().lock(), io::stderr())?
             }
-            Some(value) => by_id_or_name(&sessions, value)?,
+            Some(value) => by_id_or_name(&sessions, root, value)?,
         };
         let snapshot = snapshot(&asterpath, target.session).await?;
         Ok((target, snapshot))
@@ -335,8 +335,8 @@ fn in_root(sessions: &[CatalogEntry], root: &Path) -> Vec<CatalogEntry> {
     here
 }
 
-/// A hex id, else the last active session of that name.
-fn by_id_or_name(sessions: &[CatalogEntry], value: &str) -> CliResult<CatalogEntry> {
+/// A hex id (any root), else the last active session of that name in `root`.
+fn by_id_or_name(sessions: &[CatalogEntry], root: &Path, value: &str) -> CliResult<CatalogEntry> {
     if let Ok(id) = parse_session(value) {
         return sessions
             .iter()
@@ -344,12 +344,10 @@ fn by_id_or_name(sessions: &[CatalogEntry], value: &str) -> CliResult<CatalogEnt
             .cloned()
             .ok_or_else(|| not_found(id));
     }
-    sessions
-        .iter()
-        .filter(|entry| entry.metadata.get(NAME).map(String::as_str) == Some(value))
-        .max_by_key(|entry| entry.last_activity)
-        .cloned()
-        .ok_or_else(|| CliError::run(format!("no session named {value}")))
+    in_root(sessions, root)
+        .into_iter()
+        .find(|entry| entry.metadata.get(NAME).map(String::as_str) == Some(value))
+        .ok_or_else(|| CliError::run(format!("no session named {value} in {}", root.display())))
 }
 
 /// List the candidates and read a number.
@@ -624,22 +622,32 @@ mod tests {
     }
 
     #[test]
-    fn a_name_resolves_to_its_last_active_session_and_an_id_to_itself() {
+    fn a_name_resolves_to_its_last_active_session_in_the_root_and_an_id_to_itself() {
         let sessions = [
-            entry(1, 10, &[(NAME, "fix")]),
-            entry(2, 30, &[(NAME, "fix")]),
-            entry(3, 50, &[(NAME, "other")]),
+            entry(1, 10, &[(NAME, "fix"), (CWD, "/a")]),
+            entry(2, 30, &[(NAME, "fix"), (CWD, "/a")]),
+            entry(3, 50, &[(NAME, "other"), (CWD, "/a")]),
+            entry(4, 70, &[(NAME, "fix"), (CWD, "/b")]),
         ];
+        let root = Path::new("/a");
         assert_eq!(
-            by_id_or_name(&sessions, "fix").unwrap().session,
+            by_id_or_name(&sessions, root, "fix").unwrap().session,
             SessionId::from_bytes([2; 16])
         );
-        let hex = SessionId::from_bytes([1; 16]).to_hex();
+        let hex = SessionId::from_bytes([4; 16]).to_hex();
         assert_eq!(
-            by_id_or_name(&sessions, &hex).unwrap().session,
-            SessionId::from_bytes([1; 16])
+            by_id_or_name(&sessions, root, &hex).unwrap().session,
+            SessionId::from_bytes([4; 16]),
+            "an id resolves outside the root"
         );
-        assert_eq!(by_id_or_name(&sessions, "nope").unwrap_err().code, 1);
+        assert_eq!(by_id_or_name(&sessions, root, "nope").unwrap_err().code, 1);
+        assert_eq!(
+            by_id_or_name(&sessions, Path::new("/c"), "fix")
+                .unwrap_err()
+                .code,
+            1,
+            "a name resolves only in the root"
+        );
     }
 
     #[test]
