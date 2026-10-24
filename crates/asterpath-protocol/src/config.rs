@@ -1,6 +1,7 @@
 //! Request, turn, compaction and subagent configuration value shapes, the
 //! session config snapshot, and the tool descriptor.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use crate::LogId;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{JsonSchema, ModelId, ProviderId, ToolName};
+use crate::ids::{JsonSchema, JsonString, ModelId, ProviderId, ToolName};
 use crate::item::Part;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +26,12 @@ pub struct RequestConfig {
     pub disable_parallel_tool_use: bool,
     pub sampling: Option<SamplingParams>,
     pub reasoning: Option<ReasoningParams>,
+    #[serde(default)]
+    pub stop_sequences: Vec<String>,
+    /// Per-provider JSON objects merged into the top level of that provider's
+    /// request body; entries for other providers are ignored. Values are host policy.
+    #[serde(default)]
+    pub provider_options: BTreeMap<ProviderId, JsonString>,
 }
 
 impl Default for RequestConfig {
@@ -35,6 +42,8 @@ impl Default for RequestConfig {
             disable_parallel_tool_use: false,
             sampling: None,
             reasoning: None,
+            stop_sequences: Vec::new(),
+            provider_options: BTreeMap::new(),
         }
     }
 }

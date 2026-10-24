@@ -172,6 +172,8 @@ impl DefaultCompactor {
             sampling: None,
             max_output_tokens: job.max_summary_tokens,
             reasoning: None,
+            stop_sequences: Vec::new(),
+            provider_options: Default::default(),
         };
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {

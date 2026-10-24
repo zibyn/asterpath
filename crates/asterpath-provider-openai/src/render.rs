@@ -60,6 +60,7 @@ pub(crate) fn render(
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<u8>, ProviderError> {
     validate(request, provider, capabilities)?;
+    let options = request.provider_options_for(OWNED_KEYS)?;
 
     let instructions = system_text(&request.system);
     let input = render_input(request, provider, trace)?;
@@ -97,6 +98,8 @@ pub(crate) fn render(
         store: bool,
         stream: bool,
         include: &'static [&'static str],
+        #[serde(flatten)]
+        options: Map<String, Value>,
     }
 
     let sampling = request.sampling.as_ref();
@@ -114,6 +117,7 @@ pub(crate) fn render(
         store: false,
         stream: true,
         include: &["reasoning.encrypted_content"],
+        options,
     };
 
     serde_json::to_vec(&body).map_err(|error| {
@@ -123,6 +127,23 @@ pub(crate) fn render(
         )
     })
 }
+
+/// Every top-level key [`render`] can write; `provider_options` may not set them.
+const OWNED_KEYS: &[&str] = &[
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "reasoning",
+    "store",
+    "stream",
+    "include",
+];
 
 fn validate(
     request: &ModelRequest,
@@ -144,6 +165,11 @@ fn validate(
         .all(|part| matches!(part, Part::Text { .. }))
     {
         return Err(invalid_request("system may only contain text parts"));
+    }
+    // The Responses create body has no `stop`/`stop_sequences` parameter
+    // (https://developers.openai.com/api/reference/resources/responses/methods/create, 2026-10-24).
+    if !request.stop_sequences.is_empty() {
+        return Err(unsupported("stop_sequences"));
     }
     if let Some(sampling) = &request.sampling
         && sampling.top_k.is_some()

@@ -10,7 +10,7 @@ use futures_core::stream::BoxStream;
 use crate::config::{
     ModelSpec, ReasoningParams, RequestConfig, SamplingParams, ToolChoice, ToolDescriptor,
 };
-use crate::ids::ProviderId;
+use crate::ids::{JsonString, ProviderId};
 use crate::item::{Item, Part, RawProviderData};
 use crate::usage::Usage;
 
@@ -30,6 +30,9 @@ pub struct ModelRequest {
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,
     pub reasoning: Option<ReasoningParams>,
+    pub stop_sequences: Vec<String>,
+    /// See [`RequestConfig::provider_options`].
+    pub provider_options: BTreeMap<ProviderId, JsonString>,
 }
 
 impl ModelRequest {
@@ -54,7 +57,40 @@ impl ModelRequest {
             sampling: request.sampling.clone(),
             max_output_tokens: request.max_output_tokens.get(),
             reasoning: request.reasoning.clone(),
+            stop_sequences: request.stop_sequences.clone(),
+            provider_options: request.provider_options.clone(),
         }
+    }
+
+    /// The `provider_options` entry for `spec.provider` as top-level body fields,
+    /// rejecting any key in `owned` (fields the adapter writes itself) as
+    /// `Unsupported` and a non-object value as `InvalidRequest`.
+    // The provider error shape is fixed by the protocol contract.
+    #[allow(clippy::result_large_err)]
+    pub fn provider_options_for(
+        &self,
+        owned: &[&str],
+    ) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
+        let provider = &self.spec.provider;
+        let Some(options) = self.provider_options.get(provider) else {
+            return Ok(serde_json::Map::new());
+        };
+        let options = match serde_json::from_str(options.as_str()) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!("provider_options for {provider} must be a JSON object"),
+                ));
+            }
+        };
+        if let Some(key) = options.keys().find(|key| owned.contains(&key.as_str())) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                format!("provider_options key {key:?} is owned by the {provider} adapter"),
+            ));
+        }
+        Ok(options)
     }
 }
 

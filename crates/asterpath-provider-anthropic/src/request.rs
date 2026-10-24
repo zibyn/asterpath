@@ -13,6 +13,23 @@ use crate::models::{Thinking, rules_for};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Every top-level key [`render`] can write; `provider_options` may not set them.
+const OWNED_KEYS: &[&str] = &[
+    "model",
+    "max_tokens",
+    "system",
+    "messages",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "top_k",
+    "thinking",
+    "output_config",
+    "stop_sequences",
+    "stream",
+];
 /// One rendered JSON fragment: ordinary values are serialized compactly,
 /// replayed provider raw data is inserted exactly as persisted.
 enum Frag {
@@ -152,6 +169,7 @@ pub(crate) fn render(
     provider: &ProviderId,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
+    let options = request.provider_options_for(OWNED_KEYS)?;
     let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let messages = render_messages(provider, request, &tools_hash)?;
 
@@ -248,7 +266,13 @@ pub(crate) fn render(
             fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
         }
     }
+    if !request.stop_sequences.is_empty() {
+        fields.push(("stop_sequences", Frag::Json(json!(request.stop_sequences))));
+    }
     fields.push(("stream", Frag::Json(json!(true))));
+    for (key, value) in &options {
+        fields.push((key.as_str(), Frag::Json(value.clone())));
+    }
     Ok(object(fields))
 }
 
