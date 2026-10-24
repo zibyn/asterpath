@@ -1016,3 +1016,91 @@ async fn a_forked_child_starts_from_the_effective_tools_without_change_items() {
     assert_eq!(child.baseline_tools, child.tools);
     assert!(!has_tools_changed(&child.items), "{:?}", child.items);
 }
+
+/// Removes `lookup` during step 1, whose reply calls it: the call belongs to
+/// a step that started with `lookup`.
+fn removing_caller() -> Arc<Switching> {
+    Switching::new(
+        ScriptedProvider::new("p")
+            .respond(call_lookup("call-1"), StopReason::ToolUse, Usage::default())
+            .respond(reply("done"), StopReason::EndTurn, Usage::default()),
+        vec![Some(remove_lookup(1))],
+    )
+}
+
+fn with_lookup() -> SessionSpec {
+    SessionSpec {
+        tools: ToolSelection::Names(vec![ToolName::new("lookup")]),
+        ..spec()
+    }
+}
+
+fn tool_results(events: Vec<SessionEvent>) -> Vec<ToolResultStatus> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { status, .. } => Some(status),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_resumed_step_runs_its_calls_under_the_config_it_started_with() {
+    let live = removing_caller();
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        live.clone(),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath
+        .create_session(with_lookup())
+        .await
+        .expect("create");
+    live.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+    assert_eq!(
+        tool_results(events(&asterpath, &handle).await),
+        [ToolResultStatus::Completed]
+    );
+
+    // Dies appending `ToolCallRequested`, the 7th append: SessionCreated,
+    // InputRecorded, TurnStarted, StepStarted, ConfigChanged, AssistantMessage.
+    let shared = Arc::new(InMemoryEventLog::new());
+    let crashing = removing_caller();
+    let failing: Arc<dyn SessionStore> = Arc::new(FailpointEventLog::new(
+        shared.clone(),
+        Failpoint::panic(Point::AppendBeforeCommit)
+            .with_occurrence(NonZeroUsize::new(7).expect("non-zero")),
+    ));
+    let asterpath = assemble_with_lookup(failing, crashing.clone(), lookup_tool()).await;
+    let handle = asterpath
+        .create_session(with_lookup())
+        .await
+        .expect("create");
+    crashing.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    let driven = handle.clone();
+    let crashed = tokio::spawn(async move { drive(&driven).await }).await;
+    assert!(crashed.is_err_and(|error| error.is_panic()));
+    let prefix = kinds(shared.as_ref(), &handle).await.expect("scan");
+    assert_eq!(prefix.last(), Some(&"AssistantMessage"));
+
+    let recovered = Arc::new(ScriptedProvider::new("p").respond(
+        reply("done"),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let tool = lookup_tool();
+    let asterpath = assemble_with_lookup(shared.clone(), recovered, tool.clone()).await;
+    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    drive(&handle).await;
+
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tool_results(events(&asterpath, &handle).await),
+        [ToolResultStatus::Completed]
+    );
+}

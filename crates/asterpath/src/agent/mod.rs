@@ -273,7 +273,7 @@ impl Agent {
         if assistant_message(&current, turn, step).is_some() {
             // The model call is committed: never call it again.
             match self
-                .resume_step(session, config, turn, step, cancel, events)
+                .resume_step(session, watermark, turn, step, cancel, events)
                 .await?
             {
                 StepOutcome::Continue => {}
@@ -866,17 +866,18 @@ impl Agent {
 
     /// Finish an open step whose `AssistantMessage` is already committed: run
     /// every call without a `ToolResult`, reusing recorded intents verbatim.
-    #[allow(clippy::too_many_arguments)]
+    /// The calls run under the config at the step's `watermark`, as they did live.
     async fn resume_step(
         &self,
         session: SessionId,
-        config: &ConfigSnapshot,
+        watermark: u64,
         turn: TurnId,
         step: StepId,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
         let decoded = scan_decoded(&*self.log, session).await?;
+        let config = &config_at(session, &decoded, watermark)?;
         let (items, stop_reason) = decoded
             .iter()
             .find_map(|(_, event)| match event {
