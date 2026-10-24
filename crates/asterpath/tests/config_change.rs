@@ -1,14 +1,15 @@
 //! Mid-session configuration changes (ADR-0030, #109): `update_config` writes
 //! a `ConfigChanged`, and every step folds the config at its `StepStarted`.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use asterpath::protocol::{
-    CompactionConfig, ConfigUpdate, InputId, Item, ModelId, ModelRequest, ModelSpec, Part,
-    Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, RequestConfig,
-    Role, SessionEvent, SessionSpec, StopReason, StreamEvent, SubagentConfig, ToolSelection,
-    TurnConfig, Usage, UserInput, decode_entry, scan_all,
+    CompactionConfig, ConfigUpdate, InputId, Item, JsonString, ModelId, ModelRequest, ModelSpec,
+    Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
+    RequestConfig, Role, SessionEvent, SessionSpec, StopReason, StreamEvent, SubagentConfig,
+    ToolName, ToolSelection, TurnConfig, Usage, UserInput, decode_entry, scan_all,
 };
 use asterpath::protocol::{SessionStore, StorageError};
 use asterpath::{AsterError, Asterpath, SessionHandle};
@@ -68,15 +69,25 @@ fn input(id: u8) -> UserInput {
     }
 }
 
-/// Wraps a scripted provider; the first attempt calls `update_config` before
-/// streaming, so the change lands inside a step that is already running.
-struct SwitchOnFirstCall {
+/// Wraps a scripted provider; the n-th call first applies the n-th queued
+/// update to `handle`, so the change lands inside a step that is running.
+struct Switching {
     inner: ScriptedProvider,
     handle: OnceLock<SessionHandle>,
-    update: Mutex<Option<ConfigUpdate>>,
+    updates: Mutex<VecDeque<Option<ConfigUpdate>>>,
 }
 
-impl Provider for SwitchOnFirstCall {
+impl Switching {
+    fn new(inner: ScriptedProvider, updates: Vec<Option<ConfigUpdate>>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            handle: OnceLock::new(),
+            updates: Mutex::new(updates.into()),
+        })
+    }
+}
+
+impl Provider for Switching {
     fn id(&self) -> ProviderId {
         self.inner.id()
     }
@@ -88,10 +99,11 @@ impl Provider for SwitchOnFirstCall {
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let inner = self.inner.stream(request);
         let update = self
-            .update
+            .updates
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
+            .pop_front()
+            .flatten();
         let Some(update) = update else {
             return inner;
         };
@@ -152,14 +164,13 @@ async fn an_unregistered_provider_is_rejected_and_nothing_is_logged() {
 
 #[tokio::test]
 async fn a_mid_turn_change_applies_from_the_next_step_only() {
-    let provider = Arc::new(SwitchOnFirstCall {
-        inner: ScriptedProvider::new("p")
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
             .fail(retryable())
             .respond(reply("first"), StopReason::PauseTurn, Usage::default())
             .respond(reply("second"), StopReason::EndTurn, Usage::default()),
-        handle: OnceLock::new(),
-        update: Mutex::new(Some(switch_to("model-2"))),
-    });
+        vec![Some(switch_to("model-2"))],
+    );
     let asterpath = Asterpath::builder()
         .store(Arc::new(InMemoryEventLog::new()))
         .providers(vec![provider.clone()])
@@ -217,14 +228,13 @@ fn switch_model_and_budget() -> ConfigUpdate {
 
 /// Switches config during step 1, which pauses the turn, so step 2 runs
 /// under the change.
-fn pausing_switcher() -> Arc<SwitchOnFirstCall> {
-    Arc::new(SwitchOnFirstCall {
-        inner: ScriptedProvider::new("p")
+fn pausing_switcher() -> Arc<Switching> {
+    Switching::new(
+        ScriptedProvider::new("p")
             .respond(reply("first"), StopReason::PauseTurn, Usage::default())
             .respond(reply("second"), StopReason::EndTurn, Usage::default()),
-        handle: OnceLock::new(),
-        update: Mutex::new(Some(switch_model_and_budget())),
-    })
+        vec![Some(switch_model_and_budget())],
+    )
 }
 
 async fn assemble(store: Arc<dyn SessionStore>, provider: Arc<dyn Provider>) -> Asterpath {
@@ -290,4 +300,60 @@ async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
     drive(&handle).await;
 
     assert_eq!(recovered.requests(), [live_step_2]);
+}
+
+#[tokio::test]
+async fn a_child_inherits_the_config_of_its_spawn_step() {
+    // Calls: parent step 1 (switches to model-2), parent step 2 spawns and
+    // switches to model-3, the child, then parent step 3.
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(
+                vec![Item::ToolCall {
+                    call_id: "call-spawn".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: JsonString::new(r#"{"task":"look"}"#),
+                    raw: None,
+                }],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(reply("child done"), StopReason::EndTurn, Usage::default())
+            .respond(reply("parent done"), StopReason::EndTurn, Usage::default()),
+        vec![Some(switch_to("model-2")), Some(switch_to("model-3"))],
+    );
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
+    let handle = asterpath
+        .create_session(SessionSpec {
+            tools: ToolSelection::All,
+            ..spec()
+        })
+        .await
+        .expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let requested: Vec<ModelId> = provider
+        .inner
+        .requests()
+        .into_iter()
+        .map(|request| request.spec.model)
+        .collect();
+    assert_eq!(
+        requested,
+        ["model-1", "model-2", "model-2", "model-3"].map(ModelId::new),
+        "the child runs on the spawn step's model, not the parent's later change"
+    );
+    let spawned = events(&asterpath, &handle)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { config, .. } => Some(config.model),
+            _ => None,
+        })
+        .expect("spawned");
+    assert_eq!(spawned, model("model-2"));
 }

@@ -8,7 +8,8 @@ use std::time::Duration;
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
     ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup, encode_entry,
+    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup, effective_config,
+    encode_entry,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -154,11 +155,17 @@ impl Scheduler {
             let parent_events = scan_decoded(&*self.log, req.parent.session)
                 .await
                 .map_err(|error| SpawnError::Execution(error.into()))?;
-            let parent_config = session_config(&parent_events)
-                .ok_or(SpawnError::Execution(ExecutionError::NotFound {
-                    session: req.parent.session,
-                }))?
-                .clone();
+            // The parent's effective config at the spawn step's `StepStarted`;
+            // later parent changes never reach the child (ADR-0030).
+            let watermark =
+                spawn_step_start(&parent_events, req.caused_by).map_or(u64::MAX, |entry| entry.seq);
+            let parent_config = effective_config(
+                parent_events.iter().map(|(entry, event)| (entry, event)),
+                watermark,
+            )
+            .ok_or(SpawnError::Execution(ExecutionError::NotFound {
+                session: req.parent.session,
+            }))?;
             let subagents = parent_config.subagents.clone();
             // Per-call wins; otherwise the inherited default (None by default).
             let timeout = req.timeout.or(subagents.spawn_timeout);
@@ -867,32 +874,33 @@ fn resolve_context(
     let ContextPolicy::Fork { .. } = default else {
         return ContextPolicy::Fresh;
     };
-    let Some(caused_at) = events
+    match spawn_step_start(events, caused_by) {
+        Some(entry) => ContextPolicy::Fork { at: entry.log_id },
+        None => ContextPolicy::Fresh,
+    }
+}
+
+/// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.
+fn spawn_step_start(events: &[(LogEntry, SessionEvent)], caused_by: LogId) -> Option<&LogEntry> {
+    let caused_at = events
         .iter()
-        .position(|(entry, _)| entry.log_id == caused_by)
-    else {
-        return ContextPolicy::Fresh;
-    };
+        .position(|(entry, _)| entry.log_id == caused_by)?;
     let SessionEvent::ToolCallRequested {
         turn_id, step_id, ..
     } = &events[caused_at].1
     else {
-        return ContextPolicy::Fresh;
+        return None;
     };
-    let at = events[..caused_at]
+    events[..caused_at]
         .iter()
         .rev()
         .find_map(|(entry, event)| match event {
             SessionEvent::StepStarted {
                 turn_id: started_turn,
                 step_id: started_step,
-            } if started_turn == turn_id && started_step == step_id => Some(entry.log_id),
+            } if started_turn == turn_id && started_step == step_id => Some(entry),
             _ => None,
-        });
-    match at {
-        Some(at) => ContextPolicy::Fork { at },
-        None => ContextPolicy::Fresh,
-    }
+        })
 }
 
 fn find_spawn(events: &[(LogEntry, SessionEvent)], tool_call: ToolCallId) -> Option<SpawnRecord> {
