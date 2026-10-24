@@ -615,9 +615,10 @@ async fn pause_turn_continuation_keeps_the_declared_server_tools() {
         ScriptedProvider::new("p")
             .respond(assistant_items("first"), StopReason::PauseTurn, usage(1, 1))
             .respond(assistant_items("second"), StopReason::EndTurn, usage(1, 1))
-            .with_capabilities(ProviderCapabilities {
-                server_tools: true,
-                ..ProviderCapabilities::default()
+            .with_capabilities({
+                let mut capabilities = ProviderCapabilities::default();
+                capabilities.server_tools = true;
+                capabilities
             }),
     );
     let asterpath = open(&db, vec![provider.clone()]).await;

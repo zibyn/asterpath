@@ -16,8 +16,8 @@ use asterpath::protocol::{
 };
 use asterpath::protocol::{ContextPolicy, LogId, SessionStore, SpanAttributes, StorageError};
 use asterpath::protocol::{
-    Parallelism, Provenance, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor,
-    ToolError, ToolErrorKind, ToolOutput, ToolResultStatus,
+    Parallelism, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError,
+    ToolErrorKind, ToolOutput, ToolResultStatus,
 };
 use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
@@ -227,10 +227,9 @@ async fn a_mid_turn_change_applies_from_the_next_step_only() {
 
 fn switch_model_and_budget() -> ConfigPatch {
     let mut update = switch_to("model-2");
-    update.request = Some(RequestConfig {
-        max_output_tokens: NonZeroU32::new(512).expect("non-zero"),
-        ..RequestConfig::default()
-    });
+    let mut request = RequestConfig::default();
+    request.max_output_tokens = NonZeroU32::new(512).expect("non-zero");
+    update.request = Some(request);
     update
 }
 
@@ -645,18 +644,14 @@ async fn trace_attributes_each_model_call_to_the_model_it_used() {
 }
 
 fn lookup() -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new("lookup"),
-        description: "look something up".to_owned(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new("lookup"),
+        "look something up",
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 struct Lookup {
@@ -1049,10 +1044,7 @@ fn tool_results(events: Vec<SessionEvent>) -> Vec<ToolResultStatus> {
 #[tokio::test]
 async fn trace_describes_a_call_by_the_tools_of_its_step() {
     let tool = Arc::new(Lookup {
-        descriptor: ToolDescriptor {
-            side_effect: SideEffect::Mutating,
-            ..lookup()
-        },
+        descriptor: lookup().with_side_effect(SideEffect::Mutating),
         calls: AtomicUsize::new(0),
     });
     let provider = removing_caller();

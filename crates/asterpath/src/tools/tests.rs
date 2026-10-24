@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::tools::ToolTable;
 use asterpath_protocol::{
-    Parallelism, Provenance, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor,
-    ToolError, ToolName, ToolOutput,
+    Parallelism, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError,
+    ToolName, ToolOutput,
 };
 use futures_core::future::BoxFuture;
 
@@ -16,18 +16,14 @@ struct StubTool {
 impl StubTool {
     fn tool(name: &str) -> Arc<dyn Tool> {
         Arc::new(Self {
-            descriptor: ToolDescriptor {
-                name: ToolName::new(name),
-                description: String::new(),
-                schema: serde_json::json!({"type": "object"}),
-                parallelism: Parallelism::Parallel,
-                replay: ReplaySafety::Safe,
-                side_effect: SideEffect::ReadOnly,
-                provenance: Provenance::InProcess,
-                timeout: None,
-                max_output_bytes: None,
-                strict: None,
-            },
+            descriptor: ToolDescriptor::new(
+                ToolName::new(name),
+                String::new(),
+                serde_json::json!({"type": "object"}),
+            )
+            .with_parallelism(Parallelism::Parallel)
+            .with_replay(ReplaySafety::Safe)
+            .with_side_effect(SideEffect::ReadOnly),
         })
     }
 }

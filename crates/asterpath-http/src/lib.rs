@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use asterpath_protocol::{
-    FileSource, ModelRequest, Part, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
+    FileSource, Item, ModelRequest, Part, ProviderError, ProviderErrorKind, ProviderId,
+    RawProviderData,
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
@@ -182,11 +183,25 @@ pub fn server_tools_for(request: &ModelRequest) -> Result<Vec<Value>, ProviderEr
         .collect()
 }
 
-/// Why the first `Part::File` cannot be rendered on `request.spec.model`:
-/// its media type is not in the model's `accepted` list (protocol.md R14), or
-/// its source is one the adapters do not know yet. The detail of an
-/// `Unsupported` error.
-pub fn unrenderable_file(request: &ModelRequest, accepted: &[&str]) -> Option<String> {
+/// Why the request holds a part the adapters cannot render: a `Part`
+/// variant they do not know yet, or a `Part::File` whose media type is not in
+/// the model's `accepted` list (protocol.md R14) or whose source they do not
+/// know yet. The detail of an `Unsupported` error; with it `None`, adapters
+/// may treat unknown variants as unreachable.
+pub fn unrenderable_part(request: &ModelRequest, accepted: &[&str]) -> Option<String> {
+    let known = |part: &Part| {
+        matches!(
+            part,
+            Part::Text { .. }
+                | Part::Image { .. }
+                | Part::File { .. }
+                | Part::Refusal { .. }
+                | Part::ProviderOpaque { .. }
+        )
+    };
+    if !all_parts(request).all(known) {
+        return Some("this content part".to_owned());
+    }
     request.content_parts().find_map(|(_, part)| match part {
         Part::File {
             media_type,
@@ -197,6 +212,24 @@ pub fn unrenderable_file(request: &ModelRequest, accepted: &[&str]) -> Option<St
         Part::File { .. } => Some("this file source".to_owned()),
         _ => None,
     })
+}
+
+/// Every part of the request: the system, then each item's parts.
+fn all_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
+    let item_parts = request.items.iter().flat_map(|item| match item {
+        Item::Message { parts, .. }
+        | Item::ToolResult { parts, .. }
+        | Item::ServerToolResult { parts, .. }
+        | Item::Compaction { parts, .. }
+        | Item::Instruction { parts, .. } => parts.as_slice(),
+        Item::Reasoning { summary, .. } => summary.as_slice(),
+        // Listed, not `_`, so a new item with parts fails to compile here.
+        Item::ToolCall { .. }
+        | Item::ServerToolCall { .. }
+        | Item::ToolsChanged { .. }
+        | Item::ProviderOpaque { .. } => &[],
+    });
+    request.system.iter().chain(item_parts)
 }
 
 /// Deep-merge one `provider_options` value into the value the adapter wrote at

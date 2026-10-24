@@ -104,10 +104,7 @@ impl ApprovalPolicy for AlwaysAsk {
 }
 
 fn described(name: &str, replay: ReplaySafety) -> ToolDescriptor {
-    ToolDescriptor {
-        replay,
-        ..descriptor(name)
-    }
+    descriptor(name).with_replay(replay)
 }
 
 /// `support::agent_with` with the default tool config and an optional hook.

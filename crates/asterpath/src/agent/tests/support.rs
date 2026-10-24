@@ -8,10 +8,10 @@ use crate::tools::ToolTable;
 use crate::waits::Waits;
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Hooks,
-    Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance, Provider, ProviderCatalog,
-    ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent,
-    SideEffect, SubagentConfig, Tool, ToolConfig, ToolDescriptor, ToolName, TurnConfig,
-    decode_entry, encode_entry,
+    Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider, ProviderCatalog, ProviderId,
+    ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect,
+    SubagentConfig, Tool, ToolConfig, ToolDescriptor, ToolName, TurnConfig, decode_entry,
+    encode_entry,
 };
 use asterpath_protocol::{
     ApprovalGate, DedupKey, LogEntry, LogId, SessionId, SessionStore, scan_all,
@@ -53,18 +53,14 @@ pub(super) fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
 
 /// A safe, parallel, read-only in-process tool.
 pub(super) fn descriptor(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 pub(super) fn tool_call(call_id: &str, name: &str, args: &str) -> Item {

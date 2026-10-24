@@ -16,10 +16,10 @@ use asterpath::anthropic::{AnthropicModelProfile, AnthropicProvider};
 use asterpath::openai::OpenAiProvider;
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
-    CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Parallelism, Part, Provenance,
-    Provider, ProviderId, ReplaySafety, RequestConfig, SessionSpec, SideEffect, SubagentConfig,
-    Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
-    TurnConfig, UpdateId, UserInput,
+    CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Part, Provider, ProviderId,
+    ReplaySafety, RequestConfig, SessionSpec, SideEffect, SubagentConfig, Tool, ToolArgs,
+    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
+    UpdateId, UserInput,
 };
 use asterpath_protocol::{SessionEvent, ToolErrorKind, ToolResultStatus, decode_entry, scan_all};
 use asterpath_testing::http_mock::MockServer;
@@ -117,18 +117,12 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
     let server = MockServer::start(common::mock::openai_replies(&fixture));
 
     let switch = Arc::new(Switch {
-        descriptor: ToolDescriptor {
-            name: ToolName::new("switch"),
-            description: String::new(),
-            schema: json!({"type": "object"}),
-            parallelism: Parallelism::Exclusive,
-            replay: ReplaySafety::Safe,
-            side_effect: SideEffect::Mutating,
-            provenance: Provenance::InProcess,
-            timeout: None,
-            max_output_bytes: None,
-            strict: None,
-        },
+        descriptor: ToolDescriptor::new(
+            ToolName::new("switch"),
+            String::new(),
+            json!({"type": "object"}),
+        )
+        .with_replay(ReplaySafety::Safe),
         handle: OnceLock::new(),
         calls: AtomicUsize::new(0),
     });
@@ -233,18 +227,12 @@ impl Tool for Append {
 /// One turn: step 1 thinks and calls `append`, step 2 answers.
 async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
     let append = Arc::new(Append {
-        descriptor: ToolDescriptor {
-            name: ToolName::new("append"),
-            description: String::new(),
-            schema: json!({"type": "object"}),
-            parallelism: Parallelism::Exclusive,
-            replay: ReplaySafety::Safe,
-            side_effect: SideEffect::Mutating,
-            provenance: Provenance::InProcess,
-            timeout: None,
-            max_output_bytes: None,
-            strict: None,
-        },
+        descriptor: ToolDescriptor::new(
+            ToolName::new("append"),
+            String::new(),
+            json!({"type": "object"}),
+        )
+        .with_replay(ReplaySafety::Safe),
         handle: OnceLock::new(),
     });
     let asterpath = Asterpath::builder()
@@ -401,18 +389,13 @@ async fn openai_appends_a_developer_message_after_the_tool_output() {
 }
 
 fn plain_tool(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: format!("{name} tool"),
-        schema: json!({"type": "object"}),
-        parallelism: Parallelism::Exclusive,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        format!("{name} tool"),
+        json!({"type": "object"}),
+    )
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 /// Adds `lookup` and removes itself.

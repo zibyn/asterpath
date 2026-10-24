@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use asterpath_protocol::ExecutionError;
 use asterpath_protocol::{
-    ChildOutcome, ModelAlias, Parallelism, ParentRef, Part, Provenance, ReplaySafety, SideEffect,
-    Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    ChildOutcome, ModelAlias, Parallelism, ParentRef, Part, ReplaySafety, Tool, ToolArgs,
+    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
 };
 use futures_core::future::BoxFuture;
 
@@ -199,14 +199,14 @@ fn wait_error(error: WaitError) -> ToolError {
 }
 
 fn descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(SPAWN_TOOL_NAME),
-        description: "Run a sub-agent: starts an independent child session with a fresh \
+    ToolDescriptor::new(
+        ToolName::new(SPAWN_TOOL_NAME),
+        "Run a sub-agent: starts an independent child session with a fresh \
                       context and returns its status and task summary once it finishes. \
                       The child inherits the session configuration; the model may only \
                       narrow the model alias and the tool set."
             .to_owned(),
-        schema: serde_json::json!({
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "task": {
@@ -231,12 +231,7 @@ fn descriptor() -> ToolDescriptor {
             "required": ["task"],
             "additionalProperties": false
         }),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::Mutating,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
 }

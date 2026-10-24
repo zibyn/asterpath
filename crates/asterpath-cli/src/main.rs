@@ -968,18 +968,14 @@ mod tests {
 
     fn echo_tool(calls: Arc<AtomicUsize>) -> Arc<dyn Tool> {
         Arc::new(EchoTool {
-            descriptor: ToolDescriptor {
-                name: ToolName::new("echo"),
-                description: String::new(),
-                schema: serde_json::json!({"type": "object"}),
-                parallelism: Parallelism::Parallel,
-                replay: ReplaySafety::Safe,
-                side_effect: SideEffect::ReadOnly,
-                provenance: Provenance::InProcess,
-                timeout: None,
-                max_output_bytes: None,
-                strict: None,
-            },
+            descriptor: ToolDescriptor::new(
+                ToolName::new("echo"),
+                String::new(),
+                serde_json::json!({"type": "object"}),
+            )
+            .with_parallelism(Parallelism::Parallel)
+            .with_replay(ReplaySafety::Safe)
+            .with_side_effect(SideEffect::ReadOnly),
             calls,
         })
     }

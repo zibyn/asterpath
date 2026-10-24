@@ -80,18 +80,14 @@ fn tool_call(call: &str, name: &str) -> Item {
 }
 
 fn descriptor(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: asterpath::protocol::Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 struct BigTool {
@@ -272,9 +268,10 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
     let db = temp_db("c1");
     let provider = Arc::new(
         ScriptedProvider::new("p")
-            .with_capabilities(asterpath::protocol::ProviderCapabilities {
-                image_input: true,
-                ..Default::default()
+            .with_capabilities({
+                let mut capabilities = asterpath::protocol::ProviderCapabilities::default();
+                capabilities.image_input = true;
+                capabilities
             })
             .respond(
                 {

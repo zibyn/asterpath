@@ -380,10 +380,8 @@ fn config_snapshot_round_trips_through_json() {
 
 #[test]
 fn model_request_copies_stop_sequences_and_provider_options() {
-    let mut request = RequestConfig {
-        stop_sequences: vec!["END".to_owned()],
-        ..RequestConfig::default()
-    };
+    let mut request = RequestConfig::default();
+    request.stop_sequences = vec!["END".to_owned()];
     request.provider_options.insert(
         ProviderId::new("openai"),
         JsonString::new(r#"{"service_tier":"flex"}"#),
@@ -395,13 +393,11 @@ fn model_request_copies_stop_sequences_and_provider_options() {
 
 #[test]
 fn model_request_copies_output_format() {
-    let request = RequestConfig {
-        output_format: Some(OutputFormat::new(
-            "answer",
-            serde_json::json!({"type": "object"}),
-        )),
-        ..RequestConfig::default()
-    };
+    let mut request = RequestConfig::default();
+    request.output_format = Some(OutputFormat::new(
+        "answer",
+        serde_json::json!({"type": "object"}),
+    ));
     let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], vec![], &request);
     assert_eq!(model_request.output_format, request.output_format);
 }
@@ -502,10 +498,8 @@ fn effective_config_applies_changes_below_the_watermark_only() {
 
 #[test]
 fn a_patch_overrides_only_the_fields_it_carries() {
-    let request = RequestConfig {
-        stop_sequences: vec!["END".to_owned()],
-        ..RequestConfig::default()
-    };
+    let mut request = RequestConfig::default();
+    request.stop_sequences = vec!["END".to_owned()];
     let mut patch = ConfigPatch::default();
     patch.request = Some(request.clone());
     let mut snapshot = config();
@@ -694,18 +688,14 @@ fn compaction_moves_replaced_instructions_into_the_baseline_system() {
 }
 
 fn tool(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: format!("{name} tool"),
-        schema: json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        format!("{name} tool"),
+        json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 fn created_with_tools(names: &[&str]) -> SessionEvent {

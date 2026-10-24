@@ -13,9 +13,9 @@ use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
-    Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
-    StopReason, SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry, dedup,
+    Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, StopReason,
+    SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    ToolResultStatus, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry, dedup,
     encode_entry,
 };
 use asterpath_protocol::{
@@ -57,18 +57,14 @@ fn model() -> ModelSpec {
 }
 
 fn descriptor(name: &str, replay: ReplaySafety, provenance: Provenance) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay,
-        side_effect: SideEffect::Mutating,
-        provenance,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(replay)
+    .with_provenance(provenance)
 }
 
 fn spec() -> SessionSpec {

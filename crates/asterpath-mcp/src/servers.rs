@@ -195,18 +195,13 @@ impl McpServers {
         let adapter: Arc<dyn McpAdapter> = Arc::from(adapter);
         let mut names = Vec::with_capacity(composed.len());
         for (name, tool) in composed {
-            let descriptor = ToolDescriptor {
-                name: name.clone(),
-                description: tool.description.clone(),
-                schema: tool.schema.clone(),
-                parallelism: Parallelism::Parallel,
-                replay: tool.replay,
-                side_effect: tool.side_effect,
-                provenance: Provenance::External { transport },
-                timeout: Some(config.timeouts.call_timeout()),
-                max_output_bytes: None,
-                strict: None,
-            };
+            let descriptor =
+                ToolDescriptor::new(name.clone(), tool.description.clone(), tool.schema.clone())
+                    .with_parallelism(Parallelism::Parallel)
+                    .with_replay(tool.replay)
+                    .with_side_effect(tool.side_effect)
+                    .with_provenance(Provenance::External { transport })
+                    .with_timeout(Some(config.timeouts.call_timeout()));
             self.tools.push(Arc::new(ExternalTool {
                 descriptor,
                 adapter: Arc::clone(&adapter),

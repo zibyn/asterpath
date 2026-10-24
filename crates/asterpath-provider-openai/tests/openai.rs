@@ -48,40 +48,30 @@ fn provider(server: &MockServer) -> OpenAiProvider {
 }
 
 fn request(items: Vec<Item>) -> ModelRequest {
-    ModelRequest {
-        spec: spec("gpt-5"),
-        prefix_epoch: 0,
-        system: vec![Part::Text {
+    let mut request = ModelRequest::new(
+        spec("gpt-5"),
+        0,
+        vec![Part::Text {
             text: "You are terse.".to_owned(),
         }],
         items,
-        tools: vec![tool("get_weather")],
-        baseline_tools: vec![tool("get_weather")],
-        tool_choice: ToolChoice::Auto,
-        disable_parallel_tool_use: false,
-        sampling: None,
-        max_output_tokens: 128,
-        reasoning: None,
-        stop_sequences: Vec::new(),
-        provider_options: Default::default(),
-        output_format: None,
-        server_tools: Default::default(),
-    }
+        vec![tool("get_weather")],
+        vec![tool("get_weather")],
+        &asterpath_protocol::RequestConfig::default(),
+    );
+    request.max_output_tokens = 128;
+    request
 }
 
 fn tool(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: "Look up weather".to_owned(),
-        schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
-        parallelism: asterpath_protocol::Parallelism::Parallel,
-        replay: asterpath_protocol::ReplaySafety::Safe,
-        side_effect: asterpath_protocol::SideEffect::ReadOnly,
-        provenance: asterpath_protocol::Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        "Look up weather",
+        json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+    )
+    .with_parallelism(asterpath_protocol::Parallelism::Parallel)
+    .with_replay(asterpath_protocol::ReplaySafety::Safe)
+    .with_side_effect(asterpath_protocol::SideEffect::ReadOnly)
 }
 
 fn user_text(text: &str) -> Item {
@@ -321,22 +311,18 @@ async fn provider_declares_openai_capabilities() {
     let provider = provider(&MockServer::start(Vec::new()));
     let capabilities = provider.capabilities(&spec("gpt-5"));
     assert_eq!(provider.id(), ProviderId::new("openai"));
-    assert_eq!(
-        capabilities,
-        ProviderCapabilities {
-            server_state: false,
-            forced_tool_choice: true,
-            sampling: true,
-            reasoning_roundtrip: true,
-            citations: false,
-            structured_output: true,
-            server_tools: true,
-            cache_control: false,
-            image_input: true,
-            file_input: true,
-            parallel_tool_calls: true,
-        }
-    );
+    assert_eq!(capabilities, {
+        let mut capabilities = ProviderCapabilities::default();
+        capabilities.forced_tool_choice = true;
+        capabilities.sampling = true;
+        capabilities.reasoning_roundtrip = true;
+        capabilities.structured_output = true;
+        capabilities.server_tools = true;
+        capabilities.image_input = true;
+        capabilities.file_input = true;
+        capabilities.parallel_tool_calls = true;
+        capabilities
+    });
 }
 
 fn pdf(source: FileSource) -> Part {

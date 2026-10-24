@@ -48,10 +48,8 @@ fn requests(provider: &str) -> Vec<(&'static str, ModelRequest)> {
         ProviderId::new(provider),
         vec![JsonString::new(r#"{"type":"web_search"}"#)],
     );
-    let structured = RequestConfig {
-        output_format: Some(OutputFormat::new("answer", json!({"type": "object"}))),
-        ..RequestConfig::default()
-    };
+    let mut structured = RequestConfig::default();
+    structured.output_format = Some(OutputFormat::new("answer", json!({"type": "object"})));
     let file = user(vec![Part::File {
         media_type: "application/pdf".to_owned(),
         filename: None,

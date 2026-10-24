@@ -191,15 +191,13 @@ fn capability_check_names_the_unsupported_feature() {
         .insert(ProviderId::new("p"), Vec::new());
     assert_eq!(none.unsupported_feature(&elsewhere), None);
 
-    let all = ProviderCapabilities {
-        forced_tool_choice: true,
-        sampling: true,
-        parallel_tool_calls: true,
-        image_input: true,
-        structured_output: true,
-        server_tools: true,
-        ..ProviderCapabilities::default()
-    };
+    let mut all = ProviderCapabilities::default();
+    all.forced_tool_choice = true;
+    all.sampling = true;
+    all.parallel_tool_calls = true;
+    all.image_input = true;
+    all.structured_output = true;
+    all.server_tools = true;
     for request in [forced, sampling, serial, image, structured, server_tools] {
         assert_eq!(all.unsupported_feature(&request), None);
     }

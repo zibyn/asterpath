@@ -799,18 +799,13 @@ fn parse_session_id(hex: &str) -> Result<SessionId, String> {
 }
 
 fn descriptor(name: &str, replay: asterpath_protocol::ReplaySafety) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: asterpath_protocol::Parallelism::Parallel,
-        replay,
-        side_effect: asterpath_protocol::SideEffect::Mutating,
-        provenance: asterpath_protocol::Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(asterpath_protocol::Parallelism::Parallel)
+    .with_replay(replay)
 }
 
 /// Idempotent overwrite: a crash after the write must not duplicate anything.

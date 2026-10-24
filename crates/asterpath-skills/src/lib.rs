@@ -10,8 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use asterpath_protocol::{
-    Parallelism, Part, Provenance, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput,
+    Parallelism, Part, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor,
+    ToolError, ToolName, ToolOutput,
 };
 use futures_core::future::BoxFuture;
 use saphyr::{LoadableYamlNode, Yaml};
@@ -559,21 +559,17 @@ impl Tool for LoadSkillTool {
 }
 
 fn descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(LOAD_SKILL_TOOL_NAME),
-        description: "Load the full instructions for a skill by name.".to_owned(),
-        schema: serde_json::json!({
+    ToolDescriptor::new(
+        ToolName::new(LOAD_SKILL_TOOL_NAME),
+        "Load the full instructions for a skill by name.",
+        serde_json::json!({
             "type": "object",
             "properties": { "name": { "type": "string" } },
             "required": ["name"],
             "additionalProperties": false
         }),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }

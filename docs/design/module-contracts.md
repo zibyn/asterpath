@@ -168,6 +168,7 @@ pub enum Provenance {
     Unknown,                        // 仅用于 ToolCallRequested：请求的工具不在注册表
 }
 
+#[non_exhaustive]               // ToolDescriptor::new(name, description, schema) + with_*；默认 Exclusive / Unsafe / Mutating / InProcess
 pub struct ToolDescriptor {
     pub name: ToolName,
     pub description: String,
@@ -178,6 +179,7 @@ pub struct ToolDescriptor {
     pub provenance: Provenance,
     pub timeout: Option<Duration>,
     pub max_output_bytes: Option<usize>,
+    pub strict: Option<bool>,       // protocol.md R15
 }
 
 pub trait Compactor: Send + Sync { /* plan + compact，见 compaction.md §4 */ }

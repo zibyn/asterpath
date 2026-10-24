@@ -30,6 +30,7 @@ pub trait Tool: Send + Sync + 'static {
         -> BoxFuture<'_, Result<ToolOutput, ToolError>>;
 }
 
+#[non_exhaustive]               // ToolDescriptor::new(name, description, schema) + with_*；默认 Exclusive / Unsafe / Mutating / InProcess
 pub struct ToolDescriptor {
     pub name: ToolName,
     pub description: String,
@@ -40,6 +41,7 @@ pub struct ToolDescriptor {
     pub provenance: Provenance,     // InProcess | External { transport }；Unknown 仅出现在请求记录
     pub timeout: Option<Duration>,
     pub max_output_bytes: Option<usize>,
+    pub strict: Option<bool>,       // protocol.md R15
 }
 
 pub struct ToolContext {           // #[non_exhaustive]

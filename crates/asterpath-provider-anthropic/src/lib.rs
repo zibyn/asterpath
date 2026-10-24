@@ -114,20 +114,18 @@ impl Provider for AnthropicProvider {
 
     fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities {
         let rules = self.profile(spec);
-        ProviderCapabilities {
-            server_state: false,
-            forced_tool_choice: rules.forced_tool_choice,
-            sampling: rules.sampling,
-            reasoning_roundtrip: true,
-            citations: false,
-            structured_output: rules.structured_output,
-            server_tools: rules.server_tools,
-            // The adapter sets its own breakpoints; see request::render.
-            cache_control: true,
-            image_input: true,
-            file_input: !rules.file_media_types.is_empty(),
-            parallel_tool_calls: true,
-        }
+        let mut capabilities = ProviderCapabilities::default();
+        capabilities.forced_tool_choice = rules.forced_tool_choice;
+        capabilities.sampling = rules.sampling;
+        capabilities.reasoning_roundtrip = true;
+        capabilities.structured_output = rules.structured_output;
+        capabilities.server_tools = rules.server_tools;
+        // The adapter sets its own breakpoints; see request::render.
+        capabilities.cache_control = true;
+        capabilities.image_input = true;
+        capabilities.file_input = !rules.file_media_types.is_empty();
+        capabilities.parallel_tool_calls = true;
+        capabilities
     }
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {

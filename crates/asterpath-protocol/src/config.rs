@@ -19,6 +19,7 @@ pub struct ModelSpec {
     pub context_window: Option<u32>,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestConfig {
     pub max_output_tokens: NonZeroU32,
@@ -305,6 +306,7 @@ pub(crate) fn change_tools(
     tools.extend(added.iter().cloned());
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub name: ToolName,
@@ -319,6 +321,67 @@ pub struct ToolDescriptor {
     /// Provider strict schema adherence; `None` sends nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+impl ToolDescriptor {
+    /// An in-process tool with the conservative defaults: exclusive,
+    /// replay-unsafe, mutating, no timeout, output limit or strict flag.
+    pub fn new(name: ToolName, description: impl Into<String>, schema: JsonSchema) -> Self {
+        Self {
+            name,
+            description: description.into(),
+            schema,
+            parallelism: Parallelism::Exclusive,
+            replay: ReplaySafety::Unsafe,
+            side_effect: SideEffect::Mutating,
+            provenance: Provenance::InProcess,
+            timeout: None,
+            max_output_bytes: None,
+            strict: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_parallelism(mut self, parallelism: Parallelism) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
+    #[must_use]
+    pub fn with_replay(mut self, replay: ReplaySafety) -> Self {
+        self.replay = replay;
+        self
+    }
+
+    #[must_use]
+    pub fn with_side_effect(mut self, side_effect: SideEffect) -> Self {
+        self.side_effect = side_effect;
+        self
+    }
+
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_output_bytes(mut self, max_output_bytes: Option<usize>) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_strict(mut self, strict: Option<bool>) -> Self {
+        self.strict = strict;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

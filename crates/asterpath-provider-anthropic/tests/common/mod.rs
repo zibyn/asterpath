@@ -3,9 +3,8 @@
 #![allow(dead_code)]
 
 use asterpath_protocol::{
-    ModelId, ModelRequest, ModelSpec, Parallelism, Part, Provenance, Provider, ProviderError,
-    ProviderId, ReplaySafety, RequestConfig, SideEffect, StreamEvent, ToolChoice, ToolDescriptor,
-    ToolName,
+    ModelId, ModelRequest, ModelSpec, Parallelism, Part, Provider, ProviderError, ProviderId,
+    ReplaySafety, RequestConfig, SideEffect, StreamEvent, ToolChoice, ToolDescriptor, ToolName,
 };
 use asterpath_provider_anthropic::AnthropicProvider;
 pub use asterpath_testing::http_mock::{MockServer, Reply};
@@ -65,22 +64,18 @@ pub fn base_request() -> ModelRequest {
 }
 
 pub fn descriptor(name: &str) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: format!("{name} tool"),
-        schema: serde_json::json!({
+    ToolDescriptor::new(
+        ToolName::new(name),
+        format!("{name} tool"),
+        serde_json::json!({
             "type": "object",
             "properties": {"q": {"type": "string"}},
             "required": ["q"]
         }),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
 }
 
 pub fn tool_choice(request: &mut ModelRequest, choice: ToolChoice) {

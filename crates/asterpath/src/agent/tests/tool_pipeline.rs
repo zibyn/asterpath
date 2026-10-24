@@ -12,8 +12,8 @@ use super::support::{
 use asterpath_protocol::{
     AgentEvent, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, Parallelism, Part,
     Provenance, ReplaySafety, SessionEvent, StepCtx, StopReason, Tool, ToolArgs, ToolCallCtx,
-    ToolConfig, ToolDescriptor, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
-    TurnEndReason, Usage,
+    ToolConfig, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnEndReason,
+    Usage,
 };
 use asterpath_protocol::{ToolCallId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider, TestTool};
@@ -560,10 +560,7 @@ async fn an_exclusive_call_excludes_parallel_siblings_for_the_step() {
     let probe = Arc::new(Probe::default());
     let read_probe = Arc::clone(&probe);
     let read = TestTool::new(
-        ToolDescriptor {
-            parallelism: Parallelism::Parallel,
-            ..descriptor("read")
-        },
+        descriptor("read").with_parallelism(Parallelism::Parallel),
         Arc::new(Mutex::new(Vec::new())),
         move |_args, _ctx| {
             let probe = Arc::clone(&read_probe);
@@ -580,10 +577,7 @@ async fn an_exclusive_call_excludes_parallel_siblings_for_the_step() {
     );
     let write_probe = Arc::clone(&probe);
     let write = TestTool::new(
-        ToolDescriptor {
-            parallelism: Parallelism::Exclusive,
-            ..descriptor("write")
-        },
+        descriptor("write").with_parallelism(Parallelism::Exclusive),
         Arc::new(Mutex::new(Vec::new())),
         move |_args, _ctx| {
             let probe = Arc::clone(&write_probe);
@@ -602,10 +596,7 @@ async fn an_exclusive_call_excludes_parallel_siblings_for_the_step() {
     let registry = tool_table(vec![read, write]);
     let log = new_log(config(vec![
         descriptor("read"),
-        ToolDescriptor {
-            parallelism: Parallelism::Exclusive,
-            ..descriptor("write")
-        },
+        descriptor("write").with_parallelism(Parallelism::Exclusive),
     ]))
     .await;
     let provider = provider(
@@ -1038,10 +1029,7 @@ async fn recovery_runs_hooks_only_for_fresh_calls_and_new_steps() {
     let turn = TurnId::from_bytes([2; 16]);
     let step = asterpath_protocol::StepId::from_bytes([3; 16]);
     let recorded = ToolCallId::from_bytes([4; 16]);
-    let danger = ToolDescriptor {
-        replay: ReplaySafety::Unsafe,
-        ..descriptor("danger")
-    };
+    let danger = descriptor("danger").with_replay(ReplaySafety::Unsafe);
     let log = new_log(config(vec![descriptor("echo"), danger.clone()])).await;
     append(&log, SessionEvent::TurnStarted { turn_id: turn }, None).await;
     append(

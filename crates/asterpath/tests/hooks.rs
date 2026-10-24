@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use asterpath::protocol::{
     AgentEvent, CommittedRecord, CompactionConfig, Gate, HookError, Hooks, InputTokens, Item,
-    JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance, Provider, ProviderId,
-    ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect, StepCtx, StopReason,
-    SubagentConfig, Tool, ToolArgs, ToolCallCtx, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, ToolSelection,
-    TurnConfig, TurnEndReason, Usage, UserInput,
+    JsonString, ModelId, ModelSpec, Part, Provider, ProviderId, ReplaySafety, RequestConfig, Role,
+    SessionEvent, SessionSpec, SideEffect, StepCtx, StopReason, SubagentConfig, Tool, ToolArgs,
+    ToolCallCtx, ToolContext, ToolDescriptor, ToolError, ToolErrorKind, ToolGate, ToolName,
+    ToolOutput, ToolResultStatus, ToolResultView, ToolSelection, TurnConfig, TurnEndReason, Usage,
+    UserInput,
 };
 use asterpath::{Asterpath, InputId, SessionHandle, SessionId};
 use asterpath_testing::ScriptedProvider;
@@ -82,18 +82,13 @@ struct EchoTool {
 impl EchoTool {
     fn new(name: &str) -> Arc<Self> {
         Arc::new(Self {
-            descriptor: ToolDescriptor {
-                name: ToolName::new(name),
-                description: String::new(),
-                schema: serde_json::json!({"type": "object"}),
-                parallelism: Parallelism::Exclusive,
-                replay: ReplaySafety::Safe,
-                side_effect: SideEffect::ReadOnly,
-                provenance: Provenance::InProcess,
-                timeout: None,
-                max_output_bytes: None,
-                strict: None,
-            },
+            descriptor: ToolDescriptor::new(
+                ToolName::new(name),
+                String::new(),
+                serde_json::json!({"type": "object"}),
+            )
+            .with_replay(ReplaySafety::Safe)
+            .with_side_effect(SideEffect::ReadOnly),
             calls: Mutex::new(Vec::new()),
         })
     }

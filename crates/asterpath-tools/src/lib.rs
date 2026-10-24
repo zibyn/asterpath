@@ -20,9 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath_protocol::{
-    ConfinedSpawn, Parallelism, Part, Provenance, ReplaySafety, SandboxPolicy, SandboxProvider,
-    SideEffect, SpawnRequest, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput,
+    ConfinedSpawn, Parallelism, Part, ReplaySafety, SandboxPolicy, SandboxProvider, SideEffect,
+    SpawnRequest, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
 };
 use futures_core::future::BoxFuture;
 use serde::Deserialize;
@@ -233,33 +232,26 @@ impl RootTool {
             return Err(RelativeRoot(root));
         }
         let read_only = matches!(op, Op::Fs(FsOp::Read | FsOp::List | FsOp::Grep));
-        let descriptor = ToolDescriptor {
-            name: ToolName::new(name),
-            description: description.to_owned(),
-            schema,
-            parallelism: if read_only {
+        let descriptor = ToolDescriptor::new(ToolName::new(name), description.to_owned(), schema)
+            .with_parallelism(if read_only {
                 Parallelism::Parallel
             } else {
                 Parallelism::Exclusive
-            },
-            replay: if read_only {
+            })
+            .with_replay(if read_only {
                 ReplaySafety::Safe
             } else {
                 ReplaySafety::Unsafe
-            },
-            side_effect: if read_only {
+            })
+            .with_side_effect(if read_only {
                 SideEffect::ReadOnly
             } else {
                 SideEffect::Mutating
-            },
-            provenance: Provenance::InProcess,
-            timeout: match &op {
+            })
+            .with_timeout(match &op {
                 Op::Bash { timeout, .. } => Some(*timeout),
                 Op::Fs(_) => None,
-            },
-            max_output_bytes: None,
-            strict: None,
-        };
+            });
         Ok(Arc::new(Self {
             root,
             op,

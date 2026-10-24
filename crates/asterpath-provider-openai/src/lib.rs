@@ -122,19 +122,16 @@ impl Provider for OpenAiProvider {
 
     fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities {
         let profile = self.profile(spec);
-        ProviderCapabilities {
-            server_state: false,
-            forced_tool_choice: profile.forced_tool_choice,
-            sampling: profile.sampling,
-            reasoning_roundtrip: true,
-            citations: false,
-            structured_output: profile.structured_output,
-            server_tools: profile.server_tools,
-            cache_control: false,
-            image_input: true,
-            file_input: !profile.file_media_types.is_empty(),
-            parallel_tool_calls: true,
-        }
+        let mut capabilities = ProviderCapabilities::default();
+        capabilities.forced_tool_choice = profile.forced_tool_choice;
+        capabilities.sampling = profile.sampling;
+        capabilities.reasoning_roundtrip = true;
+        capabilities.structured_output = profile.structured_output;
+        capabilities.server_tools = profile.server_tools;
+        capabilities.image_input = true;
+        capabilities.file_input = !profile.file_media_types.is_empty();
+        capabilities.parallel_tool_calls = true;
+        capabilities
     }
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {

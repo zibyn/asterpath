@@ -73,6 +73,7 @@ pub enum Item {
     },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Part {
     Text {

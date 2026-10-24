@@ -315,6 +315,7 @@ fn visible_part(part: &Part) -> Option<Value> {
         Part::File { media_type, .. } => Some(json!({"kind": "file", "media_type": media_type})),
         // Provider-local content is not translatable across providers.
         Part::ProviderOpaque { .. } => None,
+        _ => unreachable!("fixtures build only known parts"),
     }
 }
 

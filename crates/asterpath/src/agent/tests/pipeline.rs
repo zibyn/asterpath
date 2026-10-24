@@ -515,10 +515,7 @@ async fn a_recorded_approval_wins_over_the_policy() {
 
 #[tokio::test]
 async fn recovery_never_reruns_an_unsafe_recorded_intent() {
-    let (danger, calls) = TestTool::echo(ToolDescriptor {
-        replay: ReplaySafety::Unsafe,
-        ..descriptor("danger")
-    });
+    let (danger, calls) = TestTool::echo(descriptor("danger").with_replay(ReplaySafety::Unsafe));
     let harness = Harness::new(vec![danger]).await;
     harness
         .intent(RECORDED, "call-1", "danger", Provenance::InProcess)
@@ -573,10 +570,7 @@ async fn recovery_reuses_a_recorded_intent_without_before_tool() {
 #[tokio::test]
 async fn a_tool_that_ignores_its_deadline_fails_timeout() {
     let slow = tool_with(
-        ToolDescriptor {
-            timeout: Some(Duration::from_millis(10)),
-            ..descriptor("slow")
-        },
+        descriptor("slow").with_timeout(Some(Duration::from_millis(10))),
         || Box::pin(std::future::pending()),
     );
     let harness = Harness::new(vec![slow]).await;
@@ -592,10 +586,7 @@ async fn a_tool_that_ignores_its_deadline_fails_timeout() {
 /// Returns `Cancelled` as soon as its call is cancelled.
 fn gives_up_on_cancel(timeout: Duration, turn: Option<CancelToken>) -> Arc<dyn Tool> {
     TestTool::new(
-        ToolDescriptor {
-            timeout: Some(timeout),
-            ..descriptor("quitter")
-        },
+        descriptor("quitter").with_timeout(Some(timeout)),
         Arc::default(),
         move |_args, ctx| {
             let turn = turn.clone();
@@ -651,10 +642,7 @@ async fn a_turn_cancel_during_the_kill_grace_keeps_cancelled() {
     let cancel = CancelToken::new();
     let turn = cancel.clone();
     let quitter = TestTool::new(
-        ToolDescriptor {
-            timeout: Some(Duration::from_millis(10)),
-            ..descriptor("quitter")
-        },
+        descriptor("quitter").with_timeout(Some(Duration::from_millis(10))),
         Arc::default(),
         move |_args, ctx| {
             let turn = turn.clone();
@@ -710,13 +698,7 @@ async fn a_panicking_tool_fails_alone() {
 
 #[tokio::test]
 async fn output_over_the_call_limit_is_cut_at_a_char_boundary() {
-    let (long, _) = TestTool::text(
-        ToolDescriptor {
-            max_output_bytes: Some(5),
-            ..descriptor("long")
-        },
-        "ééééé",
-    );
+    let (long, _) = TestTool::text(descriptor("long").with_max_output_bytes(Some(5)), "ééééé");
     let harness = Harness::new(vec![long]).await;
 
     harness.run(&[tool_call("call-1", "long", "{}")]).await;

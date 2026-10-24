@@ -2,23 +2,15 @@
 //! change to its output silently invalidates recorded reasoning.
 
 use asterpath_protocol::{
-    Parallelism, Provenance, ReplaySafety, SideEffect, ToolDescriptor, ToolName, tools_hash,
+    Parallelism, ReplaySafety, SideEffect, ToolDescriptor, ToolName, tools_hash,
 };
 use serde_json::json;
 
 fn descriptor(name: &str, schema: serde_json::Value) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: format!("{name} tool"),
-        schema,
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(ToolName::new(name), format!("{name} tool"), schema)
+        .with_parallelism(Parallelism::Parallel)
+        .with_replay(ReplaySafety::Safe)
+        .with_side_effect(SideEffect::ReadOnly)
 }
 
 #[test]

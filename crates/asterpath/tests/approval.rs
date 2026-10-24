@@ -46,18 +46,15 @@ fn text(value: &str) -> Part {
 }
 
 fn descriptor(name: &str, timeout: Option<Duration>) -> ToolDescriptor {
-    ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: asterpath::protocol::Provenance::InProcess,
-        timeout,
-        max_output_bytes: None,
-        strict: None,
-    }
+    ToolDescriptor::new(
+        ToolName::new(name),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    )
+    .with_parallelism(Parallelism::Parallel)
+    .with_replay(ReplaySafety::Safe)
+    .with_side_effect(SideEffect::ReadOnly)
+    .with_timeout(timeout)
 }
 
 fn tool_call(name: &str) -> Item {

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asterpath_protocol::{
-    JsonString, Parallelism, Part, Provenance, Provider, ReplaySafety, SessionEvent, SideEffect,
-    Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    JsonString, Parallelism, Part, Provider, ReplaySafety, SessionEvent, SideEffect, Tool,
+    ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
 };
 use asterpath_protocol::{LogQuery, SessionId, SessionStore};
 use asterpath_testing::{
@@ -93,18 +93,14 @@ struct CounterTool {
 impl CounterTool {
     fn new(calls: Arc<AtomicUsize>) -> Self {
         Self {
-            descriptor: ToolDescriptor {
-                name: ToolName::new("counter"),
-                description: "counts".to_owned(),
-                schema: serde_json::json!({"type": "object"}),
-                parallelism: Parallelism::Parallel,
-                replay: ReplaySafety::Safe,
-                side_effect: SideEffect::ReadOnly,
-                provenance: Provenance::InProcess,
-                timeout: None,
-                max_output_bytes: None,
-                strict: None,
-            },
+            descriptor: ToolDescriptor::new(
+                ToolName::new("counter"),
+                "counts",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_parallelism(Parallelism::Parallel)
+            .with_replay(ReplaySafety::Safe)
+            .with_side_effect(SideEffect::ReadOnly),
             calls,
         }
     }

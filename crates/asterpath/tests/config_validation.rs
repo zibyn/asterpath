@@ -59,18 +59,16 @@ async fn database_is_required_only_when_no_backend_is_injected() {
 
 #[tokio::test]
 async fn p8_in_process_tool_names_must_not_contain_the_external_separator() {
-    let tool = Arc::new(DummyTool(ToolDescriptor {
-        name: ToolName::new("a__b"),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance: Provenance::InProcess,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
-    }));
+    let tool = Arc::new(DummyTool(
+        ToolDescriptor::new(
+            ToolName::new("a__b"),
+            String::new(),
+            serde_json::json!({"type": "object"}),
+        )
+        .with_parallelism(Parallelism::Parallel)
+        .with_replay(ReplaySafety::Safe)
+        .with_side_effect(SideEffect::ReadOnly),
+    ));
     let error = Asterpath::builder()
         .tools(vec![tool])
         .build()
@@ -82,17 +80,16 @@ async fn p8_in_process_tool_names_must_not_contain_the_external_separator() {
 
 #[tokio::test]
 async fn p2_external_tool_names_are_validated_at_the_facade() {
-    let descriptor = |name: &str, provenance: Provenance| ToolDescriptor {
-        name: ToolName::new(name),
-        description: String::new(),
-        schema: serde_json::json!({"type": "object"}),
-        parallelism: Parallelism::Parallel,
-        replay: ReplaySafety::Safe,
-        side_effect: SideEffect::ReadOnly,
-        provenance,
-        timeout: None,
-        max_output_bytes: None,
-        strict: None,
+    let descriptor = |name: &str, provenance: Provenance| {
+        ToolDescriptor::new(
+            ToolName::new(name),
+            String::new(),
+            serde_json::json!({"type": "object"}),
+        )
+        .with_parallelism(Parallelism::Parallel)
+        .with_replay(ReplaySafety::Safe)
+        .with_side_effect(SideEffect::ReadOnly)
+        .with_provenance(provenance)
     };
     let external = Provenance::External {
         transport: TransportKind::Stdio,

@@ -17,6 +17,7 @@ use crate::usage::Usage;
 
 /// One complete model request for one attempt. The loop builds it from the
 /// session's `ConfigSnapshot` and the projection watermark.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelRequest {
     pub spec: ModelSpec,
@@ -115,6 +116,7 @@ pub enum PartDelta {
 }
 
 /// Capability declarations for one `ModelSpec`. Unknown capabilities are false.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     /// Always false in v1.

@@ -76,10 +76,8 @@ fn records_the_received_request() {
         StopReason::EndTurn,
         Usage::default(),
     );
-    let request_config = RequestConfig {
-        max_output_tokens: std::num::NonZeroU32::new(1024).unwrap(),
-        ..RequestConfig::default()
-    };
+    let mut request_config = RequestConfig::default();
+    request_config.max_output_tokens = std::num::NonZeroU32::new(1024).unwrap();
 
     let _ = futures::executor::block_on(async {
         use futures_util::StreamExt;
@@ -140,13 +138,11 @@ fn capability_mismatch_fails_before_the_script_is_used() {
             StopReason::EndTurn,
             Usage::default(),
         );
-    let request_config = RequestConfig {
-        sampling: Some(SamplingParams {
-            temperature: Some(0.2),
-            ..SamplingParams::default()
-        }),
-        ..RequestConfig::default()
-    };
+    let mut request_config = RequestConfig::default();
+    request_config.sampling = Some(SamplingParams {
+        temperature: Some(0.2),
+        ..SamplingParams::default()
+    });
 
     let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;

@@ -97,6 +97,7 @@ pub enum Item {
     },
 }
 
+#[non_exhaustive]                // adapter 发请求前拒绝未知变体（R10）
 pub enum Part {
     Text {
         text: String,
@@ -203,6 +204,7 @@ pub struct ModelSpec {
 }
 
 // 会话级请求配置；只用于回合内的模型调用，压缩摘要请求独立构造（compaction.md §4）。
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct RequestConfig {
     pub max_output_tokens: NonZeroU32,      // 默认 8192
     pub tool_choice: ToolChoice,            // 默认 Auto
@@ -220,6 +222,7 @@ pub struct OutputFormat {
     pub schema: JsonSchema,
 }
 
+#[non_exhaustive]                // ModelRequest::new 构造
 pub struct ModelRequest {
     pub spec: ModelSpec,
     pub prefix_epoch: u32,              // 当前压缩代次
@@ -284,7 +287,7 @@ pub enum ReasoningEffort {
 | R7 | `disable_parallel_tool_use = true` 需要 `parallel_tool_calls` 能力；否则 `Unsupported`。 |
 | R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
 | R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
-| R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。 |
+| R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。adapter 尚不认识的 `Part` 变体（system 与所有 item 中）在发 HTTP 前经 `asterpath_http::unrenderable_part` 返回 `Unsupported`。 |
 | R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于宿主策略。 |
 | R12 | `server_tools` 只取 `spec.provider` 对应的条目，每个值必须是 JSON 对象（否则 `InvalidRequest`），按序原样追加在函数工具之后；adapter 不校验内容。非空而模型 `server_tools` 能力为 false → `Unsupported`。只支持服务端执行的工具；客户端执行的供应商工具（OpenAI `shell` / `apply_patch` / `computer`，Anthropic `text_editor` / `computer` / `memory` 等）不在此机制内，误放时由供应商报错。`tool_choice` 不指向服务端工具。 |
 | R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。产出仍是普通 `Message` 文本，框架不解析、不校验。 |
@@ -306,6 +309,7 @@ pub enum ReasoningEffort {
 ## 5. 能力标志
 
 ```rust
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct ProviderCapabilities {
     pub server_state: bool,          // v1 恒 false
     pub forced_tool_choice: bool,    // Required / Tool(_)

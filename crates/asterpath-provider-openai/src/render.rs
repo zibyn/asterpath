@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use asterpath_http::{
     merge_provider_option, provider_options_for, same_provider_raw_field, server_tools_for,
-    unrenderable_file,
+    unrenderable_part,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -148,7 +148,7 @@ fn validate(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
-    if let Some(detail) = unrenderable_file(request, &profile.file_media_types) {
+    if let Some(detail) = unrenderable_part(request, &profile.file_media_types) {
         return Err(unsupported(&detail));
     }
     if request.spec.provider != *provider {
@@ -385,6 +385,7 @@ fn message_item(
                     drop_mark(source, kind, "cross_provider", trace);
                 }
             }
+            _ => unreachable!("validate rejects unknown parts"),
         }
     }
     Ok(json!({"type": "message", "role": role_name(role), "content": content}))
@@ -439,6 +440,7 @@ fn tool_output_text(part: &Part, provider: &ProviderId, trace: Option<&dyn Trace
         Part::Image { media_type, .. } => (media_type, format!("[image omitted: {media_type}]")),
         Part::File { .. } => unreachable!("tool_output renders files as input_file"),
         Part::ProviderOpaque { kind, .. } => (kind, format!("[opaque omitted: {kind}]")),
+        _ => unreachable!("validate rejects unknown parts"),
     };
     mark(
         trace,
@@ -483,6 +485,7 @@ fn text_content(
             Part::ProviderOpaque { kind, .. } => {
                 content.push(omitted(provider, trace, kind, "opaque"));
             }
+            _ => unreachable!("validate rejects unknown parts"),
         }
     }
     content

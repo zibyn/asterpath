@@ -16,8 +16,8 @@ use std::time::Duration;
 use asterpath_protocol::{
     CompactPlan, CompactSummary, CompactionConfig, CompactionError, CompactionInput, CompactionJob,
     CompactionOutcome, Compactor, Item, ModelRequest, ModelSpec, Part, ProjectedOrigin,
-    ProviderCatalog, ProviderError, ProviderErrorKind, Role, StreamEvent, ToolChoice, TurnConfig,
-    Usage,
+    ProviderCatalog, ProviderError, ProviderErrorKind, RequestConfig, Role, StreamEvent,
+    ToolChoice, TurnConfig, Usage,
 };
 use asterpath_protocol::{LogId, LogIdRange};
 use futures_core::future::BoxFuture;
@@ -161,23 +161,17 @@ impl DefaultCompactor {
             raw: None,
         }];
         items.extend(job.summary_input.iter().cloned());
-        let request = ModelRequest {
-            spec: job.model.clone(),
-            prefix_epoch: 0,
-            system: Vec::new(),
+        let mut request = ModelRequest::new(
+            job.model.clone(),
+            0,
+            Vec::new(),
             items,
-            tools: Vec::new(),
-            baseline_tools: Vec::new(),
-            tool_choice: ToolChoice::None,
-            disable_parallel_tool_use: false,
-            sampling: None,
-            max_output_tokens: job.max_summary_tokens,
-            reasoning: None,
-            stop_sequences: Vec::new(),
-            provider_options: Default::default(),
-            output_format: None,
-            server_tools: Default::default(),
-        };
+            Vec::new(),
+            Vec::new(),
+            &RequestConfig::default(),
+        );
+        request.tool_choice = ToolChoice::None;
+        request.max_output_tokens = job.max_summary_tokens;
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {
             Ok(result) => result,
@@ -311,9 +305,7 @@ fn part_bytes(part: &Part) -> u64 {
     match part {
         Part::Text { text } => text.len() as u64,
         Part::Refusal { text } => text.len() as u64,
-        Part::Image { .. } | Part::File { .. } | Part::ProviderOpaque { .. } => {
-            NON_TEXT_PLACEHOLDER.len() as u64
-        }
+        _ => NON_TEXT_PLACEHOLDER.len() as u64,
     }
 }
 
@@ -386,7 +378,7 @@ fn text_part(part: &Part) -> Option<Part> {
         Part::Refusal { text } => Some(Part::Text { text: text.clone() }),
         // Provider opaque data is dropped, not rendered.
         Part::ProviderOpaque { .. } => None,
-        Part::Image { .. } | Part::File { .. } => Some(Part::Text {
+        _ => Some(Part::Text {
             text: NON_TEXT_PLACEHOLDER.to_owned(),
         }),
     }

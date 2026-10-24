@@ -782,50 +782,41 @@ impl Settings {
 
 impl FileConfig {
     fn request_config(&self) -> Result<RequestConfig, String> {
-        let default = RequestConfig::default();
         let sampling = &self.request.sampling;
         let reasoning = &self.request.reasoning;
-        Ok(RequestConfig {
-            max_output_tokens: self
-                .request
-                .max_output_tokens
-                .unwrap_or(default.max_output_tokens),
-            tool_choice: match &self.request.tool_choice {
-                Some(value) => parse_tool_choice(value)?,
-                None => default.tool_choice,
-            },
-            disable_parallel_tool_use: self
-                .request
-                .disable_parallel_tool_use
-                .unwrap_or(default.disable_parallel_tool_use),
-            sampling: if sampling.temperature.is_none()
-                && sampling.top_p.is_none()
-                && sampling.top_k.is_none()
-                && sampling.seed.is_none()
-            {
-                None
-            } else {
-                Some(SamplingParams {
-                    temperature: sampling.temperature,
-                    top_p: sampling.top_p,
-                    top_k: sampling.top_k,
-                    seed: sampling.seed,
-                })
-            },
-            reasoning: if reasoning.effort.is_none()
-                && reasoning.budget_tokens.is_none()
-                && reasoning.summary.is_none()
-            {
-                None
-            } else {
-                Some(ReasoningParams {
-                    effort: reasoning.effort.as_deref().map(parse_effort).transpose()?,
-                    budget_tokens: reasoning.budget_tokens,
-                    summary: reasoning.summary.unwrap_or(false),
-                })
-            },
-            ..default
-        })
+        let mut config = RequestConfig::default();
+        if let Some(max_output_tokens) = self.request.max_output_tokens {
+            config.max_output_tokens = max_output_tokens;
+        }
+        if let Some(value) = &self.request.tool_choice {
+            config.tool_choice = parse_tool_choice(value)?;
+        }
+        if let Some(disable) = self.request.disable_parallel_tool_use {
+            config.disable_parallel_tool_use = disable;
+        }
+        if sampling.temperature.is_some()
+            || sampling.top_p.is_some()
+            || sampling.top_k.is_some()
+            || sampling.seed.is_some()
+        {
+            config.sampling = Some(SamplingParams {
+                temperature: sampling.temperature,
+                top_p: sampling.top_p,
+                top_k: sampling.top_k,
+                seed: sampling.seed,
+            });
+        }
+        if reasoning.effort.is_some()
+            || reasoning.budget_tokens.is_some()
+            || reasoning.summary.is_some()
+        {
+            config.reasoning = Some(ReasoningParams {
+                effort: reasoning.effort.as_deref().map(parse_effort).transpose()?,
+                budget_tokens: reasoning.budget_tokens,
+                summary: reasoning.summary.unwrap_or(false),
+            });
+        }
+        Ok(config)
     }
 
     fn compaction_config(&self) -> CompactionConfig {

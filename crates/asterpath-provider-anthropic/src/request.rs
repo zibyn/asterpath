@@ -6,7 +6,7 @@
 
 use asterpath_http::{
     TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
-    same_provider_raw_field, server_tools_for, unrenderable_file,
+    same_provider_raw_field, server_tools_for, unrenderable_part,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -137,7 +137,7 @@ pub(crate) fn check(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
-    if let Some(detail) = unrenderable_file(request, &rules.file_media_types) {
+    if let Some(detail) = unrenderable_part(request, &rules.file_media_types) {
         return Err(unsupported(&detail));
     }
     if !request
@@ -615,6 +615,7 @@ fn render_part(provider: &ProviderId, part: &Part) -> Option<Frag> {
             raw,
             ..
         } => (item_provider == provider).then(|| Frag::Raw(raw.json.as_str().to_owned())),
+        _ => unreachable!("check rejects unknown parts"),
     }
 }
 
