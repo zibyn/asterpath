@@ -399,9 +399,11 @@ impl SessionHandle {
         Ok(input.id)
     }
 
-    /// Change the session's model or request parameters (ADR-0030). Validated
-    /// first: an unregistered provider is a `Config` error and nothing is
-    /// logged. Otherwise one `ConfigChanged` is appended; it may be called
+    /// Change the session's model or request parameters, or append system
+    /// instructions (ADR-0030). Validated first: an unregistered provider, an
+    /// `append_system` without `id` or with non-text parts is a `Config` error
+    /// and nothing is logged. An update with an `id` is recorded once however
+    /// often it is retried. Otherwise one `ConfigChanged` is appended; it may be called
     /// mid-turn and takes effect at the next `StepStarted`, so a step already
     /// running keeps its config.
     pub async fn update_config(&self, update: ConfigUpdate) -> Result<(), AsterError> {
@@ -412,17 +414,32 @@ impl SessionHandle {
                 message: format!("unknown provider {}", model.provider),
             });
         }
+        if !update.append_system.is_empty() && update.id.is_none() {
+            return Err(AsterError::Config {
+                message: "append_system needs an update id: appending is not idempotent".to_owned(),
+            });
+        }
+        if !update
+            .append_system
+            .iter()
+            .all(|part| matches!(part, asterpath_protocol::Part::Text { .. }))
+        {
+            return Err(AsterError::Config {
+                message: "system may only contain text parts".to_owned(),
+            });
+        }
         let event = SessionEvent::ConfigChanged {
             patch: update.patch(),
         };
-        // No dedup key: a patch overrides whole fields, so a host retry that
-        // lands next to the original folds to the same config.
-        let entry =
-            asterpath_protocol::encode_entry(self.session, None, &event).map_err(|error| {
-                AsterError::Config {
-                    message: error.to_string(),
-                }
-            })?;
+        // Without an id a retry may land twice; whole-field overrides fold the same.
+        let entry = asterpath_protocol::encode_entry(
+            self.session,
+            update.id.map(dedup::config_changed),
+            &event,
+        )
+        .map_err(|error| AsterError::Config {
+            message: error.to_string(),
+        })?;
         self.store.append(entry).await?;
         Ok(())
     }

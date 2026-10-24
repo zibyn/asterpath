@@ -330,7 +330,11 @@ fn text_view(items: &[Item]) -> Vec<Item> {
             }
             // Never forward reasoning: the summary request's system differs from
             // the session's, and Anthropic rejects thinking replayed under it (#104).
-            Item::Reasoning { .. } | Item::ProviderOpaque { .. } | Item::ServerToolCall { .. } => {}
+            // Instructions are rebased into the system, never summarized (ADR-0030).
+            Item::Reasoning { .. }
+            | Item::ProviderOpaque { .. }
+            | Item::ServerToolCall { .. }
+            | Item::Instruction { .. } => {}
             Item::ToolCall { name, raw_args, .. } => view.push(text_item(format!(
                 "tool call {name}({})",
                 raw_args.as_str()

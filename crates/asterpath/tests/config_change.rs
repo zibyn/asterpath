@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use asterpath::protocol::{
-    CompactionConfig, ConfigUpdate, InputId, Item, JsonString, ModelId, ModelRequest, ModelSpec,
-    Part, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
-    RequestConfig, Role, SessionEvent, SessionSpec, StopReason, StreamEvent, SubagentConfig,
-    ToolName, ToolSelection, TurnConfig, Usage, UserInput, decode_entry, scan_all,
+    CompactionConfig, ConfigUpdate, ImageSource, InputId, Item, JsonString, ModelId, ModelRequest,
+    ModelSpec, Part, Provider, ProviderCapabilities, ProviderCatalog, ProviderError,
+    ProviderErrorKind, ProviderId, RequestConfig, Role, SessionEvent, SessionSpec, StopReason,
+    StreamEvent, SubagentConfig, ToolName, ToolSelection, TurnConfig, UpdateId, Usage, UserInput,
+    decode_entry, scan_all,
 };
-use asterpath::protocol::{SessionStore, SpanAttributes, StorageError};
-use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath::protocol::{ContextPolicy, LogId, SessionStore, SpanAttributes, StorageError};
+use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -356,6 +357,249 @@ async fn a_child_inherits_the_config_of_its_spawn_step() {
         })
         .expect("spawned");
     assert_eq!(spawned, model("model-2"));
+}
+
+fn append(id: u8, value: &str) -> ConfigUpdate {
+    let mut update = ConfigUpdate::default();
+    update.id = Some(UpdateId::from_bytes([id; 16]));
+    update.append_system = vec![text(value)];
+    update
+}
+
+fn instruction(value: &str) -> Item {
+    Item::Instruction {
+        parts: vec![text(value)],
+    }
+}
+
+/// Appends an instruction during step 1, which pauses the turn, so step 2
+/// runs under it.
+fn pausing_appender() -> Arc<Switching> {
+    Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(reply("second"), StopReason::EndTurn, Usage::default()),
+        vec![Some(append(1, "answer in French"))],
+    )
+}
+
+#[tokio::test]
+async fn an_appended_instruction_reaches_the_next_step_in_place() {
+    let provider = pausing_appender();
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let requests = provider.inner.requests();
+    assert!(
+        !requests[0].items.contains(&instruction("answer in French")),
+        "the running step is unaffected"
+    );
+    let step_2 = &requests[1];
+    assert_eq!(
+        step_2.system,
+        vec![text("be helpful")],
+        "top-level system unchanged"
+    );
+    assert_eq!(step_2.items.last(), Some(&instruction("answer in French")));
+    assert_eq!(step_2.prefix_epoch, 0);
+}
+
+#[tokio::test]
+async fn invalid_appends_are_rejected_and_nothing_is_logged() {
+    let asterpath = assemble(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    let before = events(&asterpath, &handle).await;
+
+    let mut without_id = append(1, "rule");
+    without_id.id = None;
+    let mut image = append(2, "rule");
+    image.append_system.push(Part::Image {
+        media_type: "image/png".to_owned(),
+        source: ImageSource::Url {
+            url: "https://example.com/a.png".to_owned(),
+        },
+    });
+    for update in [without_id, image] {
+        let error = handle.update_config(update).await.unwrap_err();
+        assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+    }
+    assert_eq!(events(&asterpath, &handle).await, before);
+}
+
+#[tokio::test]
+async fn a_retried_append_is_recorded_once() {
+    let asterpath = assemble(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    handle
+        .update_config(append(1, "rule"))
+        .await
+        .expect("first");
+    handle
+        .update_config(append(1, "rule"))
+        .await
+        .expect("retry");
+    handle
+        .update_config(append(2, "rule"))
+        .await
+        .expect("another");
+    let changes = events(&asterpath, &handle)
+        .await
+        .into_iter()
+        .filter(|event| event.kind() == "ConfigChanged")
+        .count();
+    assert_eq!(changes, 2);
+}
+
+#[tokio::test]
+async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
+    let live = pausing_appender();
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), live.clone()).await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    live.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+    let live_step_2 = live.inner.requests()[1].clone();
+
+    // Dies appending step 2's `StepStarted` (see the model-switch case).
+    let shared = Arc::new(InMemoryEventLog::new());
+    let crashing = pausing_appender();
+    let failing: Arc<dyn SessionStore> = Arc::new(FailpointEventLog::new(
+        shared.clone(),
+        Failpoint::panic(Point::AppendBeforeCommit)
+            .with_occurrence(NonZeroUsize::new(8).expect("non-zero")),
+    ));
+    let asterpath = assemble(failing, crashing.clone()).await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    crashing.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    let driven = handle.clone();
+    let crashed = tokio::spawn(async move { drive(&driven).await }).await;
+    assert!(crashed.is_err_and(|error| error.is_panic()));
+    let prefix = kinds(shared.as_ref(), &handle).await.expect("scan");
+    assert_eq!(prefix.last(), Some(&"StepCommitted"));
+
+    let recovered = Arc::new(ScriptedProvider::new("p").respond(
+        reply("second"),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let asterpath = assemble(shared.clone(), recovered.clone()).await;
+    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    drive(&handle).await;
+
+    assert_eq!(recovered.requests(), [live_step_2]);
+}
+
+#[tokio::test]
+async fn a_forked_child_sees_an_appended_instruction_once() {
+    // Calls: parent step 1 (appends), parent step 2 spawns, the child, parent step 3.
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(
+                vec![Item::ToolCall {
+                    call_id: "call-spawn".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: JsonString::new(r#"{"task":"look"}"#),
+                    raw: None,
+                }],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(reply("child done"), StopReason::EndTurn, Usage::default())
+            .respond(reply("parent done"), StopReason::EndTurn, Usage::default()),
+        vec![Some(append(1, "answer in French"))],
+    );
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
+    let handle = asterpath
+        .create_session(SessionSpec {
+            tools: ToolSelection::All,
+            subagents: SubagentConfig {
+                default_context: ContextPolicy::Fork {
+                    at: LogId::from_i64(0),
+                },
+                ..SubagentConfig::default()
+            },
+            ..spec()
+        })
+        .await
+        .expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let child = &provider.inner.requests()[2];
+    assert_eq!(child.system, vec![text("be helpful")]);
+    let copies = child
+        .items
+        .iter()
+        .filter(|item| **item == instruction("answer in French"))
+        .count();
+    assert_eq!(copies, 1, "{:?}", child.items);
+}
+
+fn mentions(items: &[Item], needle: &str) -> bool {
+    format!("{items:?}").contains(needle)
+}
+
+#[tokio::test]
+async fn compaction_rebases_replaced_instructions_into_the_system() {
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(reply("second"), StopReason::EndTurn, Usage::default())
+            .respond(reply("third"), StopReason::EndTurn, Usage::default())
+            .respond(reply("the summary"), StopReason::EndTurn, Usage::default())
+            .respond(reply("fourth"), StopReason::EndTurn, Usage::default()),
+        vec![Some(append(1, "answer in French"))],
+    );
+    let catalog = ProviderCatalog::new(vec![provider.clone() as Arc<dyn Provider>]).expect("one");
+    let asterpath = Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
+        .providers(vec![provider.clone()])
+        .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
+        .build()
+        .await
+        .expect("build");
+    let mut session = spec();
+    session.model.context_window = Some(100_000);
+    let handle = asterpath.create_session(session).await.expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+    handle.submit_input(input(2)).await.expect("input");
+    drive(&handle).await;
+    handle.compact_now().await.expect("compact");
+    handle.submit_input(input(3)).await.expect("input");
+    drive(&handle).await;
+
+    let requests = provider.inner.requests();
+    let summary = &requests[3];
+    assert!(
+        !mentions(&summary.items, "answer in French"),
+        "the instruction is not summarized: {:?}",
+        summary.items
+    );
+    assert!(mentions(&summary.items, "first"), "{:?}", summary.items);
+    let after = &requests[4];
+    assert_eq!(after.prefix_epoch, 1);
+    assert_eq!(
+        after.system,
+        vec![text("be helpful"), text("answer in French")]
+    );
+    assert!(!after.items.contains(&instruction("answer in French")));
 }
 
 #[tokio::test]

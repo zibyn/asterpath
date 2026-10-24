@@ -1005,15 +1005,18 @@ impl Agent {
                 _ => {}
             }
         }
-        let items = asterpath_protocol::history(&visible).map_err(|error| AgentError::Corrupt {
-            session,
-            detail: error.to_string(),
-        })?;
+        // The baseline system, not `config.system`: appended instructions sit
+        // in `items` at their place until a compaction rebases them (ADR-0030).
+        let history =
+            asterpath_protocol::request_history(&visible).map_err(|error| AgentError::Corrupt {
+                session,
+                detail: error.to_string(),
+            })?;
         Ok(ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
-            config.system.clone(),
-            items,
+            history.system,
+            history.items,
             config.tools.clone(),
             &config.request,
         ))
