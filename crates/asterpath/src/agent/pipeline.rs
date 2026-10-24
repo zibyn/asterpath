@@ -444,6 +444,8 @@ impl ToolPipeline {
             step: step.step,
             call: tool_call_id,
             status: ToolResultStatus::Interrupted,
+            output: None,
+            error: None,
         }));
         Ok(())
     }
@@ -473,6 +475,7 @@ impl ToolPipeline {
                 output_index: item.output_index,
                 call: item.tool_call_id,
                 tool: item.name.clone(),
+                args: item.args.clone(),
             }));
 
             // A child of the turn token: the turn broadcasts to every tool, and
@@ -598,8 +601,8 @@ impl ToolPipeline {
                 step.session,
                 item.tool_call_id,
                 status,
-                output,
-                error,
+                output.clone(),
+                error.clone(),
                 truncated,
             )
             .await?;
@@ -608,6 +611,8 @@ impl ToolPipeline {
                 step: step.step,
                 call: item.tool_call_id,
                 status,
+                output,
+                error,
             }));
 
             drop(_guard);

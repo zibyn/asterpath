@@ -230,10 +230,13 @@ pub enum AgentEvent {
     Idle { session: SessionId },
     TurnStarted { turn: TurnId },
     ModelDelta { turn: TurnId, step: StepId, output_index: u32, part_index: u32, delta: PartDelta },
-    ToolStarted { turn: TurnId, step: StepId, output_index: u32, call: ToolCallId, tool: ToolName },
-    ToolFinished { turn: TurnId, step: StepId, call: ToolCallId, status: ToolResultStatus },
+    ToolStarted { turn: TurnId, step: StepId, output_index: u32, call: ToolCallId, tool: ToolName, args: JsonString },
+    ToolFinished {
+        turn: TurnId, step: StepId, call: ToolCallId, status: ToolResultStatus,
+        output: Option<Vec<Part>>, error: Option<ToolErrorInfo>,
+    },
     ApprovalRequested(ApprovalRequest),
-    TurnCommitted { turn: TurnId, reason: TurnEndReason },
+    TurnCommitted { turn: TurnId, reason: TurnEndReason, usage: Usage },
 }
 
 #[non_exhaustive]
@@ -251,6 +254,7 @@ pub enum AgentError {
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
 - `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。
+- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归宿主。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
