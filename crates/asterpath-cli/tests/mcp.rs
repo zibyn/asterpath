@@ -59,16 +59,17 @@ fn run(dir: &Path, config: &Path, prompt: &str) -> std::process::Output {
     bin()
         .current_dir(dir)
         .args([
-            "run",
+            "exec",
             "--config",
             config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
+            "-c",
+            "model.provider=anthropic",
+            "-m",
             "claude-test",
-            "--approval",
-            "allow",
-            "--no-skills",
+            "-a",
+            "never",
+            "-c",
+            "skills.enabled=false",
             prompt,
         ])
         .output()
@@ -80,7 +81,7 @@ fn text(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn run_calls_a_configured_stdio_mcp_tool() {
+fn exec_calls_a_configured_stdio_mcp_tool() {
     let server = MockServer::start(vec![
         Reply::sse(common::tool_use_sse(
             "fixture__echo",
@@ -114,7 +115,7 @@ fn run_calls_a_configured_stdio_mcp_tool() {
 }
 
 #[test]
-fn config_check_prints_each_server_status() {
+fn doctor_prints_each_server_status() {
     let dir = tempfile::tempdir().expect("temp dir");
     let body = stdio_server("fixture", "")
         + "\n[mcp_servers.broken]\ncommand = \"/nonexistent/asterpath-mcp\"\n";
@@ -122,9 +123,9 @@ fn config_check_prints_each_server_status() {
 
     let output = bin()
         .current_dir(dir.path())
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("run config check");
+        .expect("run doctor");
 
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
     let stdout = text(&output.stdout);
@@ -146,9 +147,9 @@ fn a_required_server_failure_is_a_config_error() {
 
     let output = bin()
         .current_dir(dir.path())
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("run config check");
+        .expect("run doctor");
 
     assert_eq!(
         output.status.code(),
@@ -176,9 +177,9 @@ fn unknown_config_fields_are_rejected() {
         let config = write(dir.path(), body);
         let output = bin()
             .current_dir(dir.path())
-            .args(["config", "check", "--config", config.to_str().unwrap()])
+            .args(["doctor", "--config", config.to_str().unwrap()])
             .output()
-            .expect("run config check");
+            .expect("run doctor");
         assert_eq!(output.status.code(), Some(2), "{body}");
         assert!(
             text(&output.stderr).contains("bogus"),
@@ -198,9 +199,9 @@ fn an_mcp_server_needs_exactly_one_transport() {
         let config = write(dir.path(), body);
         let output = bin()
             .current_dir(dir.path())
-            .args(["config", "check", "--config", config.to_str().unwrap()])
+            .args(["doctor", "--config", config.to_str().unwrap()])
             .output()
-            .expect("run config check");
+            .expect("run doctor");
         assert_eq!(
             output.status.code(),
             Some(2),
@@ -223,9 +224,9 @@ fn full_access_runs_stdio_servers_without_a_sandbox_backend() {
     let output = bin()
         .current_dir(dir.path())
         .env("PATH", "/nonexistent")
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("run config check");
+        .expect("run doctor");
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
     assert!(text(&output.stdout).contains("mcp: fixture loaded"));
 
@@ -233,9 +234,9 @@ fn full_access_runs_stdio_servers_without_a_sandbox_backend() {
     let output = bin()
         .current_dir(dir.path())
         .env("PATH", "/nonexistent")
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("run config check");
+        .expect("run doctor");
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
     assert!(
         text(&output.stdout).contains("mcp: fixture failed at Sandbox"),
@@ -278,7 +279,13 @@ fn compaction_run(
         .trim()
         .to_owned();
     let trace = bin()
-        .args(["trace", "--config", config.to_str().unwrap(), &session])
+        .args([
+            "debug",
+            "trace",
+            "--config",
+            config.to_str().unwrap(),
+            &session,
+        ])
         .output()
         .expect("run trace");
     (output, text(&trace.stdout), server.requests())
@@ -288,7 +295,7 @@ fn compaction_run(
 fn context_window_enables_threshold_compaction() {
     let (output, trace, requests) = compaction_run(Some(600));
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(trace.contains("compaction"), "{trace}");
+    assert!(trace.contains("\"Compaction\""), "{trace}");
     assert_eq!(requests.len(), 4, "two steps, a summary, the final step");
 }
 
@@ -296,6 +303,6 @@ fn context_window_enables_threshold_compaction() {
 fn without_a_context_window_nothing_is_compacted() {
     let (output, trace, requests) = compaction_run(None);
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(!trace.contains("compaction"), "{trace}");
+    assert!(!trace.contains("\"Compaction\""), "{trace}");
     assert_eq!(requests.len(), 3);
 }

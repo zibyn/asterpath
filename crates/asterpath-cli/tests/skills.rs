@@ -1,6 +1,6 @@
 //! Reference CLI skill integration: discovery feeds the new session, the
-//! switch suppresses it, `config check` reports diagnostics, and `resume`
-//! keeps the loader registered.
+//! switch suppresses it, `doctor` reports diagnostics, and a continued
+//! session keeps the loader registered.
 
 mod common;
 
@@ -85,7 +85,7 @@ impl Project {
 }
 
 #[test]
-fn run_appends_the_index_and_registers_load_skill() {
+fn a_new_session_appends_the_index_and_registers_load_skill() {
     let project = Project::new();
     project.skill(
         &project.project_skills(),
@@ -106,12 +106,12 @@ fn run_appends_the_index_and_registers_load_skill() {
     let output = project
         .command()
         .args([
-            "run",
+            "exec",
             "--config",
             config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
+            "-c",
+            "model.provider=anthropic",
+            "-m",
             "claude-test",
             "say hello",
         ])
@@ -127,7 +127,7 @@ fn run_appends_the_index_and_registers_load_skill() {
     assert!(stderr.contains("DescriptionMissing"), "{stderr}");
     assert!(
         !stderr.contains("AuthorityFieldIgnored"),
-        "the authority-field advisory belongs to `config check`: {stderr}"
+        "the authority-field advisory belongs to `doctor`: {stderr}"
     );
     let request = &server.requests()[0];
     assert!(request.body.contains("## Skills"), "{}", request.body);
@@ -144,7 +144,7 @@ fn run_appends_the_index_and_registers_load_skill() {
 }
 
 #[test]
-fn run_no_skills_omits_the_index_and_the_tool() {
+fn disabled_skills_omit_the_index_and_the_tool() {
     let project = Project::new();
     project.skill(
         &project.project_skills(),
@@ -158,13 +158,14 @@ fn run_no_skills_omits_the_index_and_the_tool() {
     let output = project
         .command()
         .args([
-            "run",
+            "exec",
             "--config",
             config.to_str().unwrap(),
-            "--no-skills",
-            "--provider",
-            "anthropic",
-            "--model",
+            "-c",
+            "skills.enabled=false",
+            "-c",
+            "model.provider=anthropic",
+            "-m",
             "claude-test",
             "say hello",
         ])
@@ -182,7 +183,7 @@ fn run_no_skills_omits_the_index_and_the_tool() {
 }
 
 #[test]
-fn config_check_prints_skill_diagnostics() {
+fn doctor_prints_skill_diagnostics() {
     let project = Project::new();
     project.skill(&project.project_skills(), "broken", "name: broken", "body");
     project.skill(
@@ -196,9 +197,9 @@ fn config_check_prints_skill_diagnostics() {
 
     let output = project
         .command()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("config check");
+        .expect("doctor");
 
     assert!(
         output.status.success(),
@@ -214,9 +215,9 @@ fn config_check_prints_skill_diagnostics() {
     let config = project.config(&server, "[skills]\nenabled = false\n");
     let output = project
         .command()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
-        .expect("config check");
+        .expect("doctor");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("DescriptionMissing"), "{stdout}");
@@ -295,11 +296,12 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
     let output = project
         .command()
         .args([
-            "resume",
+            "exec",
             "--config",
             config.to_str().unwrap(),
-            "--approval",
-            "allow",
+            "-a",
+            "never",
+            "-r",
             &session.to_hex(),
         ])
         .output()
