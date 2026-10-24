@@ -10,6 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use asterpath_protocol::{
     ConfinedSpawn, Parallelism, Part, Provenance, ReplaySafety, SandboxPolicy, SandboxProvider,
@@ -43,16 +44,17 @@ pub fn read_only(root: PathBuf) -> Tools {
     ])
 }
 
-/// [`read_only`] plus `write_file`, `edit_file` and `bash`.
+/// [`read_only`] plus `write_file`, `edit_file` and `bash` (see [`bash`] for `timeout`).
 pub fn coding(
     root: PathBuf,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
+    timeout: Duration,
 ) -> Tools {
     let mut tools = read_only(root.clone())?;
     tools.push(write_file(root.clone())?);
     tools.push(edit_file(root.clone())?);
-    tools.push(bash(root, sandbox, policy)?);
+    tools.push(bash(root, sandbox, policy, timeout)?);
     Ok(tools)
 }
 
@@ -150,14 +152,23 @@ pub fn edit_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 /// hang the call; the output then says reading stopped. After a successful
 /// exit, background processes keep running and are no longer subject to
 /// cancellation. Elsewhere only bash itself is killed.
+///
+/// `timeout` becomes the descriptor's deadline: the engine cancels the call
+/// when it expires and records a `Timeout` carrying the tail of the output.
+/// The model cannot change it.
 pub fn bash(
     root: PathBuf,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
+    timeout: Duration,
 ) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Bash { sandbox, policy },
+        Op::Bash {
+            sandbox,
+            policy,
+            timeout,
+        },
         "bash",
         "Run a bash command with the project root as the working directory. Returns stdout, stderr and the exit status.",
         serde_json::json!({
@@ -168,6 +179,9 @@ pub fn bash(
         }),
     )
 }
+
+/// A host default for [`bash`]'s `timeout`.
+pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on what any tool reads into memory or returns; the pipeline
 /// truncates further to `ToolConfig::max_output_bytes`.
@@ -187,6 +201,7 @@ enum Op {
     Bash {
         sandbox: Option<Arc<dyn SandboxProvider>>,
         policy: SandboxPolicy,
+        timeout: Duration,
     },
 }
 
@@ -228,7 +243,10 @@ impl RootTool {
                 SideEffect::Mutating
             },
             provenance: Provenance::InProcess,
-            timeout: None,
+            timeout: match &op {
+                Op::Bash { timeout, .. } => Some(*timeout),
+                Op::Fs(_) => None,
+            },
             max_output_bytes: None,
         };
         Ok(Arc::new(Self {
@@ -248,8 +266,9 @@ impl RootTool {
                         message: format!("tool task failed: {error}"),
                     })?
             }
-            Op::Bash { sandbox, policy } => {
-                // shortcut: no default timeout, so a command that never exits runs until the host cancels; set descriptor.timeout once a policy for unattended hosts is decided.
+            Op::Bash {
+                sandbox, policy, ..
+            } => {
                 let args: BashArgs = parse(&args)?;
                 let root = resolve(&self.root, ".")?;
                 run_bash(&root, &args.command, sandbox.as_deref(), policy, &ctx).await
@@ -653,7 +672,21 @@ async fn run_bash(
                 // Even if bash exited, a descendant may have ignored SIGTERM.
                 signal_group(pid, Signal::Kill);
             }
-            return Err(ToolError::Cancelled { message: "bash cancelled".to_owned() });
+            let mut message = String::from("bash stopped before exiting");
+            let mut seen = String::from_utf8_lossy(&stdout).into_owned();
+            if !stderr.is_empty() {
+                seen.push_str("\n[stderr]\n");
+                seen.push_str(&String::from_utf8_lossy(&stderr));
+            }
+            if !seen.is_empty() {
+                let mut start = seen.len().saturating_sub(CANCEL_TAIL);
+                while !seen.is_char_boundary(start) {
+                    start += 1;
+                }
+                message.push_str("; last output:\n");
+                message.push_str(&seen[start..]);
+            }
+            return Err(ToolError::Cancelled { message });
         }
     };
     let mut text = String::from_utf8_lossy(&stdout).into_owned();
@@ -695,6 +728,8 @@ async fn drain(
     }
 }
 
+/// Bytes of captured output kept in the error when a run is cancelled.
+const CANCEL_TAIL: usize = 4096;
 /// How long to keep reading the pipes after bash exits.
 const READ_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Grace between SIGTERM and SIGKILL on cancel.

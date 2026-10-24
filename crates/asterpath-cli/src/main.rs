@@ -668,8 +668,13 @@ fn workspace_tools(
     let root = std::env::current_dir()
         .map_err(|error| CliError::config(format!("cannot read working directory: {error}")))?;
     let policy = settings.sandbox_policy();
-    let all = asterpath_tools::coding(root, sandbox_provider(&policy), policy)
-        .map_err(|error| CliError::config(error.to_string()))?;
+    let all = asterpath_tools::coding(
+        root,
+        sandbox_provider(&policy),
+        policy,
+        asterpath_tools::DEFAULT_BASH_TIMEOUT,
+    )
+    .map_err(|error| CliError::config(error.to_string()))?;
     let Some(selection) = selection else {
         return Ok(all);
     };
@@ -1180,8 +1185,13 @@ mod tests {
             StopReason::ToolUse,
             Usage::default(),
         ));
-        let bash = asterpath_tools::bash(root.to_path_buf(), None, SandboxPolicy::FullAccess)
-            .expect("absolute root");
+        let bash = asterpath_tools::bash(
+            root.to_path_buf(),
+            None,
+            SandboxPolicy::FullAccess,
+            asterpath_tools::DEFAULT_BASH_TIMEOUT,
+        )
+        .expect("absolute root");
         let config = AsterpathConfig::default();
         let policy = config::approval_policy(config::ApprovalMode::Ask, Arc::clone(&config.gate));
         AsterpathBuilder::from_config(config)

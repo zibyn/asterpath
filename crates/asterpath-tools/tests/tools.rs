@@ -7,7 +7,7 @@ use asterpath_protocol::{
     CancelToken, JsonString, Part, ReplaySafety, SessionId, SideEffect, StepId, Tool, ToolCallId,
     ToolContext, ToolError, TurnId,
 };
-use asterpath_tools::{coding, read_only};
+use asterpath_tools::{DEFAULT_BASH_TIMEOUT, coding, read_only};
 
 fn ctx(cancel: CancelToken) -> ToolContext {
     ToolContext::new(
@@ -61,6 +61,7 @@ fn full_access(root: &Path) -> Vec<Arc<dyn Tool>> {
         root.to_path_buf(),
         None,
         asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
     )
     .expect("absolute root")
 }
@@ -72,7 +73,8 @@ fn a_relative_root_fails_construction() {
         coding(
             PathBuf::from("rel"),
             None,
-            asterpath_protocol::SandboxPolicy::FullAccess
+            asterpath_protocol::SandboxPolicy::FullAccess,
+            DEFAULT_BASH_TIMEOUT
         )
         .is_err()
     );
@@ -242,7 +244,13 @@ async fn bash_spawns_through_the_sandbox_provider_in_the_root() {
     let policy = asterpath_protocol::SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![root.clone()],
     };
-    let bash = asterpath_tools::bash(root.clone(), Some(sandbox.clone()), policy.clone()).unwrap();
+    let bash = asterpath_tools::bash(
+        root.clone(),
+        Some(sandbox.clone()),
+        policy.clone(),
+        DEFAULT_BASH_TIMEOUT,
+    )
+    .unwrap();
 
     let output = call(
         &bash,
@@ -275,6 +283,7 @@ async fn bash_without_a_provider_fails_closed_unless_full_access() {
         asterpath_protocol::SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![root.clone()],
         },
+        DEFAULT_BASH_TIMEOUT,
     )
     .unwrap();
 
@@ -288,6 +297,7 @@ async fn bash_without_a_provider_fails_closed_unless_full_access() {
         root.clone(),
         None,
         asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
     )
     .unwrap();
     call(&bash, serde_json::json!({ "command": "touch ran" }))
@@ -456,6 +466,7 @@ async fn cancelling_bash_kills_the_sandbox_wrapper_and_its_descendants() {
         root.clone(),
         Some(Arc::new(ShWrapper)),
         asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
     )
     .unwrap();
     let cancel = CancelToken::new();
@@ -633,4 +644,41 @@ async fn write_and_edit_replace_the_file_atomically_and_keep_its_mode() {
         .map(|entry| entry.expect("entry").file_name())
         .collect();
     assert_eq!(names, ["run.sh"], "temp files left behind");
+}
+
+#[test]
+fn coding_gives_bash_the_host_timeout() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    assert_eq!(
+        bash.descriptor().timeout,
+        Some(std::time::Duration::from_secs(120))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelled_bash_reports_the_tail_of_its_output() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let cancel = CancelToken::new();
+    // 2-byte chars, so a 4 KiB cut from an odd total lands mid-character.
+    let (running, _) = start(
+        bash,
+        &root,
+        "printf '#'; printf 'é%.0s' $(seq 5000); echo end >&2; echo 1 > ready; exec sleep 100",
+        &["ready"],
+        cancel.clone(),
+    )
+    .await;
+
+    cancel.cancel();
+    let error = running.await.unwrap().unwrap_err();
+    let ToolError::Cancelled { message } = error else {
+        panic!("{error:?}");
+    };
+    assert!(message.ends_with("[stderr]\nend\n"), "{}", tail(&message));
+    assert!(message.contains("éé"), "{}", tail(&message));
+    assert!(!message.contains('#'), "only the tail is kept");
+    assert!(message.len() <= 4096 + 100, "{} bytes", message.len());
 }

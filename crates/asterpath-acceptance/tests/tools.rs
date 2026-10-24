@@ -37,8 +37,13 @@ impl Project {
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        asterpath_tools::coding(self.root.clone(), None, SandboxPolicy::FullAccess)
-            .expect("absolute root")
+        asterpath_tools::coding(
+            self.root.clone(),
+            None,
+            SandboxPolicy::FullAccess,
+            asterpath_tools::DEFAULT_BASH_TIMEOUT,
+        )
+        .expect("absolute root")
     }
 
     async fn open(&self, provider: Arc<ScriptedProvider>, tools: Vec<Arc<dyn Tool>>) -> Asterpath {
@@ -152,6 +157,61 @@ fn tool_results(entries: &[LogEntry]) -> Vec<(ToolResultStatus, String)> {
 
 fn read(root: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(root.join(name)).ok()
+}
+
+#[tokio::test]
+async fn bash_past_its_timeout_fails_timeout_with_partial_output_and_is_killed() {
+    let project = Project::new();
+    let bash = asterpath_tools::bash(
+        project.root.clone(),
+        None,
+        SandboxPolicy::FullAccess,
+        Duration::from_millis(500),
+    )
+    .expect("absolute root");
+    let provider = script(vec![
+        call(
+            "b1",
+            "bash",
+            serde_json::json!({ "command": "echo start; sleep 100 & echo $! > sleep.pid; wait" }),
+        ),
+        done(),
+    ]);
+    let asterpath = project.open(provider, vec![bash]).await;
+    let handle = start(&asterpath, 1).await;
+
+    drive_all(&handle).await;
+
+    let errors: Vec<_> = entries(&asterpath, handle.id())
+        .await
+        .iter()
+        .filter_map(|entry| match decode_entry(entry).ok()? {
+            SessionEvent::ToolResult { status, error, .. } => Some((status, error?)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let (status, error) = &errors[0];
+    assert_eq!(*status, ToolResultStatus::Failed);
+    assert_eq!(error.kind, asterpath_protocol::ToolErrorKind::Timeout);
+    assert!(error.message.contains("start"), "{}", error.message);
+    let pid: libc::pid_t = read(&project.root, "sleep.pid")
+        .expect("pid")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+    // Retried: the orphaned sleep may linger as a zombie until its reaper runs.
+    let mut gone = false;
+    for _ in 0..200 {
+        // SAFETY: kill(2) with signal 0 only probes the pid.
+        gone = unsafe { libc::kill(pid, 0) } != 0;
+        if gone {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "sleep still running");
+    asterpath.shutdown().await.unwrap();
 }
 
 #[tokio::test]
