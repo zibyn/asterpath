@@ -141,6 +141,8 @@ impl Asterpath {
     pub fn builder() -> AsterpathBuilder;
     pub async fn create_session(&self, spec: SessionSpec) -> Result<SessionHandle, AsterError>;
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError>;
+    pub async fn fork_session(&self, source: SessionId, metadata: BTreeMap<String, String>)
+        -> Result<SessionHandle, AsterError>;           // 会话分叉（ADR-0033）
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
@@ -169,6 +171,7 @@ impl Asterpath {
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、宿主元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
+- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由宿主重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
 - `sessions(query)` 是存储目录查询的原样转发：按父会话过滤，按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序或过滤由宿主在结果上完成（ADR-0032）。
 
 ### 3.3 Session 驱动

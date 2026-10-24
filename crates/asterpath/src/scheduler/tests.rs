@@ -1308,7 +1308,10 @@ async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
     else {
         unreachable!()
     };
-    assert_eq!(source, &fork_parent_ref());
+    assert_eq!(
+        source,
+        &asterpath_protocol::ForkSource::Spawn(fork_parent_ref())
+    );
     assert_eq!(*source_log, at);
     assert_eq!(
         items,

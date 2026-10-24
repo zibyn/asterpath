@@ -26,7 +26,8 @@ pub enum SessionEvent {
         metadata: BTreeMap<String, String>,
     },
     ContextForked {
-        source: ParentRef,
+        source: ForkSource,
+        /// The source log position the snapshot was taken at.
         source_log: LogId,
         items: Vec<Item>,
     },
@@ -170,6 +171,16 @@ pub struct ParentRef {
     pub session: SessionId,
     pub turn: TurnId,
     pub tool_call: ToolCallId,
+}
+
+/// Where a `ContextForked` snapshot came from (ADR-0033).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForkSource {
+    /// A `spawn_agent` call: the child's parent session, turn and tool call.
+    Spawn(ParentRef),
+    /// A host session fork; the new session has no parent.
+    Session { session: SessionId },
 }
 
 #[non_exhaustive]

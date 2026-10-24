@@ -30,6 +30,7 @@ pub use asterpath_protocol::{InputId, LogId, SessionId, StepId, Timestamp, ToolC
 #[cfg(feature = "anthropic")]
 pub use asterpath_provider_anthropic as anthropic;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agent::Agent;
@@ -41,9 +42,9 @@ use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts,
-    SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError, UsageError,
-    UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
+    ForkSource, Item, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
+    SessionFacts, SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError,
+    UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
     ApprovalGate, CatalogEntry, Clock, SessionQuery, SessionStore, unique_bytes,
@@ -232,19 +233,7 @@ impl Asterpath {
                 message: "system may only contain text parts".to_owned(),
             });
         }
-        // Host metadata limits (storage.md §5).
-        if spec.metadata.len() > 64
-            || spec
-                .metadata
-                .iter()
-                .any(|(key, value)| key.len() > 128 || value.len() > 4096)
-        {
-            return Err(AsterError::Config {
-                message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
-                          up to 4096 bytes"
-                    .to_owned(),
-            });
-        }
+        check_metadata(&spec.metadata)?;
         let tools = match &spec.tools {
             ToolSelection::All => self
                 .tools
@@ -279,6 +268,92 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.store.append(entry).await?;
+        Ok(self.handle(session))
+    }
+
+    /// Fork `source` into a new, parentless session (ADR-0033). The snapshot
+    /// is the source's projection at the end of its last committed turn, so a
+    /// turn in progress is not copied and `source` may be driven meanwhile.
+    /// The config is the source's effective config there, unnarrowed; the
+    /// copied history drops tool changes. `metadata` is the host's, not
+    /// inherited. Unknown source = `NotFound`; metadata over the limits =
+    /// `Config`.
+    pub async fn fork_session(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<SessionHandle, AsterError> {
+        check_metadata(&metadata)?;
+        let records = scan::scan_decoded(&*self.store, source)
+            .await
+            .map_err(AgentError::from)?;
+        let not_found = || AsterError::Agent(AgentError::NotFound { session: source });
+        let corrupt = |detail: String| {
+            AsterError::Agent(AgentError::Corrupt {
+                session: source,
+                detail,
+            })
+        };
+        // The last committed turn's end, or creation when none has committed.
+        let waterline = records
+            .iter()
+            .rev()
+            .find(|(_, event)| matches!(event, SessionEvent::TurnCommitted { .. }))
+            .or_else(|| records.first())
+            .map(|(entry, _)| entry.clone())
+            .ok_or_else(not_found)?;
+        // Inputs after the last step started belong to the next turn.
+        let last_step = records
+            .iter()
+            .filter(|(entry, event)| {
+                entry.seq <= waterline.seq && matches!(event, SessionEvent::StepStarted { .. })
+            })
+            .map(|(entry, _)| entry.seq)
+            .max()
+            .unwrap_or(0);
+        // Compactions fold regardless of the waterline, as for a spawn fork.
+        let prefix: Vec<_> = records
+            .iter()
+            .filter(|(entry, event)| match event {
+                SessionEvent::CompactionApplied { .. } => true,
+                SessionEvent::InputRecorded { .. } => entry.seq <= last_step,
+                _ => entry.seq <= waterline.seq,
+            })
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        let history =
+            asterpath_protocol::request_history(&prefix).map_err(|e| corrupt(e.to_string()))?;
+        let mut config =
+            asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
+        // The copied history already holds the instructions appended so far.
+        config.system = history.system;
+        let mut items = history.items;
+        items.retain(|item| !matches!(item, Item::ToolsChanged { .. }));
+
+        let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
+        // shortcut: two appends, so a crash between them leaves an empty fork; needs a batch append in SessionStore
+        for (key, event) in [
+            (
+                dedup::session_created(session),
+                SessionEvent::SessionCreated {
+                    config,
+                    parent: None,
+                    metadata,
+                },
+            ),
+            (
+                dedup::context_forked(session),
+                SessionEvent::ContextForked {
+                    source: ForkSource::Session { session: source },
+                    source_log: waterline.log_id,
+                    items,
+                },
+            ),
+        ] {
+            let entry = asterpath_protocol::encode_entry(session, Some(key), &event)
+                .map_err(|error| corrupt(error.to_string()))?;
+            self.store.append(entry).await?;
+        }
         Ok(self.handle(session))
     }
 
@@ -370,6 +445,22 @@ impl Asterpath {
             .try_collect()
             .await
     }
+}
+
+/// Host metadata limits (storage.md §5).
+fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
+    if metadata.len() > 64
+        || metadata
+            .iter()
+            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+    {
+        return Err(AsterError::Config {
+            message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
+                      up to 4096 bytes"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Totals over `scope` with no further narrowing.

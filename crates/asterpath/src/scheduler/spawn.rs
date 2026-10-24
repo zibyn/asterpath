@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
-    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup, effective_config,
-    encode_entry,
+    ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
+    RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup,
+    effective_config, encode_entry,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -755,7 +755,7 @@ impl Scheduler {
             self.append(
                 child,
                 SessionEvent::ContextForked {
-                    source: parent,
+                    source: ForkSource::Spawn(parent),
                     source_log: *at,
                     items,
                 },

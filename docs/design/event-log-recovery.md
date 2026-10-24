@@ -43,8 +43,8 @@ pub struct ParentRef {
 #[non_exhaustive]
 pub enum SessionEvent {
     SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef>, metadata: BTreeMap<String, String> },  // metadata：宿主元数据，ADR-0032
-    ContextForked { source: ParentRef, source_log: LogId,
-                    items: Vec<Item> },                           // fork 子会话的首个模型可见记录
+    ContextForked { source: ForkSource, source_log: LogId,
+                    items: Vec<Item> },                           // fork 子会话或会话分叉的首个模型可见记录（ADR-0033）
     StreamResumed { from: LogId, reason: ResumeReason },          // 非模型可见
     InputRecorded { input: Vec<Part> },                           // 模型可见
     TurnStarted { turn_id: TurnId },
@@ -154,7 +154,7 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | 事件 | dedup key |
 | --- | --- |
 | `SessionCreated` | session id |
-| `ContextForked` | child session id |
+| `ContextForked` | 新会话 id（fork 子会话或会话分叉） |
 | `InputRecorded` | 调用方提供的 input id |
 | `AssistantMessage` | `(turn_id, step_id)` |
 | `ToolCallRequested` | 意图提交时生成的 `tool_call_id` |
