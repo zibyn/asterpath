@@ -133,14 +133,10 @@ pub(crate) fn check(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
-    let instructions = request.items.iter().flat_map(|item| match item {
-        Item::Instruction { parts } => parts.as_slice(),
-        _ => &[],
-    });
     if !request
         .system
         .iter()
-        .chain(instructions)
+        .chain(instruction_parts(request))
         .all(|part| matches!(part, Part::Text { .. }))
     {
         return Err(invalid_request("system may only contain text parts"));
@@ -178,6 +174,14 @@ pub(crate) fn check(
     Ok(())
 }
 
+/// Every appended instruction's parts, in history order.
+fn instruction_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
+    request.items.iter().flat_map(|item| match item {
+        Item::Instruction { parts } => parts.as_slice(),
+        _ => &[],
+    })
+}
+
 fn unsupported(detail: &str) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Unsupported,
@@ -204,10 +208,7 @@ pub(crate) fn render(
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_system {
         // Fallback: appended instructions join the top-level system.
-        system.extend(request.items.iter().flat_map(|item| match item {
-            Item::Instruction { parts } => parts.as_slice(),
-            _ => &[],
-        }));
+        system.extend(instruction_parts(request));
     }
 
     let mut fields: Vec<(&str, Frag)> = vec![
