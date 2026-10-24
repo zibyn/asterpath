@@ -28,8 +28,8 @@ pub mod usage;
 
 pub use agent::{
     AgentError, AgentEvent, ApprovalRequest, CancelRegistration, CancellationRegistry,
-    CompactResult, CompactionError, CompactionOutcome, ConfigUpdate, RunRequest, RunTrigger,
-    SessionSpec, ToolSelection, UserInput,
+    CompactResult, CompactionError, CompactionOutcome, RunRequest, RunTrigger, SessionSpec,
+    ToolSelection, UserInput,
 };
 
 pub use compactor::{

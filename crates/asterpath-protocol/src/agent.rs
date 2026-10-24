@@ -9,11 +9,11 @@ use crate::{
 };
 
 use crate::config::{
-    CompactionConfig, ConfigPatch, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety,
-    RequestConfig, SideEffect, SubagentConfig, ToolDescriptor, TurnConfig,
+    CompactionConfig, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety, RequestConfig,
+    SideEffect, SubagentConfig, ToolDescriptor, TurnConfig,
 };
 use crate::event::{ToolResultStatus, TurnEndReason};
-use crate::ids::{JsonString, ToolName, UpdateId};
+use crate::ids::{JsonString, ToolName};
 use crate::item::{Part, RawProviderData};
 use crate::provider::{PartDelta, ProviderError};
 use crate::tool::CancelToken;
@@ -29,34 +29,6 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
-}
-
-/// A host change to a running session's configuration, validated by
-/// `SessionHandle::update_config` and recorded as one `ConfigChanged`.
-/// Each present field replaces the effective value whole; `append_system` is
-/// appended to the system.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ConfigUpdate {
-    /// Dedup key: a retried update with the same id is recorded once.
-    /// Required when `append_system` is non-empty, since appending twice is
-    /// not idempotent.
-    pub id: Option<UpdateId>,
-    pub model: Option<ModelSpec>,
-    pub request: Option<RequestConfig>,
-    /// Only `Part::Text` is valid.
-    pub append_system: Vec<Part>,
-}
-
-impl ConfigUpdate {
-    /// The patch recorded for this update.
-    pub fn patch(&self) -> ConfigPatch {
-        ConfigPatch {
-            model: self.model.clone(),
-            request: self.request.clone(),
-            append_system: self.append_system.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

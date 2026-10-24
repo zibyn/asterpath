@@ -14,7 +14,7 @@ use asterpath::anthropic::{AnthropicModelProfile, AnthropicProvider};
 use asterpath::openai::OpenAiProvider;
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
-    CompactionConfig, ConfigUpdate, InputId, ModelId, ModelSpec, Parallelism, Part, Provenance,
+    CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Parallelism, Part, Provenance,
     Provider, ProviderId, ReplaySafety, RequestConfig, SessionSpec, SideEffect, SubagentConfig,
     Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
     TurnConfig, UpdateId, UserInput,
@@ -56,7 +56,7 @@ impl Tool for Switch {
                 0 => "model-2",
                 _ => "model-1",
             };
-            let mut update = ConfigUpdate::default();
+            let mut update = ConfigPatch::default();
             update.model = Some(model(target));
             self.handle
                 .get()
@@ -208,7 +208,7 @@ impl Tool for Append {
         _ctx: ToolContext,
     ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
-            let mut update = ConfigUpdate::default();
+            let mut update = ConfigPatch::default();
             update.id = Some(UpdateId::from_bytes([7; 16]));
             update.append_system = vec![Part::Text {
                 text: "answer in French".to_owned(),

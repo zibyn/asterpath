@@ -40,7 +40,7 @@ use crate::views::usage::UsageService;
 use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigUpdate,
+    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
     ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts,
     SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError, UsageError,
     UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
@@ -406,20 +406,20 @@ impl SessionHandle {
     /// often it is retried. Otherwise one `ConfigChanged` is appended; it may be called
     /// mid-turn and takes effect at the next `StepStarted`, so a step already
     /// running keeps its config.
-    pub async fn update_config(&self, update: ConfigUpdate) -> Result<(), AsterError> {
-        if let Some(model) = &update.model
+    pub async fn update_config(&self, patch: ConfigPatch) -> Result<(), AsterError> {
+        if let Some(model) = &patch.model
             && self.providers.get(&model.provider).is_none()
         {
             return Err(AsterError::Config {
                 message: format!("unknown provider {}", model.provider),
             });
         }
-        if !update.append_system.is_empty() && update.id.is_none() {
+        if !patch.append_system.is_empty() && patch.id.is_none() {
             return Err(AsterError::Config {
                 message: "append_system needs an update id: appending is not idempotent".to_owned(),
             });
         }
-        if !update
+        if !patch
             .append_system
             .iter()
             .all(|part| matches!(part, asterpath_protocol::Part::Text { .. }))
@@ -428,14 +428,12 @@ impl SessionHandle {
                 message: "system may only contain text parts".to_owned(),
             });
         }
-        let event = SessionEvent::ConfigChanged {
-            patch: update.patch(),
-        };
+        let key = patch.id.map(dedup::config_changed);
         // Without an id a retry may land twice; whole-field overrides fold the same.
         let entry = asterpath_protocol::encode_entry(
             self.session,
-            update.id.map(dedup::config_changed),
-            &event,
+            key,
+            &SessionEvent::ConfigChanged { patch },
         )
         .map_err(|error| AsterError::Config {
             message: error.to_string(),

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::LogId;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{JsonSchema, JsonString, ModelId, ProviderId, ToolName};
+use crate::ids::{JsonSchema, JsonString, ModelId, ProviderId, ToolName, UpdateId};
 use crate::item::Part;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,12 +161,18 @@ pub enum ContextPolicy {
     Fork { at: LogId },
 }
 
-/// The fields one `ConfigChanged` changes (ADR-0030). Each present field
-/// replaces the effective value whole; absent fields keep theirs.
-/// `append_system` is appended, never replaced.
+/// A host change to a session's configuration (ADR-0030), validated by
+/// `SessionHandle::update_config` and recorded as one `ConfigChanged`. Each
+/// present field replaces the effective value whole; absent fields keep
+/// theirs. `append_system` is appended, never replaced.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigPatch {
+    /// Dedup key: a retried patch with the same id is recorded once.
+    /// Required when `append_system` is non-empty, since appending twice is
+    /// not idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<UpdateId>,
     #[serde(default)]
     pub model: Option<ModelSpec>,
     #[serde(default)]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use asterpath::protocol::{
-    CompactionConfig, ConfigUpdate, ImageSource, InputId, Item, JsonString, ModelId, ModelRequest,
+    CompactionConfig, ConfigPatch, ImageSource, InputId, Item, JsonString, ModelId, ModelRequest,
     ModelSpec, Part, Provider, ProviderCapabilities, ProviderCatalog, ProviderError,
     ProviderErrorKind, ProviderId, RequestConfig, Role, SessionEvent, SessionSpec, StopReason,
     StreamEvent, SubagentConfig, ToolName, ToolSelection, TurnConfig, UpdateId, Usage, UserInput,
@@ -57,8 +57,8 @@ fn spec() -> SessionSpec {
     }
 }
 
-fn switch_to(name: &str) -> ConfigUpdate {
-    let mut update = ConfigUpdate::default();
+fn switch_to(name: &str) -> ConfigPatch {
+    let mut update = ConfigPatch::default();
     update.model = Some(model(name));
     update
 }
@@ -75,11 +75,11 @@ fn input(id: u8) -> UserInput {
 struct Switching {
     inner: ScriptedProvider,
     handle: OnceLock<SessionHandle>,
-    updates: Mutex<VecDeque<Option<ConfigUpdate>>>,
+    updates: Mutex<VecDeque<Option<ConfigPatch>>>,
 }
 
 impl Switching {
-    fn new(inner: ScriptedProvider, updates: Vec<Option<ConfigUpdate>>) -> Arc<Self> {
+    fn new(inner: ScriptedProvider, updates: Vec<Option<ConfigPatch>>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             handle: OnceLock::new(),
@@ -152,7 +152,7 @@ async fn an_unregistered_provider_is_rejected_and_nothing_is_logged() {
     let handle = asterpath.create_session(spec()).await.expect("create");
     let before = events(&asterpath, &handle).await;
 
-    let mut update = ConfigUpdate::default();
+    let mut update = ConfigPatch::default();
     update.model = Some(ModelSpec {
         provider: ProviderId::new("nope"),
         ..model("model-2")
@@ -218,7 +218,7 @@ async fn a_mid_turn_change_applies_from_the_next_step_only() {
     );
 }
 
-fn switch_model_and_budget() -> ConfigUpdate {
+fn switch_model_and_budget() -> ConfigPatch {
     let mut update = switch_to("model-2");
     update.request = Some(RequestConfig {
         max_output_tokens: NonZeroU32::new(512).expect("non-zero"),
@@ -359,8 +359,8 @@ async fn a_child_inherits_the_config_of_its_spawn_step() {
     assert_eq!(spawned, model("model-2"));
 }
 
-fn append(id: u8, value: &str) -> ConfigUpdate {
-    let mut update = ConfigUpdate::default();
+fn append(id: u8, value: &str) -> ConfigPatch {
+    let mut update = ConfigPatch::default();
     update.id = Some(UpdateId::from_bytes([id; 16]));
     update.append_system = vec![text(value)];
     update

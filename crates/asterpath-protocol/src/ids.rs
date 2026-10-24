@@ -150,7 +150,7 @@ opaque_id!(TurnId);
 opaque_id!(StepId);
 opaque_id!(InputId);
 opaque_id!(ToolCallId);
-// UpdateId: host-chosen identity of one `ConfigUpdate`, the `ConfigChanged` dedup key.
+// UpdateId: host-chosen identity of one `ConfigPatch`, the `ConfigChanged` dedup key.
 opaque_id!(UpdateId);
 
 /// Position of a committed log record within its session stream.
