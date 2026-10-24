@@ -651,7 +651,6 @@ async fn reasoning_is_dropped_and_traced_when_binding_does_not_match() {
         ),
         (binding("gpt-4", 0, "x"), "model_mismatch"),
         (binding("gpt-5", 1, "x"), "prefix_epoch_mismatch"),
-        (binding("gpt-5", 0, "not-the-hash"), "tools_hash_mismatch"),
     ];
     for (binding, reason) in cases {
         let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
@@ -673,6 +672,25 @@ async fn reasoning_is_dropped_and_traced_when_binding_does_not_match() {
         assert_eq!(marks[0].kind, "reasoning");
         assert_eq!(marks[0].reason, reason);
     }
+}
+
+#[tokio::test]
+async fn reasoning_is_replayed_after_the_tool_set_changes() {
+    let raw_item = r#"{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA"}"#;
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
+    let events = collect(
+        &provider(&server),
+        request(vec![
+            user_text("go"),
+            reasoning_item(binding("gpt-5", 0, "an-older-tool-set"), raw_item),
+        ]),
+    )
+    .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert!(
+        server.requests()[0].body.contains(raw_item),
+        "reasoning from a different tool set must still be replayed"
+    );
 }
 
 #[tokio::test]

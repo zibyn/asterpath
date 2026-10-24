@@ -152,11 +152,11 @@ _Avoid_: token 数、消耗
 _Avoid_: 原始响应、provider payload
 
 **推理绑定（Reasoning Binding）**：
-推理条目与其产出供应商、模型、前缀代次及工具集指纹的关联；任一不匹配即不可回放。
+推理条目与其产出供应商、模型、前缀代次及工具集指纹的关联；回放时由 adapter 按其协议的规则比较，不匹配即不可回放。
 _Avoid_: 签名、reasoning key
 
 **工具集指纹（Tools Hash）**：
-一次请求中模型可见工具定义（名称、说明、参数 schema）的确定性摘要；推理条目据此判断能否在工具集相同的请求中回放。
+一次请求中模型可见工具定义（名称、说明、参数 schema）的确定性摘要；Anthropic adapter 据此判断推理条目能否回放（服务端 prefix 校验的本地近似）；OpenAI 不比较它。
 _Avoid_: 工具版本、schema hash
 
 **前缀代次（Prefix Epoch）**：

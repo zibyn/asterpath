@@ -252,7 +252,6 @@ fn render_input(
     provider: &ProviderId,
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<Box<RawValue>>, ProviderError> {
-    let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let mut input = Vec::with_capacity(request.items.len());
     for item in &request.items {
         match item {
@@ -277,9 +276,9 @@ fn render_input(
                     Some("model_mismatch")
                 } else if binding.prefix_epoch != request.prefix_epoch {
                     Some("prefix_epoch_mismatch")
-                } else if binding.tools_hash != tools_hash {
-                    Some("tools_hash_mismatch")
                 } else {
+                    // No tools_hash check: OpenAI documents no binding between
+                    // reasoning items and the tool set (#108).
                     None
                 };
                 match reason {

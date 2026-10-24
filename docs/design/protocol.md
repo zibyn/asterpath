@@ -135,7 +135,7 @@ pub struct RawProviderData {
 - `Message.role` 只有 `User | Assistant`；tool result 是顶层 item，不存在 `Tool` role。
 - `Message.parts` 中 user 侧可含 `Text` / `Image` / `ProviderOpaque`；assistant 侧可含 `Text` / `Refusal` / `ProviderOpaque`。
 - `Reasoning.summary` 只用于展示与 trace；同 provider 回放以 `raw` 为准，跨 provider 时整个 `Reasoning` 不进入请求。
-- `Reasoning.binding` 由 adapter 按实际服务的请求填写：`provider` / `model` / `prefix_epoch` / `tools_hash`。`tools_hash` 覆盖请求里的模型可见工具集，fork 收窄工具集后旧 reasoning 因此失效（§9）。
+- `Reasoning.binding` 由 adapter 按实际服务的请求填写：`provider` / `model` / `prefix_epoch` / `tools_hash`。`tools_hash` 覆盖请求里的模型可见工具集；只有 Anthropic adapter 据此让 fork 收窄工具集后的旧 reasoning 失效（§9 规则 5）。
 - `ToolCall.raw_args` 是 pre-execute 之前的模型原始参数；工具执行使用 `ToolCallRequested.raw_args`（effective args，#7）。
 - `ToolResult.parts` 是模型可见内容；`is_error` 由 #7 的 `status != Completed` 投影而来。
 - `InputRecorded.input` 投影为一条 `Item::Message { role: User, parts }`；连续输入按 seq 各成一条，Anthropic adapter 可合并相邻同角色消息。
@@ -153,7 +153,7 @@ pub struct RawProviderData {
 | P3 | `Part` 不嵌套 `Item`；`Message.parts`、`ToolResult.parts`、`Compaction.parts` 只含 `Part`。 |
 | P4 | `ToolCall.call_id` 在投影历史内唯一；`ToolResult.call_id` 必须引用较早的 `ToolCall`，投影按 `ToolCall` 的 seq 排序。 |
 | P5 | `ToolCall.raw_args` 是权威值；不存 `parsed_args`，不 re-serialize。 |
-| P6 | `Reasoning.binding` 记录产出 provider / model / 前缀代次 / 工具集指纹；任一不匹配即不可回放。 |
+| P6 | `Reasoning.binding` 记录产出 provider / model / 前缀代次 / 工具集指纹；adapter 按 §9 的规则比较，不匹配即不可回放。 |
 | P7 | `raw.json` 是原始 provider JSON 的字符串片段；回放时不得 parse 后重新序列化。 |
 | P8 | `ProviderOpaque`、`ServerToolCall`、`ServerToolResult` 只在同 provider 请求中回放。 |
 | P9 | `Compaction` 是模型可见摘要；同一时刻投影只保留最新一条。 |
@@ -593,15 +593,15 @@ pub enum ProviderErrorKind {
 
 回放规则：
 
-1. **同 provider + 同 model + `binding.prefix_epoch == request.prefix_epoch` + `binding.tools_hash == tools_hash(request.tools)`**、且 item 未被改写：adapter 直接 splice `raw.json`，不 parse、不重新序列化。
+1. **同 provider + 同 model + `binding.prefix_epoch == request.prefix_epoch`**（Anthropic 另要求 `binding.tools_hash == tools_hash(request.tools)`，见规则 5）、且 item 未被改写：adapter 直接 splice `raw.json`，不 parse、不重新序列化。
 2. **跨 provider**：`Reasoning`、`ServerToolCall/Result`、`ProviderOpaque` 不进入请求；规范可见的 `Message` / `ToolCall` / `ToolResult` / `Compaction` 正常渲染。`Reasoning.summary` 不转成文本。
 3. **epoch 不匹配**（压缩改变了前缀）：`Reasoning` 不进入请求；其他 item 不受影响。
 4. **model 变化但 provider 相同**：视为不匹配，`Reasoning` 不进入请求。
-5. **工具集指纹不匹配**（fork 收窄工具集，或将来任何工具集变化）：`Reasoning` 不进入请求；其他 item 不受影响。
+5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：system 变化与前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
 
-`tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；请求前对每条 `Reasoning` 重算比较。
+`tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
 
 `prefix_epoch` 的定义：会话中截至请求水位已发生的 `CompactionApplied` 数量。`Reasoning.binding.prefix_epoch` 在产出时写入（取自 `request.prefix_epoch`）；压缩后旧 reasoning 自然失效，压缩后新产出的 reasoning 使用新代次。
 
@@ -772,7 +772,7 @@ pub enum ProviderErrorKind {
 | A2 | OpenAI encrypted reasoning（`store:false`） | 请求含 `include:["reasoning.encrypted_content"]`；无 `previous_response_id`；回放成功 |
 | A3 | 跨 provider 切换 | `Reasoning` / `ServerTool*` / `ProviderOpaque` 不进入请求；规范历史仍可投影；trace 有 `dropped_items`；不报错 |
 | A4 | 压缩后旧 reasoning | `binding.prefix_epoch` 不匹配 → 丢弃；压缩后新 reasoning 使用新代次并可回放 |
-| A17 | 工具集变化（fork 收窄） | `binding.tools_hash` 不匹配 → `Reasoning` 丢弃并记 `dropped_items`；规范历史与工具调用仍完整 |
+| A17 | 工具集变化（fork 收窄） | Anthropic：`binding.tools_hash` 不匹配 → `Reasoning` 丢弃并记 `dropped_items`；OpenAI：照常回放。规范历史与工具调用仍完整 |
 | A18 | 重启后同名工具 schema 变化 | 请求 `tools` 仍由 `ConfigSnapshot.tools` 渲染，与崩溃前一致；注册表新 schema 只影响新 session |
 | A5 | 工具调用/结果双向映射 | Anthropic 合并 user 消息且 `tool_result` 在文本前；OpenAI `function_call` / `function_call_output` 成对 |
 | A6 | OpenAI 事件交错 | 按 `output_index` 归一；item 不丢不重；`ItemCompleted` 顺序不影响最终历史 |
