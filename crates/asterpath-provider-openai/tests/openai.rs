@@ -4,7 +4,7 @@ use std::time::Duration;
 use asterpath_testing::http_mock::{MockServer, Reply as MockResponse};
 
 use asterpath_protocol::{
-    ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, Provider,
+    ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
     ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
     ReasoningBinding, Role, StopReason, StreamEvent, ToolChoice, ToolDescriptor, ToolName, Usage,
 };
@@ -402,6 +402,66 @@ async fn interleaved_items_are_normalized_by_output_index() {
         }
         last_sequence = Some(sequence);
     }
+}
+
+#[tokio::test]
+async fn parallel_function_call_argument_deltas_carry_their_item_output_index() {
+    let args_delta = |sequence: u64, index: u32, id: &str, delta: &str| {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": sequence,
+            "item_id": id,
+            "output_index": index,
+            "delta": delta
+        })
+    };
+    let first = function_call_item("fc_a", "call_a", "search", r#"{"q":"a"}"#);
+    let second = function_call_item("fc_b", "call_b", "search", r#"{"q":"b"}"#);
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, function_call_item("fc_a", "call_a", "search", "")),
+        added(2, 1, function_call_item("fc_b", "call_b", "search", "")),
+        args_delta(3, 1, "fc_b", r#"{"q":"#),
+        args_delta(4, 0, "fc_a", r#"{"q":"#),
+        args_delta(5, 0, "fc_a", r#""a"}"#),
+        args_delta(6, 1, "fc_b", r#""b"}"#),
+        done(7, 0, first.clone()),
+        done(8, 1, second.clone()),
+        completed(9, vec![first, second], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let mut fragments: std::collections::BTreeMap<u32, String> = Default::default();
+    let mut order = Vec::new();
+    for event in &events {
+        if let Ok(StreamEvent::PartDelta {
+            output_index,
+            part_index: 0,
+            delta: PartDelta::JsonArgs { fragment },
+            ..
+        }) = event
+        {
+            order.push(*output_index);
+            fragments
+                .entry(*output_index)
+                .or_default()
+                .push_str(fragment);
+        }
+    }
+    assert_eq!(order, [1, 0, 0, 1]);
+    let calls: std::collections::BTreeMap<u32, (String, String)> = completed_items(&events)
+        .into_iter()
+        .map(|(index, item)| match item {
+            Item::ToolCall {
+                call_id, raw_args, ..
+            } => (index, (call_id, raw_args.as_str().to_owned())),
+            other => panic!("expected a tool call, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(calls[&0], ("call_a".to_owned(), fragments[&0].clone()));
+    assert_eq!(calls[&1], ("call_b".to_owned(), fragments[&1].clone()));
+    assert_eq!(fragments[&0], r#"{"q":"a"}"#);
 }
 
 #[tokio::test]

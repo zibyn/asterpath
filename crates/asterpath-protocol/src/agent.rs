@@ -56,7 +56,11 @@ pub enum RunTrigger {
 }
 
 /// Live UI notifications. Never a substitute for the event log.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// The JSON shape is a Tier 1 promise: tag `type`, snake_case variant names.
+/// Within a step, `(step, output_index)` identifies one streamed block.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
     Idle {
@@ -68,11 +72,14 @@ pub enum AgentEvent {
     ModelDelta {
         turn: TurnId,
         step: StepId,
+        output_index: u32,
+        part_index: u32,
         delta: PartDelta,
     },
     ToolStarted {
         turn: TurnId,
         step: StepId,
+        output_index: u32,
         call: ToolCallId,
         tool: ToolName,
     },
@@ -90,7 +97,7 @@ pub enum AgentEvent {
 }
 
 /// One tool call awaiting a host decision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct ApprovalRequest {
     pub session: SessionId,
