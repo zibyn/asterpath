@@ -402,6 +402,89 @@ impl SessionHandle {
     }
 
     /// Stream live `AgentEvent`s until `TurnCommitted` or `Idle`.
+    ///
+    /// The turn advances only while this stream is polled. Dropping it does
+    /// not cancel anything: the next `drive` resumes from the log (ADR-0006).
+    /// A second `drive` on a session that is already being driven yields
+    /// [`AgentError::Busy`].
+    ///
+    /// # Host driver pattern
+    ///
+    /// - **Do not tie the stream to a web request or connection.** When the
+    ///   client disconnects the stream is dropped, and the turn stops until
+    ///   someone drives again.
+    /// - **Drive from a spawned task.** `tokio::spawn` a task that owns a
+    ///   cloned `SessionHandle`, reads every `drive()` stream to the end, and
+    ///   fans `AgentEvent`s out over `tokio::sync::broadcast`. Subscribers
+    ///   come and go without affecting the turn.
+    /// - **Queue through the log, not by retrying `Busy`.** Keep at most one
+    ///   driver task per session. New input only needs
+    ///   [`submit_input`](Self::submit_input) plus a wake-up; after each
+    ///   drive the task drives again while
+    ///   [`SessionFacts::has_pending_input`] holds.
+    /// - **Reconnect by resubscribing.** A new client calls
+    ///   `broadcast::Sender::subscribe`. An `ApprovalRequested` it missed is
+    ///   still listed by [`ApprovalGate::pending`] (via
+    ///   [`Asterpath::approval_gate`]), and a re-drive after a dropped stream
+    ///   emits it again.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use asterpath::SessionHandle;
+    /// use asterpath::protocol::AgentEvent;
+    /// use futures_util::StreamExt;
+    /// use tokio::sync::{Notify, broadcast};
+    ///
+    /// /// One per session. `wake` is notified after every `submit_input`.
+    /// fn spawn_driver(
+    ///     handle: SessionHandle,
+    ///     wake: Arc<Notify>,
+    /// ) -> broadcast::Sender<AgentEvent> {
+    ///     let (events, _) = broadcast::channel(256);
+    ///     let fan_out = events.clone();
+    ///     tokio::spawn(async move {
+    ///         loop {
+    ///             let mut stream = handle.drive();
+    ///             while let Some(event) = stream.next().await {
+    ///                 match event {
+    ///                     // No subscribers is fine: the turn keeps going.
+    ///                     Ok(event) => drop(fan_out.send(event)),
+    ///                     Err(error) => {
+    ///                         eprintln!("drive failed: {error}");
+    ///                         return;
+    ///                     }
+    ///                 }
+    ///             }
+    ///             let pending = handle
+    ///                 .facts()
+    ///                 .await
+    ///                 .map(|facts| facts.has_pending_input())
+    ///                 .unwrap_or(false);
+    ///             if !pending {
+    ///                 // Notify keeps a permit, so input submitted since the
+    ///                 // check is not lost.
+    ///                 wake.notified().await;
+    ///             }
+    ///         }
+    ///     });
+    ///     events
+    /// }
+    ///
+    /// async fn on_user_message(
+    ///     handle: &SessionHandle,
+    ///     wake: &Notify,
+    ///     input: asterpath::protocol::UserInput,
+    /// ) -> Result<(), asterpath::AsterError> {
+    ///     handle.submit_input(input).await?;
+    ///     wake.notify_one();
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// [`AgentError::Busy`]: asterpath_protocol::AgentError::Busy
+    /// [`SessionFacts::has_pending_input`]: asterpath_protocol::SessionFacts::has_pending_input
+    /// [`ApprovalGate::pending`]: asterpath_protocol::ApprovalGate::pending
     pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>> {
         let run = self.agent.run(RunRequest {
             session: self.session,
