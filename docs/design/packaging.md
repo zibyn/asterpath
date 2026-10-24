@@ -357,7 +357,7 @@ pub enum AsterError {
 
 ### 4.5 交互模式
 
-- 斜杠命令：`/help`、`/new`（新建会话）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
+- 斜杠命令：`/help`、`/new`（新建会话，沿用当前模型）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
 - 回合进行中第一次 Ctrl-C 调用 `cancel()`；空闲时 Ctrl-C 或 Ctrl-D 退出。
 - 显示：`ModelDelta` 文本增量直接输出；`ToolStarted` 显示工具名与参数，`ToolFinished` 显示状态与截断后的结果。显示前的脱敏是 CLI 的策略。
 

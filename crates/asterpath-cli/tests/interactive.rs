@@ -134,5 +134,9 @@ fn slash_commands_switch_model_report_status_and_start_a_new_session() {
         body.contains("fresh start") && !body.contains("\"hi\""),
         "{body}"
     );
-    assert_eq!(requests[1].json_body()["model"], "claude-test");
+    assert_eq!(
+        requests[1].json_body()["model"],
+        "claude-other",
+        "/new keeps the model chosen with /model"
+    );
 }

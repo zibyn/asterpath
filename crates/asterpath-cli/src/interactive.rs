@@ -8,8 +8,8 @@ use std::io::{self, BufRead, Write};
 
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, ConfigPatch, InputId, ModelId, Part, PartDelta,
-    SystemClock, UsageScope, UserInput, unique_bytes,
+    AgentEvent, ApprovalDecision, ApprovalRequest, InputId, Part, PartDelta, SystemClock,
+    UsageScope, UserInput, unique_bytes,
 };
 use asterpath_protocol::{Clock, CompactResult};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -63,18 +63,30 @@ pub async fn interactive(
         )
         .await;
         drop(endpoint);
+        // `/new` keeps the model in use, including one chosen with `/model`.
+        // shortcut: carries the model id only, so a resumed session on another provider than the config's hands over a foreign id; carry the provider when `-m` can name one
+        let model = match &next {
+            Ok(Next::New) => session::snapshot(&opened.asterpath, opened.handle.id())
+                .await
+                .ok()
+                .map(|snapshot| snapshot.model.model.as_str().to_owned()),
+            _ => None,
+        };
         opened.shutdown().await?;
         match next? {
             Next::Exit => return Ok(()),
-            Next::New => opened = session::open(global, &new_session(&args), None).await?,
+            Next::New => {
+                let args = new_session(&args, model);
+                opened = session::open(global, &args, None).await?;
+            }
         }
     }
 }
 
 /// The flags of a fresh session in the current work root.
-fn new_session(args: &SessionArgs) -> SessionArgs {
+fn new_session(args: &SessionArgs, model: Option<String>) -> SessionArgs {
     SessionArgs {
-        model: args.model.clone(),
+        model: model.or_else(|| args.model.clone()),
         approval: args.approval,
         sandbox: args.sandbox,
         cd: None,
@@ -232,11 +244,11 @@ async fn switch_model(
     handle: &SessionHandle,
     model: &str,
 ) -> CliResult<String> {
-    let mut spec = session::snapshot(asterpath, handle.id()).await?.model;
-    spec.model = ModelId::new(model.to_owned());
-    let mut patch = ConfigPatch::default();
-    patch.model = Some(spec);
-    handle.update_config(patch).await.map_err(aster_error)?;
+    let snapshot = session::snapshot(asterpath, handle.id()).await?;
+    handle
+        .update_config(session::model_patch(&snapshot, model))
+        .await
+        .map_err(aster_error)?;
     Ok(format!("model: {model}"))
 }
 
@@ -337,8 +349,8 @@ mod tests {
     use std::time::Duration;
 
     use asterpath_protocol::{
-        Item, JsonString, ModelSpec, Provider, ProviderId, Role, SessionSpec, StopReason, Tool,
-        ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, Usage,
+        Item, JsonString, ModelId, ModelSpec, Provider, ProviderId, Role, SessionSpec, StopReason,
+        Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, Usage,
     };
     use asterpath_testing::ScriptedProvider;
     use futures_util::future::BoxFuture;

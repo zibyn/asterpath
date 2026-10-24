@@ -165,12 +165,10 @@ pub async fn open(
     };
     eprintln!("session: {}", handle.id().to_hex());
 
-    let mut patch = ConfigPatch::default();
-    if let Some(model) = &args.model {
-        let mut spec = snapshot.model.clone();
-        spec.model = ModelId::new(model.clone());
-        patch.model = Some(spec);
-    }
+    let mut patch = match &args.model {
+        Some(model) => model_patch(&snapshot, model),
+        None => ConfigPatch::default(),
+    };
     if let Some(format) = output_format {
         let mut request = snapshot.request.clone();
         request.output_format = Some(format);
@@ -185,6 +183,15 @@ pub async fn open(
         handle,
         continued,
     })
+}
+
+/// Switch `snapshot`'s model id; the provider stays.
+pub fn model_patch(snapshot: &ConfigSnapshot, model: &str) -> ConfigPatch {
+    let mut spec = snapshot.model.clone();
+    spec.model = ModelId::new(model.to_owned());
+    let mut patch = ConfigPatch::default();
+    patch.model = Some(spec);
+    patch
 }
 
 /// A new session: workspace tools, skills, `AGENTS.md` and host metadata.
