@@ -802,11 +802,16 @@ async fn c1_parallel_children_survive_a_waiting_crash() {
     // --- child logs: one clean turn each ----------------------------------
 
     let catalog = asterpath.store();
-    let mut child_stream = catalog.children(parent);
-    let mut catalog_children = Vec::new();
-    while let Some(child) = child_stream.next().await {
-        catalog_children.push(child.expect("child session"));
-    }
+    let catalog_children: Vec<SessionId> = catalog
+        .sessions(asterpath_protocol::SessionQuery {
+            parent: asterpath_protocol::ParentFilter::ChildrenOf(parent),
+            ..Default::default()
+        })
+        .await
+        .expect("child sessions")
+        .into_iter()
+        .map(|entry| entry.session)
+        .collect();
     assert_eq!(
         catalog_children.len(),
         2,

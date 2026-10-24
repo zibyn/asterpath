@@ -233,7 +233,9 @@ fn retirement_leaves_no_rows_behind() {
     retire(storage.as_ref(), target, captured);
 
     assert!(
-        block_on(storage.sessions()).expect("sessions").is_empty(),
+        block_on(storage.sessions(Default::default()))
+            .expect("sessions")
+            .is_empty(),
         "a retired session is never listed, so never woken"
     );
     drop(storage);

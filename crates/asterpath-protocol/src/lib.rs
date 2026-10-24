@@ -41,8 +41,9 @@ pub use config::{
     SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, DedupKey, LogEntry, LogQuery, NewEntry,
-    PendingApproval, SessionStore, SignalDelivery, SignalName, SignalPayload, WakeCause, scan_all,
+    ApprovalEndpoint, ApprovalGate, AwaitSignal, CatalogCursor, CatalogEntry, DedupKey, LogEntry,
+    LogQuery, NewEntry, ParentFilter, PendingApproval, SessionQuery, SessionStore, SignalDelivery,
+    SignalName, SignalPayload, WakeCause, scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;

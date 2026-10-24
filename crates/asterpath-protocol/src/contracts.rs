@@ -84,22 +84,69 @@ pub struct LogQuery {
     pub limit: Option<usize>,
 }
 
+/// Which sessions a catalog query lists, by parent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParentFilter {
+    #[default]
+    Any,
+    Roots,
+    ChildrenOf(SessionId),
+}
+
+/// Position in the catalog order: the last entry of the previous page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CatalogCursor {
+    pub created_at: Timestamp,
+    pub session: SessionId,
+}
+
+/// A page request over the session catalog (ADR-0028).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub parent: ParentFilter,
+    /// Exclusive cursor: the page starts after this entry.
+    pub after: Option<CatalogCursor>,
+    pub limit: Option<usize>,
+}
+
+/// One live session in the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub session: SessionId,
+    pub parent: Option<SessionId>,
+    /// `recorded_at` of the session's `SessionCreated`.
+    pub created_at: Timestamp,
+    /// `recorded_at` of the session's last committed record; display only,
+    /// recovery and wake never read it.
+    pub last_activity: Timestamp,
+}
+
+impl CatalogEntry {
+    pub fn cursor(&self) -> CatalogCursor {
+        CatalogCursor {
+            created_at: self.created_at,
+            session: self.session,
+        }
+    }
+}
+
 /// The one storage adapter (ADR-0023): the append-only per-session event log
-/// plus the session catalog (`sessions` / `parent` / `children`) and optional
+/// plus the session catalog (`sessions` / `parent`) and optional
 /// whole-session retirement. Retired sessions are invisible to every read.
 pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 
-    /// Every session that has a `SessionCreated` and is not retired,
-    /// children included, ordered by id.
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
+    /// Sessions that have a `SessionCreated` and are not retired, filtered by
+    /// parent, ordered by `(created_at, session)` descending (ADR-0028).
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>>;
     /// The parent recorded in `SessionCreated`; `None` for a root or unknown
     /// session.
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
-    /// Live children of `session`, ordered by id.
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>>;
 
     /// Write the tombstone and delete the session's log and catalog row.
     /// `expected_frontier` must equal the current last log id. Backends
