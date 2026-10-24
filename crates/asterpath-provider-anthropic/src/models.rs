@@ -13,13 +13,13 @@
 //! Opus 5.5, Fable 5.1, Mythos 5.1, Fable 5, Mythos 5 and Mythos Preview (thinking
 //! "Always on"; the effort page repeats this for Opus 5.5), and Sonnet 5.5 (On by
 //! default, but it takes `between_tools` instead of `"disabled"`). Unrecognized
-//! ids get [`LATEST`] and so reject `Off` too.
+//! ids get [`UNRECOGNIZED`] and so reject `Off` too.
 //!
 //! `inline_system`: the supported-models list of build-with-claude/
 //! mid-conversation-system-messages (checked 2026-10-24; no beta header). Sonnet 5
 //! is listed as unsupported; models the page does not list fall back, and so
 //! do unrecognized ids (third-party endpoints such as DeepSeek reach
-//! [`LATEST`]): only listed models render inline.
+//! [`UNRECOGNIZED`]): only listed models render inline.
 //!
 //! `inline_tools`: the same page says mid-conversation tool changes are in
 //! beta "on the same models" (checked 2026-10-24); definitions by value need
@@ -28,7 +28,7 @@
 //!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
-//! (`claude-opus-5`). Ids no row matches get [`LATEST`], so a new model works
+//! (`claude-opus-5`). Ids no row matches get [`UNRECOGNIZED`], so a new model works
 //! without a row as long as it follows the newest rules.
 
 use std::borrow::Cow;
@@ -80,7 +80,7 @@ impl AnthropicModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
     /// inline system messages or tools, which only listed models accept.
     pub fn latest() -> Self {
-        LATEST
+        UNRECOGNIZED
     }
 
     #[must_use]
@@ -158,10 +158,10 @@ const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
 const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
-/// Unrecognized ids: the newest generation's rules, no inline changes.
-const LATEST: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
-const CURRENT: AnthropicModelProfile = inline(LATEST);
+const LATEST: AnthropicModelProfile = inline(UNRECOGNIZED);
+/// Unrecognized ids: [`LATEST`] without inline changes.
+const UNRECOGNIZED: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
 /// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
@@ -192,10 +192,10 @@ const EXTENDED_EFFORT: AnthropicModelProfile =
     rules(Thinking::Extended, &[Off, Low, Medium, High], true, true);
 
 static TABLE: &[(&str, AnthropicModelProfile)] = &[
-    ("claude-opus-5-5", CURRENT),
-    ("claude-sonnet-5-5", CURRENT),
-    ("claude-fable-5-1", CURRENT),
-    ("claude-mythos-5-1", CURRENT),
+    ("claude-opus-5-5", LATEST),
+    ("claude-sonnet-5-5", LATEST),
+    ("claude-fable-5-1", LATEST),
+    ("claude-mythos-5-1", LATEST),
     ("claude-haiku-5-5", ADAPTIVE),
     ("claude-opus-5", ADAPTIVE),
     ("claude-sonnet-5", SONNET_5),
@@ -214,10 +214,10 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-3", EXTENDED),
 ];
 
-static LATEST_PROFILE: AnthropicModelProfile = LATEST;
+static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;
 
 /// Host model entries (first prefix match wins), then the host default, then
-/// the built-in table, then [`LATEST`].
+/// the built-in table, then [`UNRECOGNIZED`].
 pub(crate) fn profile_for<'a>(
     models: &'a [(String, AnthropicModelProfile)],
     default: Option<&'a AnthropicModelProfile>,
@@ -235,7 +235,7 @@ fn builtin(model: &str) -> &'static AnthropicModelProfile {
     TABLE
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
-        .map_or(&LATEST_PROFILE, |(_, profile)| profile)
+        .map_or(&UNRECOGNIZED_PROFILE, |(_, profile)| profile)
 }
 
 #[cfg(test)]
@@ -244,13 +244,13 @@ mod tests {
 
     #[test]
     fn specific_ids_win_over_their_prefixes() {
-        assert_eq!(*builtin("claude-opus-5-5"), CURRENT);
+        assert_eq!(*builtin("claude-opus-5-5"), LATEST);
         assert_eq!(*builtin("claude-opus-5"), ADAPTIVE);
         assert_eq!(*builtin("claude-opus-4-6"), BOTH);
         assert_eq!(*builtin("claude-opus-4-5-20251101"), EXTENDED_EFFORT);
         assert_eq!(*builtin("claude-opus-4-1-20250805"), EXTENDED);
         assert_eq!(*builtin("claude-sonnet-4-20250514"), EXTENDED);
-        assert_eq!(*builtin("claude-next"), LATEST);
+        assert_eq!(*builtin("claude-next"), UNRECOGNIZED);
     }
 
     #[test]

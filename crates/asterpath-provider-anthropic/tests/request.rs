@@ -1261,7 +1261,7 @@ async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
     assert!(capabilities.forced_tool_choice);
     assert!(!capabilities.sampling);
 
-    // Without injection: built-in table, then LATEST.
+    // Without injection: built-in table, then UNRECOGNIZED.
     let plain = AnthropicProvider::new("k");
     let mut spec = model();
     spec.model = ModelId::new("claude-sonnet-4-5");
