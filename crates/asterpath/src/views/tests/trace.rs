@@ -92,6 +92,7 @@ fn created(_session: SessionId) -> SessionEvent {
     SessionEvent::SessionCreated {
         config: config(),
         parent: None,
+        metadata: Default::default(),
     }
 }
 
@@ -1109,6 +1110,7 @@ async fn t9_subagent_links_parent_and_child_traces() {
                 turn: t,
                 tool_call: c,
             }),
+            metadata: Default::default(),
         },
         Some(dedup::session_created(child)),
     )

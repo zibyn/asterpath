@@ -233,12 +233,7 @@ impl SessionStore for TestLog {
             .unwrap_or_default();
         let entries = children
             .into_iter()
-            .map(|session| CatalogEntry {
-                session,
-                parent: Some(parent),
-                created_at: 0,
-                last_activity: 0,
-            })
+            .map(|session| CatalogEntry::new(session, Some(parent), 0, 0, Default::default()))
             .collect();
         Box::pin(async move { Ok(entries) })
     }

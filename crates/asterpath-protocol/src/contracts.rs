@@ -89,7 +89,8 @@ pub struct SessionQuery {
 }
 
 /// One live session in the catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CatalogEntry {
     pub session: SessionId,
     pub parent: Option<SessionId>,
@@ -98,9 +99,28 @@ pub struct CatalogEntry {
     /// `recorded_at` of the session's last committed record; display only,
     /// recovery and wake never read it.
     pub last_activity: Timestamp,
+    /// The host metadata recorded in `SessionCreated` (ADR-0032).
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl CatalogEntry {
+    /// For store adapters, which build entries outside this crate.
+    pub fn new(
+        session: SessionId,
+        parent: Option<SessionId>,
+        created_at: Timestamp,
+        last_activity: Timestamp,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            session,
+            parent,
+            created_at,
+            last_activity,
+            metadata,
+        }
+    }
+
     pub fn cursor(&self) -> CatalogCursor {
         CatalogCursor {
             created_at: self.created_at,

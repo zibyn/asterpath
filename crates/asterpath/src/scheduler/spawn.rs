@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use asterpath_protocol::{
     AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
-    ContextPolicy, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest, RunTrigger,
-    SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup, effective_config,
-    encode_entry,
+    ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
+    RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup,
+    effective_config, encode_entry,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -22,6 +22,7 @@ use futures_util::StreamExt;
 use super::tool::SPAWN_TOOL_NAME;
 use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
 use crate::agent::Agent;
+use crate::fork;
 use crate::scan::{backend, scan_decoded};
 use crate::waits::Waits;
 
@@ -694,19 +695,13 @@ impl Scheduler {
     }
 
     /// Projection of the parent stream at the spawn step's `StepStarted`.
-    /// `CompactionApplied` folds regardless of the waterline, mirroring the
-    /// agent's request projection; nothing after the waterline is visible.
     async fn fork_snapshot(
         &self,
         parent: ParentRef,
         at: LogId,
     ) -> Result<Vec<Item>, ExecutionError> {
         let entries = scan_decoded(&*self.log, parent.session).await?;
-        let prefix = fork_prefix(&entries, at)?;
-        let mut items = asterpath_protocol::history(&prefix).map_err(backend)?;
-        // The child's created tools are already the narrowed effective set, so
-        // copied changes would re-add tools the allowlist removed (ADR-0030).
-        items.retain(|item| !matches!(item, Item::ToolsChanged { .. }));
+        let items = fork_snapshot_at(&entries, at)?.items;
         Ok(items)
     }
 
@@ -735,6 +730,8 @@ impl Scheduler {
                     SessionEvent::SessionCreated {
                         config: config.clone(),
                         parent: Some(parent.clone()),
+                        // Children never inherit host metadata (ADR-0032).
+                        metadata: Default::default(),
                     },
                     Some(dedup::session_created(child)),
                 )
@@ -753,7 +750,7 @@ impl Scheduler {
             self.append(
                 child,
                 SessionEvent::ContextForked {
-                    source: parent,
+                    source: ForkSource::Spawn(parent),
                     source_log: *at,
                     items,
                 },
@@ -872,43 +869,28 @@ fn resolve_context(
     }
 }
 
-/// The parent records a fork at `at` copies.
-fn fork_prefix(
+/// The parent's fork snapshot at `at`, the spawn step's `StepStarted`.
+fn fork_snapshot_at(
     entries: &[(LogEntry, SessionEvent)],
     at: LogId,
-) -> Result<Vec<LogEntry>, ExecutionError> {
-    let Some(at_seq) = entries
-        .iter()
-        .find(|(entry, _)| entry.log_id == at)
-        .map(|(entry, _)| entry.seq)
-    else {
-        return Err(backend(format!(
+) -> Result<fork::Snapshot, ExecutionError> {
+    let prefix = fork::spawn_prefix(entries, at).ok_or_else(|| {
+        backend(format!(
             "fork point LogId({}) is not in the parent log",
             at.as_i64()
-        )));
-    };
-    let prefix = entries
-        .iter()
-        .filter(|(entry, event)| {
-            entry.seq <= at_seq || matches!(event, SessionEvent::CompactionApplied { .. })
-        })
-        .map(|(entry, _)| entry.clone())
-        .collect();
-    Ok(prefix)
+        ))
+    })?;
+    fork::snapshot(&prefix).map_err(backend)
 }
 
-/// A forked child's system: the parent's baseline at the fork point, since the
-/// copied history already holds the instructions appended before it. The fork
+/// A forked child's system: the parent's baseline at the fork point. The fork
 /// point is the spawn step's `StepStarted`, so no change falls between it and
 /// the config watermark (ADR-0030).
 fn fork_system(
     entries: &[(LogEntry, SessionEvent)],
     at: LogId,
 ) -> Result<Vec<Part>, ExecutionError> {
-    let prefix = fork_prefix(entries, at)?;
-    Ok(asterpath_protocol::request_history(&prefix)
-        .map_err(backend)?
-        .system)
+    Ok(fork_snapshot_at(entries, at)?.system)
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.

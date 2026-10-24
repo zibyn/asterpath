@@ -1,7 +1,7 @@
 //! Driver-facing values: session spec, run request, live `AgentEvent`
 //! stream and the summed `AgentError`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::config::{
     CompactionConfig, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety, RequestConfig,
     SideEffect, SubagentConfig, ToolDescriptor, TurnConfig,
 };
-use crate::event::{ToolResultStatus, TurnEndReason};
+use crate::event::{ToolErrorInfo, ToolResultStatus, TurnEndReason};
 use crate::ids::{JsonString, ToolName};
 use crate::item::{Part, RawProviderData};
 use crate::provider::{PartDelta, ProviderError};
@@ -29,6 +29,9 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+    /// Opaque host metadata, recorded in `SessionCreated` and listed in the
+    /// catalog; never in the snapshot or a model request (ADR-0032).
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,17 +85,25 @@ pub enum AgentEvent {
         output_index: u32,
         call: ToolCallId,
         tool: ToolName,
+        /// The arguments the tool is invoked with, after `before_tool` hooks.
+        args: JsonString,
     },
+    /// Carries the logged `ToolResult` content unredacted; redaction is the host's.
     ToolFinished {
         turn: TurnId,
         step: StepId,
         call: ToolCallId,
         status: ToolResultStatus,
+        output: Option<Vec<Part>>,
+        error: Option<ToolErrorInfo>,
     },
     ApprovalRequested(ApprovalRequest),
+    /// `usage` is the turn's model calls plus compactions, as
+    /// `UsageScope::Turn` totals them.
     TurnCommitted {
         turn: TurnId,
         reason: TurnEndReason,
+        usage: Usage,
     },
 }
 

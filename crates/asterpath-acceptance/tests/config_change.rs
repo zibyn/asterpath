@@ -150,6 +150,7 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
+            metadata: Default::default(),
         })
         .await
         .expect("create");
@@ -259,6 +260,7 @@ async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
+            metadata: Default::default(),
         })
         .await
         .expect("create");
@@ -488,6 +490,7 @@ async fn run_equip_turn(
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
+            metadata: Default::default(),
         })
         .await
         .expect("create");

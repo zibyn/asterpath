@@ -12,6 +12,7 @@ mod commit;
 mod compaction;
 pub mod config;
 pub mod error;
+mod fork;
 mod scan;
 mod scheduler;
 mod tools;
@@ -30,6 +31,7 @@ pub use asterpath_protocol::{InputId, LogId, SessionId, StepId, Timestamp, ToolC
 #[cfg(feature = "anthropic")]
 pub use asterpath_provider_anthropic as anthropic;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agent::Agent;
@@ -41,11 +43,13 @@ use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts,
-    SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError, UsageError,
-    UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
+    ForkSource, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
+    SessionFacts, SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError,
+    UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
-use asterpath_protocol::{ApprovalGate, Clock, SessionQuery, SessionStore, unique_bytes};
+use asterpath_protocol::{
+    ApprovalGate, CatalogEntry, Clock, SessionQuery, SessionStore, unique_bytes,
+};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -230,6 +234,7 @@ impl Asterpath {
                 message: "system may only contain text parts".to_owned(),
             });
         }
+        check_metadata(&spec.metadata)?;
         let tools = match &spec.tools {
             ToolSelection::All => self
                 .tools
@@ -253,6 +258,7 @@ impl Asterpath {
         let event = SessionEvent::SessionCreated {
             config: spec.snapshot(tools),
             parent: None,
+            metadata: spec.metadata,
         };
         let entry = asterpath_protocol::encode_entry(
             session,
@@ -263,6 +269,63 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.store.append(entry).await?;
+        Ok(self.handle(session))
+    }
+
+    /// Fork `source` into a new, parentless session (ADR-0033). The snapshot
+    /// is the source's projection at the end of its last committed turn, so a
+    /// turn in progress is not copied and `source` may be driven meanwhile.
+    /// The config is the source's effective config there, unnarrowed; the
+    /// copied history drops tool changes. `metadata` is the host's, not
+    /// inherited. Unknown source = `NotFound`; metadata over the limits =
+    /// `Config`.
+    pub async fn fork_session(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<SessionHandle, AsterError> {
+        check_metadata(&metadata)?;
+        let records = scan::scan_decoded(&*self.store, source)
+            .await
+            .map_err(AgentError::from)?;
+        let not_found = || AsterError::Agent(AgentError::NotFound { session: source });
+        let corrupt = |detail: String| {
+            AsterError::Agent(AgentError::Corrupt {
+                session: source,
+                detail,
+            })
+        };
+        let (waterline, prefix) = fork::session_prefix(&records).ok_or_else(not_found)?;
+        let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
+        let mut config =
+            asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
+        config.system = snapshot.system;
+        let items = snapshot.items;
+
+        let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
+        // shortcut: two appends, so a crash between them leaves an empty fork that, being the newest, a host "continue the last active session" (CLI `--continue`) picks; needs a batch append in SessionStore
+        for (key, event) in [
+            (
+                dedup::session_created(session),
+                SessionEvent::SessionCreated {
+                    config,
+                    parent: None,
+                    metadata,
+                },
+            ),
+            (
+                dedup::context_forked(session),
+                SessionEvent::ContextForked {
+                    source: ForkSource::Session { session: source },
+                    source_log: waterline.log_id,
+                    items,
+                },
+            ),
+        ] {
+            let entry = asterpath_protocol::encode_entry(session, Some(key), &event)
+                .map_err(|error| corrupt(error.to_string()))?;
+            self.store.append(entry).await?;
+        }
         Ok(self.handle(session))
     }
 
@@ -298,6 +361,13 @@ impl Asterpath {
     /// store has none).
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
+    }
+
+    /// One page of the session catalog, host metadata included (ADR-0032):
+    /// filtered by parent, newest `(created_at, session)` first, resumed
+    /// after `query.after`. Sorting or filtering by metadata is the host's.
+    pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError> {
+        Ok(self.store.sessions(query).await?)
     }
 
     /// Sessions with unfinished work (ADR-0023): a non-compaction intent is
@@ -347,6 +417,22 @@ impl Asterpath {
             .try_collect()
             .await
     }
+}
+
+/// Host metadata limits (storage.md §5).
+fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
+    if metadata.len() > 64
+        || metadata
+            .iter()
+            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+    {
+        return Err(AsterError::Config {
+            message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
+                      up to 4096 bytes"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Totals over `scope` with no further narrowing.

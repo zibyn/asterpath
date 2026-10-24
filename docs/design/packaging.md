@@ -85,7 +85,7 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
+  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -141,9 +141,12 @@ impl Asterpath {
     pub fn builder() -> AsterpathBuilder;
     pub async fn create_session(&self, spec: SessionSpec) -> Result<SessionHandle, AsterError>;
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError>;
+    pub async fn fork_session(&self, source: SessionId, metadata: BTreeMap<String, String>)
+        -> Result<SessionHandle, AsterError>;           // 会话分叉（ADR-0033）
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
+    pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError>;  // 会话目录（ADR-0032）
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 唤醒发现（storage.md §7）
     pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
@@ -158,7 +161,7 @@ impl Asterpath {
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
-- 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
+- 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `[model] provider` + `[model] id`（`-m` 覆盖）组装该值。
 - 注入 `store` 时 `database` 被忽略；未注入时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
@@ -167,7 +170,9 @@ impl Asterpath {
 - 没有 `agent` / `executor` 注入：agent 循环与持久等待是引擎内部类型，不可替换（ADR-0026）。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
-- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider` = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
+- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、宿主元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
+- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由宿主重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
+- `sessions(query)` 是存储目录查询的原样转发：按父会话过滤，按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序或过滤由宿主在结果上完成（ADR-0032）。
 
 ### 3.3 Session 驱动
 
@@ -180,6 +185,7 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+    pub metadata: BTreeMap<String, String>,   // 宿主元数据（ADR-0032），不进 ConfigSnapshot
 }
 
 pub enum ToolSelection { All, Names(Vec<ToolName>) }
@@ -227,10 +233,13 @@ pub enum AgentEvent {
     Idle { session: SessionId },
     TurnStarted { turn: TurnId },
     ModelDelta { turn: TurnId, step: StepId, output_index: u32, part_index: u32, delta: PartDelta },
-    ToolStarted { turn: TurnId, step: StepId, output_index: u32, call: ToolCallId, tool: ToolName },
-    ToolFinished { turn: TurnId, step: StepId, call: ToolCallId, status: ToolResultStatus },
+    ToolStarted { turn: TurnId, step: StepId, output_index: u32, call: ToolCallId, tool: ToolName, args: JsonString },
+    ToolFinished {
+        turn: TurnId, step: StepId, call: ToolCallId, status: ToolResultStatus,
+        output: Option<Vec<Part>>, error: Option<ToolErrorInfo>,
+    },
     ApprovalRequested(ApprovalRequest),
-    TurnCommitted { turn: TurnId, reason: TurnEndReason },
+    TurnCommitted { turn: TurnId, reason: TurnEndReason, usage: Usage },
 }
 
 #[non_exhaustive]
@@ -248,6 +257,7 @@ pub enum AgentError {
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
 - `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。
+- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归宿主。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
@@ -320,7 +330,7 @@ pub enum AsterError {
 | `-i, --image <file>` | 交互、`exec` | 给首条输入附图（文件输入，ADR-0031） |
 | `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
 | `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
-| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031） |
+| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031）；写进新会话或分叉会话的配置，因此只用于新会话与 `--fork-session`，续原会话时是用法错误（没有单回合的请求选项，写进去会留在会话里） |
 
 - Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
 - 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。
@@ -328,14 +338,14 @@ pub enum AsterError {
 
 **续会话的驱动语义**：`--continue` / `-r` 打开会话后，先检查会话事实；有未闭合回合或待处理输入则先 `drive()` 到结束（崩溃恢复），再处理新输入。`exec -r <id>` 不带 `PROMPT` 只做恢复，没有可恢复的内容时输出 `idle`、退出 0；交互模式恢复后进入提示符。
 
-**续会话的工作根目录**：取会话元数据里的 `cwd`，显式 `-C` 时取 `-C`；目录不存在是配置错误（退出 2）。`--continue` 与选择器按当前工作根目录（或 `-C`）匹配元数据 `cwd`。名字重复时 `-r <name>` 取最后活动的一个。
+**续会话的工作根目录**：取会话元数据里的 `cwd`，显式 `-C` 时取 `-C`；目录不存在是配置错误（退出 2）。`--continue`、选择器与 `-r <name>` 按当前工作根目录（或 `-C`）匹配元数据 `cwd`；`-r <id>` 不限目录。名字重复时 `-r <name>` 取最后活动的一个。
 
 ### 4.3 无头输出与输入
 
 - `--output-format text`（默认）：stdout 只有最终助手文本；stderr 输出 session id 与诊断。
 - `--output-format json`：stdout 一个对象 `{ "session": <hex>, "result": <最终助手文本>, "reason": <TurnEndReason>, "usage": <本回合用量> }`；字段只增不改。
 - `--output-format stream-json`：stdout 每行一个 `AgentEvent` 的 serde 序列化（`tag = "type"`），最后一行是上面的结果对象。
-- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出。
+- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出，stdin 关闭时仍有审批在等则取消该回合（没有人能回答了）。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；无法解析的命令（或读不了 stdin）停止读入并取消进行中的回合，照常输出结果行后以用法错误退出（退出 2）。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
 
 ### 4.4 审批
@@ -347,7 +357,7 @@ pub enum AsterError {
 
 ### 4.5 交互模式
 
-- 斜杠命令：`/help`、`/new`（新建会话）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
+- 斜杠命令：`/help`、`/new`（新建会话，沿用当前模型）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
 - 回合进行中第一次 Ctrl-C 调用 `cancel()`；空闲时 Ctrl-C 或 Ctrl-D 退出。
 - 显示：`ModelDelta` 文本增量直接输出；`ToolStarted` 显示工具名与参数，`ToolFinished` 显示状态与截断后的结果。显示前的脱敏是 CLI 的策略。
 
@@ -461,9 +471,9 @@ default = "untrusted"         # untrusted | never
 | M1 恢复 | 场景 (a)；引入 `asterpath-acceptance` | `acceptance` 的 A1–A3 通过 |
 | M2 双协议 | 两个 provider crate + adapter 测试 | 场景 (b) 通过 |
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；默认 compactor 可选接入 | 场景 (c) 通过 |
-| M4 CLI | `asterpath-cli` 六命令、配置、审批端 | CLI 场景测试通过 |
+| M4 CLI | `asterpath-cli` 交互模式与 `exec` / `doctor` / `debug`（§4.1）、配置、审批端 | CLI 场景测试通过 |
 | M5 扩展（已交付） | `asterpath-mcp`（MCP 服务配置、子进程、MCP adapter；#80 前为 `asterpath-plugin-host`）、沙箱合约（#80 起在 protocol）与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
-| M6 技能（已交付） | `asterpath-skills`、CLI `[skills]` 与 `run --no-skills`、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
+| M6 技能（已交付） | `asterpath-skills`、CLI `[skills]`（`enabled` 开关）、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
 
 - M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；M5 / M6 的成员已在 workspace 中，但不属于 v1 验收闸门。插件分发、ACP 与 WASM 出界，归 host 或生态工具。
 - M6 与 M5 同性质：不属于 v1 验收闸门；技能不新增事件，日志 schema 不变。

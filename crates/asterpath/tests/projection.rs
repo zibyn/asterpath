@@ -65,6 +65,7 @@ fn spec() -> SessionSpec {
             config
         },
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

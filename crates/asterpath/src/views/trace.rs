@@ -79,7 +79,7 @@ async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<
     }
 
     let created = decoded.iter().find_map(|(entry, event)| match event {
-        SessionEvent::SessionCreated { config, parent } => Some((entry, config, parent)),
+        SessionEvent::SessionCreated { config, parent, .. } => Some((entry, config, parent)),
         _ => None,
     });
     let Some((created_entry, config, parent)) = created else {

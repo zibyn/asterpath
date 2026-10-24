@@ -39,6 +39,7 @@ fn created(parent: Option<ParentRef>) -> SessionEvent {
     SessionEvent::SessionCreated {
         config: config(),
         parent,
+        metadata: Default::default(),
     }
 }
 

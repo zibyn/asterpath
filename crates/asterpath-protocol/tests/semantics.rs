@@ -473,6 +473,7 @@ fn effective_config_applies_changes_below_the_watermark_only() {
         SessionEvent::SessionCreated {
             config: config(),
             parent: None,
+            metadata: Default::default(),
         },
         changed("second"),
         SessionEvent::StepStarted {
@@ -544,6 +545,7 @@ fn created_with_system(value: &str) -> SessionEvent {
             ..config()
         },
         parent: None,
+        metadata: Default::default(),
     }
 }
 
@@ -705,6 +707,7 @@ fn created_with_tools(names: &[&str]) -> SessionEvent {
             ..config()
         },
         parent: None,
+        metadata: Default::default(),
     }
 }
 

@@ -15,7 +15,7 @@ use asterpath_protocol::{
 };
 use asterpath_protocol::{
     Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageRecord, UsageReport, UsageScope,
-    UsageTotals, decode_entry, usage_of,
+    decode_entry, usage_of,
 };
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -196,7 +196,12 @@ impl UsageService {
                         } else {
                             &mut report.descendants
                         };
-                        add_usage(totals, record.bucket, record.usage);
+                        let target = match record.bucket {
+                            UsageBucket::ModelCall => &mut totals.model_calls,
+                            UsageBucket::Compaction => &mut totals.compaction,
+                            UsageBucket::Partial => &mut totals.partial,
+                        };
+                        add_usage(target, record.usage);
                     }
                 }
             }
@@ -328,12 +333,32 @@ fn scope_accepts(
     }
 }
 
-fn add_usage(totals: &mut UsageTotals, bucket: UsageBucket, usage: Usage) {
-    let target = match bucket {
-        UsageBucket::ModelCall => &mut totals.model_calls,
-        UsageBucket::Compaction => &mut totals.compaction,
-        UsageBucket::Partial => &mut totals.partial,
+/// Model calls plus compactions of `turn`, as `UsageScope::Turn` sums them,
+/// folded from `entries`: the turn's records, from its `TurnStarted` on.
+pub(crate) fn turn_usage(
+    session: SessionId,
+    turn: TurnId,
+    entries: &[LogEntry],
+) -> Result<Usage, UsageError> {
+    let filter = UsageFilter {
+        scope: UsageScope::Turn { session, turn },
+        bucket: None,
+        model: None,
+        since: None,
+        until: None,
+        limit: None,
     };
+    let mut scan = SessionScan::new(session);
+    let mut usage = Usage::default();
+    for entry in entries {
+        if let Some(record) = evaluate(&mut scan, entry, &filter)? {
+            add_usage(&mut usage, record.usage);
+        }
+    }
+    Ok(usage)
+}
+
+fn add_usage(target: &mut Usage, usage: Usage) {
     target.input.uncached += usage.input.uncached;
     target.input.cache_read += usage.input.cache_read;
     target.input.cache_write += usage.input.cache_write;

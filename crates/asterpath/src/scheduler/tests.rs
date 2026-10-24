@@ -191,6 +191,7 @@ async fn seed_parent_at_depth(
             SessionEvent::SessionCreated {
                 config: config(max_depth),
                 parent: ancestor.map(parent_ref),
+                metadata: Default::default(),
             },
         )
         .await;
@@ -316,6 +317,7 @@ async fn spawn_materializes_once_and_reuses_the_child_on_replay() {
     let SessionEvent::SessionCreated {
         config: created,
         parent: edge,
+        ..
     } = &child_events[0]
     else {
         unreachable!()
@@ -1097,6 +1099,7 @@ async fn seed_fork_parent(log: &dyn SessionStore, subagents: &SubagentConfig) ->
         SessionEvent::SessionCreated {
             config: config_with(3, subagents.clone()),
             parent: None,
+            metadata: Default::default(),
         },
     )
     .await;
@@ -1305,7 +1308,10 @@ async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
     else {
         unreachable!()
     };
-    assert_eq!(source, &fork_parent_ref());
+    assert_eq!(
+        source,
+        &asterpath_protocol::ForkSource::Spawn(fork_parent_ref())
+    );
     assert_eq!(*source_log, at);
     assert_eq!(
         items,
@@ -1363,6 +1369,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
         SessionEvent::SessionCreated {
             config: config(3),
             parent: None,
+            metadata: Default::default(),
         },
     )
     .await;
@@ -1599,6 +1606,7 @@ async fn spawn_after_child_spawn_record_fills_the_fork_stream_idempotently() {
         SessionEvent::SessionCreated {
             config: config(3),
             parent: Some(fork_parent_ref()),
+            metadata: Default::default(),
         },
     )
     .await;
@@ -1653,6 +1661,7 @@ async fn seed_parent_with(
         SessionEvent::SessionCreated {
             config: config_with(3, subagents.clone()),
             parent: None,
+            metadata: Default::default(),
         },
     )
     .await;

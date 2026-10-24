@@ -55,7 +55,8 @@ const SCHEMA: &str = "
 CREATE TABLE sessions (
     session_id  BLOB    PRIMARY KEY,
     parent_id   BLOB,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    metadata    TEXT    NOT NULL
 );
 CREATE TABLE log (
     log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -347,14 +348,18 @@ fn append_in(
     )
     .map_err(backend)?;
     let log_id = LogId::from_i64(tx.last_insert_rowid());
-    if let SessionEvent::SessionCreated { parent, .. } = &event {
+    if let SessionEvent::SessionCreated {
+        parent, metadata, ..
+    } = &event
+    {
         let parent = parent
             .as_ref()
             .map(|parent| parent.session.as_bytes().to_vec());
+        let metadata = serde_json::to_string(metadata).map_err(backend)?;
         tx.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
-            params![entry.session.as_bytes(), parent, recorded_at],
+            "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at, metadata) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![entry.session.as_bytes(), parent, recorded_at, metadata],
         )
         .map_err(backend)?;
     }
@@ -565,7 +570,7 @@ impl SqliteStorage {
             .prepare(
                 "SELECT s.session_id, s.parent_id, s.created_at, \
                  COALESCE((SELECT l.recorded_at FROM log l WHERE l.session_id = s.session_id \
-                           ORDER BY l.seq DESC LIMIT 1), s.created_at) \
+                           ORDER BY l.seq DESC LIMIT 1), s.created_at), s.metadata \
                  FROM sessions s \
                  WHERE s.session_id NOT IN (SELECT session_id FROM retired_sessions) \
                  AND (?1 = 0 OR (?1 = 1 AND s.parent_id IS NULL) OR (?1 = 2 AND s.parent_id = ?2)) \
@@ -583,18 +588,24 @@ impl SqliteStorage {
                         row.get::<_, Option<Vec<u8>>>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .map_err(backend)?;
         rows.map(|row| {
-            let (session, parent, created_at, last_activity) = row.map_err(backend)?;
-            Ok(CatalogEntry {
-                session: session_from_blob(session)?,
-                parent: parent.map(session_from_blob).transpose()?,
+            let (session, parent, created_at, last_activity, metadata) = row.map_err(backend)?;
+            let session = session_from_blob(session)?;
+            Ok(CatalogEntry::new(
+                session,
+                parent.map(session_from_blob).transpose()?,
                 created_at,
                 last_activity,
-            })
+                serde_json::from_str(&metadata).map_err(|error| StorageError::Corrupt {
+                    session: Some(session),
+                    detail: format!("catalog metadata: {error}"),
+                })?,
+            ))
         })
         .collect()
     }

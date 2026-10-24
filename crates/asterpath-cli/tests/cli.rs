@@ -1,4 +1,5 @@
-//! Reference CLI behaviour: run, resume, inspect, trace, usage and config check.
+//! Reference CLI behaviour (packaging.md §4): `exec`, session continuation and
+//! forking, configuration and `-c`, `doctor` and `debug`.
 
 mod common;
 
@@ -6,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use assert_cmd::Command;
 use asterpath::{Asterpath, anthropic::AnthropicProvider};
 use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionEvent,
@@ -26,7 +28,9 @@ impl TestDir {
             unique()
         ));
         fs::create_dir_all(&path).expect("temp dir");
-        Self { path }
+        Self {
+            path: path.canonicalize().expect("canonical temp dir"),
+        }
     }
 
     fn config(&self, body: &str) -> PathBuf {
@@ -35,8 +39,28 @@ impl TestDir {
         path
     }
 
+    fn config_path(&self) -> PathBuf {
+        self.path.join("asterpath.toml")
+    }
+
     fn db(&self) -> PathBuf {
         self.path.join("sessions.db")
+    }
+
+    /// A subdirectory to run in.
+    fn sub(&self, name: &str) -> PathBuf {
+        let path = self.path.join(name);
+        fs::create_dir_all(&path).expect("subdir");
+        path
+    }
+
+    /// `asterpath exec --config <this config>` run from `cwd`.
+    fn exec(&self, cwd: &Path) -> Command {
+        let mut command = bin();
+        command
+            .current_dir(cwd)
+            .args(["exec", "--config", self.config_path().to_str().unwrap()]);
+        command
     }
 }
 
@@ -54,7 +78,11 @@ fn unique() -> u64 {
 
 fn config_body(server: &MockServer, db: &Path) -> String {
     format!(
-        "[storage]\npath = \"{}\"\n\n[providers.anthropic]\nbase_url = \"{}\"\n",
+        concat!(
+            "[model]\nprovider = \"anthropic\"\nid = \"claude-test\"\n\n",
+            "[storage]\npath = \"{}\"\n\n[providers.anthropic]\nbase_url = \"{}\"\n\n",
+            "[skills]\nenabled = false\n",
+        ),
         db.display(),
         server.base_url()
     )
@@ -69,122 +97,666 @@ fn session_from_stderr(stderr: &str) -> String {
         .to_owned()
 }
 
-#[test]
-fn run_prints_final_assistant_text_and_session_id() {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
-    let dir = TestDir::new("run-ok");
-    let config = dir.config(&config_body(&server, &dir.db()));
-
-    let output = bin()
-        .env("ASTERPATH_PROVIDER", "not-a-provider")
-        .env("ASTERPATH_MODEL", "env-model")
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
-            "claude-test",
-            "say hello",
-        ])
-        .output()
-        .expect("run asterpath");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "Hello from the mock"
-    );
+/// Run to success and return (stdout, session id).
+fn ok(command: &mut Command) -> (String, String) {
+    let output = command.output().expect("run asterpath");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let session = session_from_stderr(&stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    (
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        session_from_stderr(&stderr),
+    )
+}
+
+fn code(command: &mut Command) -> Option<i32> {
+    command.output().expect("run asterpath").status.code()
+}
+
+/// Every text the model saw in request `index`, joined.
+fn seen(server: &MockServer, index: usize) -> String {
+    server.requests()[index].body.clone()
+}
+
+#[test]
+fn exec_prints_final_assistant_text_and_session_id() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
+    let dir = TestDir::new("exec-ok");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, session) = ok(dir.exec(&dir.path).arg("say hello"));
+
+    assert_eq!(stdout, "Hello from the mock");
     assert_eq!(session.len(), 32, "hex session id: {session}");
     assert!(dir.db().exists(), "the sqlite database was created");
 }
 
 #[test]
-fn run_uses_the_model_flag_over_the_environment() {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
+fn model_flag_beats_override_beats_file() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("ok")),
+        Reply::sse(common::text_sse("ok")),
+        Reply::sse(common::text_sse("ok")),
+    ]);
     let dir = TestDir::new("model-precedence");
-    let config = dir.config(&config_body(&server, &dir.db()));
+    dir.config(&config_body(&server, &dir.db()));
 
-    bin()
-        .env("ASTERPATH_MODEL", "env-model")
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
-            "flag-model",
-            "hi",
-        ])
-        .assert()
-        .success();
+    ok(dir.exec(&dir.path).arg("hi"));
+    ok(dir.exec(&dir.path).args(["-c", "model.id=c-model", "hi"]));
+    ok(dir
+        .exec(&dir.path)
+        .args(["-c", "model.id=c-model", "-m", "flag-model", "hi"]));
 
-    let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].body.contains("\"model\":\"flag-model\""),
-        "flag model wins: {}",
-        requests[0].body
-    );
-    assert!(!requests[0].body.contains("env-model"));
+    let models: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|request| request.json_body()["model"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(models, ["claude-test", "c-model", "flag-model"]);
 }
 
 #[test]
-fn run_fails_with_one_when_the_turn_does_not_complete() {
+fn exec_fails_with_one_when_the_turn_does_not_complete() {
     let server = MockServer::start(vec![Reply::sse(common::context_exceeded_sse("truncated"))]);
-    let dir = TestDir::new("run-failed");
-    let config = dir.config(&config_body(&server, &dir.db()));
+    let dir = TestDir::new("exec-failed");
+    dir.config(&config_body(&server, &dir.db()));
 
-    bin()
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
-            "claude-test",
-            "hi",
-        ])
-        .assert()
-        .code(1);
+    assert_eq!(code(dir.exec(&dir.path).arg("hi")), Some(1));
 }
 
 #[test]
-fn run_rejects_a_session_option_and_other_usage_errors_with_two() {
-    let dir = TestDir::new("run-usage");
+fn removed_commands_and_flags_and_missing_model_are_usage_errors() {
+    let dir = TestDir::new("usage");
     let config = dir.config("");
+    let config = config.to_str().unwrap();
 
-    bin()
-        .args([
-            "run",
+    for args in [
+        &["run", "--config", config, "hi"][..],
+        &["exec", "--config", config, "--provider", "anthropic", "hi"],
+        &["exec", "--config", config, "--db", "x.db", "hi"],
+        &["exec", "--config", config, "--approval", "ask", "hi"],
+        &["exec", "--config", config, "--no-tools", "hi"],
+        &["config", "check", "--config", config],
+        // No `[model] provider` / `id`.
+        &["exec", "--config", config, "hi"],
+        &[
+            "exec",
             "--config",
-            config.to_str().unwrap(),
-            "--session",
-            "00000000000000000000000000000000",
+            config,
+            "-c",
+            "model.provider=anthropic",
             "hi",
-        ])
-        .assert()
-        .code(2);
-
-    // Provider and model are required to assemble a SessionSpec.
-    bin()
-        .args(["run", "--config", config.to_str().unwrap(), "hi"])
-        .assert()
-        .code(2);
+        ],
+        // `-r` without a value needs a terminal.
+        &["exec", "--config", config, "-r"],
+        &["exec", "--config", config, "--fork-session", "hi"],
+        &["exec", "--config", config, "-r", "x", "-n", "name", "hi"],
+        &["exec", "--config", config, "-C", "/does/not/exist", "hi"],
+        &["exec", "--config", config, "-s", "no-sandbox", "hi"],
+        &["exec", "--config", config, "-a", "on-request", "hi"],
+    ] {
+        let output = bin().current_dir(&dir.path).args(args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
-fn config_check_validates_without_initialising_modules() {
-    let dir = TestDir::new("config-ok");
+fn exec_reads_stdin_without_a_prompt_and_appends_piped_stdin_to_one() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("ok")),
+        Reply::sse(common::text_sse("ok")),
+    ]);
+    let dir = TestDir::new("stdin");
+    dir.config(&config_body(&server, &dir.db()));
+
+    ok(dir.exec(&dir.path).write_stdin("from stdin only"));
+    ok(dir
+        .exec(&dir.path)
+        .arg("explain this")
+        .write_stdin("piped body"));
+
+    assert!(seen(&server, 0).contains("from stdin only"));
+    assert!(
+        seen(&server, 1).contains(r"explain this\n\n<stdin>\npiped body\n</stdin>"),
+        "{}",
+        seen(&server, 1)
+    );
+    // Neither a prompt nor stdin: nothing to run.
+    assert_eq!(code(dir.exec(&dir.path).write_stdin("")), Some(2));
+}
+
+#[test]
+fn json_output_is_one_result_object() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("json");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, session) = ok(dir.exec(&dir.path).args(["--output-format", "json", "hi"]));
+
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("one json object");
+    assert_eq!(result["session"], session);
+    assert_eq!(result["result"], "Hello");
+    assert_eq!(result["reason"], "Completed");
+    assert_eq!(result["usage"]["input"]["uncached"], 5, "{result}");
+}
+
+#[test]
+fn stream_json_output_prints_each_event_then_the_result_object() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("stream-json");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, session) = ok(dir
+        .exec(&dir.path)
+        .args(["--output-format", "stream-json", "hi"]));
+
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one json value per line"))
+        .collect();
+    let types: Vec<&str> = lines[..lines.len() - 1]
+        .iter()
+        .map(|event| event["type"].as_str().expect("tagged event"))
+        .collect();
+    assert_eq!(types.first(), Some(&"turn_started"), "{types:?}");
+    assert!(types.contains(&"model_delta"), "{types:?}");
+    assert_eq!(types.last(), Some(&"turn_committed"), "{types:?}");
+    let result = lines.last().unwrap();
+    assert_eq!(result["session"], session);
+    assert_eq!(result["result"], "Hello");
+    assert_eq!(result["reason"], "Completed");
+    assert_eq!(result["usage"]["input"]["uncached"], 5, "{result}");
+}
+
+/// `exec` in stream-json mode with a host on stdin. Every read times out, so
+/// a hang fails the test; the child is killed on drop.
+struct Host {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Host {
+    fn start(dir: &TestDir) -> Self {
+        use std::io::BufRead;
+        use std::process::Stdio;
+
+        let mut child = common::process_bin()
+            .current_dir(&dir.path)
+            .args(["exec", "--config", dir.config_path().to_str().unwrap()])
+            .args(["-s", "full-access", "--output-format", "stream-json"])
+            .args(["--input-format", "stream-json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn asterpath");
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            lines,
+        }
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write;
+        writeln!(self.stdin.as_mut().expect("stdin open"), "{line}").unwrap();
+    }
+
+    fn close(&mut self) {
+        self.stdin = None;
+    }
+
+    fn next(&self) -> serde_json::Value {
+        let line = self
+            .lines
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a stdout line in time");
+        serde_json::from_str(&line).expect("json line")
+    }
+
+    /// Skip to the next event of `kind`.
+    fn until(&self, kind: &str) -> serde_json::Value {
+        loop {
+            let event = self.next();
+            if event["type"] == kind {
+                return event;
+            }
+        }
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(std::time::Instant::now() < deadline, "asterpath exits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const GO: &str = r#"{"type":"user_input","parts":[{"Text":{"text":"go"}}]}"#;
+
+/// A host on stdin answers the `bash` approval; closing stdin while idle ends
+/// the run with the result object.
+#[test]
+fn stream_json_input_round_trips_an_approval_through_the_host() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-input");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    let request = host.until("approval_requested");
+    assert_eq!(request["tool"], "bash");
+    assert!(!dir.path.join("ran").exists(), "asked before running");
+    host.send(&format!(
+        r#"{{"type":"approval","call":{},"decision":"Allow"}}"#,
+        request["tool_call_id"]
+    ));
+    host.until("turn_committed");
+    host.close();
+
+    let result = host.next();
+    assert_eq!(result["result"], "done");
+    assert_eq!(result["reason"], "Completed");
+    assert_eq!(host.exit_code(), Some(0));
+    assert!(dir.path.join("ran").exists(), "the allowed bash ran");
+}
+
+/// Closing stdin while an approval waits cancels the turn instead of hanging.
+#[test]
+fn stream_json_stdin_closed_during_an_approval_cancels_the_turn() {
+    let server = MockServer::start(vec![Reply::sse(common::tool_use_sse(
+        "bash",
+        r#"{"command":"touch ran"}"#,
+    ))]);
+    let dir = TestDir::new("stream-eof");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    host.until("approval_requested");
+    host.close();
+
+    assert_eq!(host.until("turn_committed")["reason"], "Cancelled");
+    assert_eq!(host.next()["reason"], "Cancelled", "the result line");
+    assert_eq!(host.exit_code(), Some(1));
+    assert!(!dir.path.join("ran").exists());
+}
+
+/// A bad command cancels the open turn, still prints the result line, then
+/// exits with a usage error.
+#[test]
+fn stream_json_bad_command_cancels_and_exits_two_after_the_result() {
+    let server = MockServer::start(vec![Reply::sse(common::tool_use_sse(
+        "bash",
+        r#"{"command":"touch ran"}"#,
+    ))]);
+    let dir = TestDir::new("stream-bad");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    host.until("approval_requested");
+    host.send(r#"{"type":"quit"}"#);
+
+    assert_eq!(host.until("turn_committed")["reason"], "Cancelled");
+    let result = host.next();
+    assert_eq!(result["reason"], "Cancelled", "{result}");
+    assert!(result.get("session").is_some(), "{result}");
+    assert_eq!(host.exit_code(), Some(2));
+    assert!(!dir.path.join("ran").exists());
+}
+
+#[test]
+fn stream_json_input_needs_stream_json_output() {
+    let dir = TestDir::new("stream-input-usage");
+    let server = MockServer::start(Vec::new());
+    dir.config(&config_body(&server, &dir.db()));
+    assert_eq!(
+        code(dir.exec(&dir.path).args(["--input-format", "stream-json"])),
+        Some(2)
+    );
+}
+
+#[test]
+fn output_schema_constrains_the_request() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("{}"))]);
+    let dir = TestDir::new("schema");
+    dir.config(&config_body(&server, &dir.db()));
+    let schema = dir.path.join("schema.json");
+    fs::write(
+        &schema,
+        r#"{"type":"object","properties":{"verdict_field":{"type":"string"}}}"#,
+    )
+    .unwrap();
+
+    ok(dir.exec(&dir.path).args(["-m", "claude-fable-5-1"]).args([
+        "--output-schema",
+        schema.to_str().unwrap(),
+        "hi",
+    ]));
+
+    assert!(
+        seen(&server, 0).contains("verdict_field"),
+        "{}",
+        seen(&server, 0)
+    );
+}
+
+/// A schema would stay in a continued session's config after this exec, so
+/// it is refused there; a fork is a new session and takes it.
+#[test]
+fn output_schema_on_a_continued_session_is_a_usage_error() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("first")),
+        Reply::sse(common::text_sse("{}")),
+    ]);
+    let dir = TestDir::new("schema-resume");
+    dir.config(&config_body(&server, &dir.db()));
+    let schema = dir.path.join("schema.json");
+    fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+
+    let schema = schema.to_str().unwrap();
+    assert_eq!(
+        code(
+            dir.exec(&dir.path)
+                .args(["-r", &session, "--output-schema", schema, "again"])
+        ),
+        Some(2)
+    );
+    assert_eq!(server.requests().len(), 1, "nothing was sent");
+    ok(dir.exec(&dir.path).args([
+        "-r",
+        &session,
+        "--fork-session",
+        "-m",
+        "claude-fable-5-1",
+        "--output-schema",
+        schema,
+        "again",
+    ]));
+}
+
+#[test]
+fn image_flag_attaches_the_file_to_the_first_input() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("a picture"))]);
+    let dir = TestDir::new("image");
+    dir.config(&config_body(&server, &dir.db()));
+    fs::write(dir.path.join("pic.png"), b"abc").unwrap();
+
+    ok(dir.exec(&dir.path).args(["-i", "pic.png", "what is this"]));
+
+    let body = seen(&server, 0);
+    assert!(
+        body.contains("image/png") && body.contains("YWJj"),
+        "{body}"
+    );
+    assert_eq!(
+        code(dir.exec(&dir.path).args(["-i", "notes.txt", "hi"])),
+        Some(2)
+    );
+}
+
+#[test]
+fn a_new_session_reads_agents_md_from_the_work_root() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
+    let dir = TestDir::new("agents-md");
+    dir.config(&config_body(&server, &dir.db()));
+    let project = dir.sub("project");
+    fs::write(project.join("AGENTS.md"), "Always answer in haiku.").unwrap();
+
+    // `-C` picks the work root regardless of the process directory.
+    ok(dir
+        .exec(&dir.path)
+        .args(["-C", project.to_str().unwrap(), "hi"]));
+
+    let body = server.requests()[0].json_body();
+    assert!(
+        body["system"]
+            .to_string()
+            .contains("Always answer in haiku."),
+        "{body}"
+    );
+}
+
+#[test]
+fn continue_picks_the_last_active_session_of_the_work_root() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+        Reply::sse(common::text_sse("elsewhere")),
+        Reply::sse(common::text_sse("continued")),
+    ]);
+    let dir = TestDir::new("continue");
+    dir.config(&config_body(&server, &dir.db()));
+    let a = dir.sub("a");
+    let b = dir.sub("b");
+
+    ok(dir.exec(&a).arg("first in a"));
+    let (_, latest) = ok(dir.exec(&a).arg("second in a"));
+    ok(dir.exec(&b).arg("only in b"));
+    let (stdout, session) = ok(dir.exec(&a).args(["--continue", "more"]));
+
+    assert_eq!(stdout, "continued");
+    assert_eq!(session, latest);
+    let body = seen(&server, 3);
+    assert!(
+        body.contains("second in a") && body.contains("more"),
+        "{body}"
+    );
+    assert!(!body.contains("first in a") && !body.contains("only in b"));
+    // A directory without sessions has nothing to continue.
+    let empty = dir.sub("empty");
+    assert_eq!(code(dir.exec(&empty).args(["--continue", "x"])), Some(1));
+}
+
+#[test]
+fn resume_finds_a_session_by_id_or_by_name() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("named")),
+        Reply::sse(common::text_sse("by name")),
+        Reply::sse(common::text_sse("by id")),
+    ]);
+    let dir = TestDir::new("resume-name");
+    dir.config(&config_body(&server, &dir.db()));
+    let (_, named) = ok(dir.exec(&dir.path).args(["-n", "bugfix", "remember 42"]));
+
+    let (stdout, session) = ok(dir.exec(&dir.path).args(["-r", "bugfix", "and?"]));
+    assert_eq!(
+        (stdout.as_str(), session.as_str()),
+        ("by name", named.as_str())
+    );
+    // From another directory: a name matches only the work root, an id anywhere.
+    let other = dir.sub("other");
+    assert_eq!(code(dir.exec(&other).args(["-r", "bugfix", "x"])), Some(1));
+    let (_, session) = ok(dir.exec(&other).args(["-r", &named, "again"]));
+    assert_eq!(session, named);
+    assert!(seen(&server, 2).contains("remember 42"));
+
+    assert_eq!(code(dir.exec(&other).args(["-r", "nope", "x"])), Some(1));
+    assert_eq!(
+        code(
+            dir.exec(&other)
+                .args(["-r", "00000000000000000000000000000000", "x"])
+        ),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_continued_session_runs_in_its_recorded_work_root() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
+    let dir = TestDir::new("resume-root");
+    dir.config(&config_body(&server, &dir.db()));
+    let project = dir.sub("project");
+    let (_, session) = ok(dir.exec(&project).arg("hi"));
+
+    fs::remove_dir_all(&project).unwrap();
+    // The recorded `cwd` is gone: a configuration error, not a silent fallback.
+    assert_eq!(code(dir.exec(&dir.path).args(["-r", &session])), Some(2));
+    // An explicit `-C` overrides the recorded directory.
+    let (stdout, _) =
+        ok(dir
+            .exec(&dir.path)
+            .args(["-C", dir.path.to_str().unwrap(), "-r", &session]));
+    assert_eq!(stdout, "idle");
+}
+
+#[test]
+fn fork_session_copies_the_history_into_a_new_session() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("source")),
+        Reply::sse(common::text_sse("forked")),
+        Reply::sse(common::text_sse("source again")),
+    ]);
+    let dir = TestDir::new("fork");
+    dir.config(&config_body(&server, &dir.db()));
+    let (_, source) = ok(dir.exec(&dir.path).arg("the secret is 7"));
+
+    let (stdout, fork) = ok(dir.exec(&dir.path).args([
+        "-r",
+        &source,
+        "--fork-session",
+        "-n",
+        "branch",
+        "fork turn",
+    ]));
+    assert_eq!(stdout, "forked");
+    assert_ne!(fork, source);
+    assert!(seen(&server, 1).contains("the secret is 7"));
+
+    // The source never saw the fork's turn; the fork is now the last active.
+    ok(dir.exec(&dir.path).args(["-r", &source, "back"]));
+    assert!(!seen(&server, 2).contains("fork turn"));
+    let output = dir.exec(&dir.path).args(["-r", "branch"]).output().unwrap();
+    assert_eq!(
+        session_from_stderr(&String::from_utf8_lossy(&output.stderr)),
+        fork
+    );
+}
+
+#[test]
+fn model_flag_on_a_continued_session_switches_its_model() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("ok")),
+        Reply::sse(common::text_sse("ok")),
+    ]);
+    let dir = TestDir::new("resume-model");
+    dir.config(&config_body(&server, &dir.db()));
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+
+    ok(dir
+        .exec(&dir.path)
+        .args(["-r", &session, "-m", "claude-next", "again"]));
+
+    assert_eq!(server.requests()[1].json_body()["model"], "claude-next");
+}
+
+#[test]
+fn resume_without_a_prompt_prints_idle_for_a_finished_session() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("resume-idle");
+    dir.config(&config_body(&server, &dir.db()));
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+
+    let (stdout, _) = ok(dir.exec(&dir.path).args(["-r", &session]));
+    assert_eq!(stdout, "idle");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn resume_recovers_an_open_turn_before_new_input() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("Resumed turn")),
+        Reply::sse(common::text_sse("Recovered first")),
+        Reply::sse(common::text_sse("New input ran")),
+    ]);
+    let (dir, session) = prepared_session("resume-open", &server, true, "anthropic");
+
+    let (stdout, _) = ok(dir.exec(&dir.path).args(["-r", &session]));
+    assert_eq!(stdout, "Resumed turn");
+
+    let (dir, session) = prepared_session("resume-open-input", &server, true, "anthropic");
+    let (stdout, _) = ok(dir.exec(&dir.path).args(["-r", &session, "next"]));
+    assert_eq!(stdout, "New input ran");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "recovery, then the new input");
+    assert!(!requests[1].body.contains("next") && requests[2].body.contains("next"));
+}
+
+#[test]
+fn resume_continues_pending_input() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Pending input ran"))]);
+    let (dir, session) = prepared_session("resume-pending", &server, false, "anthropic");
+
+    let (stdout, _) = ok(dir.exec(&dir.path).args(["-r", &session]));
+    assert_eq!(stdout, "Pending input ran");
+}
+
+#[test]
+fn untrusted_denies_mutating_tools_in_exec_and_never_runs_them() {
+    for (flags, ran) in [
+        (&["-s", "full-access"][..], false),
+        (&["-a", "never", "-s", "full-access"], true),
+        (
+            &["-c", "approval.default=\"never\"", "-s", "full-access"],
+            true,
+        ),
+        (
+            &[
+                "-c",
+                "approval.default=\"never\"",
+                "-a",
+                "untrusted",
+                "-s",
+                "full-access",
+            ],
+            false,
+        ),
+    ] {
+        let server = MockServer::start(vec![
+            Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+            Reply::sse(common::text_sse("done")),
+        ]);
+        let dir = TestDir::new("approval");
+        dir.config(&config_body(&server, &dir.db()));
+        ok(dir.exec(&dir.path).args(flags).arg("go"));
+        assert_eq!(dir.path.join("ran").exists(), ran, "{flags:?}");
+    }
+}
+
+#[test]
+fn doctor_validates_without_initialising_modules() {
+    let dir = TestDir::new("doctor-ok");
     let db = dir.db();
     let config = dir.config(&format!(
         "[storage]\npath = \"{}\"\n\n[model_aliases.fast]\nprovider = \"anthropic\"\nmodel = \"claude-test\"\n",
@@ -192,346 +764,127 @@ fn config_check_validates_without_initialising_modules() {
     ));
 
     bin()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .assert()
         .success();
 
-    assert!(!db.exists(), "config check must not open the database");
+    assert!(!db.exists(), "doctor must not open the database");
 }
 
 #[test]
-fn config_check_rejects_zero_max_steps_with_two() {
-    let dir = TestDir::new("config-zero");
-    let config = dir.config("[turn]\nmax_steps_per_turn = 0\n");
-
-    bin()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
-        .assert()
-        .code(2);
-}
-
-#[test]
-fn config_check_rejects_secret_fields_with_two() {
-    for field in ["api_key", "secret", "token"] {
-        let dir = TestDir::new(&format!("config-secret-{field}"));
-        let config = dir.config(&format!("[providers.anthropic]\n{field} = \"leaked\"\n"));
+fn doctor_rejects_bad_configs_with_two() {
+    for (body, overrides) in [
+        ("[turn]\nmax_steps_per_turn = 0\n", &[][..]),
+        ("[providers.anthropic]\napi_key = \"leaked\"\n", &[]),
+        ("[providers.anthropic]\nsecret = \"leaked\"\n", &[]),
+        ("[providers.anthropic]\ntoken = \"leaked\"\n", &[]),
+        ("", &["-c", "providers.anthropic.api_key=leaked"]),
+        ("", &["-c", "turn.max_steps_per_turn=0"]),
+        ("", &["-c", "turn.mystery=1"]),
+        ("", &["-c", "model.provider=nope"]),
+        (
+            "[model_aliases.fast]\nprovider = \"nope\"\nmodel = \"m\"\n",
+            &[],
+        ),
+    ] {
+        let dir = TestDir::new("doctor-bad");
+        let config = dir.config(body);
         let output = bin()
-            .args(["config", "check", "--config", config.to_str().unwrap()])
+            .args(["doctor", "--config", config.to_str().unwrap()])
+            .args(overrides)
             .output()
-            .expect("run config check");
+            .expect("run doctor");
         assert_eq!(
             output.status.code(),
             Some(2),
-            "{field} must be rejected: {}",
+            "{body} {overrides:?} must be rejected: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 }
 
 #[test]
-fn config_check_rejects_an_alias_to_an_unknown_provider() {
-    let dir = TestDir::new("config-alias");
-    let config = dir.config("[model_aliases.fast]\nprovider = \"nope\"\nmodel = \"m\"\n");
+fn an_override_beats_the_file() {
+    let dir = TestDir::new("override");
+    let config = dir.config("[turn]\nmax_steps_per_turn = 0\n");
 
     bin()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .args(["-c", "turn.max_steps_per_turn=3"])
         .assert()
-        .code(2);
+        .success();
 }
 
 #[test]
-fn config_flag_wins_over_the_environment() {
+fn config_flag_beats_the_environment_which_beats_the_default_path() {
     let dir = TestDir::new("config-precedence");
     let invalid = dir.config("[turn]\nmax_steps_per_turn = 0\n");
     let valid = dir.path.join("valid.toml");
     fs::write(&valid, "[turn]\nmax_steps_per_turn = 3\n").expect("write valid config");
+    let xdg = dir.sub("xdg");
+    fs::create_dir_all(xdg.join("asterpath")).unwrap();
+    fs::copy(&invalid, xdg.join("asterpath/config.toml")).unwrap();
 
-    bin()
+    let doctor = || {
+        let mut command = bin();
+        command.env("XDG_CONFIG_HOME", &xdg).arg("doctor");
+        command
+    };
+    // The default path is read when nothing else names a file.
+    assert_eq!(code(&mut doctor()), Some(2));
+    doctor().env("ASTERPATH_CONFIG", &valid).assert().success();
+    doctor()
         .env("ASTERPATH_CONFIG", &valid)
-        .args(["config", "check", "--config", invalid.to_str().unwrap()])
+        .args(["--config", invalid.to_str().unwrap()])
         .assert()
         .code(2);
-
-    bin()
+    doctor()
         .env("ASTERPATH_CONFIG", &invalid)
-        .args(["config", "check", "--config", valid.to_str().unwrap()])
+        .args(["--config", valid.to_str().unwrap()])
         .assert()
         .success();
 }
 
 #[test]
-fn inspect_reports_the_projection_summary_and_open_intents() {
-    let (dir, session) = completed_session("inspect-summary");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["inspect", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run inspect");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(&format!("session: {session}")), "{stdout}");
-    assert!(stdout.contains("state: idle"), "{stdout}");
-    assert!(stdout.contains("open intents: none"), "{stdout}");
-}
-
-#[test]
-fn inspect_json_prints_the_full_projection() {
-    let (dir, session) = completed_session("inspect-json");
-    let config = dir.path.join("asterpath.toml");
+fn debug_prompt_input_prints_the_projection_and_open_intents() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
+    let dir = TestDir::new("prompt-input");
+    let config = dir.config(&config_body(&server, &dir.db()));
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
 
     let output = bin()
         .args([
-            "inspect",
-            "--json",
+            "debug",
+            "prompt-input",
             "--config",
             config.to_str().unwrap(),
             &session,
         ])
         .output()
-        .expect("run inspect");
+        .expect("run debug");
     assert!(output.status.success());
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json projection");
-    let items = value.as_array().expect("projection is an array");
-    assert!(
-        items
-            .iter()
-            .any(|item| item.to_string().contains("Hello from the mock")),
-        "{items:?}"
-    );
-}
-
-/// Pins both `inspect` renderings byte for byte, so moving the projection read
-/// onto the session handle cannot change what the CLI prints.
-#[test]
-fn inspect_output_is_byte_stable() {
-    let (dir, session) = completed_session("inspect-bytes");
-    let config = dir.path.join("asterpath.toml");
-    let inspect = |json: bool| {
-        let mut command = bin();
-        command.arg("inspect");
-        if json {
-            command.arg("--json");
-        }
-        let output = command
-            .args(["--config", config.to_str().unwrap(), &session])
-            .output()
-            .expect("run inspect");
-        assert!(output.status.success());
-        String::from_utf8(output.stdout).expect("utf-8")
-    };
-
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let items = value["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "{value}");
+    assert_eq!(items[0]["Message"]["parts"][0]["Text"]["text"], "hi");
     assert_eq!(
-        inspect(false),
-        format!(
-            "session: {session}\nstate: idle\nentries: 7\nprojected items: 2\nopen intents: none\n"
-        )
+        items[1]["Message"]["parts"][0]["Text"]["text"],
+        "Hello from the mock"
     );
-    assert_eq!(
-        inspect(true),
-        r#"[
-  {
-    "Message": {
-      "role": "User",
-      "parts": [
-        {
-          "Text": {
-            "text": "hi"
-          }
-        }
-      ]
-    }
-  },
-  {
-    "Message": {
-      "role": "Assistant",
-      "parts": [
-        {
-          "Text": {
-            "text": "Hello from the mock"
-          }
-        }
-      ],
-      "raw": {
-        "provider": "anthropic",
-        "model": "claude-test",
-        "kind": "anthropic.text",
-        "json": "{\"text\":\"Hello from the mock\",\"type\":\"text\"}"
-      }
-    }
-  }
-]
-"#
-    );
+    assert_eq!(value["open_intents"], serde_json::json!([]));
 }
 
 #[test]
-fn inspect_unknown_session_exits_one() {
-    let dir = TestDir::new("inspect-missing");
-    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
-
-    bin()
-        .args([
-            "inspect",
-            "--config",
-            config.to_str().unwrap(),
-            "00000000000000000000000000000000",
-        ])
-        .assert()
-        .code(1);
-}
-
-#[test]
-fn db_flag_wins_over_the_environment() {
-    let (dir, session) = completed_session("db-precedence");
-    let config = dir.path.join("asterpath.toml");
-    let real_db = dir.db();
-    let other_db = dir.path.join("other.db");
-
-    bin()
-        .env("ASTERPATH_DB", &other_db)
-        .args([
-            "inspect",
-            "--config",
-            config.to_str().unwrap(),
-            "--db",
-            real_db.to_str().unwrap(),
-            &session,
-        ])
-        .assert()
-        .success();
-
-    bin()
-        .env("ASTERPATH_DB", &real_db)
-        .args([
-            "inspect",
-            "--config",
-            config.to_str().unwrap(),
-            "--db",
-            other_db.to_str().unwrap(),
-            &session,
-        ])
-        .assert()
-        .code(1);
-}
-
-#[test]
-fn resume_prints_idle_for_a_finished_session() {
-    let (dir, session) = completed_session("resume-idle");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["resume", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run resume");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "idle");
-}
-
-#[test]
-fn resume_continues_an_open_turn() {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("Resumed turn"))]);
-    let (dir, session) = prepared_session("resume-open", &server, true, "anthropic");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["resume", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run resume");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "Resumed turn"
-    );
-    assert_eq!(server.requests().len(), 1);
-}
-
-#[test]
-fn resume_continues_pending_input() {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("Pending input ran"))]);
-    let (dir, session) = prepared_session("resume-pending", &server, false, "anthropic");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["resume", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run resume");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "Pending input ran"
-    );
-}
-
-#[test]
-fn resume_unknown_session_exits_one() {
-    let dir = TestDir::new("resume-missing");
-    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
-
-    bin()
-        .args([
-            "resume",
-            "--config",
-            config.to_str().unwrap(),
-            "00000000000000000000000000000000",
-        ])
-        .assert()
-        .code(1);
-}
-
-#[test]
-fn trace_prints_the_span_tree() {
-    let (dir, session) = completed_session("trace-tree");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["trace", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run trace");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for prefix in [
-        "session session",
-        "  turn turn",
-        "    step step",
-        "      model_call chat",
-    ] {
-        assert!(
-            stdout.lines().any(|line| line.starts_with(prefix)),
-            "missing {prefix:?} in:\n{stdout}"
-        );
-    }
-}
-
-#[test]
-fn trace_json_prints_the_full_spans() {
-    let (dir, session) = completed_session("trace-json");
-    let config = dir.path.join("asterpath.toml");
+fn debug_trace_prints_the_spans() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("trace");
+    let config = dir.config(&config_body(&server, &dir.db()));
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
 
     let output = bin()
         .args([
+            "debug",
             "trace",
-            "--json",
             "--config",
             config.to_str().unwrap(),
             &session,
@@ -547,101 +900,173 @@ fn trace_json_prints_the_full_spans() {
             "missing {kind}: {spans:?}"
         );
     }
-    assert!(spans.iter().all(|span| span["session"].is_string()));
 }
 
 #[test]
-fn trace_unknown_session_exits_one() {
-    let dir = TestDir::new("trace-missing");
+fn debug_of_an_unknown_session_exits_one() {
+    let dir = TestDir::new("debug-missing");
     let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
 
-    bin()
+    for command in ["prompt-input", "trace"] {
+        bin()
+            .args([
+                "debug",
+                command,
+                "--config",
+                config.to_str().unwrap(),
+                "00000000000000000000000000000000",
+            ])
+            .assert()
+            .code(1);
+    }
+}
+
+#[test]
+fn a_vendor_provider_uses_its_own_endpoint_key_and_profile() {
+    let anthropic = MockServer::start(Vec::new());
+    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("from deepseek"))]);
+    let dir = TestDir::new("vendor");
+    dir.config(&vendor_config(&anthropic, &deepseek, &dir.db()));
+
+    let (stdout, _) = ok(dir.exec(&dir.path).env("DEEPSEEK_API_KEY", "ds-key").args([
+        "-c",
+        "model.provider=deepseek",
+        "-m",
+        "deepseek-flash",
+        "hi",
+    ]));
+    assert_eq!(stdout, "from deepseek");
+    assert!(anthropic.requests().is_empty());
+    let requests = deepseek.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].head.contains("x-api-key: ds-key"),
+        "{}",
+        requests[0].head
+    );
+    // The injected profile accepts `off` and disables default-on thinking.
+    let body = requests[0].json_body();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+}
+
+#[test]
+fn resume_rebuilds_a_vendor_provider_from_the_snapshot() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("resumed"))]);
+    let (dir, session) = prepared_session("resume-vendor", &server, false, "deepseek");
+
+    ok(dir
+        .exec(&dir.path)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env("DEEPSEEK_API_KEY", "ds-key")
+        .args(["-r", &session]));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].head.contains("x-api-key: ds-key"),
+        "{}",
+        requests[0].head
+    );
+}
+
+#[test]
+fn a_vendor_model_entry_replaces_the_vendor_default() {
+    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("pro"))]);
+    let dir = TestDir::new("vendor-model");
+    let config = dir.config(&format!(
+        concat!(
+            "[model]\nprovider = \"deepseek\"\n\n",
+            "[storage]\npath = \"{db}\"\n\n",
+            "[providers.deepseek]\nprotocol = \"anthropic\"\nbase_url = \"{url}\"\n",
+            "api_key_env = \"DEEPSEEK_API_KEY\"\n\n",
+            "[providers.deepseek.profile]\nefforts = [\"low\"]\n\n",
+            "[providers.deepseek.models.\"deepseek-v4\"]\nefforts = [\"low\"]\n\n",
+            "[providers.deepseek.models.\"deepseek-v4-pro\"]\nefforts = [\"off\"]\n",
+            "thinking_default_on = true\n\n",
+            "[request.reasoning]\neffort = \"off\"\n",
+        ),
+        db = dir.db().display(),
+        url = deepseek.base_url(),
+    ));
+    let run = |model: &str| {
+        dir.exec(&dir.path)
+            .env("DEEPSEEK_API_KEY", "ds-key")
+            .args(["-m", model, "hi"])
+            .output()
+            .expect("run asterpath")
+    };
+
+    // The default lists no `off`: rejected before any HTTP.
+    let rejected = run("deepseek-flash");
+    assert!(!rejected.status.success());
+    assert!(deepseek.requests().is_empty());
+    // The provider's error reaches stderr and the trace, not just `Failed`.
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("turn ended with Failed: Unsupported: "),
+        "stderr: {stderr}"
+    );
+    let trace = bin()
         .args([
+            "debug",
             "trace",
             "--config",
             config.to_str().unwrap(),
-            "00000000000000000000000000000000",
+            &session_from_stderr(&stderr),
         ])
-        .assert()
-        .code(1);
-}
-
-#[test]
-fn usage_lists_own_and_descendants_totals() {
-    let (dir, session) = completed_session("usage-text");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args(["usage", "--config", config.to_str().unwrap(), &session])
         .output()
-        .expect("run usage");
+        .expect("run trace");
+    let trace = String::from_utf8_lossy(&trace.stdout);
+    assert!(trace.contains("Unsupported"), "trace: {trace}");
+    // The longer prefix wins over `deepseek-v4` though it sorts after it.
+    let output = run("deepseek-v4-pro-0601");
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("own: input=5 output=2 total=7"), "{stdout}");
-    assert!(
-        stdout.contains("descendants: input=0 output=0 total=0"),
-        "{stdout}"
-    );
+    assert_eq!(deepseek.requests().len(), 1);
 }
 
 #[test]
-fn usage_json_prints_the_report() {
-    let (dir, session) = completed_session("usage-json");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .args([
-            "usage",
-            "--json",
-            "--config",
-            config.to_str().unwrap(),
-            &session,
-        ])
-        .output()
-        .expect("run usage");
-    assert!(output.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("usage json");
-    assert_eq!(report["own"]["model_calls"]["input"]["uncached"], 5);
-    assert_eq!(report["own"]["model_calls"]["output"]["total"], 2);
-    assert_eq!(report["descendants"]["model_calls"]["input"]["uncached"], 0);
-}
-
-#[test]
-fn usage_unknown_session_exits_one() {
-    let dir = TestDir::new("usage-missing");
-    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
-
+fn doctor_accepts_vendor_providers_and_aliases_to_them() {
+    let dir = TestDir::new("vendor-check");
+    let config = dir.config(concat!(
+        "[providers.deepseek]\nprotocol = \"openai\"\n\n",
+        "[providers.deepseek.profile]\nefforts = [\"off\"]\nsampling = false\n\n",
+        "[model_aliases.fast]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n",
+    ));
     bin()
-        .args([
-            "usage",
-            "--config",
-            config.to_str().unwrap(),
-            "00000000000000000000000000000000",
-        ])
+        .args(["doctor", "--config", config.to_str().unwrap()])
         .assert()
-        .code(1);
+        .success();
 }
 
 #[test]
-fn explicit_ask_without_a_tty_is_a_usage_error() {
-    let dir = TestDir::new("ask-non-tty");
-    let config = dir.config("");
-
-    bin()
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--approval",
-            "ask",
-            "hi",
-        ])
-        .assert()
-        .code(2);
+fn doctor_rejects_bad_vendor_provider_sections_with_two() {
+    for body in [
+        "[providers.deepseek]\nprotocol = \"anthropic\"\nmystery = 1\n",
+        "[providers.deepseek]\nprotocol = \"gemini\"\n",
+        "[providers.deepseek]\nbase_url = \"http://x\"\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nefforts = [\"none\"]\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.models.m]\nmystery = 1\n",
+        "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\nthinking = \"adaptive\"\n",
+        "[providers.openai.models.m]\nthinking_default_on = true\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nthinking = \"sometimes\"\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\napi_key = \"leaked\"\n",
+    ] {
+        let dir = TestDir::new("vendor-bad");
+        let config = dir.config(body);
+        let output = bin()
+            .args(["doctor", "--config", config.to_str().unwrap()])
+            .output()
+            .expect("run doctor");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{body} must be rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Create a session through the library: pending input, optionally with an
@@ -690,6 +1115,7 @@ fn prepared_session(
                 turn: TurnConfig::default(),
                 compaction: CompactionConfig::default(),
                 subagents: SubagentConfig::default(),
+                metadata: Default::default(),
             })
             .await
             .expect("create session");
@@ -720,29 +1146,6 @@ fn prepared_session(
     (dir, session)
 }
 
-/// Run one successful turn and return the directory and session id.
-fn completed_session(name: &str) -> (TestDir, String) {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello from the mock"))]);
-    let dir = TestDir::new(name);
-    let config = dir.config(&config_body(&server, &dir.db()));
-    let output = bin()
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--provider",
-            "anthropic",
-            "--model",
-            "claude-test",
-            "hi",
-        ])
-        .output()
-        .expect("run asterpath");
-    assert!(output.status.success());
-    let session = session_from_stderr(&String::from_utf8_lossy(&output.stderr));
-    (dir, session)
-}
-
 fn vendor_config(anthropic: &MockServer, deepseek: &MockServer, db: &Path) -> String {
     format!(
         concat!(
@@ -759,184 +1162,4 @@ fn vendor_config(anthropic: &MockServer, deepseek: &MockServer, db: &Path) -> St
         anthropic = anthropic.base_url(),
         deepseek = deepseek.base_url(),
     )
-}
-
-#[test]
-fn a_vendor_provider_uses_its_own_endpoint_key_and_profile() {
-    let anthropic = MockServer::start(Vec::new());
-    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("from deepseek"))]);
-    let dir = TestDir::new("vendor");
-    let config = dir.config(&vendor_config(&anthropic, &deepseek, &dir.db()));
-
-    let output = bin()
-        .env("DEEPSEEK_API_KEY", "ds-key")
-        .args([
-            "run",
-            "--config",
-            config.to_str().unwrap(),
-            "--provider",
-            "deepseek",
-            "--model",
-            "deepseek-flash",
-            "hi",
-        ])
-        .output()
-        .expect("run asterpath");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "from deepseek"
-    );
-    assert!(anthropic.requests().is_empty());
-    let requests = deepseek.requests();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].head.contains("x-api-key: ds-key"),
-        "{}",
-        requests[0].head
-    );
-    // The injected profile accepts `off` and disables default-on thinking.
-    let body = requests[0].json_body();
-    assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
-}
-
-#[test]
-fn resume_rebuilds_a_vendor_provider_from_the_snapshot() {
-    let server = MockServer::start(vec![Reply::sse(common::text_sse("resumed"))]);
-    let (dir, session) = prepared_session("resume-vendor", &server, false, "deepseek");
-    let config = dir.path.join("asterpath.toml");
-
-    let output = bin()
-        .env_remove("ANTHROPIC_API_KEY")
-        .env("DEEPSEEK_API_KEY", "ds-key")
-        .args(["resume", "--config", config.to_str().unwrap(), &session])
-        .output()
-        .expect("run resume");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].head.contains("x-api-key: ds-key"),
-        "{}",
-        requests[0].head
-    );
-}
-
-#[test]
-fn a_vendor_model_entry_replaces_the_vendor_default() {
-    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("pro"))]);
-    let dir = TestDir::new("vendor-model");
-    let config = dir.config(&format!(
-        concat!(
-            "[storage]\npath = \"{db}\"\n\n",
-            "[providers.deepseek]\nprotocol = \"anthropic\"\nbase_url = \"{url}\"\n",
-            "api_key_env = \"DEEPSEEK_API_KEY\"\n\n",
-            "[providers.deepseek.profile]\nefforts = [\"low\"]\n\n",
-            "[providers.deepseek.models.\"deepseek-v4\"]\nefforts = [\"low\"]\n\n",
-            "[providers.deepseek.models.\"deepseek-v4-pro\"]\nefforts = [\"off\"]\n",
-            "thinking_default_on = true\n\n",
-            "[request.reasoning]\neffort = \"off\"\n",
-        ),
-        db = dir.db().display(),
-        url = deepseek.base_url(),
-    ));
-    let run = |model: &str| {
-        bin()
-            .env("DEEPSEEK_API_KEY", "ds-key")
-            .args([
-                "run",
-                "--config",
-                config.to_str().unwrap(),
-                "--provider",
-                "deepseek",
-                "--model",
-                model,
-                "hi",
-            ])
-            .output()
-            .expect("run asterpath")
-    };
-
-    // The default lists no `off`: rejected before any HTTP.
-    let rejected = run("deepseek-flash");
-    assert!(!rejected.status.success());
-    assert!(deepseek.requests().is_empty());
-    // The provider's error reaches stderr and the trace, not just `Failed`.
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(
-        stderr.contains("turn ended with Failed: Unsupported: "),
-        "stderr: {stderr}"
-    );
-    let trace = bin()
-        .args([
-            "trace",
-            "--config",
-            config.to_str().unwrap(),
-            &session_from_stderr(&stderr),
-        ])
-        .output()
-        .expect("run trace");
-    let trace = String::from_utf8_lossy(&trace.stdout);
-    assert!(
-        trace.contains("deepseek-flash [error] Unsupported: "),
-        "trace: {trace}"
-    );
-    // The longer prefix wins over `deepseek-v4` though it sorts after it.
-    let output = run("deepseek-v4-pro-0601");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(deepseek.requests().len(), 1);
-}
-
-#[test]
-fn config_check_accepts_vendor_providers_and_aliases_to_them() {
-    let dir = TestDir::new("vendor-check");
-    let config = dir.config(concat!(
-        "[providers.deepseek]\nprotocol = \"openai\"\n\n",
-        "[providers.deepseek.profile]\nefforts = [\"off\"]\nsampling = false\n\n",
-        "[model_aliases.fast]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n",
-    ));
-    bin()
-        .args(["config", "check", "--config", config.to_str().unwrap()])
-        .assert()
-        .success();
-}
-
-#[test]
-fn config_check_rejects_bad_vendor_provider_sections_with_two() {
-    for body in [
-        "[providers.deepseek]\nprotocol = \"anthropic\"\nmystery = 1\n",
-        "[providers.deepseek]\nprotocol = \"gemini\"\n",
-        "[providers.deepseek]\nbase_url = \"http://x\"\n",
-        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nefforts = [\"none\"]\n",
-        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.models.m]\nmystery = 1\n",
-        "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\nthinking = \"adaptive\"\n",
-        "[providers.openai.models.m]\nthinking_default_on = true\n",
-        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nthinking = \"sometimes\"\n",
-        "[providers.deepseek]\nprotocol = \"anthropic\"\napi_key = \"leaked\"\n",
-    ] {
-        let dir = TestDir::new("vendor-bad");
-        let config = dir.config(body);
-        let output = bin()
-            .args(["config", "check", "--config", config.to_str().unwrap()])
-            .output()
-            .expect("run config check");
-        assert_eq!(
-            output.status.code(),
-            Some(2),
-            "{body} must be rejected: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 }

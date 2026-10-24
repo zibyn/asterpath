@@ -66,6 +66,7 @@ async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {
         SessionEvent::SessionCreated {
             config,
             parent: None,
+            metadata: Default::default(),
         },
         Some(dedup::session_created(SESSION)),
     )
