@@ -6,7 +6,7 @@
 
 use asterpath_http::{
     TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
-    same_provider_raw_field, server_tools_for,
+    same_provider_raw_field, server_tools_for, unrenderable_file,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -137,14 +137,8 @@ pub(crate) fn check(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
-    if let Some(media_type) = request
-        .file_media_types()
-        .find(|media_type| !rules.file_media_types.contains(media_type))
-    {
-        return Err(unsupported(&format!(
-            "file media type {media_type} on {}",
-            request.spec.model
-        )));
+    if let Some(detail) = unrenderable_file(request, &rules.file_media_types) {
+        return Err(unsupported(&detail));
     }
     if !request
         .system
@@ -608,6 +602,7 @@ fn render_part(provider: &ProviderId, part: &Part) -> Option<Frag> {
                 }
                 FileSource::Url { url } => json!({"type": "url", "url": url}),
                 FileSource::ProviderFile(file) => json!({"type": "file", "file_id": file.id}),
+                _ => unreachable!("check rejects unknown file sources"),
             };
             let mut block = json!({"type": "document", "source": source});
             if let Some(filename) = filename {

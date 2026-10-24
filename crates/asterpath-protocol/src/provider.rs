@@ -158,10 +158,9 @@ impl ProviderCapabilities {
         if !self.structured_output && request.output_format.is_some() {
             return Some("structured output");
         }
-        let has_image = request.items.iter().any(|item| {
-            matches!(item, Item::Message { parts, .. }
-                if parts.iter().any(|part| matches!(part, Part::Image { .. })))
-        });
+        let has_image = request
+            .content_parts()
+            .any(|(_, part)| matches!(part, Part::Image { .. }));
         if !self.image_input && has_image {
             return Some("image input");
         }
@@ -195,17 +194,9 @@ impl ProviderCapabilities {
 }
 
 impl ModelRequest {
-    /// Media types of every `Part::File` the request renders, for the
-    /// adapter's per-model accepted-type check (protocol.md R14).
-    pub fn file_media_types(&self) -> impl Iterator<Item = &str> {
-        self.content_parts().filter_map(|(_, part)| match part {
-            Part::File { media_type, .. } => Some(media_type.as_str()),
-            _ => None,
-        })
-    }
-
-    /// Parts of user/assistant messages (with their role) and tool results.
-    fn content_parts(&self) -> impl Iterator<Item = (Option<Role>, &Part)> {
+    /// Parts of user/assistant messages (with their role) and tool results:
+    /// the parts an adapter renders as content.
+    pub fn content_parts(&self) -> impl Iterator<Item = (Option<Role>, &Part)> {
         self.items.iter().flat_map(|item| {
             let (role, parts) = match item {
                 Item::Message { role, parts, .. } => (Some(*role), parts.as_slice()),

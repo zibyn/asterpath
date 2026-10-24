@@ -105,6 +105,7 @@ pub enum ImageSource {
     ProviderFile(ProviderFileId),
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileSource {
     Base64 { data: String },
@@ -114,10 +115,20 @@ pub enum FileSource {
 
 /// An ID in one provider's file store; only that provider can resolve it
 /// (ADR-0031). Uploading and deleting files is the host's job.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderFileId {
     pub provider: ProviderId,
     pub id: String,
+}
+
+impl ProviderFileId {
+    pub fn new(provider: ProviderId, id: impl Into<String>) -> Self {
+        Self {
+            provider,
+            id: id.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

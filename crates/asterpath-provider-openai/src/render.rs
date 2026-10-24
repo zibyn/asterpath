@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use asterpath_http::{
     merge_provider_option, provider_options_for, same_provider_raw_field, server_tools_for,
+    unrenderable_file,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -147,14 +148,8 @@ fn validate(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
-    if let Some(media_type) = request
-        .file_media_types()
-        .find(|media_type| !profile.file_media_types.contains(media_type))
-    {
-        return Err(unsupported(&format!(
-            "file media type {media_type} on {}",
-            request.spec.model
-        )));
+    if let Some(detail) = unrenderable_file(request, &profile.file_media_types) {
+        return Err(unsupported(&detail));
     }
     if request.spec.provider != *provider {
         return Err(invalid_request(format!(
@@ -442,7 +437,7 @@ fn tool_output_text(part: &Part, provider: &ProviderId, trace: Option<&dyn Trace
     let (kind, placeholder) = match part {
         Part::Text { text } | Part::Refusal { text } => return text.clone(),
         Part::Image { media_type, .. } => (media_type, format!("[image omitted: {media_type}]")),
-        Part::File { media_type, .. } => (media_type, format!("[file omitted: {media_type}]")),
+        Part::File { .. } => unreachable!("tool_output renders files as input_file"),
         Part::ProviderOpaque { kind, .. } => (kind, format!("[opaque omitted: {kind}]")),
     };
     mark(
@@ -464,6 +459,7 @@ fn input_file(media_type: &str, filename: Option<&String>, source: &FileSource) 
         }
         FileSource::Url { url } => item["file_url"] = json!(url),
         FileSource::ProviderFile(file) => item["file_id"] = json!(file.id),
+        _ => unreachable!("validate rejects unknown file sources"),
     }
     item
 }
@@ -478,42 +474,27 @@ fn text_content(
         match part {
             Part::Text { text } => content.push(json!({"type": "input_text", "text": text})),
             Part::Refusal { text } => content.push(json!({"type": "input_text", "text": text})),
-            Part::Image { media_type, .. } | Part::File { media_type, .. } => {
-                mark(
-                    trace,
-                    TraceMark::rendered_as_text(
-                        provider.clone(),
-                        media_type.clone(),
-                        "compaction content is text-only",
-                    ),
-                );
-                let noun = if matches!(part, Part::File { .. }) {
-                    "file"
-                } else {
-                    "image"
-                };
-                content.push(json!({
-                    "type": "input_text",
-                    "text": format!("[{noun} omitted: {media_type}]"),
-                }));
+            Part::Image { media_type, .. } => {
+                content.push(omitted(provider, trace, media_type, "image"));
+            }
+            Part::File { media_type, .. } => {
+                content.push(omitted(provider, trace, media_type, "file"));
             }
             Part::ProviderOpaque { kind, .. } => {
-                mark(
-                    trace,
-                    TraceMark::rendered_as_text(
-                        provider.clone(),
-                        kind.clone(),
-                        "compaction content is text-only",
-                    ),
-                );
-                content.push(json!({
-                    "type": "input_text",
-                    "text": format!("[opaque omitted: {kind}]"),
-                }));
+                content.push(omitted(provider, trace, kind, "opaque"));
             }
         }
     }
     content
+}
+
+/// A text placeholder for a non-text compaction or instruction part, traced.
+fn omitted(provider: &ProviderId, trace: Option<&dyn TraceSink>, kind: &str, noun: &str) -> Value {
+    mark(
+        trace,
+        TraceMark::rendered_as_text(provider.clone(), kind, "compaction content is text-only"),
+    );
+    json!({"type": "input_text", "text": format!("[{noun} omitted: {kind}]")})
 }
 
 fn role_name(role: Role) -> &'static str {

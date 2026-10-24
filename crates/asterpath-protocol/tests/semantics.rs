@@ -396,10 +396,10 @@ fn model_request_copies_stop_sequences_and_provider_options() {
 #[test]
 fn model_request_copies_output_format() {
     let request = RequestConfig {
-        output_format: Some(OutputFormat {
-            name: "answer".to_owned(),
-            schema: serde_json::json!({"type": "object"}),
-        }),
+        output_format: Some(OutputFormat::new(
+            "answer",
+            serde_json::json!({"type": "object"}),
+        )),
         ..RequestConfig::default()
     };
     let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], vec![], &request);

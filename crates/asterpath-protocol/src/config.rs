@@ -42,10 +42,20 @@ pub struct RequestConfig {
 }
 
 /// A named JSON schema the model's reply must follow (structured output).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputFormat {
     pub name: String,
     pub schema: JsonSchema,
+}
+
+impl OutputFormat {
+    pub fn new(name: impl Into<String>, schema: JsonSchema) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+        }
+    }
 }
 
 impl Default for RequestConfig {

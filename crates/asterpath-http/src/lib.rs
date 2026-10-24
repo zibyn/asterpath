@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use asterpath_protocol::{
-    ModelRequest, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
+    FileSource, ModelRequest, Part, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
@@ -180,6 +180,23 @@ pub fn server_tools_for(request: &ModelRequest) -> Result<Vec<Value>, ProviderEr
             )),
         })
         .collect()
+}
+
+/// Why the first `Part::File` cannot be rendered on `request.spec.model`:
+/// its media type is not in the model's `accepted` list (protocol.md R14), or
+/// its source is one the adapters do not know yet. The detail of an
+/// `Unsupported` error.
+pub fn unrenderable_file(request: &ModelRequest, accepted: &[&str]) -> Option<String> {
+    request.content_parts().find_map(|(_, part)| match part {
+        Part::File {
+            media_type,
+            source: FileSource::Base64 { .. } | FileSource::Url { .. } | FileSource::ProviderFile(_),
+            ..
+        } => (!accepted.contains(&media_type.as_str()))
+            .then(|| format!("file media type {media_type} on {}", request.spec.model)),
+        Part::File { .. } => Some("this file source".to_owned()),
+        _ => None,
+    })
 }
 
 /// Deep-merge one `provider_options` value into the value the adapter wrote at

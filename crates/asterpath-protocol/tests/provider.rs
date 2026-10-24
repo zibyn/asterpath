@@ -159,10 +159,10 @@ fn capability_check_names_the_unsupported_feature() {
     assert_eq!(none.unsupported_feature(&image), Some("image input"));
 
     let mut structured = capability_request();
-    structured.output_format = Some(asterpath_protocol::OutputFormat {
-        name: "answer".to_owned(),
-        schema: serde_json::json!({"type": "object"}),
-    });
+    structured.output_format = Some(asterpath_protocol::OutputFormat::new(
+        "answer",
+        serde_json::json!({"type": "object"}),
+    ));
     assert_eq!(
         none.unsupported_feature(&structured),
         Some("structured output")
