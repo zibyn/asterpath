@@ -80,6 +80,7 @@ pub(super) fn assistant_text(value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }]
 }
 

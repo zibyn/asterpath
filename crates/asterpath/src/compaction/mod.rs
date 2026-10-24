@@ -158,6 +158,7 @@ impl DefaultCompactor {
             parts: vec![Part::Text {
                 text: SUMMARY_PROMPT.to_owned(),
             }],
+            raw: None,
         }];
         items.extend(job.summary_input.iter().cloned());
         let request = ModelRequest {
@@ -315,10 +316,14 @@ fn text_view(items: &[Item]) -> Vec<Item> {
     let mut view = Vec::new();
     for item in items {
         match item {
-            Item::Message { role, parts } => {
+            Item::Message { role, parts, .. } => {
                 let parts: Vec<Part> = parts.iter().filter_map(text_part).collect();
                 if !parts.is_empty() {
-                    view.push(Item::Message { role: *role, parts });
+                    view.push(Item::Message {
+                        role: *role,
+                        parts,
+                        raw: None,
+                    });
                 }
             }
             Item::Reasoning { .. } | Item::ProviderOpaque { .. } | Item::ServerToolCall { .. } => {}
@@ -351,6 +356,7 @@ fn text_view(items: &[Item]) -> Vec<Item> {
                     view.push(Item::Message {
                         role: Role::User,
                         parts,
+                        raw: None,
                     });
                 }
             }
@@ -387,6 +393,7 @@ fn text_item(text: String) -> Item {
     Item::Message {
         role: Role::User,
         parts: vec![Part::Text { text }],
+        raw: None,
     }
 }
 

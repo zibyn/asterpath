@@ -57,6 +57,7 @@ fn assistant(value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }]
 }
 
@@ -371,6 +372,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("summarize the file")],
+            raw: None,
         }]
     );
     assert_eq!(requests[1].system, vec![text("inherited system")]);
@@ -405,6 +407,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
                     Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("working")],
+                        raw: None,
                     },
                     tool_call("echo", r#"{"q":"hi"}"#),
                 ],
@@ -416,6 +419,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
                     Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("still working")],
+                        raw: None,
                     },
                     tool_call("echo", r#"{"q":"again"}"#),
                 ],
@@ -683,6 +687,7 @@ impl Provider for RoutingProvider {
             Item::Message {
                 role: Role::User,
                 parts,
+                ..
             } => parts.iter().find_map(|part| match part {
                 Part::Text { text } if text.starts_with("task-") => Some(text.clone()),
                 _ => None,

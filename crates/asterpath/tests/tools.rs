@@ -168,6 +168,7 @@ async fn two_step_turn_with_a_tool_call_matches_l1_and_projects_the_result() {
                 vec![Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("done")],
+                    raw: None,
                 }],
                 StopReason::EndTurn,
                 Usage::default(),
@@ -413,6 +414,7 @@ async fn a_snapshotted_spawn_call_fails_after_the_tool_is_disabled() {
                 vec![Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("done")],
+                    raw: None,
                 }],
                 StopReason::EndTurn,
                 Usage::default(),
@@ -516,6 +518,7 @@ async fn interleaved_json_args_fragments_reassemble_by_step_and_output_index() {
                 vec![Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("done")],
+                    raw: None,
                 }],
                 StopReason::EndTurn,
                 Usage::default(),
