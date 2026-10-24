@@ -2,6 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#4 日志版本、重放确定性与迁移](https://github.com/zibyn/asterpath/issues/4)（范围随 ADR-0003 收缩为 session 日志）
+**修订**: 2026-10-24 — 首个发布前不承担历史数据兼容：`LOG_SCHEMA_VERSION` 固定为 1，不写 upcaster、不维护历史 fixture，持久 payload 不用 `#[serde(default)]` 兼容旧记录；形状变化直接改，开发库删掉重建（沿用 [ADR-0024](0024-durable-waits-only-approval-and-child.md) 的口径）。SQLite DDL 同理只有一个版本。下文的 upcast 链、逐版本 fixture 与兼容性门禁从首个发布版起生效；版本字段与「版本不符即拒绝」现在就保留。
 
 ## Context
 

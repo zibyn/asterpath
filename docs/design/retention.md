@@ -134,7 +134,7 @@ SessionStore::retire(session, F)
 
 ## 8. SQLite 实现
 
-墓碑表在初始 schema（`user_version = 1`）里，v2 迁移保留它：
+墓碑表在初始 schema（`user_version = 1`）里：
 
 ```sql
 CREATE TABLE retired_sessions (

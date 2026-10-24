@@ -170,7 +170,7 @@ fn capability_check_names_the_unsupported_feature() {
 }
 
 #[test]
-fn model_call_aborted_carries_provider_error_info_and_v1_logs_upcast_without_it() {
+fn model_call_aborted_carries_provider_error_info() {
     use asterpath_protocol::{ModelId, ModelSpec, ProviderErrorInfo, StepId, TurnId};
 
     let error = ProviderError::new(ProviderErrorKind::Unsupported, "effort Off on m")
@@ -191,7 +191,7 @@ fn model_call_aborted_carries_provider_error_info_and_v1_logs_upcast_without_it(
         error: Some(ProviderErrorInfo::from(&error)),
     };
     let entry = encode_entry(SessionId::from_bytes([7; 16]), None, &event).unwrap();
-    let mut payload = entry.payload.clone();
+    let payload = entry.payload.clone();
     let log_entry = |payload| asterpath_protocol::LogEntry {
         log_id: asterpath_protocol::LogId::from_i64(1),
         session: entry.session,
@@ -209,18 +209,4 @@ fn model_call_aborted_carries_provider_error_info_and_v1_logs_upcast_without_it(
         payload["ModelCallAborted"]["error"],
         serde_json::json!({"kind": "Unsupported", "message": "effort Off on m", "request_id": "req-1"})
     );
-
-    // A v1 record, written before the field existed, upcasts to `None`.
-    payload["ModelCallAborted"]
-        .as_object_mut()
-        .unwrap()
-        .remove("error");
-    let v1 = asterpath_protocol::LogEntry {
-        schema_version: 1,
-        ..log_entry(payload)
-    };
-    match decode_entry(&v1).unwrap() {
-        SessionEvent::ModelCallAborted { error, .. } => assert_eq!(error, None),
-        other => panic!("unexpected {other:?}"),
-    }
 }

@@ -26,11 +26,9 @@ pub struct RequestConfig {
     pub disable_parallel_tool_use: bool,
     pub sampling: Option<SamplingParams>,
     pub reasoning: Option<ReasoningParams>,
-    #[serde(default)]
     pub stop_sequences: Vec<String>,
     /// Per-provider JSON objects merged into the top level of that provider's
     /// request body; entries for other providers are ignored. Values are host policy.
-    #[serde(default)]
     pub provider_options: BTreeMap<ProviderId, JsonString>,
 }
 

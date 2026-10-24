@@ -34,7 +34,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 /// Physical schema version tracked in `PRAGMA user_version`.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
 
 /// Durability of committed appends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub struct OpenOptions {
     pub synchronous: Synchronous,
 }
 
-const SCHEMA_V1: &str = "
+const SCHEMA: &str = "
 CREATE TABLE sessions (
     session_id  BLOB    PRIMARY KEY,
     parent_id   BLOB,
@@ -75,15 +75,6 @@ CREATE TABLE retired_sessions (
     last_log_id  INTEGER NOT NULL,
     retired_at   INTEGER NOT NULL
 );
-";
-
-/// v2 (ADR-0023): wake discovery folds session facts, so the derived wake
-/// tables go. The log is untouched.
-const MIGRATE_V2: &str = "
-DROP TABLE IF EXISTS open_intents;
-DROP INDEX IF EXISTS timers_due;
-DROP TABLE IF EXISTS timers;
-DROP TABLE IF EXISTS pending_inputs;
 ";
 
 /// Open the database with the production defaults.
@@ -748,7 +739,7 @@ fn acquire_writer_lock(path: &Path) -> Result<WriterLock, StorageError> {
 }
 
 fn migrate(conn: &Connection) -> Result<(), StorageError> {
-    let mut version: i64 = conn
+    let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(backend)?;
     if version > SUPPORTED_SCHEMA_VERSION {
@@ -757,33 +748,15 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
             supported: SUPPORTED_SCHEMA_VERSION,
         });
     }
-    while version < SUPPORTED_SCHEMA_VERSION {
-        match version {
-            0 => migrate_v1(conn)?,
-            1 => migrate_v2(conn)?,
-            _ => {
-                return Err(StorageError::Backend(format!(
-                    "no migration from schema version {version}"
-                )));
-            }
-        }
-        version += 1;
+    // Pre-release: no DDL migrations; a database from an older layout is rebuilt.
+    if version == 0 {
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(SCHEMA).map_err(backend)?;
+        tx.pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
     }
     Ok(())
-}
-
-fn migrate_v1(conn: &Connection) -> Result<(), StorageError> {
-    let tx = conn.unchecked_transaction().map_err(backend)?;
-    tx.execute_batch(SCHEMA_V1).map_err(backend)?;
-    tx.pragma_update(None, "user_version", 1).map_err(backend)?;
-    tx.commit().map_err(backend)
-}
-
-fn migrate_v2(conn: &Connection) -> Result<(), StorageError> {
-    let tx = conn.unchecked_transaction().map_err(backend)?;
-    tx.execute_batch(MIGRATE_V2).map_err(backend)?;
-    tx.pragma_update(None, "user_version", 2).map_err(backend)?;
-    tx.commit().map_err(backend)
 }
 
 type RawEntry = (i64, Vec<u8>, i64, i64, i64, Option<String>, String);

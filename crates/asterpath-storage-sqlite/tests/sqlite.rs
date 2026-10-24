@@ -228,7 +228,7 @@ fn higher_schema_version_is_rejected() {
     }
     match open(&db) {
         Err(StorageError::SchemaTooNew { found, supported }) => {
-            assert_eq!((found, supported), (3, 2));
+            assert_eq!((found, supported), (3, 1));
         }
         Ok(_) => panic!("expected SchemaTooNew, got a successful open"),
         Err(other) => panic!("expected SchemaTooNew, got {other}"),
@@ -443,28 +443,8 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
 }
 
 // ---------------------------------------------------------------------------
-// Migration v1 -> v2: the derived wake tables are dropped (ADR-0023).
+// Physical layout.
 // ---------------------------------------------------------------------------
-
-/// The v1 physical schema as shipped, with its three derived tables.
-const SCHEMA_V1: &str = "
-CREATE TABLE sessions (session_id BLOB PRIMARY KEY, parent_id BLOB, created_at INTEGER NOT NULL);
-CREATE TABLE open_intents (session_id BLOB NOT NULL, kind TEXT NOT NULL, ref_id BLOB NOT NULL,
-    PRIMARY KEY (session_id, kind, ref_id));
-CREATE TABLE log (
-    log_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id BLOB NOT NULL, seq INTEGER NOT NULL,
-    recorded_at INTEGER NOT NULL, schema_version INTEGER NOT NULL, event_kind TEXT NOT NULL,
-    dedup_key TEXT, payload TEXT NOT NULL,
-    UNIQUE (session_id, seq), UNIQUE (session_id, event_kind, dedup_key));
-CREATE TABLE timers (timer_id BLOB PRIMARY KEY, session_id BLOB NOT NULL,
-    deadline INTEGER NOT NULL, fired_at INTEGER);
-CREATE INDEX timers_due ON timers (deadline) WHERE fired_at IS NULL;
-CREATE TABLE pending_inputs (session_id BLOB NOT NULL, input_id BLOB NOT NULL,
-    PRIMARY KEY (session_id, input_id));
-CREATE TABLE retired_sessions (session_id BLOB PRIMARY KEY, parent_id BLOB,
-    last_log_id INTEGER NOT NULL, retired_at INTEGER NOT NULL);
-PRAGMA user_version = 1;
-";
 
 fn tables(conn: &rusqlite::Connection) -> Vec<String> {
     let mut statement = conn
@@ -478,53 +458,7 @@ fn tables(conn: &rusqlite::Connection) -> Vec<String> {
 }
 
 #[test]
-fn a_v1_database_migrates_to_v2_and_keeps_its_log() {
-    let dir = TempDir::new("migrate-v2");
-    let db = dir.db();
-    let target = session(0xd0);
-    let created = serde_json::to_string(&session_created(None)).expect("serialize");
-    {
-        let conn = rusqlite::Connection::open(&db).expect("raw open");
-        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
-        conn.execute(
-            "INSERT INTO log (session_id, seq, recorded_at, schema_version, event_kind, \
-             dedup_key, payload) VALUES (?1, 1, 0, ?2, 'SessionCreated', NULL, ?3)",
-            rusqlite::params![target.as_bytes(), LOG_SCHEMA_VERSION, created],
-        )
-        .expect("v1 log row");
-        conn.execute(
-            "INSERT INTO sessions (session_id, parent_id, created_at) VALUES (?1, NULL, 0)",
-            [target.as_bytes()],
-        )
-        .expect("v1 sessions row");
-        conn.execute(
-            "INSERT INTO pending_inputs (session_id, input_id) VALUES (?1, x'00')",
-            [target.as_bytes()],
-        )
-        .expect("v1 derived row");
-    }
-
-    let storage = open(&db).expect("open migrates");
-    let entries = scan(storage.as_ref(), target);
-    assert_eq!(entries.len(), 1, "the log survives the migration");
-    assert!(entries[0].is_ok());
-    assert_eq!(listed(storage.as_ref(), ParentFilter::Any), vec![target]);
-    drop(storage);
-
-    let conn = rusqlite::Connection::open(&db).expect("raw open");
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("user_version");
-    assert_eq!(version, 2);
-    assert_eq!(
-        tables(&conn),
-        vec!["log", "retired_sessions", "sessions", "sqlite_sequence"],
-        "open_intents, timers and pending_inputs are gone"
-    );
-}
-
-#[test]
-fn a_new_database_is_created_at_v2() {
+fn a_new_database_has_only_the_current_tables() {
     let dir = TempDir::new("fresh-v2");
     let db = dir.db();
     drop(open(&db).expect("open"));

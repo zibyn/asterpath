@@ -118,11 +118,11 @@ fn newer_schema_version_is_rejected() {
 }
 
 #[test]
-fn older_schema_version_goes_through_the_upcast_chain() {
+fn older_schema_version_is_rejected_without_upcasting() {
     let payload = json!({"InputRecorded": {"input": []}});
     let error = decode_entry(&entry(1, 0, payload)).unwrap_err();
     assert!(
-        matches!(error, LogDecodeError::Upcast { from: 0, to: 1, .. }),
+        matches!(error, LogDecodeError::UnsupportedVersion { found: 0, .. }),
         "{error:?}"
     );
 }
@@ -378,17 +378,6 @@ fn config_snapshot_round_trips_through_json() {
     let json = serde_json::to_value(&snapshot).expect("serialize");
     let back: ConfigSnapshot = serde_json::from_value(json).expect("deserialize");
     assert_eq!(back, snapshot);
-}
-
-#[test]
-fn config_snapshot_without_stop_sequences_or_provider_options_decodes_empty() {
-    let mut json = serde_json::to_value(config()).expect("serialize");
-    let request = json["request"].as_object_mut().expect("request object");
-    request.remove("stop_sequences");
-    request.remove("provider_options");
-    let back: ConfigSnapshot = serde_json::from_value(json).expect("old snapshot decodes");
-    assert!(back.request.stop_sequences.is_empty());
-    assert!(back.request.provider_options.is_empty());
 }
 
 #[test]

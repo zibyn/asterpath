@@ -156,7 +156,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F);
 仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 
 - G1：`append` 返回后 `SIGKILL`，重启能读到该条；FULL 下的掉电承诺以 `synchronous=FULL` 配置测试，不在 CI 模拟真实掉电。
-- `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version` 迁移（v1 库打开后升到 v2、三张派生表消失、日志可读）。
+- `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version`（新库只有当前表、更高版本 → `SchemaTooNew`）。
 - G8：退役事务中途失败整体回滚；跨重启的墓碑幂等与残留行（[retention.md](retention.md)）。
 
 in-memory 后端在文档与代码中显式标注 **不满足 G1**；它实现退役，语义与 SQLite 一致（同一把锁内判定、CAS、删除、墓碑）。

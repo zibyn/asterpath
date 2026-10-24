@@ -1,5 +1,6 @@
-//! Compatibility gate for the golden v1 log fixture: every historical version
-//! must keep decoding and projecting to its canonical expected result.
+//! Golden log fixture at the current schema version: it must keep decoding and
+//! projecting to its canonical expected result. Historical-version fixtures
+//! start with the first release (ADR-0004).
 
 use asterpath_protocol::{DedupKey, LogEntry, LogId, SessionId};
 use asterpath_protocol::{LOG_SCHEMA_VERSION, decode_entry, history};
@@ -20,7 +21,7 @@ fn parse_entry(line: &str) -> LogEntry {
 }
 
 #[test]
-fn v1_fixture_decodes_upcasts_and_projects_to_its_canonical_expectation() {
+fn fixture_decodes_and_projects_to_its_canonical_expectation() {
     let fixture = include_str!("fixtures/log/v1/basic_turn.jsonl");
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/log/v1/basic_turn.expected.json"))
@@ -36,7 +37,7 @@ fn v1_fixture_decodes_upcasts_and_projects_to_its_canonical_expectation() {
     for entry in &entries {
         let event = decode_entry(entry).expect("every fixture entry decodes");
         assert_eq!(event.kind(), expected_event_kind(entry));
-        assert!(entry.schema_version <= LOG_SCHEMA_VERSION);
+        assert_eq!(entry.schema_version, LOG_SCHEMA_VERSION);
     }
 
     let history = history(&entries).expect("projection");
@@ -87,8 +88,8 @@ fn current_version_round_trips_written_entries() {
 }
 
 #[test]
-fn v1_messages_without_raw_decode_with_raw_none() {
-    // The v1 fixture predates `Item::Message.raw`.
+fn messages_without_raw_decode_with_raw_none() {
+    // `Item::Message.raw` is omitted when absent.
     let fixture = include_str!("fixtures/log/v1/basic_turn.jsonl");
     let entries: Vec<LogEntry> = fixture
         .lines()

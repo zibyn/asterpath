@@ -113,7 +113,6 @@ pub enum SessionEvent {
         parent_tool_call_id: ToolCallId,
         caused_by: LogId,
         /// Absolute spawn-timeout deadline, written with the spawn record.
-        #[serde(default)]
         deadline: Option<crate::Timestamp>,
     },
     ChildSessionCompleted {

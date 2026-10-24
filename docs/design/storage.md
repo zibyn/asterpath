@@ -94,7 +94,7 @@ pub enum StorageError {
 ## 4. SQLite schema
 
 ```sql
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;
 
 CREATE TABLE sessions (
     session_id  BLOB    PRIMARY KEY,           -- SessionId 的 16 字节
@@ -125,14 +125,14 @@ CREATE TABLE retired_sessions (
 ```
 
 - `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions`。
-- v2 迁移（`migrate_v2`）删除 v1 的 `open_intents`、`timers`（含 `timers_due`）与 `pending_inputs`；`log` 不动，`LOG_SCHEMA_VERSION` 不变。
+- 发布前只有一个 DDL 版本（1），不写迁移；旧布局的开发库删掉重建。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
 - `recorded_at` 由 `append` 分配，不接受调用方传入；只供 trace/审计读取，不参与任何逻辑。
 - 无外键：单写者 + 派生索引，外键只会增加写放大。
-- 物理 DDL 迁移用 `PRAGMA user_version`，前向逐级；打开时发现更高版本 → `SchemaTooNew`。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0004）。
+- 物理 DDL 版本记在 `PRAGMA user_version`：0 → 建表；打开时发现更高版本 → `SchemaTooNew`。逐级前向迁移从首个发布版起才写。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0004）。
 
 ## 5. 写路径与事务边界
 
@@ -185,7 +185,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **没有持久队列、租约或 ack。** 宿主的恢复循环是 `wakeable → open_session → drive`；并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
 - 成本随会话总量线性增长（启动时全量折叠）；会话量大时在 SQLite 模块内部加索引，不改接口。
 - spawn 超时不经存储：截止时间在 `ChildSessionSpawned.deadline` 上，open 的子会话意图已让父会话可唤醒，到期由 spawn 重放处理（[subagents.md](subagents.md) §9）。
-- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（必要时前向迁移）→ 宿主对 `wakeable()` 结果逐个驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
+- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（新库建表）→ 宿主对 `wakeable()` 结果逐个驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
 
 ## 8. 保证清单
 
@@ -217,7 +217,7 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 | 场景 | 归属 |
 | --- | --- |
 | S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；会话目录与退役 | 共享 `session_store_contract`（sqlite 与 memory） |
-| v1 → v2 迁移：三张派生表消失、日志可读 | SQLite crate 单测 |
+| 新库只有当前表；更高 `user_version` → `SchemaTooNew` | SQLite crate 单测 |
 | S13 活会话不判 idle；S18 steering 输入后崩溃仍可唤醒；仅 compaction 未闭合时不可唤醒 | facade `wakeable` 双后端测试；会话事实单测 |
 | S1 `Safe` 工具中 kill、S2 `Unsafe` 工具中 kill、S3 模型流中 kill、S6 父等子时 kill | #6 / #17 的进程级验收；本轮只固定注入点契约 |
 | S9 spawn 超时在停机期间到期 | scheduler 测试（#65） |

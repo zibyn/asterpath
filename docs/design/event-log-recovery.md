@@ -95,7 +95,7 @@ pub enum SessionEvent {
                           config: ConfigSnapshot, context: ContextPolicy,
                           parent_tool_call_id: ToolCallId,
                           caused_by: LogId,
-                          #[serde(default)] deadline: Option<Timestamp> },
+                          deadline: Option<Timestamp> },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
     SignalReceived { signal_id: SignalId, name: SignalName, payload: JsonValue },
 }
