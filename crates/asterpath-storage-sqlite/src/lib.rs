@@ -1,26 +1,35 @@
 //! SQLite backend: one file holds every session, and one module implements
 //! `SessionStore`.
 //!
-//! A single writer connection owns the file: `append` writes the log row and
-//! its `sessions` catalog row in one transaction. The process takes a
-//! non-blocking `flock` at open, so a second process gets `WriterBusy`.
-//! `retire` folds the session facts, writes the tombstone and deletes the
-//! log and catalog row in one immediate transaction.
+//! A dedicated writer thread owns the write connection; `append` and `retire`
+//! are commands on an unbounded queue, answered over a oneshot. The thread
+//! group-commits whatever is already queued (no wait window, at most
+//! `MAX_BATCH`) in one immediate transaction, each command in its own
+//! savepoint, and replies only after `COMMIT`. `append` writes the log row and
+//! its `sessions` catalog row; `retire` folds the session facts, writes the
+//! tombstone and deletes the log and catalog row. Reads run on the caller
+//! over a separate read-only connection, so they never queue behind a fsync.
+//! The process takes a non-blocking `flock` at open, so a second process gets
+//! `WriterBusy`.
 
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::thread::JoinHandle;
 
 use asterpath_protocol::{
     CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter,
     RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
+use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -103,95 +112,391 @@ pub fn open_with_clock(
     configure(&conn, options.synchronous)?;
     let lock = acquire_writer_lock(path)?;
     migrate(&conn)?;
+    let reader = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(backend)?;
+    let (commands, queue) = mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("asterpath-sqlite-writer".to_owned())
+        .spawn(move || run_writer(conn, queue, clock))
+        .map_err(backend)?;
     Ok(Arc::new(SqliteStorage {
-        conn: Mutex::new(conn),
+        writer: Writer {
+            commands: Some(commands),
+            thread: Some(thread),
+        },
+        reader: Mutex::new(reader),
         _lock: lock,
-        clock,
     }))
 }
 
+/// Field order is drop order: the writer drains and joins before the reader
+/// closes, and the `flock` is released last, so a same-process reopen works.
 pub struct SqliteStorage {
-    conn: Mutex<Connection>,
+    writer: Writer,
+    reader: Mutex<Connection>,
     _lock: WriterLock,
-    clock: Arc<dyn Clock>,
+}
+
+/// Most writes group-committed in one transaction.
+const MAX_BATCH: usize = 64;
+
+type WriterJob = Box<dyn FnOnce(&Connection) + Send>;
+
+enum Command {
+    Write(Write),
+    Run(WriterJob),
+}
+
+enum Write {
+    Append {
+        entry: NewEntry,
+        payload: String,
+        reply: oneshot::Sender<Result<LogId, StorageError>>,
+    },
+    Retire {
+        session: SessionId,
+        expected_frontier: LogId,
+        reply: oneshot::Sender<Result<(), RetirementError>>,
+    },
+}
+
+/// A write executed in the batch, waiting for `COMMIT` before its reply.
+enum Done {
+    Append(
+        oneshot::Sender<Result<LogId, StorageError>>,
+        Result<LogId, StorageError>,
+    ),
+    Retire(
+        oneshot::Sender<Result<(), RetirementError>>,
+        Result<(), RetirementError>,
+    ),
+}
+
+impl Done {
+    /// A write that never ran because the transaction did not begin.
+    fn skipped(write: Write) -> Self {
+        match write {
+            Write::Append { reply, .. } => Done::Append(reply, Err(writer_stopped())),
+            Write::Retire { reply, .. } => Done::Retire(reply, Err(writer_stopped().into())),
+        }
+    }
+
+    /// Callers whose future was dropped are gone; their send error is moot.
+    fn reply(self, commit: &Result<(), StorageError>) {
+        match (self, commit) {
+            (Done::Append(reply, result), Ok(())) => drop(reply.send(result)),
+            (Done::Append(reply, _), Err(error)) => drop(reply.send(Err(backend(error)))),
+            (Done::Retire(reply, result), Ok(())) => drop(reply.send(result)),
+            (Done::Retire(reply, _), Err(error)) => drop(reply.send(Err(backend(error).into()))),
+        }
+    }
+}
+
+struct Writer {
+    commands: Option<mpsc::Sender<Command>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Closing the queue ends the thread once it has drained it.
+        drop(self.commands.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn writer_stopped() -> StorageError {
+    StorageError::Backend("sqlite writer stopped".to_owned())
+}
+
+fn run_writer(mut conn: Connection, queue: mpsc::Receiver<Command>, clock: Arc<dyn Clock>) {
+    while let Ok(first) = queue.recv() {
+        let mut batch = match first {
+            Command::Run(job) => {
+                job(&conn);
+                continue;
+            }
+            Command::Write(write) => vec![write],
+        };
+        // Take only what is already queued: no timer, no added latency.
+        let mut after = None;
+        while batch.len() < MAX_BATCH {
+            match queue.try_recv() {
+                Ok(Command::Write(write)) => batch.push(write),
+                Ok(Command::Run(job)) => {
+                    after = Some(job);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        commit_batch(&mut conn, batch, clock.as_ref());
+        if let Some(job) = after {
+            job(&conn);
+        }
+    }
+}
+
+fn commit_batch(conn: &mut Connection, batch: Vec<Write>, clock: &dyn Clock) {
+    let (done, commit): (Vec<_>, _) =
+        match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(mut tx) => {
+                let done = batch
+                    .into_iter()
+                    .map(|write| execute(&mut tx, write, clock))
+                    .collect();
+                (done, tx.commit().map_err(backend))
+            }
+            Err(error) => (
+                batch.into_iter().map(Done::skipped).collect(),
+                Err(backend(error)),
+            ),
+        };
+    for done in done {
+        done.reply(&commit);
+    }
+}
+
+fn execute(tx: &mut Transaction<'_>, write: Write, clock: &dyn Clock) -> Done {
+    match write {
+        Write::Append {
+            entry,
+            payload,
+            reply,
+        } => Done::Append(
+            reply,
+            in_savepoint(tx, |conn| append_in(conn, &entry, payload, clock)),
+        ),
+        Write::Retire {
+            session,
+            expected_frontier,
+            reply,
+        } => Done::Retire(
+            reply,
+            in_savepoint(tx, |conn| {
+                retire_in(conn, session, expected_frontier, clock)
+            }),
+        ),
+    }
+}
+
+/// A failed write rolls back only its own savepoint; the batch goes on.
+fn in_savepoint<T, E: From<StorageError>>(
+    tx: &mut Transaction<'_>,
+    op: impl FnOnce(&Connection) -> Result<T, E>,
+) -> Result<T, E> {
+    let savepoint = tx.savepoint().map_err(backend)?;
+    let value = op(&savepoint)?;
+    savepoint.commit().map_err(backend)?;
+    Ok(value)
+}
+
+fn append_in(
+    tx: &Connection,
+    entry: &NewEntry,
+    payload: String,
+    clock: &dyn Clock,
+) -> Result<LogId, StorageError> {
+    // Decode inside the transaction and before dedup: a bad payload is a
+    // hard error, and the decoded event yields the `event_kind`
+    // discriminator and the catalog row.
+    let event = decode_payload(&entry.payload, entry.schema_version)
+        .map_err(|error| StorageError::InvalidEntry(error.to_string()))?;
+    let kind = event.kind().to_owned();
+
+    if let Some(key) = &entry.dedup_key {
+        let existing = tx
+            .query_row(
+                "SELECT log_id FROM log \
+                     WHERE session_id = ?1 AND event_kind = ?2 AND dedup_key = ?3",
+                params![entry.session.as_bytes(), kind, key.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(log_id) = existing {
+            return Ok(LogId::from_i64(log_id));
+        }
+    }
+
+    let seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM log WHERE session_id = ?1",
+            [entry.session.as_bytes()],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    let recorded_at = clock.now();
+    tx.execute(
+        "INSERT INTO log \
+             (session_id, seq, recorded_at, schema_version, event_kind, dedup_key, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            entry.session.as_bytes(),
+            seq,
+            recorded_at,
+            entry.schema_version,
+            kind,
+            entry.dedup_key.as_ref().map(DedupKey::as_str),
+            payload
+        ],
+    )
+    .map_err(backend)?;
+    let log_id = LogId::from_i64(tx.last_insert_rowid());
+    if let SessionEvent::SessionCreated { parent, .. } = &event {
+        let parent = parent
+            .as_ref()
+            .map(|parent| parent.session.as_bytes().to_vec());
+        tx.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+            params![entry.session.as_bytes(), parent, recorded_at],
+        )
+        .map_err(backend)?;
+    }
+    Ok(log_id)
+}
+
+/// Session retirement; the check order is the contract in retention.md §5.
+fn retire_in(
+    tx: &Connection,
+    session: SessionId,
+    expected_frontier: LogId,
+    clock: &dyn Clock,
+) -> Result<(), RetirementError> {
+    // An existing tombstone is the truth: the log is already gone.
+    let tombstone: Option<i64> = tx
+        .query_row(
+            "SELECT last_log_id FROM retired_sessions WHERE session_id = ?1",
+            [session.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    if let Some(last_log_id) = tombstone {
+        return if last_log_id == expected_frontier.as_i64() {
+            Ok(())
+        } else {
+            Err(RetirementError::FrontierMoved {
+                expected: expected_frontier,
+                actual: Some(LogId::from_i64(last_log_id)),
+            })
+        };
+    }
+
+    let parent: Option<Option<Vec<u8>>> = tx
+        .query_row(
+            "SELECT parent_id FROM sessions WHERE session_id = ?1",
+            [session.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some(parent) = parent else {
+        return Err(RetirementError::NotFound);
+    };
+
+    if !is_idle(tx, session)? {
+        return Err(RetirementError::NotIdle);
+    }
+
+    let actual: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(log_id) FROM log WHERE session_id = ?1",
+            [session.as_bytes()],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if actual != Some(expected_frontier.as_i64()) {
+        return Err(RetirementError::FrontierMoved {
+            expected: expected_frontier,
+            actual: actual.map(LogId::from_i64),
+        });
+    }
+
+    // Live children: a sessions row whose parent is this session and that
+    // has not itself been retired.
+    let children: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.parent_id = ?1 \
+                 AND NOT EXISTS \
+                     (SELECT 1 FROM retired_sessions r WHERE r.session_id = s.session_id))",
+            [session.as_bytes()],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if children != 0 {
+        return Err(RetirementError::HasChildren);
+    }
+
+    if let Some(parent_bytes) = parent.as_deref() {
+        let parent = session_from_blob(parent_bytes.to_vec())?;
+        if !is_idle(tx, parent)? {
+            return Err(RetirementError::ParentNotIdle);
+        }
+    }
+
+    let retired_at = clock.now();
+    tx.execute(
+        "INSERT INTO retired_sessions (session_id, parent_id, last_log_id, retired_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+        params![
+            session.as_bytes(),
+            parent.as_deref(),
+            expected_frontier.as_i64(),
+            retired_at
+        ],
+    )
+    .map_err(backend)?;
+    tx.execute(
+        "DELETE FROM log WHERE session_id = ?1",
+        [session.as_bytes()],
+    )
+    .map_err(backend)?;
+    tx.execute(
+        "DELETE FROM sessions WHERE session_id = ?1",
+        [session.as_bytes()],
+    )
+    .map_err(backend)?;
+    Ok(())
 }
 
 impl SqliteStorage {
-    fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn append_sync(&self, entry: NewEntry) -> Result<LogId, StorageError> {
-        let payload = serde_json::to_string(&entry.payload).map_err(backend)?;
+    fn send(&self, write: Write) -> Result<(), StorageError> {
+        self.writer
+            .commands
+            .as_ref()
+            .ok_or_else(writer_stopped)?
+            .send(Command::Write(write))
+            .map_err(|_| writer_stopped())
+    }
 
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
-
-        // Decode inside the transaction and before dedup: a bad payload is a
-        // hard error, and the decoded event yields the `event_kind`
-        // discriminator and the catalog row.
-        let event = decode_payload(&entry.payload, entry.schema_version)
-            .map_err(|error| StorageError::InvalidEntry(error.to_string()))?;
-        let kind = event.kind().to_owned();
-
-        if let Some(key) = &entry.dedup_key {
-            let existing = tx
-                .query_row(
-                    "SELECT log_id FROM log \
-                     WHERE session_id = ?1 AND event_kind = ?2 AND dedup_key = ?3",
-                    params![entry.session.as_bytes(), kind, key.as_str()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(backend)?;
-            if let Some(log_id) = existing {
-                return Ok(LogId::from_i64(log_id));
-            }
-        }
-
-        let seq: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM log WHERE session_id = ?1",
-                [entry.session.as_bytes()],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        let recorded_at = self.clock.now();
-        tx.execute(
-            "INSERT INTO log \
-             (session_id, seq, recorded_at, schema_version, event_kind, dedup_key, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                entry.session.as_bytes(),
-                seq,
-                recorded_at,
-                entry.schema_version,
-                kind,
-                entry.dedup_key.as_ref().map(DedupKey::as_str),
-                payload
-            ],
-        )
-        .map_err(backend)?;
-        let log_id = LogId::from_i64(tx.last_insert_rowid());
-        if let SessionEvent::SessionCreated { parent, .. } = &event {
-            let parent = parent
-                .as_ref()
-                .map(|parent| parent.session.as_bytes().to_vec());
-            tx.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, parent_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
-                params![entry.session.as_bytes(), parent, recorded_at],
-            )
-            .map_err(backend)?;
-        }
-        tx.commit().map_err(backend)?;
-        Ok(log_id)
+    /// Test seam: run `job` on the writer thread between batches (inspect
+    /// the write connection, park the writer, or crash it).
+    #[doc(hidden)]
+    pub fn run_on_writer(
+        &self,
+        job: impl FnOnce(&Connection) + Send + 'static,
+    ) -> Result<(), StorageError> {
+        self.writer
+            .commands
+            .as_ref()
+            .ok_or_else(writer_stopped)?
+            .send(Command::Run(Box::new(job)))
+            .map_err(|_| writer_stopped())
     }
 
     fn scan_sync(&self, query: LogQuery) -> Vec<Result<LogEntry, StorageError>> {
-        let conn = self.conn();
+        let conn = self.reader();
         let limit = query.limit.map(|limit| limit as i64).unwrap_or(-1);
         let after = query.after.map(LogId::as_i64).unwrap_or(0);
         let mut statement = match conn.prepare(
@@ -236,7 +541,7 @@ impl SqliteStorage {
     }
 
     fn frontier_sync(&self, session: SessionId) -> Result<Option<LogId>, StorageError> {
-        let conn = self.conn();
+        let conn = self.reader();
         let frontier: Option<i64> = conn
             .query_row(
                 "SELECT MAX(log_id) FROM log WHERE session_id = ?1 \
@@ -246,115 +551,6 @@ impl SqliteStorage {
             )
             .map_err(backend)?;
         Ok(frontier.map(LogId::from_i64))
-    }
-
-    /// Session retirement; the check order is the contract in retention.md §5.
-    fn retire_sync(
-        &self,
-        session: SessionId,
-        expected_frontier: LogId,
-    ) -> Result<(), RetirementError> {
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
-
-        // An existing tombstone is the truth: the log is already gone.
-        let tombstone: Option<i64> = tx
-            .query_row(
-                "SELECT last_log_id FROM retired_sessions WHERE session_id = ?1",
-                [session.as_bytes()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        if let Some(last_log_id) = tombstone {
-            return if last_log_id == expected_frontier.as_i64() {
-                Ok(())
-            } else {
-                Err(RetirementError::FrontierMoved {
-                    expected: expected_frontier,
-                    actual: Some(LogId::from_i64(last_log_id)),
-                })
-            };
-        }
-
-        let parent: Option<Option<Vec<u8>>> = tx
-            .query_row(
-                "SELECT parent_id FROM sessions WHERE session_id = ?1",
-                [session.as_bytes()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        let Some(parent) = parent else {
-            return Err(RetirementError::NotFound);
-        };
-
-        if !is_idle(&tx, session)? {
-            return Err(RetirementError::NotIdle);
-        }
-
-        let actual: Option<i64> = tx
-            .query_row(
-                "SELECT MAX(log_id) FROM log WHERE session_id = ?1",
-                [session.as_bytes()],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        if actual != Some(expected_frontier.as_i64()) {
-            return Err(RetirementError::FrontierMoved {
-                expected: expected_frontier,
-                actual: actual.map(LogId::from_i64),
-            });
-        }
-
-        // Live children: a sessions row whose parent is this session and that
-        // has not itself been retired.
-        let children: i64 = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.parent_id = ?1 \
-                 AND NOT EXISTS \
-                     (SELECT 1 FROM retired_sessions r WHERE r.session_id = s.session_id))",
-                [session.as_bytes()],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        if children != 0 {
-            return Err(RetirementError::HasChildren);
-        }
-
-        if let Some(parent_bytes) = parent.as_deref() {
-            let parent = session_from_blob(parent_bytes.to_vec())?;
-            if !is_idle(&tx, parent)? {
-                return Err(RetirementError::ParentNotIdle);
-            }
-        }
-
-        let retired_at = self.clock.now();
-        tx.execute(
-            "INSERT INTO retired_sessions (session_id, parent_id, last_log_id, retired_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                session.as_bytes(),
-                parent.as_deref(),
-                expected_frontier.as_i64(),
-                retired_at
-            ],
-        )
-        .map_err(backend)?;
-        tx.execute(
-            "DELETE FROM log WHERE session_id = ?1",
-            [session.as_bytes()],
-        )
-        .map_err(backend)?;
-        tx.execute(
-            "DELETE FROM sessions WHERE session_id = ?1",
-            [session.as_bytes()],
-        )
-        .map_err(backend)?;
-        tx.commit().map_err(backend)?;
-        Ok(())
     }
 
     /// `last_activity` reads the last row through the `(session_id, seq)`
@@ -370,7 +566,7 @@ impl SqliteStorage {
         let limit = query
             .limit
             .map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
-        let conn = self.conn();
+        let conn = self.reader();
         let mut statement = conn
             .prepare(
                 "SELECT s.session_id, s.parent_id, s.created_at, \
@@ -410,7 +606,7 @@ impl SqliteStorage {
     }
 
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
-        let conn = self.conn();
+        let conn = self.reader();
         let parent: Option<Option<Vec<u8>>> = conn
             .query_row(
                 "SELECT parent_id FROM sessions WHERE session_id = ?1 \
@@ -429,7 +625,16 @@ impl SqliteStorage {
 
 impl SessionStore for SqliteStorage {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
-        Box::pin(async move { self.append_sync(entry) })
+        Box::pin(async move {
+            let payload = serde_json::to_string(&entry.payload).map_err(backend)?;
+            let (reply, response) = oneshot::channel();
+            self.send(Write::Append {
+                entry,
+                payload,
+                reply,
+            })?;
+            response.await.unwrap_or_else(|_| Err(writer_stopped()))
+        })
     }
 
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
@@ -456,7 +661,17 @@ impl SessionStore for SqliteStorage {
         session: SessionId,
         expected_frontier: LogId,
     ) -> BoxFuture<'_, Result<(), RetirementError>> {
-        Box::pin(async move { self.retire_sync(session, expected_frontier) })
+        Box::pin(async move {
+            let (reply, response) = oneshot::channel();
+            self.send(Write::Retire {
+                session,
+                expected_frontier,
+                reply,
+            })?;
+            response
+                .await
+                .unwrap_or_else(|_| Err(writer_stopped().into()))
+        })
     }
 }
 
@@ -612,7 +827,7 @@ fn session_from_blob(bytes: Vec<u8>) -> Result<SessionId, StorageError> {
 
 /// Session facts over the session's committed log, read inside `tx`
 /// (storage.md §5): idle is the absence of a non-compaction open intent.
-fn is_idle(tx: &Transaction<'_>, session: SessionId) -> Result<bool, StorageError> {
+fn is_idle(tx: &Connection, session: SessionId) -> Result<bool, StorageError> {
     let mut statement = tx
         .prepare(
             "SELECT log_id, session_id, seq, recorded_at, schema_version, dedup_key, payload \
@@ -668,21 +883,42 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create temp dir");
             let path = dir.join("db.sqlite");
             let storage = open_with(&path, options).expect("open");
-            {
-                let conn = storage.conn();
-                let journal: String = conn
-                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                    .expect("journal_mode");
-                assert_eq!(journal.to_lowercase(), "wal");
-                let synchronous: i64 = conn
-                    .query_row("PRAGMA synchronous", [], |row| row.get(0))
-                    .expect("synchronous");
-                assert_eq!(synchronous, expected_synchronous);
-                let busy_timeout: i64 = conn
-                    .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-                    .expect("busy_timeout");
-                assert_eq!(busy_timeout, 0);
-            }
+            let (sender, pragmas) = std::sync::mpsc::channel();
+            storage
+                .run_on_writer(move |conn| {
+                    let pragma = |name: &str| -> String {
+                        conn.query_row(&format!("PRAGMA {name}"), [], |row| {
+                            row.get::<_, rusqlite::types::Value>(0)
+                        })
+                        .map(|value| format!("{value:?}"))
+                        .expect("pragma")
+                    };
+                    sender
+                        .send((
+                            pragma("journal_mode"),
+                            pragma("synchronous"),
+                            pragma("busy_timeout"),
+                            conn.is_readonly(rusqlite::MAIN_DB).expect("readonly"),
+                        ))
+                        .expect("send pragmas");
+                })
+                .expect("run on writer");
+            assert_eq!(
+                pragmas.recv().expect("writer pragmas"),
+                (
+                    "Text(\"wal\")".to_owned(),
+                    format!("Integer({expected_synchronous})"),
+                    "Integer(0)".to_owned(),
+                    false,
+                )
+            );
+            assert!(
+                storage
+                    .reader()
+                    .is_readonly(rusqlite::MAIN_DB)
+                    .expect("readonly"),
+                "reads use a read-only connection"
+            );
             drop(storage);
             std::fs::remove_dir_all(&dir).ok();
         }

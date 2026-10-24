@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 asterpath-protocol = { path = "../asterpath-protocol" }
+futures-channel = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
 libc = "0.2"

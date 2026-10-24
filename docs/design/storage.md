@@ -14,7 +14,7 @@
 - **信封强类型列 + `payload` JSON。** `SessionEvent` 不拆成 typed columns；upcast 继续在读取时对 `Value` 做（ADR-0004）。
 - **`journal_mode=WAL` + `synchronous=FULL` 为默认。** `NORMAL` 只作为显式配置项，供测试/开发用。
 - **写者是进程独占的。** `flock` 写者锁在打开时非阻塞获取，进程死亡由 OS 释放；不续约、不过期。第二个进程打开即 `WriterBusy`。
-- **一条日志记录 = 一个事务。** 不做多记录批量事务；`seq` 在事务内用 `MAX(seq)+1` 分配。
+- **一条日志记录 = 一个 savepoint；同时排队的记录 group commit 进一个事务**（#97）。不设等待窗口；`seq` 在事务内用 `MAX(seq)+1` 分配，同批内的查重与 `seq` 看得到同批前面的记录，结果与逐条提交一致。
 - **只有会话目录 `sessions` 在 `append` 内同一事务维护**：它是日志的派生索引，不是真相源。唤醒与空闲不物化，由会话事实（protocol 的 `SessionFacts`）按需折叠。
 - **`idle` 是未闭合意图的谓词，不是缓存列。** `sessions` 没有 `state`；存在任一非 compaction 的 open intent 即非 `idle`。退役、唤醒与恢复共用同一个折叠（[event-log-recovery.md](event-log-recovery.md) §6）。
 - **没有 torn tail 修复。** SQLite 提交原子；解码失败一律硬错误。
@@ -162,7 +162,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 
 | 写入 | 事务 |
 | --- | --- |
-| 任意一条日志记录 + 其 `sessions` 行 | 一个事务，提交后返回 |
+| 任意一条日志记录 + 其 `sessions` 行 | 一个 savepoint，与同时排队的写入 group commit 进一个事务；`COMMIT` 后才返回 |
 | 子会话终态（子流）与 `ChildSessionCompleted`（父流） | 两个事务，不跨流；靠幂等键修复 |
 | 取消 | 就是一条终态记录（`TurnCommitted{Cancelled}` 或 `ToolResult`），无额外事务 |
 | `ToolCallRequested` → 调用工具 | append 提交返回后才调用 |
@@ -174,7 +174,8 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - 写者锁：`<db>.lock` 上非阻塞 `flock(2)`，进程生命周期持有；拿不到 → `WriterBusy`。不另设租约表。
 - 不允许多进程共享同一 DB；只读外部连接不在契约内。
 - `busy_timeout=0`：任何 `SQLITE_BUSY` 立即以 `Backend` 暴露，不静默等待。
-- 连接模型：一个 `Mutex<Connection>`，所有操作经 `spawn_blocking`。ops 串行化；扫描长到阻塞写路径时，再升级为 writer 线程 + WAL 只读连接（模块内优化，不动 trait）。
+- 连接模型（#97）：写连接归一个专用 writer 线程；`append` / `retire` 经无界命令队列发给它，用 oneshot 回复。线程取到一条命令后把已排队的命令取完（单批上限 64），放进一个 `BEGIN IMMEDIATE` 事务，每条命令一个 `SAVEPOINT`：单条失败只回滚该条、只给该调用方回错误；`COMMIT` 成功后才回复，`COMMIT` 失败则整批都收到错误。读（`scan` / `frontier` / `sessions` / `parent`）走一条独立只读连接，在调用方同步执行，不排在 fsync 后面；append 返回后立即读必能读到。writer 线程停止后，在途与后续写都得到 `Backend`。drop 时先关队列、join 线程，最后释放 `flock`。
+- **取消语义**：append 请求一旦发出，丢弃其 future 不会撤回写入——记录**可能已提交**而调用方不知道 `log_id`。状态以日志折叠为准：引擎在 select 中途放弃 drive、取消宽限期丢弃 future 的路径之后都会重读日志。
 - 文件创建时权限 `0600`。
 - 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档的 seam 见 [retention.md](retention.md)。删除释放页供复用，不保证文件缩小。
 
