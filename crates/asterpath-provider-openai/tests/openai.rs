@@ -60,6 +60,8 @@ fn request(items: Vec<Item>) -> ModelRequest {
         sampling: None,
         max_output_tokens: 128,
         reasoning: None,
+        stop_sequences: Vec::new(),
+        provider_options: Default::default(),
     }
 }
 
@@ -1378,4 +1380,65 @@ async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
     let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
     let events = collect(&self::provider(&server), with_effort("gpt-next", High)).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
+}
+
+#[tokio::test]
+async fn same_provider_options_merge_into_the_top_level_body() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let mut request = request(vec![user_text("hello")]);
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":"session-1","service_tier":"flex"}"#),
+    );
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"metadata":{"user_id":"u-1"}}"#),
+    );
+    let events = collect(&provider(&server), request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(body["prompt_cache_key"], json!("session-1"));
+    assert_eq!(body["service_tier"], json!("flex"));
+    assert!(body.get("metadata").is_none(), "other provider ignored");
+    assert_eq!(body["store"], json!(false));
+}
+
+#[tokio::test]
+async fn bad_provider_options_and_stop_sequences_fail_before_http() {
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    let with_options = |options: &str| {
+        let mut request = request(vec![user_text("go")]);
+        request
+            .provider_options
+            .insert(ProviderId::new("openai"), JsonString::new(options));
+        request
+    };
+    let mut stop = request(vec![user_text("go")]);
+    stop.stop_sequences = vec!["END".to_owned()];
+
+    for (request, kind) in [
+        (
+            with_options(r#"{"store":true}"#),
+            ProviderErrorKind::Unsupported,
+        ),
+        (
+            with_options(r#"{"input":[]}"#),
+            ProviderErrorKind::Unsupported,
+        ),
+        (
+            with_options(r#"{"reasoning":{}}"#),
+            ProviderErrorKind::Unsupported,
+        ),
+        (with_options(r#""flex""#), ProviderErrorKind::InvalidRequest),
+        (stop, ProviderErrorKind::Unsupported),
+    ] {
+        let events = collect(&provider, request).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let error = events[0].as_ref().expect_err("rejected");
+        assert_eq!(error.kind, kind, "{error:?}");
+        assert!(!error.retryable);
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
 }

@@ -381,6 +381,32 @@ fn config_snapshot_round_trips_through_json() {
 }
 
 #[test]
+fn config_snapshot_without_stop_sequences_or_provider_options_decodes_empty() {
+    let mut json = serde_json::to_value(config()).expect("serialize");
+    let request = json["request"].as_object_mut().expect("request object");
+    request.remove("stop_sequences");
+    request.remove("provider_options");
+    let back: ConfigSnapshot = serde_json::from_value(json).expect("old snapshot decodes");
+    assert!(back.request.stop_sequences.is_empty());
+    assert!(back.request.provider_options.is_empty());
+}
+
+#[test]
+fn model_request_copies_stop_sequences_and_provider_options() {
+    let mut request = RequestConfig {
+        stop_sequences: vec!["END".to_owned()],
+        ..RequestConfig::default()
+    };
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"service_tier":"flex"}"#),
+    );
+    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], &request);
+    assert_eq!(model_request.stop_sequences, request.stop_sequences);
+    assert_eq!(model_request.provider_options, request.provider_options);
+}
+
+#[test]
 fn usage_totals_use_the_exclusive_rule() {
     let usage = Usage {
         input: InputTokens {

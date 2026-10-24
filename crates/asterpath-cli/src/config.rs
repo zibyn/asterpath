@@ -626,6 +626,7 @@ impl FileConfig {
                     summary: reasoning.summary.unwrap_or(false),
                 })
             },
+            ..default
         })
     }
 

@@ -981,3 +981,71 @@ async fn breakpoint_skips_replayed_raw_blocks_and_leaves_them_byte_identical() {
     assert!(recorded[1].body.contains(raw), "{}", recorded[1].body);
     assert_eq!(breakpoints(&recorded[1].json_body()), 0);
 }
+
+#[tokio::test]
+async fn renders_stop_sequences_and_same_provider_options_at_top_level() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.stop_sequences = vec!["END".to_owned(), "\n\nHuman:".to_owned()];
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"service_tier":"standard_only","metadata":{"user_id":"u-1"}}"#),
+    );
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":"k"}"#),
+    );
+
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["stop_sequences"],
+        serde_json::json!(["END", "\n\nHuman:"])
+    );
+    assert_eq!(body["service_tier"], "standard_only");
+    assert_eq!(body["metadata"], serde_json::json!({"user_id": "u-1"}));
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "other provider ignored"
+    );
+}
+
+#[tokio::test]
+async fn empty_stop_sequences_are_not_sent() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    drain(&provider(&server), base_request()).await;
+    assert!(
+        server.requests()[0]
+            .json_body()
+            .get("stop_sequences")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn provider_options_conflicting_or_non_object_fail_before_http() {
+    let server = MockServer::start(Vec::new());
+    for (options, kind) in [
+        (r#"{"model":"other"}"#, ProviderErrorKind::Unsupported),
+        (r#"{"messages":[]}"#, ProviderErrorKind::Unsupported),
+        (
+            r#"{"thinking":{"type":"adaptive"}}"#,
+            ProviderErrorKind::Unsupported,
+        ),
+        (
+            r#"{"stop_sequences":["x"]}"#,
+            ProviderErrorKind::Unsupported,
+        ),
+        (r#"["service_tier"]"#, ProviderErrorKind::InvalidRequest),
+        ("not json", ProviderErrorKind::InvalidRequest),
+    ] {
+        let mut request = base_request();
+        request
+            .provider_options
+            .insert(ProviderId::new("anthropic"), JsonString::new(options));
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, kind, "{options}: {error:?}");
+        assert!(!error.retryable);
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
