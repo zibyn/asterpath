@@ -26,6 +26,8 @@ const READ_ONLY_FLAGS: [&str; 8] = [
     "/dev",
     "--proc",
     "/proc",
+    // Never add `--new-session` without `--unshare-pid`: bash's killpg on the
+    // bwrap process group would no longer reach anything inside.
     "--die-with-parent",
 ];
 
