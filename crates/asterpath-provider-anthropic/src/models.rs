@@ -20,11 +20,14 @@
 //! (`claude-opus-5`). Ids no row matches get [`LATEST`], so a new model works
 //! without a row as long as it follows the newest rules.
 
+use std::borrow::Cow;
+
 use asterpath_protocol::ReasoningEffort::{self, High, Low, Max, Medium, Off, XHigh};
 
 /// Which `thinking.type` values a model accepts for reasoning requests.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Thinking {
+pub enum Thinking {
     /// Only `enabled` + `budget_tokens` (4.5 and earlier).
     Extended,
     /// Both; `enabled` is deprecated (4.6).
@@ -33,12 +36,19 @@ pub(crate) enum Thinking {
     Adaptive,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModelRules {
+/// The request rules for one model behind one provider instance.
+///
+/// The adapter's built-in table covers official model ids; hosts inject
+/// profiles for other endpoints with
+/// [`AnthropicProvider::with_default_profile`](crate::AnthropicProvider::with_default_profile)
+/// and [`with_model_profile`](crate::AnthropicProvider::with_model_profile).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnthropicModelProfile {
     pub thinking: Thinking,
     /// Accepted `ReasoningEffort` levels; every one but `Off` is sent as
     /// `output_config.effort`.
-    pub efforts: &'static [ReasoningEffort],
+    pub efforts: Cow<'static, [ReasoningEffort]>,
     /// Thinking runs when `thinking` is omitted, so `Off` must send `disabled`.
     pub thinking_default_on: bool,
     /// Accepts `tool_choice` `any` / `tool`.
@@ -47,9 +57,44 @@ pub(crate) struct ModelRules {
     pub sampling: bool,
 }
 
-impl ModelRules {
+impl AnthropicModelProfile {
+    /// The rules unrecognized model ids get: the newest generation's.
+    pub fn latest() -> Self {
+        LATEST
+    }
+
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    #[must_use]
+    pub fn with_efforts(mut self, efforts: impl Into<Cow<'static, [ReasoningEffort]>>) -> Self {
+        self.efforts = efforts.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_thinking_default_on(mut self, on: bool) -> Self {
+        self.thinking_default_on = on;
+        self
+    }
+
+    #[must_use]
+    pub fn with_forced_tool_choice(mut self, forced: bool) -> Self {
+        self.forced_tool_choice = forced;
+        self
+    }
+
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: bool) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
-    pub fn thinking_display(self) -> bool {
+    pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
     }
 }
@@ -59,10 +104,10 @@ const fn rules(
     efforts: &'static [ReasoningEffort],
     forced: bool,
     sampling: bool,
-) -> ModelRules {
-    ModelRules {
+) -> AnthropicModelProfile {
+    AnthropicModelProfile {
         thinking,
-        efforts,
+        efforts: Cow::Borrowed(efforts),
         thinking_default_on: false,
         forced_tool_choice: forced,
         sampling,
@@ -74,23 +119,27 @@ const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1 and unrecognized ids.
-pub(crate) const LATEST: ModelRules = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
+const LATEST: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
 /// Opus 5, Sonnet 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
-const ADAPTIVE: ModelRules = ModelRules {
+const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
+    thinking: Thinking::Adaptive,
+    efforts: Cow::Borrowed(OFF_TO_MAX),
     thinking_default_on: true,
-    ..rules(Thinking::Adaptive, OFF_TO_MAX, true, false)
+    forced_tool_choice: true,
+    sampling: false,
 };
 /// Fable 5 and Mythos 5: thinking is always on.
-const ALWAYS_ON: ModelRules = rules(Thinking::Adaptive, LOW_TO_MAX, true, false);
+const ALWAYS_ON: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, true, false);
 /// Opus 4.7 / 4.8: thinking is off by default.
-const ADAPTIVE_OFF: ModelRules = rules(Thinking::Adaptive, OFF_TO_MAX, true, false);
-const MYTHOS_PREVIEW: ModelRules = rules(Thinking::Both, NO_XHIGH, true, true);
-const BOTH: ModelRules = rules(Thinking::Both, &[Off, Low, Medium, High, Max], true, true);
-const EXTENDED: ModelRules = rules(Thinking::Extended, &[Off], true, true);
-const EXTENDED_EFFORT: ModelRules =
+const ADAPTIVE_OFF: AnthropicModelProfile = rules(Thinking::Adaptive, OFF_TO_MAX, true, false);
+const MYTHOS_PREVIEW: AnthropicModelProfile = rules(Thinking::Both, NO_XHIGH, true, true);
+const BOTH: AnthropicModelProfile =
+    rules(Thinking::Both, &[Off, Low, Medium, High, Max], true, true);
+const EXTENDED: AnthropicModelProfile = rules(Thinking::Extended, &[Off], true, true);
+const EXTENDED_EFFORT: AnthropicModelProfile =
     rules(Thinking::Extended, &[Off, Low, Medium, High], true, true);
 
-const TABLE: &[(&str, ModelRules)] = &[
+static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-opus-5-5", LATEST),
     ("claude-sonnet-5-5", LATEST),
     ("claude-fable-5-1", LATEST),
@@ -113,11 +162,28 @@ const TABLE: &[(&str, ModelRules)] = &[
     ("claude-3", EXTENDED),
 ];
 
-pub(crate) fn rules_for(model: &str) -> ModelRules {
+static LATEST_PROFILE: AnthropicModelProfile = LATEST;
+
+/// Host model entries (first prefix match wins), then the host default, then
+/// the built-in table, then [`LATEST`].
+pub(crate) fn profile_for<'a>(
+    models: &'a [(String, AnthropicModelProfile)],
+    default: Option<&'a AnthropicModelProfile>,
+    model: &str,
+) -> &'a AnthropicModelProfile {
+    models
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix.as_str()))
+        .map(|(_, profile)| profile)
+        .or(default)
+        .unwrap_or_else(|| builtin(model))
+}
+
+fn builtin(model: &str) -> &'static AnthropicModelProfile {
     TABLE
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
-        .map_or(LATEST, |(_, rules)| *rules)
+        .map_or(&LATEST_PROFILE, |(_, profile)| profile)
 }
 
 #[cfg(test)]
@@ -126,24 +192,24 @@ mod tests {
 
     #[test]
     fn specific_ids_win_over_their_prefixes() {
-        assert_eq!(rules_for("claude-opus-5-5"), LATEST);
-        assert_eq!(rules_for("claude-opus-5"), ADAPTIVE);
-        assert_eq!(rules_for("claude-opus-4-6"), BOTH);
-        assert_eq!(rules_for("claude-opus-4-5-20251101"), EXTENDED_EFFORT);
-        assert_eq!(rules_for("claude-opus-4-1-20250805"), EXTENDED);
-        assert_eq!(rules_for("claude-sonnet-4-20250514"), EXTENDED);
-        assert_eq!(rules_for("claude-next"), LATEST);
+        assert_eq!(*builtin("claude-opus-5-5"), LATEST);
+        assert_eq!(*builtin("claude-opus-5"), ADAPTIVE);
+        assert_eq!(*builtin("claude-opus-4-6"), BOTH);
+        assert_eq!(*builtin("claude-opus-4-5-20251101"), EXTENDED_EFFORT);
+        assert_eq!(*builtin("claude-opus-4-1-20250805"), EXTENDED);
+        assert_eq!(*builtin("claude-sonnet-4-20250514"), EXTENDED);
+        assert_eq!(*builtin("claude-next"), LATEST);
     }
 
     #[test]
     fn mythos_preview_accepts_both_thinking_types() {
-        assert_eq!(rules_for("claude-mythos-preview").thinking, Thinking::Both);
+        assert_eq!(builtin("claude-mythos-preview").thinking, Thinking::Both);
     }
 
     #[test]
     fn display_is_sent_only_from_4_6_on() {
-        assert!(rules_for("claude-opus-5-5").thinking_display());
-        assert!(rules_for("claude-sonnet-4-6").thinking_display());
-        assert!(!rules_for("claude-sonnet-4-5").thinking_display());
+        assert!(builtin("claude-opus-5-5").thinking_display());
+        assert!(builtin("claude-sonnet-4-6").thinking_display());
+        assert!(!builtin("claude-sonnet-4-5").thinking_display());
     }
 }

@@ -25,6 +25,7 @@ use asterpath_protocol::{
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+pub use models::OpenAiModelProfile;
 pub use render::TraceMark;
 use wire::WireContext;
 
@@ -44,6 +45,8 @@ pub struct OpenAiProvider {
     base_url: String,
     id: ProviderId,
     trace: Option<Arc<dyn TraceSink>>,
+    default_profile: Option<OpenAiModelProfile>,
+    model_profiles: Vec<(String, OpenAiModelProfile)>,
 }
 
 impl OpenAiProvider {
@@ -55,7 +58,44 @@ impl OpenAiProvider {
             base_url: "https://api.openai.com/v1".to_owned(),
             id: ProviderId::new("openai"),
             trace: None,
+            default_profile: None,
+            model_profiles: Vec::new(),
         }
+    }
+
+    /// Name this instance (one per vendor endpoint); raw and reasoning
+    /// replay is gated by it.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = ProviderId::new(id);
+        self
+    }
+
+    /// The rules for every model no [`Self::with_model_profile`] entry matches.
+    #[must_use]
+    pub fn with_default_profile(mut self, profile: OpenAiModelProfile) -> Self {
+        self.default_profile = Some(profile);
+        self
+    }
+
+    /// The rules for model ids starting with `prefix`; the first registered
+    /// match wins, and an entry overrides the built-in table.
+    #[must_use]
+    pub fn with_model_profile(
+        mut self,
+        prefix: impl Into<String>,
+        profile: OpenAiModelProfile,
+    ) -> Self {
+        self.model_profiles.push((prefix.into(), profile));
+        self
+    }
+
+    fn profile(&self, spec: &ModelSpec) -> &OpenAiModelProfile {
+        models::profile_for(
+            &self.model_profiles,
+            self.default_profile.as_ref(),
+            spec.model.as_str(),
+        )
     }
 
     #[must_use]
@@ -89,11 +129,12 @@ impl Provider for OpenAiProvider {
         self.id.clone()
     }
 
-    fn capabilities(&self, _spec: &ModelSpec) -> ProviderCapabilities {
+    fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities {
+        let profile = self.profile(spec);
         ProviderCapabilities {
             server_state: false,
-            forced_tool_choice: true,
-            sampling: true,
+            forced_tool_choice: profile.forced_tool_choice,
+            sampling: profile.sampling,
             reasoning_roundtrip: true,
             citations: false,
             // Only `function` tools are rendered today.
@@ -106,7 +147,14 @@ impl Provider for OpenAiProvider {
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let capabilities = self.capabilities(&request.spec);
-        let rendered = render::render(&request, &self.id, capabilities, self.trace.as_deref());
+        let efforts = &self.profile(&request.spec).efforts;
+        let rendered = render::render(
+            &request,
+            &self.id,
+            capabilities,
+            efforts,
+            self.trace.as_deref(),
+        );
         let body = match rendered {
             Ok(rendered) => rendered,
             Err(error) => return stream::once(async move { Err(error) }).boxed(),
@@ -128,7 +176,8 @@ impl Provider for OpenAiProvider {
             tools_hash: asterpath_protocol::tools_hash(&request.tools),
         };
 
-        stream::once(async move { connect(send).await })
+        let provider = self.id.clone();
+        stream::once(async move { connect(send, provider).await })
             .flat_map(move |result| match result {
                 Ok(response) => wire::stream(response, context.clone()),
                 Err(error) => stream::once(async move { Err(error) }).boxed(),
@@ -139,12 +188,13 @@ impl Provider for OpenAiProvider {
 
 async fn connect(
     send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    provider: ProviderId,
 ) -> Result<reqwest::Response, ProviderError> {
     let response = send.await.map_err(transport_error)?;
     if response.status().is_success() {
         return Ok(response);
     }
-    Err(http_error(response).await)
+    Err(http_error(response, provider).await)
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
@@ -156,7 +206,7 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     ProviderError::new(kind, error.to_string())
 }
 
-async fn http_error(response: reqwest::Response) -> ProviderError {
+async fn http_error(response: reqwest::Response, provider: ProviderId) -> ProviderError {
     let status = response.status();
     let request_id = asterpath_http::request_id(response.headers());
     let retry_after = asterpath_http::retry_after(response.headers());
@@ -183,7 +233,7 @@ async fn http_error(response: reqwest::Response) -> ProviderError {
     error.request_id = request_id;
     if !body.is_empty() {
         error.raw = Some(asterpath_protocol::RawProviderData {
-            provider: ProviderId::new("openai"),
+            provider,
             model: None,
             kind: "openai.error".to_owned(),
             json: asterpath_protocol::JsonString::new(body),

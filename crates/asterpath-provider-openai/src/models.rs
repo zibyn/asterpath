@@ -10,44 +10,112 @@
 //! and `gpt-5` last of the GPT-5 family. Ids no row matches get [`LATEST`], so
 //! a new model works without a row as long as it follows the newest rules.
 
+use std::borrow::Cow;
+
 use asterpath_protocol::ReasoningEffort::{self, High, Low, Max, Medium, Minimal, Off, XHigh};
 
+/// The request rules for one model behind one provider instance.
+///
+/// The adapter's built-in table covers official model ids; hosts inject
+/// profiles for other endpoints with
+/// [`OpenAiProvider::with_default_profile`](crate::OpenAiProvider::with_default_profile)
+/// and [`with_model_profile`](crate::OpenAiProvider::with_model_profile).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAiModelProfile {
+    /// Accepted `reasoning.effort` levels.
+    pub efforts: Cow<'static, [ReasoningEffort]>,
+    /// Accepts `tool_choice` `required` / a named function.
+    pub forced_tool_choice: bool,
+    /// Accepts `temperature` / `top_p`.
+    pub sampling: bool,
+}
+
+impl OpenAiModelProfile {
+    /// The rules unrecognized model ids get: the newest generation's.
+    pub fn latest() -> Self {
+        profile(LATEST)
+    }
+
+    #[must_use]
+    pub fn with_efforts(mut self, efforts: impl Into<Cow<'static, [ReasoningEffort]>>) -> Self {
+        self.efforts = efforts.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_forced_tool_choice(mut self, forced: bool) -> Self {
+        self.forced_tool_choice = forced;
+        self
+    }
+
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: bool) -> Self {
+        self.sampling = sampling;
+        self
+    }
+}
+
+const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
+    OpenAiModelProfile {
+        efforts: Cow::Borrowed(efforts),
+        forced_tool_choice: true,
+        sampling: true,
+    }
+}
+
 /// GPT-6.1 Sol and unrecognized ids.
-pub(crate) const LATEST: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
+const LATEST: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
 const NONE_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NONE_TO_XHIGH: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh];
 const LOW_TO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, XHigh];
 const PRO: &[ReasoningEffort] = &[Medium, High, XHigh];
 const LOW_TO_HIGH: &[ReasoningEffort] = &[Low, Medium, High];
 
-const TABLE: &[(&str, &[ReasoningEffort])] = &[
-    ("gpt-6.1-sol", LATEST),
-    ("gpt-6-astra", LATEST),
-    ("gpt-6-luna", NONE_TO_MAX),
-    ("gpt-6-sol", NONE_TO_MAX),
-    ("gpt-5.6", NONE_TO_MAX),
-    ("gpt-5.5-pro", PRO),
-    ("gpt-5.5", NONE_TO_XHIGH),
-    ("gpt-5.4-pro", PRO),
-    ("gpt-5.4", NONE_TO_XHIGH),
-    ("gpt-5.3-codex", LOW_TO_XHIGH),
-    ("gpt-5.2-codex", LOW_TO_XHIGH),
-    ("gpt-5.2-pro", PRO),
-    ("gpt-5.2", NONE_TO_XHIGH),
-    ("gpt-5.1", &[Off, Low, Medium, High]),
-    ("gpt-5-pro", &[High]),
-    ("gpt-5", &[Minimal, Low, Medium, High]),
-    ("o1", LOW_TO_HIGH),
-    ("o3", LOW_TO_HIGH),
-    ("o4", LOW_TO_HIGH),
+static TABLE: &[(&str, OpenAiModelProfile)] = &[
+    ("gpt-6.1-sol", profile(LATEST)),
+    ("gpt-6-astra", profile(LATEST)),
+    ("gpt-6-luna", profile(NONE_TO_MAX)),
+    ("gpt-6-sol", profile(NONE_TO_MAX)),
+    ("gpt-5.6", profile(NONE_TO_MAX)),
+    ("gpt-5.5-pro", profile(PRO)),
+    ("gpt-5.5", profile(NONE_TO_XHIGH)),
+    ("gpt-5.4-pro", profile(PRO)),
+    ("gpt-5.4", profile(NONE_TO_XHIGH)),
+    ("gpt-5.3-codex", profile(LOW_TO_XHIGH)),
+    ("gpt-5.2-codex", profile(LOW_TO_XHIGH)),
+    ("gpt-5.2-pro", profile(PRO)),
+    ("gpt-5.2", profile(NONE_TO_XHIGH)),
+    ("gpt-5.1", profile(&[Off, Low, Medium, High])),
+    ("gpt-5-pro", profile(&[High])),
+    ("gpt-5", profile(&[Minimal, Low, Medium, High])),
+    ("o1", profile(LOW_TO_HIGH)),
+    ("o3", profile(LOW_TO_HIGH)),
+    ("o4", profile(LOW_TO_HIGH)),
 ];
 
-/// The `reasoning.effort` levels the model accepts.
-pub(crate) fn efforts_for(model: &str) -> &'static [ReasoningEffort] {
+static LATEST_PROFILE: OpenAiModelProfile = profile(LATEST);
+
+/// Host model entries (first prefix match wins), then the host default, then
+/// the built-in table, then [`LATEST`].
+pub(crate) fn profile_for<'a>(
+    models: &'a [(String, OpenAiModelProfile)],
+    default: Option<&'a OpenAiModelProfile>,
+    model: &str,
+) -> &'a OpenAiModelProfile {
+    models
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix.as_str()))
+        .map(|(_, profile)| profile)
+        .or(default)
+        .unwrap_or_else(|| builtin(model))
+}
+
+fn builtin(model: &str) -> &'static OpenAiModelProfile {
     TABLE
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
-        .map_or(LATEST, |(_, efforts)| *efforts)
+        .map_or(&LATEST_PROFILE, |(_, profile)| profile)
 }
 
 #[cfg(test)]
@@ -56,11 +124,12 @@ mod tests {
 
     #[test]
     fn specific_ids_win_over_their_prefixes() {
-        assert_eq!(efforts_for("gpt-5.5-pro-2026-04-01"), PRO);
-        assert_eq!(efforts_for("gpt-5.5"), NONE_TO_XHIGH);
-        assert_eq!(efforts_for("gpt-5-pro"), &[High]);
-        assert_eq!(efforts_for("gpt-5.1"), &[Off, Low, Medium, High]);
-        assert_eq!(efforts_for("gpt-5-mini"), &[Minimal, Low, Medium, High]);
-        assert_eq!(efforts_for("gpt-next"), LATEST);
+        let efforts = |model| &*builtin(model).efforts;
+        assert_eq!(efforts("gpt-5.5-pro-2026-04-01"), PRO);
+        assert_eq!(efforts("gpt-5.5"), NONE_TO_XHIGH);
+        assert_eq!(efforts("gpt-5-pro"), &[High]);
+        assert_eq!(efforts("gpt-5.1"), &[Off, Low, Medium, High]);
+        assert_eq!(efforts("gpt-5-mini"), &[Minimal, Low, Medium, High]);
+        assert_eq!(efforts("gpt-next"), LATEST);
     }
 }

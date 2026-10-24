@@ -2,7 +2,7 @@
 
 **Status**: accepted (2026-10-22)
 **来源**: [#11](https://github.com/zibyn/asterpath/issues/11)
-**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `Provider` 增加 `id()`；新增 `ProviderCatalog`；请求参数由 `RequestConfig` 提供（`SessionSpec` / `ConfigSnapshot`），能力匹配仍由 adapter 判定。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— `ReasoningBinding` 增加 `tools_hash`；工具集变化使旧 reasoning 不可回放。2026-10-24（[#96](https://github.com/zibyn/asterpath/issues/96)）— 逐字节回放只适用于不透明 item（reasoning、server tool、opaque）；`Item::Message` 增加可选 raw，回放按规范 parts 渲染，仅同 provider 时从 raw 合并已知字段（OpenAI `phase`、Anthropic text `citations`）。
+**修订**: 2026-10-22（[#26](https://github.com/zibyn/asterpath/issues/26)）— `Provider` 增加 `id()`；新增 `ProviderCatalog`；请求参数由 `RequestConfig` 提供（`SessionSpec` / `ConfigSnapshot`），能力匹配仍由 adapter 判定。2026-10-22（[#28](https://github.com/zibyn/asterpath/issues/28)）— `ReasoningBinding` 增加 `tools_hash`；工具集变化使旧 reasoning 不可回放。2026-10-24（[#96](https://github.com/zibyn/asterpath/issues/96)）— 逐字节回放只适用于不透明 item（reasoning、server tool、opaque）；`Item::Message` 增加可选 raw，回放按规范 parts 渲染，仅同 provider 时从 raw 合并已知字段（OpenAI `phase`、Anthropic text `citations`）。2026-10-24（[#106](https://github.com/zibyn/asterpath/issues/106)）— provider id 是实例 id 而非协议名，同 provider 门控按实例生效；按模型规则可由宿主注入（[ADR-0029](0029-provider-instance-is-a-vendor-endpoint.md)）。
 
 ## Context
 

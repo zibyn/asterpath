@@ -439,7 +439,7 @@ fn resume_prints_idle_for_a_finished_session() {
 #[test]
 fn resume_continues_an_open_turn() {
     let server = MockServer::start(vec![Reply::sse(common::text_sse("Resumed turn"))]);
-    let (dir, session) = prepared_session("resume-open", &server, true);
+    let (dir, session) = prepared_session("resume-open", &server, true, "anthropic");
     let config = dir.path.join("asterpath.toml");
 
     let output = bin()
@@ -461,7 +461,7 @@ fn resume_continues_an_open_turn() {
 #[test]
 fn resume_continues_pending_input() {
     let server = MockServer::start(vec![Reply::sse(common::text_sse("Pending input ran"))]);
-    let (dir, session) = prepared_session("resume-pending", &server, false);
+    let (dir, session) = prepared_session("resume-pending", &server, false, "anthropic");
     let config = dir.path.join("asterpath.toml");
 
     let output = bin()
@@ -645,16 +645,32 @@ fn explicit_ask_without_a_tty_is_a_usage_error() {
 }
 
 /// Create a session through the library: pending input, optionally with an
-/// already-open turn. No drive happens, so the CLI must resume it.
-fn prepared_session(name: &str, server: &MockServer, turn_started: bool) -> (TestDir, String) {
+/// already-open turn, on provider instance `id` (an anthropic-protocol
+/// section reading `DEEPSEEK_API_KEY` unless `id` is `anthropic`). No drive
+/// happens, so the CLI must resume it.
+fn prepared_session(
+    name: &str,
+    server: &MockServer,
+    turn_started: bool,
+    id: &str,
+) -> (TestDir, String) {
     let dir = TestDir::new(name);
-    dir.config(&config_body(server, &dir.db()));
+    let mut config = config_body(server, &dir.db());
+    if id != "anthropic" {
+        config.push_str(&format!(
+            "\n[providers.{id}]\nprotocol = \"anthropic\"\nbase_url = \"{}\"\napi_key_env = \"DEEPSEEK_API_KEY\"\n",
+            server.base_url()
+        ));
+    }
+    dir.config(&config);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     let session = runtime.block_on(async {
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.base_url());
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.base_url())
+            .with_id(id);
         let asterpath = Asterpath::builder()
             .database(dir.db())
             .provider(Arc::new(provider))
@@ -664,7 +680,7 @@ fn prepared_session(name: &str, server: &MockServer, turn_started: bool) -> (Tes
         let handle = asterpath
             .create_session(SessionSpec {
                 model: ModelSpec {
-                    provider: ProviderId::new("anthropic"),
+                    provider: ProviderId::new(id),
                     model: ModelId::new("claude-test"),
                     context_window: None,
                 },
@@ -725,4 +741,181 @@ fn completed_session(name: &str) -> (TestDir, String) {
     assert!(output.status.success());
     let session = session_from_stderr(&String::from_utf8_lossy(&output.stderr));
     (dir, session)
+}
+
+fn vendor_config(anthropic: &MockServer, deepseek: &MockServer, db: &Path) -> String {
+    format!(
+        concat!(
+            "[storage]\npath = \"{db}\"\n\n",
+            "[providers.anthropic]\nbase_url = \"{anthropic}\"\n\n",
+            "[providers.deepseek]\nprotocol = \"anthropic\"\nbase_url = \"{deepseek}\"\n",
+            "api_key_env = \"DEEPSEEK_API_KEY\"\n\n",
+            "[providers.deepseek.profile]\nefforts = [\"off\", \"low\", \"high\", \"max\"]\n",
+            "thinking_default_on = true\n\n",
+            "[providers.deepseek.models.\"deepseek-v4-pro\"]\nefforts = [\"low\", \"high\", \"max\"]\n\n",
+            "[request.reasoning]\neffort = \"off\"\n",
+        ),
+        db = db.display(),
+        anthropic = anthropic.base_url(),
+        deepseek = deepseek.base_url(),
+    )
+}
+
+#[test]
+fn a_vendor_provider_uses_its_own_endpoint_key_and_profile() {
+    let anthropic = MockServer::start(Vec::new());
+    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("from deepseek"))]);
+    let dir = TestDir::new("vendor");
+    let config = dir.config(&vendor_config(&anthropic, &deepseek, &dir.db()));
+
+    let output = bin()
+        .env("DEEPSEEK_API_KEY", "ds-key")
+        .args([
+            "run",
+            "--config",
+            config.to_str().unwrap(),
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-flash",
+            "hi",
+        ])
+        .output()
+        .expect("run asterpath");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "from deepseek"
+    );
+    assert!(anthropic.requests().is_empty());
+    let requests = deepseek.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].head.contains("x-api-key: ds-key"),
+        "{}",
+        requests[0].head
+    );
+    // The injected profile accepts `off` and disables default-on thinking.
+    let body = requests[0].json_body();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+}
+
+#[test]
+fn resume_rebuilds_a_vendor_provider_from_the_snapshot() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("resumed"))]);
+    let (dir, session) = prepared_session("resume-vendor", &server, false, "deepseek");
+    let config = dir.path.join("asterpath.toml");
+
+    let output = bin()
+        .env_remove("ANTHROPIC_API_KEY")
+        .env("DEEPSEEK_API_KEY", "ds-key")
+        .args(["resume", "--config", config.to_str().unwrap(), &session])
+        .output()
+        .expect("run resume");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].head.contains("x-api-key: ds-key"),
+        "{}",
+        requests[0].head
+    );
+}
+
+#[test]
+fn a_vendor_model_entry_replaces_the_vendor_default() {
+    let deepseek = MockServer::start(vec![Reply::sse(common::text_sse("pro"))]);
+    let dir = TestDir::new("vendor-model");
+    let config = dir.config(&format!(
+        concat!(
+            "[storage]\npath = \"{db}\"\n\n",
+            "[providers.deepseek]\nprotocol = \"anthropic\"\nbase_url = \"{url}\"\n",
+            "api_key_env = \"DEEPSEEK_API_KEY\"\n\n",
+            "[providers.deepseek.profile]\nefforts = [\"low\"]\n\n",
+            "[providers.deepseek.models.\"deepseek-v4\"]\nefforts = [\"low\"]\n\n",
+            "[providers.deepseek.models.\"deepseek-v4-pro\"]\nefforts = [\"off\"]\n",
+            "thinking_default_on = true\n\n",
+            "[request.reasoning]\neffort = \"off\"\n",
+        ),
+        db = dir.db().display(),
+        url = deepseek.base_url(),
+    ));
+    let run = |model: &str| {
+        bin()
+            .env("DEEPSEEK_API_KEY", "ds-key")
+            .args([
+                "run",
+                "--config",
+                config.to_str().unwrap(),
+                "--provider",
+                "deepseek",
+                "--model",
+                model,
+                "hi",
+            ])
+            .output()
+            .expect("run asterpath")
+    };
+
+    // The default lists no `off`: rejected before any HTTP.
+    assert!(!run("deepseek-flash").status.success());
+    assert!(deepseek.requests().is_empty());
+    // The longer prefix wins over `deepseek-v4` though it sorts after it.
+    let output = run("deepseek-v4-pro-0601");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(deepseek.requests().len(), 1);
+}
+
+#[test]
+fn config_check_accepts_vendor_providers_and_aliases_to_them() {
+    let dir = TestDir::new("vendor-check");
+    let config = dir.config(concat!(
+        "[providers.deepseek]\nprotocol = \"openai\"\n\n",
+        "[providers.deepseek.profile]\nefforts = [\"off\"]\nsampling = false\n\n",
+        "[model_aliases.fast]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n",
+    ));
+    bin()
+        .args(["config", "check", "--config", config.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn config_check_rejects_bad_vendor_provider_sections_with_two() {
+    for body in [
+        "[providers.deepseek]\nprotocol = \"anthropic\"\nmystery = 1\n",
+        "[providers.deepseek]\nprotocol = \"gemini\"\n",
+        "[providers.deepseek]\nbase_url = \"http://x\"\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nefforts = [\"none\"]\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.models.m]\nmystery = 1\n",
+        "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\nthinking = \"adaptive\"\n",
+        "[providers.openai.models.m]\nthinking_default_on = true\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nthinking = \"sometimes\"\n",
+        "[providers.deepseek]\nprotocol = \"anthropic\"\napi_key = \"leaked\"\n",
+    ] {
+        let dir = TestDir::new("vendor-bad");
+        let config = dir.config(body);
+        let output = bin()
+            .args(["config", "check", "--config", config.to_str().unwrap()])
+            .output()
+            .expect("run config check");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{body} must be rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

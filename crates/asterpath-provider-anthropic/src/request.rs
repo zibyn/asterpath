@@ -13,7 +13,7 @@ use asterpath_protocol::{
     ToolChoice,
 };
 
-use crate::models::{ModelRules, Thinking, rules_for};
+use crate::models::{AnthropicModelProfile, Thinking};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -94,6 +94,7 @@ fn array(items: Vec<Frag>) -> String {
 /// Capability and structural checks that must run before any HTTP request.
 pub(crate) fn check(
     capabilities: ProviderCapabilities,
+    rules: &AnthropicModelProfile,
     request: &ModelRequest,
 ) -> Result<(), ProviderError> {
     if let Some(feature) = capabilities.unsupported_feature(request) {
@@ -114,7 +115,6 @@ pub(crate) fn check(
         return Err(unsupported("sampling.seed"));
     }
     if let Some(reasoning) = &request.reasoning {
-        let rules = rules_for(request.spec.model.as_str());
         if let Some(effort) = reasoning.effort
             && !rules.efforts.contains(&effort)
         {
@@ -155,6 +155,7 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
 /// responsibility so they can run before anything is serialized.
 pub(crate) fn render(
     provider: &ProviderId,
+    rules: &AnthropicModelProfile,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
     let options = provider_options_for(request, &[])?;
@@ -226,7 +227,6 @@ pub(crate) fn render(
     }
     if let Some(reasoning) = &request.reasoning {
         // check() has rejected combinations the model does not accept.
-        let rules = rules_for(request.spec.model.as_str());
         if reasoning.effort == Some(ReasoningEffort::Off) {
             if rules.thinking_default_on {
                 fields.push(("thinking", Frag::Json(json!({"type": "disabled"}))));
@@ -253,7 +253,7 @@ pub(crate) fn render(
 fn render_reasoning(
     fields: &mut Vec<(&str, Frag)>,
     reasoning: &ReasoningParams,
-    rules: ModelRules,
+    rules: &AnthropicModelProfile,
 ) {
     let thinking = match (reasoning.budget_tokens, rules.thinking) {
         (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),

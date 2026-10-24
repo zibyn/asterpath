@@ -87,13 +87,15 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
     if settings.file.turn.max_steps_per_turn == Some(0) {
         return Err("max_steps_per_turn must be greater than zero".to_owned());
     }
-    for id in settings.file.providers.keys() {
-        if !provider_available(id) {
+    for (id, section) in &settings.file.providers {
+        let protocol = protocol(id, &settings.file)?;
+        if !protocol.enabled() {
             return Err(format!("unknown provider {id}"));
         }
+        section.check(id, protocol)?;
     }
     for (alias, model) in &settings.file.model_aliases {
-        if !provider_available(&model.provider) {
+        if !provider_available(&model.provider, &settings.file) {
             return Err(format!(
                 "model alias {alias} references unknown provider {}",
                 model.provider
@@ -101,7 +103,7 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
         }
     }
     if let Some(provider) = &settings.provider
-        && !provider_available(provider)
+        && !provider_available(provider, &settings.file)
     {
         return Err(format!("unknown provider {provider}"));
     }
@@ -248,57 +250,190 @@ fn secret_field(value: &toml::Value) -> Option<String> {
     }
 }
 
-// Feature flags, not a literal set: the suggestion to use `matches!` is wrong.
-#[allow(clippy::match_like_matches_macro)]
-fn provider_available(id: &str) -> bool {
-    match id {
-        "anthropic" => cfg!(feature = "anthropic"),
-        "openai" => cfg!(feature = "openai"),
-        _ => false,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Anthropic,
+    OpenAi,
+}
+
+impl Protocol {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::OpenAi),
+            _ => None,
+        }
     }
+
+    fn enabled(self) -> bool {
+        match self {
+            Self::Anthropic => cfg!(feature = "anthropic"),
+            Self::OpenAi => cfg!(feature = "openai"),
+        }
+    }
+
+    fn key_env(self) -> &'static str {
+        match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenAi => "OPENAI_API_KEY",
+        }
+    }
+}
+
+/// `protocol` when set, else the built-in protocol of the same name.
+fn protocol(id: &str, file: &FileConfig) -> Result<Protocol, String> {
+    let section = file.providers.get(id);
+    match section.and_then(|section| section.protocol.as_deref()) {
+        Some(name) => {
+            Protocol::parse(name).ok_or_else(|| format!("providers.{id}: unknown protocol {name}"))
+        }
+        None => Protocol::parse(id).ok_or_else(|| match section {
+            Some(_) => format!("providers.{id}: `protocol` must be \"anthropic\" or \"openai\""),
+            None => format!("unknown provider {id}"),
+        }),
+    }
+}
+
+fn provider_available(id: &str, file: &FileConfig) -> bool {
+    protocol(id, file).is_ok_and(Protocol::enabled)
 }
 
 fn build_provider(id: &str, file: &FileConfig) -> Result<Arc<dyn Provider>, String> {
-    let base = file
-        .providers
-        .get(id)
-        .and_then(|section| section.base_url.as_deref());
-    match id {
-        "anthropic" => build_anthropic(base),
-        "openai" => build_openai(base),
-        other => Err(format!("unknown provider {other}")),
+    let protocol = protocol(id, file)?;
+    let section = file.providers.get(id).cloned().unwrap_or_default();
+    let key_env = section
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| protocol.key_env().to_owned());
+    let key = env_string(&key_env)
+        .ok_or_else(|| format!("{key_env} is required for the {id} provider"))?;
+    match protocol {
+        Protocol::Anthropic => build_anthropic(id, key, &section),
+        Protocol::OpenAi => build_openai(id, key, &section),
     }
 }
 
+/// The instance default and the model entries, longest prefix first: the
+/// table is read in key order, which would let `a` shadow `a-pro`.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+type Profiles<P> = (Option<P>, Vec<(String, P)>);
+
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+fn profiles<P>(
+    id: &str,
+    section: &ProviderSection,
+    profile: impl Fn(&ProfileSection) -> Result<P, String>,
+) -> Result<Profiles<P>, String> {
+    let default = section
+        .profile
+        .as_ref()
+        .map(&profile)
+        .transpose()
+        .map_err(|error| format!("providers.{id}.profile: {error}"))?;
+    let mut models = section
+        .models
+        .iter()
+        .map(|(prefix, entry)| {
+            profile(entry)
+                .map(|profile| (prefix.clone(), profile))
+                .map_err(|error| format!("providers.{id}.models.{prefix}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    models.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+    Ok((default, models))
+}
+
 #[cfg(feature = "anthropic")]
-fn build_anthropic(base_url: Option<&str>) -> Result<Arc<dyn Provider>, String> {
-    let key = env_string("ANTHROPIC_API_KEY")
-        .ok_or_else(|| "ANTHROPIC_API_KEY is required for the anthropic provider".to_owned())?;
-    let mut provider = asterpath::anthropic::AnthropicProvider::new(key);
-    if let Some(base_url) = base_url {
+fn build_anthropic(
+    id: &str,
+    key: String,
+    section: &ProviderSection,
+) -> Result<Arc<dyn Provider>, String> {
+    use asterpath::anthropic::{AnthropicModelProfile, Thinking};
+    let (default, models) = profiles(id, section, |entry| {
+        let mut profile = AnthropicModelProfile::latest();
+        if let Some(efforts) = entry.efforts()? {
+            profile = profile.with_efforts(efforts);
+        }
+        if let Some(thinking) = entry.thinking {
+            profile = profile.with_thinking(match thinking {
+                ThinkingSection::Extended => Thinking::Extended,
+                ThinkingSection::Both => Thinking::Both,
+                ThinkingSection::Adaptive => Thinking::Adaptive,
+            });
+        }
+        if let Some(on) = entry.thinking_default_on {
+            profile = profile.with_thinking_default_on(on);
+        }
+        if let Some(forced) = entry.forced_tool_choice {
+            profile = profile.with_forced_tool_choice(forced);
+        }
+        if let Some(sampling) = entry.sampling {
+            profile = profile.with_sampling(sampling);
+        }
+        Ok(profile)
+    })?;
+    let mut provider = asterpath::anthropic::AnthropicProvider::new(key).with_id(id);
+    if let Some(base_url) = &section.base_url {
         provider = provider.with_base_url(base_url);
+    }
+    if let Some(default) = default {
+        provider = provider.with_default_profile(default);
+    }
+    for (prefix, profile) in models {
+        provider = provider.with_model_profile(prefix, profile);
     }
     Ok(Arc::new(provider))
 }
 
 #[cfg(not(feature = "anthropic"))]
-fn build_anthropic(_base_url: Option<&str>) -> Result<Arc<dyn Provider>, String> {
+fn build_anthropic(
+    _id: &str,
+    _key: String,
+    _section: &ProviderSection,
+) -> Result<Arc<dyn Provider>, String> {
     Err("the anthropic feature is not enabled".to_owned())
 }
 
 #[cfg(feature = "openai")]
-fn build_openai(base_url: Option<&str>) -> Result<Arc<dyn Provider>, String> {
-    let key = env_string("OPENAI_API_KEY")
-        .ok_or_else(|| "OPENAI_API_KEY is required for the openai provider".to_owned())?;
-    let mut provider = asterpath::openai::OpenAiProvider::new(key);
-    if let Some(base_url) = base_url {
+fn build_openai(
+    id: &str,
+    key: String,
+    section: &ProviderSection,
+) -> Result<Arc<dyn Provider>, String> {
+    use asterpath::openai::OpenAiModelProfile;
+    let (default, models) = profiles(id, section, |entry| {
+        let mut profile = OpenAiModelProfile::latest();
+        if let Some(efforts) = entry.efforts()? {
+            profile = profile.with_efforts(efforts);
+        }
+        if let Some(forced) = entry.forced_tool_choice {
+            profile = profile.with_forced_tool_choice(forced);
+        }
+        if let Some(sampling) = entry.sampling {
+            profile = profile.with_sampling(sampling);
+        }
+        Ok(profile)
+    })?;
+    let mut provider = asterpath::openai::OpenAiProvider::new(key).with_id(id);
+    if let Some(base_url) = &section.base_url {
         provider = provider.with_base_url(base_url);
+    }
+    if let Some(default) = default {
+        provider = provider.with_default_profile(default);
+    }
+    for (prefix, profile) in models {
+        provider = provider.with_model_profile(prefix, profile);
     }
     Ok(Arc::new(provider))
 }
 
 #[cfg(not(feature = "openai"))]
-fn build_openai(_base_url: Option<&str>) -> Result<Arc<dyn Provider>, String> {
+fn build_openai(
+    _id: &str,
+    _key: String,
+    _section: &ProviderSection,
+) -> Result<Arc<dyn Provider>, String> {
     Err("the openai feature is not enabled".to_owned())
 }
 
@@ -379,7 +514,70 @@ struct StorageSection {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ProviderSection {
+    /// Which adapter: `anthropic` or `openai`; defaults to the table name.
+    protocol: Option<String>,
     base_url: Option<String>,
+    /// Defaults to the protocol's own variable.
+    api_key_env: Option<String>,
+    /// The instance default; absent fields are the adapter's newest rules.
+    profile: Option<ProfileSection>,
+    /// Model id prefix -> a complete profile. Absent fields are the adapter's
+    /// newest rules, not `profile`'s.
+    models: BTreeMap<String, ProfileSection>,
+}
+
+impl ProviderSection {
+    fn check(&self, id: &str, protocol: Protocol) -> Result<(), String> {
+        let entries = self
+            .profile
+            .iter()
+            .map(|entry| (format!("providers.{id}.profile"), entry))
+            .chain(
+                self.models
+                    .iter()
+                    .map(|(prefix, entry)| (format!("providers.{id}.models.{prefix}"), entry)),
+            );
+        for (path, entry) in entries {
+            entry
+                .efforts()
+                .map_err(|error| format!("{path}: {error}"))?;
+            if protocol == Protocol::OpenAi
+                && (entry.thinking.is_some() || entry.thinking_default_on.is_some())
+            {
+                return Err(format!(
+                    "{path}: `thinking` and `thinking_default_on` need the anthropic protocol"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProfileSection {
+    efforts: Option<Vec<String>>,
+    thinking: Option<ThinkingSection>,
+    thinking_default_on: Option<bool>,
+    forced_tool_choice: Option<bool>,
+    sampling: Option<bool>,
+}
+
+impl ProfileSection {
+    fn efforts(&self) -> Result<Option<Vec<ReasoningEffort>>, String> {
+        self.efforts
+            .as_ref()
+            .map(|efforts| efforts.iter().map(|effort| parse_effort(effort)).collect())
+            .transpose()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ThinkingSection {
+    Extended,
+    Both,
+    Adaptive,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

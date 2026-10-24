@@ -11,7 +11,6 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use crate::TraceSink;
-use crate::models::efforts_for;
 
 /// A protocol-level trace mark emitted while rendering.
 ///
@@ -60,9 +59,10 @@ pub(crate) fn render(
     request: &ModelRequest,
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
+    efforts: &[ReasoningEffort],
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<u8>, ProviderError> {
-    validate(request, provider, capabilities)?;
+    validate(request, provider, capabilities, efforts)?;
     // R1: no server state, written or not.
     let options = provider_options_for(request, &["previous_response_id", "conversation"])?;
 
@@ -155,6 +155,7 @@ fn validate(
     request: &ModelRequest,
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
+    efforts: &[ReasoningEffort],
 ) -> Result<(), ProviderError> {
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
@@ -193,7 +194,7 @@ fn validate(
         return Err(unsupported("reasoning budget_tokens"));
     }
     if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
-        && !efforts_for(request.spec.model.as_str()).contains(&effort)
+        && !efforts.contains(&effort)
     {
         return Err(unsupported(&format!(
             "reasoning effort {effort:?} on {}",

@@ -11,7 +11,7 @@ use asterpath_protocol::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use asterpath_provider_openai::{OpenAiProvider, TraceMark, TraceSink};
+use asterpath_provider_openai::{OpenAiModelProfile, OpenAiProvider, TraceMark, TraceSink};
 
 #[derive(Default)]
 struct RecordingSink(Mutex<Vec<TraceMark>>);
@@ -1496,4 +1496,92 @@ async fn bad_provider_options_and_stop_sequences_fail_before_http() {
         assert!(!error.retryable);
     }
     assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+fn deepseek_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> ModelRequest {
+    let mut request = with_effort(model, effort);
+    request.spec.provider = ProviderId::new("deepseek");
+    request
+}
+
+#[tokio::test]
+async fn with_id_names_the_instance_and_gates_replay_by_it() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let deepseek = provider(&server).with_id("deepseek");
+    assert_eq!(deepseek.id(), ProviderId::new("deepseek"));
+
+    let tools_hash = asterpath_protocol::tools_hash(&[tool("get_weather")]);
+    let mut request = request(vec![
+        reasoning_item(
+            binding("deepseek-flash", 0, &tools_hash),
+            r#"{"type":"reasoning","id":"rs_openai","encrypted_content":"from-openai"}"#,
+        ),
+        user_text("hello"),
+    ]);
+    request.spec = spec("deepseek-flash");
+    request.spec.provider = ProviderId::new("deepseek");
+    let events = collect(&deepseek, request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body = &server.requests()[0].body;
+    assert!(!body.contains("from-openai"), "{body}");
+}
+
+#[tokio::test]
+async fn an_injected_profile_allows_off_and_sets_capabilities() {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Off};
+    let server = MockServer::start(Vec::new());
+    let uninjected = provider(&server).with_id("deepseek");
+    let events = collect(&uninjected, deepseek_effort("deepseek-flash", Off)).await;
+    assert_eq!(
+        events[0].as_ref().expect_err("unsupported").kind,
+        ProviderErrorKind::Unsupported
+    );
+    assert!(server.requests().is_empty());
+
+    let server = MockServer::start(vec![
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+    ]);
+    let injected = provider(&server)
+        .with_id("deepseek")
+        .with_default_profile(
+            OpenAiModelProfile::latest()
+                .with_efforts(vec![Off, Low, High])
+                .with_sampling(false),
+        )
+        .with_model_profile(
+            "deepseek-v4-pro",
+            OpenAiModelProfile::latest()
+                .with_efforts(vec![Low])
+                .with_forced_tool_choice(false),
+        )
+        // A host entry overrides an official id.
+        .with_model_profile(
+            "gpt-6.1-sol",
+            OpenAiModelProfile::latest().with_efforts(vec![Off]),
+        );
+    let events = collect(&injected, deepseek_effort("deepseek-flash", Off)).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+    assert_eq!(body["reasoning"], json!({"effort": "none"}));
+
+    // The model entry wins over the instance default.
+    let events = collect(&injected, deepseek_effort("deepseek-v4-pro", Off)).await;
+    assert_eq!(
+        events[0].as_ref().expect_err("unsupported").kind,
+        ProviderErrorKind::Unsupported
+    );
+    let events = collect(&injected, deepseek_effort("gpt-6.1-sol", Off)).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    // The instance default beats the built-in row (`gpt-5` has no `none`).
+    let events = collect(&injected, deepseek_effort("gpt-5", Off)).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let flash = injected.capabilities(&spec("deepseek-flash"));
+    assert!(flash.forced_tool_choice);
+    assert!(!flash.sampling);
+    let pro = injected.capabilities(&spec("deepseek-v4-pro"));
+    assert!(!pro.forced_tool_choice);
+    assert!(pro.sampling);
 }

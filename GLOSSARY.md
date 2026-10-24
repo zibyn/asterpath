@@ -139,8 +139,16 @@ _Avoid_: 事件
 ## 协议与模型
 
 **协议适配器（Protocol Adapter）**：
-实现 `Provider` 契约、在规范模型与某供应商传输格式之间双向映射的模块。
+实现 `Provider` 契约、在规范模型与某个协议（Anthropic Messages、OpenAI Responses）的传输格式之间双向映射的模块；每个供应商端点是它的一个 provider 实例（ADR-0029）。
 _Avoid_: provider 客户端、SDK 包装
+
+**provider 实例（Provider Instance）**：
+协议适配器的一个实例，对应一个供应商端点：协议 + 端点 + key + 模型规则，以自己的 `ProviderId` 注册；同 provider 回放按实例 id 门控（ADR-0029）。
+_Avoid_: 把 provider id 当作协议名
+
+**模型规则（Model Profile）**：
+adapter 对某个模型的请求规则（可用档位、thinking 形态、强制工具选择、采样）；内置表只收官方模型，宿主可按实例默认与模型前缀注入（ADR-0029）。与「模型规格」不同：规格说用哪个模型，规则说这个模型接受什么。
+_Avoid_: 模型能力表、模型预设
 
 **模型规格（Model Spec）**：
 供应商、模型与上下文窗口的组合；能力标志按它查询。

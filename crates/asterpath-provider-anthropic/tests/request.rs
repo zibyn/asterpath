@@ -7,6 +7,7 @@ use asterpath_protocol::{
     RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role, SamplingParams,
     ToolChoice, ToolName,
 };
+use asterpath_provider_anthropic::{AnthropicModelProfile, AnthropicProvider};
 use common::{
     MockServer, Reply, base_request, descriptor, drain, empty_sse, model, provider, text,
 };
@@ -1077,4 +1078,184 @@ async fn provider_options_conflicting_or_non_object_fail_before_http() {
         assert!(!error.retryable);
     }
     assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+fn deepseek_request(model: &str) -> ModelRequest {
+    let mut request = request_for(model);
+    request.spec.provider = ProviderId::new("deepseek");
+    request
+}
+
+#[tokio::test]
+async fn with_id_names_the_instance_and_gates_replay_by_it() {
+    let thinking_sse = common::sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":1}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-ds"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![Reply::sse(thinking_sse), Reply::sse(empty_sse())]);
+    let deepseek = provider(&server).with_id("deepseek");
+    assert_eq!(
+        asterpath_protocol::Provider::id(&deepseek),
+        ProviderId::new("deepseek")
+    );
+    assert_eq!(
+        asterpath_protocol::Provider::id(&provider(&server)),
+        ProviderId::new("anthropic")
+    );
+
+    let events = drain(&deepseek, deepseek_request("deepseek-flash")).await;
+    let binding = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(asterpath_protocol::StreamEvent::ItemCompleted {
+                item: Item::Reasoning { binding, raw, .. },
+                ..
+            }) => {
+                assert_eq!(raw.provider, ProviderId::new("deepseek"));
+                Some(binding.clone())
+            }
+            _ => None,
+        })
+        .expect("produced reasoning");
+    assert_eq!(binding.provider, ProviderId::new("deepseek"));
+
+    // Data from the real Anthropic instance never reaches the deepseek one.
+    let anthropic_raw = r#"{"type":"thinking","thinking":"a","signature":"sig-anthropic"}"#;
+    let opaque_raw = r#"{"type":"server_thing","id":"anthropic-opaque"}"#;
+    let mut replay = deepseek_request("deepseek-flash");
+    replay.items = vec![
+        Item::Reasoning {
+            summary: vec![text("a")],
+            binding: ReasoningBinding {
+                provider: ProviderId::new("anthropic"),
+                ..binding
+            },
+            raw: RawProviderData {
+                provider: ProviderId::new("anthropic"),
+                model: Some(ModelId::new("deepseek-flash")),
+                kind: "anthropic.thinking".to_owned(),
+                json: JsonString::new(anthropic_raw),
+            },
+        },
+        assistant_message(vec![Part::ProviderOpaque {
+            provider: ProviderId::new("anthropic"),
+            kind: "anthropic.server_thing".to_owned(),
+            raw: RawProviderData {
+                provider: ProviderId::new("anthropic"),
+                model: None,
+                kind: "anthropic.server_thing".to_owned(),
+                json: JsonString::new(opaque_raw),
+            },
+        }]),
+        user_message(vec![text("next")]),
+    ];
+    drain(&deepseek, replay).await;
+    let body = server.requests()[1].body.clone();
+    assert!(!body.contains("sig-anthropic"), "{body}");
+    assert!(!body.contains("anthropic-opaque"), "{body}");
+}
+
+#[tokio::test]
+async fn an_injected_default_profile_lets_off_disable_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let uninjected = provider(&server).with_id("deepseek");
+    let mut request = deepseek_request("deepseek-flash");
+    request.reasoning = effort(ReasoningEffort::Off);
+    let error = match drain(&uninjected, request.clone()).await.remove(0) {
+        Err(error) => error,
+        Ok(event) => panic!("expected an error, got {event:?}"),
+    };
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+
+    let injected = provider(&server).with_id("deepseek").with_default_profile(
+        AnthropicModelProfile::latest()
+            .with_efforts(vec![
+                ReasoningEffort::Off,
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ])
+            .with_thinking_default_on(true),
+    );
+    drain(&injected, request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+    assert!(body.get("output_config").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
+    let off = || {
+        AnthropicModelProfile::latest()
+            .with_efforts(vec![ReasoningEffort::Off, ReasoningEffort::Low])
+            .with_thinking_default_on(true)
+    };
+    let low_only = || AnthropicModelProfile::latest().with_efforts(vec![ReasoningEffort::Low]);
+    let provider = AnthropicProvider::new("k")
+        .with_default_profile(off())
+        .with_model_profile("deepseek-v4-pro", low_only())
+        .with_model_profile("deepseek-v4", off())
+        // A host entry overrides an official id.
+        .with_model_profile("claude-opus-5-5", off().with_forced_tool_choice(true));
+    let server = MockServer::start((0..4).map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider.with_base_url(server.base_url());
+    let mut accepted = Vec::new();
+    for model in [
+        "deepseek-v4-pro-0601",
+        "deepseek-v4-flash",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "deepseek-flash",
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = effort(ReasoningEffort::Off);
+        if drain(&provider, request).await[0].is_ok() {
+            accepted.push(model);
+        }
+    }
+    // The first registered model entry wins over a later shorter prefix; the
+    // instance default beats the built-in table (Sonnet 5.5 rejects `Off`).
+    assert_eq!(
+        accepted,
+        [
+            "deepseek-v4-flash",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "deepseek-flash"
+        ]
+    );
+    // The host entry's capabilities replace the official row's.
+    let mut spec = model();
+    spec.model = ModelId::new("claude-opus-5-5");
+    let capabilities = asterpath_protocol::Provider::capabilities(&provider, &spec);
+    assert!(capabilities.forced_tool_choice);
+    assert!(!capabilities.sampling);
+
+    // Without injection: built-in table, then LATEST.
+    let plain = AnthropicProvider::new("k");
+    let mut spec = model();
+    spec.model = ModelId::new("claude-sonnet-4-5");
+    assert!(asterpath_protocol::Provider::capabilities(&plain, &spec).sampling);
+    spec.model = ModelId::new("deepseek-flash");
+    assert!(!asterpath_protocol::Provider::capabilities(&plain, &spec).sampling);
 }

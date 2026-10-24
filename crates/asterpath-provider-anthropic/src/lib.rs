@@ -19,6 +19,8 @@ use asterpath_protocol::{
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+pub use models::{AnthropicModelProfile, Thinking};
+
 /// Default Anthropic API origin.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
@@ -27,10 +29,13 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    id: ProviderId,
+    default_profile: Option<AnthropicModelProfile>,
+    model_profiles: Vec<(String, AnthropicModelProfile)>,
 }
 
 impl AnthropicProvider {
-    /// Provider id used in [`ProviderId`] and reasoning bindings.
+    /// Default provider id used in [`ProviderId`] and reasoning bindings.
     pub const ID: &'static str = "anthropic";
 
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -38,7 +43,45 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             client: reqwest::Client::new(),
+            id: ProviderId::new(Self::ID),
+            default_profile: None,
+            model_profiles: Vec::new(),
         }
+    }
+
+    /// Name this instance (one per vendor endpoint); raw and reasoning
+    /// replay is gated by it.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = ProviderId::new(id);
+        self
+    }
+
+    /// The rules for every model no [`Self::with_model_profile`] entry matches.
+    #[must_use]
+    pub fn with_default_profile(mut self, profile: AnthropicModelProfile) -> Self {
+        self.default_profile = Some(profile);
+        self
+    }
+
+    /// The rules for model ids starting with `prefix`; the first registered
+    /// match wins, and an entry overrides the built-in table.
+    #[must_use]
+    pub fn with_model_profile(
+        mut self,
+        prefix: impl Into<String>,
+        profile: AnthropicModelProfile,
+    ) -> Self {
+        self.model_profiles.push((prefix.into(), profile));
+        self
+    }
+
+    fn profile(&self, spec: &ModelSpec) -> &AnthropicModelProfile {
+        models::profile_for(
+            &self.model_profiles,
+            self.default_profile.as_ref(),
+            spec.model.as_str(),
+        )
     }
 
     /// Override the API origin (mock servers, gateways).
@@ -55,11 +98,11 @@ impl AnthropicProvider {
 
 impl Provider for AnthropicProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::new(Self::ID)
+        self.id.clone()
     }
 
     fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities {
-        let rules = models::rules_for(spec.model.as_str());
+        let rules = self.profile(spec);
         ProviderCapabilities {
             server_state: false,
             forced_tool_choice: rules.forced_tool_choice,
@@ -77,11 +120,12 @@ impl Provider for AnthropicProvider {
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let capabilities = self.capabilities(&request.spec);
-        if let Err(error) = request::check(capabilities, &request) {
+        let profile = self.profile(&request.spec);
+        if let Err(error) = request::check(capabilities, profile, &request) {
             return stream::once(async move { Err(error) }).boxed();
         }
         let provider = self.id();
-        let body = match request::render(&provider, &request) {
+        let body = match request::render(&provider, profile, &request) {
             Ok(body) => body,
             Err(error) => return stream::once(async move { Err(error) }).boxed(),
         };

@@ -316,6 +316,20 @@ base_url = "https://api.anthropic.com"
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 
+# 供应商实例（ADR-0029）：表名即 provider id；非内置名必须写 protocol
+# 示例取值为宿主策略，DeepSeek 端点与档位按 2026-10-24 实测（#106），不随框架维护
+[providers.deepseek]
+protocol = "anthropic"                          # anthropic | openai
+base_url = "https://api.deepseek.com/anthropic"
+api_key_env = "DEEPSEEK_API_KEY"                # 缺省取协议原有变量；key 只从环境读
+
+[providers.deepseek.profile]                    # 实例默认；缺省字段取 LATEST
+efforts = ["off", "low", "high", "max"]         # 另有 thinking（仅 anthropic）、thinking_default_on（仅 anthropic）、forced_tool_choice、sampling
+thinking_default_on = true
+
+[providers.deepseek.models."deepseek-v4-pro"]   # 按前缀，长者优先；完整 profile，不继承 profile
+efforts = ["low", "high", "max"]
+
 [turn]
 # max_steps_per_turn = 100    # 省略 = 不设上限（None）；0 是配置错误；其余字段用默认值
 

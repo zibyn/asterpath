@@ -261,6 +261,7 @@ pub enum ReasoningEffort {
 | R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于宿主策略。 |
 
 - `RequestConfig` 在 `create_session` 时随 `SessionSpec` 写入 `ConfigSnapshot`；loop 每次都从快照读取，恢复后重建出同一请求。
+- R5–R8 用到的按模型规则（`forced_tool_choice`、`sampling`、可用档位、thinking 形态）由 adapter 的 profile 查找给出：实例的模型前缀条目 → 实例默认 → 内置官方表 → `LATEST`；宿主可为第三方服务商注入（ADR-0029）。
 - `create_session` 只做结构校验（provider 已注册、`system` 全为 `Part::Text`、工具名可解析）；`sampling` / `reasoning` / `Required` / `disable_parallel_tool_use` 的能力不匹配不在创建时预检，由 adapter 按 R5–R8 返回 `Unsupported`。
 
 `ReasoningParams` 映射：

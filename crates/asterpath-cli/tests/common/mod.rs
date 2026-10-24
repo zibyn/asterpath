@@ -16,6 +16,7 @@ pub fn bin() -> Command {
         "ASTERPATH_MODEL",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY",
     ] {
         command.env_remove(name);
     }
