@@ -9,9 +9,9 @@ use asterpath_http::{
     same_provider_raw_field,
 };
 use asterpath_protocol::{
-    ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
-    ToolChoice, ToolDescriptor,
+    FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
+    ProviderErrorKind, ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort,
+    ReasoningParams, Role, ToolChoice, ToolDescriptor,
 };
 
 use crate::models::{AnthropicModelProfile, Thinking};
@@ -132,6 +132,15 @@ pub(crate) fn check(
 ) -> Result<(), ProviderError> {
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
+    }
+    if let Some(media_type) = request
+        .file_media_types()
+        .find(|media_type| !rules.file_media_types.contains(media_type))
+    {
+        return Err(unsupported(&format!(
+            "file media type {media_type} on {}",
+            request.spec.model
+        )));
     }
     if !request
         .system
@@ -568,7 +577,29 @@ fn render_part(provider: &ProviderId, part: &Part) -> Option<Frag> {
                 "type": "image",
                 "source": {"type": "url", "url": url},
             }),
+            ImageSource::ProviderFile(file) => json!({
+                "type": "image",
+                "source": {"type": "file", "file_id": file.id},
+            }),
         })),
+        Part::File {
+            media_type,
+            filename,
+            source,
+        } => {
+            let source = match source {
+                FileSource::Base64 { data } => {
+                    json!({"type": "base64", "media_type": media_type, "data": data})
+                }
+                FileSource::Url { url } => json!({"type": "url", "url": url}),
+                FileSource::ProviderFile(file) => json!({"type": "file", "file_id": file.id}),
+            };
+            let mut block = json!({"type": "document", "source": source});
+            if let Some(filename) = filename {
+                block["title"] = json!(filename);
+            }
+            Some(Frag::Json(block))
+        }
         Part::ProviderOpaque {
             provider: item_provider,
             raw,

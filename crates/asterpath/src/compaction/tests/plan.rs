@@ -216,6 +216,20 @@ fn summary_input_is_text_only() {
     let history = vec![
         log(1, message(Role::User, "hello")),
         log(
+            2,
+            vec![Item::Message {
+                role: Role::User,
+                parts: vec![Part::File {
+                    media_type: "application/pdf".to_owned(),
+                    filename: Some("secret-report.pdf".to_owned()),
+                    source: asterpath_protocol::FileSource::Base64 {
+                        data: "JVBERi0xLjQ".to_owned(),
+                    },
+                }],
+                raw: None,
+            }],
+        ),
+        log(
             3,
             vec![
                 Item::Reasoning {
@@ -281,6 +295,8 @@ fn summary_input_is_text_only() {
     assert!(!rendered.contains("image/png"));
     assert!(!rendered.contains("https://example.invalid"));
     assert!(!rendered.contains("wire-opaque"));
+    assert!(!rendered.contains("secret-report.pdf"));
+    assert!(!rendered.contains("JVBERi0xLjQ"));
     assert!(rendered.contains("answer"));
     assert!(rendered.contains("non-text content omitted"));
     assert!(rendered.contains("tool call shell"));

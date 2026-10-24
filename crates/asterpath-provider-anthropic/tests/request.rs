@@ -3,9 +3,9 @@
 mod common;
 
 use asterpath_protocol::{
-    ImageSource, Item, JsonString, ModelId, ModelRequest, Part, ProviderErrorKind, ProviderId,
-    RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role, SamplingParams,
-    ToolChoice, ToolName,
+    FileSource, ImageSource, Item, JsonString, ModelId, ModelRequest, Part, Provider,
+    ProviderErrorKind, ProviderFileId, ProviderId, RawProviderData, ReasoningBinding,
+    ReasoningEffort, ReasoningParams, Role, SamplingParams, ToolChoice, ToolName,
 };
 use asterpath_provider_anthropic::{
     AnthropicModelProfile, AnthropicProvider, TraceMark, TraceSink,
@@ -321,6 +321,125 @@ async fn tool_result_images_render_natively() {
             "cache_control": {"type": "ephemeral"}
         })
     );
+}
+
+fn pdf(source: FileSource) -> Part {
+    Part::File {
+        media_type: "application/pdf".to_owned(),
+        filename: Some("report.pdf".to_owned()),
+        source,
+    }
+}
+
+fn anthropic_file(id: &str) -> ProviderFileId {
+    ProviderFileId {
+        provider: ProviderId::new("anthropic"),
+        id: id.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn files_render_as_document_blocks() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.items = vec![
+        user_message(vec![
+            pdf(FileSource::Base64 {
+                data: "JVBE".to_owned(),
+            }),
+            pdf(FileSource::Url {
+                url: "https://example.invalid/r.pdf".to_owned(),
+            }),
+            pdf(FileSource::ProviderFile(anthropic_file("file_a"))),
+            Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::ProviderFile(anthropic_file("file_b")),
+            },
+        ]),
+        Item::ToolResult {
+            call_id: "toolu_a".to_owned(),
+            provider_item_id: None,
+            parts: vec![pdf(FileSource::ProviderFile(anthropic_file("file_c")))],
+            is_error: false,
+            raw: None,
+        },
+    ];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": [
+                {"type": "document", "source": {"type": "file", "file_id": "file_c"}, "title": "report.pdf"}
+            ], "is_error": false},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}, "title": "report.pdf"},
+            {"type": "document", "source": {"type": "url", "url": "https://example.invalid/r.pdf"}, "title": "report.pdf"},
+            {"type": "document", "source": {"type": "file", "file_id": "file_a"}, "title": "report.pdf"},
+            {"type": "image", "source": {"type": "file", "file_id": "file_b"}, "cache_control": {"type": "ephemeral"}}
+        ])
+    );
+    assert!(
+        !server.requests()[0]
+            .head
+            .to_ascii_lowercase()
+            .contains("anthropic-beta"),
+        "the Files API reference is GA"
+    );
+}
+
+#[tokio::test]
+async fn unrenderable_files_fail_before_any_http() {
+    let server = MockServer::start(Vec::new());
+    let other = ProviderFileId {
+        provider: ProviderId::new("openai"),
+        id: "file-x".to_owned(),
+    };
+    let cases = [
+        // Media type the model rules do not accept.
+        user_message(vec![Part::File {
+            media_type: "text/csv".to_owned(),
+            filename: None,
+            source: FileSource::Base64 {
+                data: "YQ==".to_owned(),
+            },
+        }]),
+        assistant_message(vec![pdf(FileSource::Base64 {
+            data: "JVBE".to_owned(),
+        })]),
+        user_message(vec![pdf(FileSource::ProviderFile(other.clone()))]),
+        user_message(vec![Part::Image {
+            media_type: "image/png".to_owned(),
+            source: ImageSource::ProviderFile(other.clone()),
+        }]),
+        Item::ToolResult {
+            call_id: "toolu_a".to_owned(),
+            provider_item_id: None,
+            parts: vec![pdf(FileSource::ProviderFile(other))],
+            is_error: false,
+            raw: None,
+        },
+    ];
+    for item in cases {
+        let mut request = base_request();
+        request.items = vec![item];
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported, "{error:?}");
+    }
+
+    // A profile that accepts no file types has no file input at all.
+    let provider = provider(&server)
+        .with_default_profile(AnthropicModelProfile::latest().with_file_media_types(Vec::new()));
+    let mut request = base_request();
+    request.items = vec![user_message(vec![pdf(FileSource::Base64 {
+        data: "JVBE".to_owned(),
+    })])];
+    assert!(!provider.capabilities(&request.spec).file_input);
+    let events = drain(&provider, request).await;
+    assert!(matches!(
+        &events[0],
+        Err(error) if error.kind == ProviderErrorKind::Unsupported
+    ));
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]

@@ -82,6 +82,12 @@ pub enum Part {
         media_type: String,
         source: ImageSource,
     },
+    /// Only in user messages and tool results (ADR-0031).
+    File {
+        media_type: String,
+        filename: Option<String>,
+        source: FileSource,
+    },
     Refusal {
         text: String,
     },
@@ -96,6 +102,22 @@ pub enum Part {
 pub enum ImageSource {
     Base64 { data: String },
     Url { url: String },
+    ProviderFile(ProviderFileId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileSource {
+    Base64 { data: String },
+    Url { url: String },
+    ProviderFile(ProviderFileId),
+}
+
+/// An ID in one provider's file store; only that provider can resolve it
+/// (ADR-0031). Uploading and deleting files is the host's job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFileId {
+    pub provider: ProviderId,
+    pub id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

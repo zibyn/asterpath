@@ -312,6 +312,7 @@ fn visible_part(part: &Part) -> Option<Value> {
         Part::Text { text } => Some(json!({"kind": "text", "text": text})),
         Part::Refusal { text } => Some(json!({"kind": "refusal", "text": text})),
         Part::Image { media_type, .. } => Some(json!({"kind": "image", "media_type": media_type})),
+        Part::File { media_type, .. } => Some(json!({"kind": "file", "media_type": media_type})),
         // Provider-local content is not translatable across providers.
         Part::ProviderOpaque { .. } => None,
     }

@@ -309,7 +309,9 @@ fn part_bytes(part: &Part) -> u64 {
     match part {
         Part::Text { text } => text.len() as u64,
         Part::Refusal { text } => text.len() as u64,
-        Part::Image { .. } | Part::ProviderOpaque { .. } => NON_TEXT_PLACEHOLDER.len() as u64,
+        Part::Image { .. } | Part::File { .. } | Part::ProviderOpaque { .. } => {
+            NON_TEXT_PLACEHOLDER.len() as u64
+        }
     }
 }
 
@@ -382,7 +384,7 @@ fn text_part(part: &Part) -> Option<Part> {
         Part::Refusal { text } => Some(Part::Text { text: text.clone() }),
         // Provider opaque data is dropped, not rendered.
         Part::ProviderOpaque { .. } => None,
-        Part::Image { .. } => Some(Part::Text {
+        Part::Image { .. } | Part::File { .. } => Some(Part::Text {
             text: NON_TEXT_PLACEHOLDER.to_owned(),
         }),
     }
