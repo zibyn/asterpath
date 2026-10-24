@@ -282,7 +282,7 @@ pub enum AsterError {
 - 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。策略取 `--approval` > `[approval] default` > `ask`。TTY 上 `ask` 提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 上来自配置或缺省的 `ask` 一律降级为 `deny`（无法提示），而显式 `--approval ask` 是用法错误（退出码 2）。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 - MCP（ADR-0027）：`run` / `resume` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。外部工具（`<id>__<tool>`）默认 `Ask`，走上面的审批路径。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
-- 内置工具（#83）：`run` 默认以工作目录为根、按 `[sandbox]` 策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 或 `run --tools a,b` 选子集（flag 优先），`run --no-tools` 全关，未知工具名是配置错误（退出码 2）。`resume` 总是注册全部六个，模型可见的子集由 `SessionCreated` 快照决定。`ask` 模式下 `SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）在端点打开时 `Ask`、关闭时以 `NO_APPROVAL_ENDPOINT` 拒绝；其余按框架默认策略。
+- 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：`run` 默认以工作目录为根、按 `[sandbox]` 策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 或 `run --tools a,b` 选子集（flag 优先），`run --no-tools` 全关，未知工具名是配置错误（退出码 2）。`resume` 总是注册全部六个，模型可见的子集由 `SessionCreated` 快照决定。`ask` 模式下 `SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）在端点打开时 `Ask`、关闭时以 `NO_APPROVAL_ENDPOINT` 拒绝；其余按框架默认策略。
 - 压缩：`run` / `resume` 总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
 
 ### 4.1 配置
@@ -328,7 +328,7 @@ disable_parallel_tool_use = false
 
 [tools]
 max_parallel_calls = 8        # ToolConfig；缺省字段用 Default
-# enabled = ["read_file", "list_dir", "grep"]   # 新 session 的内置工具；省略 = 全部六个
+# enabled = ["read_file", "list_dir", "grep"]   # 新 session 的工作区工具；省略 = 全部六个
 
 [model_aliases.fast]          # 宿主提供的 alias 集合，spawn 用它收窄模型
 provider = "anthropic"

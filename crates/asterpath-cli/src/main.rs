@@ -216,7 +216,7 @@ async fn config_check(args: CheckArgs) -> CliResult<()> {
     for diagnostic in discovery.diagnostics.iter().chain(&budget) {
         println!("skill: {diagnostic}");
     }
-    builtin_tools(&settings, settings.tool_names())?;
+    workspace_tools(&settings, settings.tool_names())?;
     // Loading is the only way to report a server's status; stop them again.
     let mcp = load_mcp(&settings).await?;
     for line in mcp_status_lines(&settings, &mcp)? {
@@ -235,7 +235,7 @@ async fn run(args: RunArgs) -> CliResult<()> {
     } else {
         args.tools.as_deref().or(settings.tool_names())
     };
-    let builtin = builtin_tools(&settings, selection)?;
+    let workspace = workspace_tools(&settings, selection)?;
     let mut skills = skill_setup(&settings, args.no_skills);
     for diagnostic in skills
         .diagnostics
@@ -246,7 +246,7 @@ async fn run(args: RunArgs) -> CliResult<()> {
     }
     let mcp = load_mcp(&settings).await?;
     report_mcp_failures(&settings, &mcp)?;
-    let mut tools = builtin;
+    let mut tools = workspace;
     tools.extend(skills.tools());
     tools.extend(mcp.tools());
     let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
@@ -311,7 +311,7 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     report_mcp_failures(&settings, &mcp)?;
     // The frozen snapshot decides what the model sees; register every
     // built-in tool so any subset chosen at `run` still resolves.
-    let mut tools = builtin_tools(&settings, None)?;
+    let mut tools = workspace_tools(&settings, None)?;
     tools.push(Arc::new(LoadSkillTool::new(skill_roots(&settings))));
     tools.extend(mcp.tools());
     let asterpath = assemble(&settings, providers, approval, tools).await?;
@@ -661,7 +661,7 @@ fn skill_roots(settings: &config::Settings) -> Vec<SkillRoot> {
 
 /// `asterpath-tools` rooted at the working directory under the `[sandbox]`
 /// policy, filtered to `selection` (`None` = all) in the order given.
-fn builtin_tools(
+fn workspace_tools(
     settings: &config::Settings,
     selection: Option<&[String]>,
 ) -> CliResult<Vec<Arc<dyn Tool>>> {

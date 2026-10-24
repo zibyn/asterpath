@@ -14,9 +14,9 @@ use asterpath_mcp::{
 };
 use asterpath_protocol::{
     ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig,
-    ContextPolicy, DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, NO_APPROVAL_ENDPOINT,
-    Provider, ProviderId, ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams,
-    SandboxPolicy, SideEffect, SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
+    ContextPolicy, DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderId,
+    ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SandboxPolicy, SideEffect,
+    SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -194,32 +194,23 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
 }
 
 /// `Ask` asks for every `Mutating` tool (the framework default allows all
-/// in-process tools) and otherwise keeps the default; both deny when no
-/// endpoint is open.
+/// in-process tools) and otherwise keeps the default; the pipeline denies
+/// `Ask` when no endpoint is open.
 pub fn approval_policy(mode: ApprovalMode, gate: Arc<ApprovalGate>) -> Arc<dyn ApprovalPolicy> {
     match mode {
-        ApprovalMode::Ask => Arc::new(AskMutating {
-            fallback: DefaultApprovalPolicy::new(Arc::clone(&gate)),
-            gate,
-        }),
+        ApprovalMode::Ask => Arc::new(AskMutating(DefaultApprovalPolicy::new(gate))),
         ApprovalMode::Allow => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
         ApprovalMode::Deny => Arc::new(FixedApproval(ApprovalVerdict::Deny { reason: None })),
     }
 }
 
-struct AskMutating {
-    gate: Arc<ApprovalGate>,
-    fallback: DefaultApprovalPolicy,
-}
+struct AskMutating(DefaultApprovalPolicy);
 
 impl ApprovalPolicy for AskMutating {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
         match request.side_effect {
-            SideEffect::Mutating if self.gate.is_open() => ApprovalVerdict::Ask,
-            SideEffect::Mutating => ApprovalVerdict::Deny {
-                reason: Some(NO_APPROVAL_ENDPOINT.to_owned()),
-            },
-            _ => self.fallback.classify(request),
+            SideEffect::Mutating => ApprovalVerdict::Ask,
+            _ => self.0.classify(request),
         }
     }
 }
