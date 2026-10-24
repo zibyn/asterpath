@@ -68,7 +68,8 @@ impl Provider for AnthropicProvider {
             citations: false,
             // Server tools are not expressible in the normalized protocol yet.
             builtin_tools: false,
-            cache_control: false,
+            // The adapter sets its own breakpoints; see request::render.
+            cache_control: true,
             image_input: true,
             parallel_tool_calls: true,
         }

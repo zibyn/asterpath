@@ -18,6 +18,8 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 enum Frag {
     Json(Value),
     Raw(String),
+    /// An object whose fields may hold raw data; written by [`object`].
+    Object(Vec<(&'static str, Frag)>),
 }
 
 impl Frag {
@@ -27,8 +29,29 @@ impl Frag {
                 out.push_str(&serde_json::to_string(&value).expect("JSON value serializes"));
             }
             Self::Raw(raw) => out.push_str(&raw),
+            Self::Object(fields) => out.push_str(&object(fields)),
         }
     }
+
+    /// Add an ephemeral cache breakpoint. Replayed raw blocks are never
+    /// modified (ADR 0010), so they cannot carry one; returns whether it was set.
+    fn set_cache_control(&mut self) -> bool {
+        match self {
+            Self::Json(Value::Object(map)) => {
+                map.insert("cache_control".to_owned(), ephemeral());
+                true
+            }
+            Self::Object(fields) => {
+                fields.push(("cache_control", Frag::Json(ephemeral())));
+                true
+            }
+            Self::Json(_) | Self::Raw(_) => false,
+        }
+    }
+}
+
+fn ephemeral() -> Value {
+    json!({"type": "ephemeral"})
 }
 
 fn object(fields: Vec<(&str, Frag)>) -> String {
@@ -121,7 +144,7 @@ pub(crate) fn render(
         ("max_tokens", Frag::Json(json!(request.max_output_tokens))),
     ];
     if !request.system.is_empty() {
-        let blocks: Vec<Value> = request
+        let mut blocks: Vec<Value> = request
             .system
             .iter()
             .map(|part| match part {
@@ -129,11 +152,14 @@ pub(crate) fn render(
                 _ => unreachable!("check rejects non-text system parts"),
             })
             .collect();
+        if let Some(last) = blocks.last_mut() {
+            last["cache_control"] = ephemeral();
+        }
         fields.push(("system", Frag::Json(Value::Array(blocks))));
     }
     fields.push(("messages", Frag::Raw(messages)));
     if !request.tools.is_empty() {
-        let tools = request
+        let mut tools: Vec<Value> = request
             .tools
             .iter()
             .map(|tool| {
@@ -144,6 +170,9 @@ pub(crate) fn render(
                 })
             })
             .collect();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = ephemeral();
+        }
         fields.push(("tools", Frag::Json(Value::Array(tools))));
         let mut choice = match &request.tool_choice {
             ToolChoice::Auto => json!({"type": "auto"}),
@@ -269,13 +298,13 @@ fn render_messages(
                     .iter()
                     .filter_map(|part| render_part(provider, part))
                     .collect();
-                let block = object(vec![
+                let block = Frag::Object(vec![
                     ("type", Frag::Json(json!("tool_result"))),
                     ("tool_use_id", Frag::Json(json!(call_id))),
                     ("content", Frag::Raw(array(content))),
                     ("is_error", Frag::Json(json!(is_error))),
                 ]);
-                push_blocks(&mut messages, "user", vec![Frag::Raw(block)], Vec::new());
+                push_blocks(&mut messages, "user", vec![block], Vec::new());
             }
             Item::ServerToolCall {
                 provider: item_provider,
@@ -313,11 +342,17 @@ fn render_messages(
         }
     }
 
+    let count = messages.len();
     let rendered = messages
         .into_iter()
-        .map(|message| {
+        .enumerate()
+        .map(|(position, message)| {
             let mut content = message.tool_results;
             content.extend(message.other);
+            if position + 1 == count {
+                // Breakpoint on the last carrier block; omitted if every block is raw.
+                let _ = content.iter_mut().rev().any(Frag::set_cache_control);
+            }
             Frag::Raw(object(vec![
                 ("role", Frag::Json(json!(message.role))),
                 ("content", Frag::Raw(array(content))),
