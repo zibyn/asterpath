@@ -266,6 +266,7 @@ fn render_input(
                     .filter(|data| &data.provider == provider)
                     .and_then(|data| serde_json::from_str::<Value>(data.json.as_str()).ok())
                     .and_then(|mut value| value.get_mut("phase").map(Value::take))
+                    .filter(|phase| !phase.is_null())
                 {
                     message["phase"] = phase;
                 }
