@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 
+use crate::agent::ApprovalRequest;
 use crate::error::{RetirementError, StorageError};
 use crate::ids::{LogId, SessionId, SignalId};
 use crate::time::Timestamp;
@@ -153,11 +155,19 @@ pub enum WakeCause {
     ChildCompleted(SessionId),
 }
 
-/// Liveness declaration for approval responders: the kernel mechanism only
-/// tells the pipeline whether anyone can answer.
+/// Liveness declaration for approval responders, plus the requests waiting
+/// for a decision in this process (ADR-0028). Nothing here is durable:
+/// recovery re-emits `ApprovalRequested` after a restart.
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalGate {
     open: Arc<AtomicUsize>,
+    pending: Arc<Mutex<PendingRequests>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingRequests {
+    next: u64,
+    waiting: BTreeMap<u64, ApprovalRequest>,
 }
 
 impl ApprovalGate {
@@ -175,6 +185,46 @@ impl ApprovalGate {
 
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::SeqCst) > 0
+    }
+
+    /// Every request still waiting for a decision, across all sessions, in
+    /// the order they were requested.
+    pub fn pending(&self) -> Vec<ApprovalRequest> {
+        self.lock().waiting.values().cloned().collect()
+    }
+
+    /// Lists `request` as pending until the returned guard drops, however the
+    /// wait ends: a decision, a cancel or a dropped drive stream.
+    pub fn wait_for(&self, request: ApprovalRequest) -> PendingApproval {
+        let mut pending = self.lock();
+        let key = pending.next;
+        pending.next += 1;
+        pending.waiting.insert(key, request);
+        PendingApproval {
+            pending: Arc::clone(&self.pending),
+            key,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingRequests> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// RAII listing of one waiting request; see `ApprovalGate::wait_for`.
+#[derive(Debug)]
+pub struct PendingApproval {
+    pending: Arc<Mutex<PendingRequests>>,
+    key: u64,
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+            .remove(&self.key);
     }
 }
 
