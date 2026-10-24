@@ -13,12 +13,15 @@ mod models;
 mod request;
 mod sse;
 
+use std::sync::Arc;
+
 use asterpath_protocol::{
     ModelRequest, ModelSpec, Provider, ProviderCapabilities, ProviderError, ProviderId, StreamEvent,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+pub use asterpath_http::{TraceMark, TraceSink};
 pub use models::{AnthropicModelProfile, Thinking};
 
 /// Default Anthropic API origin.
@@ -30,6 +33,7 @@ pub struct AnthropicProvider {
     base_url: String,
     client: reqwest::Client,
     id: ProviderId,
+    trace: Option<Arc<dyn TraceSink>>,
     default_profile: Option<AnthropicModelProfile>,
     model_profiles: Vec<(String, AnthropicModelProfile)>,
 }
@@ -44,6 +48,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             client: reqwest::Client::new(),
             id: ProviderId::new(Self::ID),
+            trace: None,
             default_profile: None,
             model_profiles: Vec::new(),
         }
@@ -91,6 +96,12 @@ impl AnthropicProvider {
         self
     }
 
+    #[must_use]
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
+    }
+
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
     }
@@ -125,7 +136,7 @@ impl Provider for AnthropicProvider {
             return stream::once(async move { Err(error) }).boxed();
         }
         let provider = self.id();
-        let body = match request::render(&provider, profile, &request) {
+        let body = match request::render(&provider, profile, &request, self.trace.as_deref()) {
             Ok(body) => body,
             Err(error) => return stream::once(async move { Err(error) }).boxed(),
         };

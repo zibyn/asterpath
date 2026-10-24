@@ -794,7 +794,7 @@ pub enum ProviderErrorKind {
 | A2 | OpenAI encrypted reasoning（`store:false`） | 请求含 `include:["reasoning.encrypted_content"]`；无 `previous_response_id`；回放成功 |
 | A3 | 跨 provider 切换 | `Reasoning` / `ServerTool*` / `ProviderOpaque` 不进入请求；规范历史仍可投影；trace 有 `dropped_items`；不报错 |
 | A4 | 压缩后旧 reasoning | `binding.prefix_epoch` 不匹配 → 丢弃；压缩后新 reasoning 使用新代次并可回放 |
-| A17 | 工具集变化（fork 收窄、会话中途增删） | Anthropic inline 路径：顶层 `tools` 保持基线，变更渲染为 `tool_addition` / `tool_removal`，旧 thinking 照常回放；退回路径与 fork 收窄：`binding.tools_hash` 不匹配 → `Reasoning` 丢弃（OpenAI adapter 记 `dropped_items`；Anthropic adapter 尚无 trace sink）。OpenAI：顶层 `tools` 是生效集合，照常回放。规范历史与对已移除工具的调用仍完整 |
+| A17 | 工具集变化（fork 收窄、会话中途增删） | Anthropic inline 路径：顶层 `tools` 保持基线，变更渲染为 `tool_addition` / `tool_removal`，旧 thinking 照常回放；退回路径与 fork 收窄：`binding.tools_hash` 不匹配 → `Reasoning` 丢弃，trace 记 `dropped_items`（reason `tools_hash_mismatch`）。OpenAI：顶层 `tools` 是生效集合，照常回放。规范历史与对已移除工具的调用仍完整 |
 | A18 | 重启后同名工具 schema 变化 | 请求 `tools` 仍由日志里记录的描述符（`SessionCreated.config.tools` 加 `ConfigChanged.add_tools`）渲染，与崩溃前一致；注册表新 schema 只影响新 session |
 | A5 | 工具调用/结果双向映射 | Anthropic 合并 user 消息且 `tool_result` 在文本前；OpenAI `function_call` / `function_call_output` 成对 |
 | A6 | OpenAI 事件交错 | 按 `output_index` 归一；item 不丢不重；`ItemCompleted` 顺序不影响最终历史 |
@@ -805,7 +805,7 @@ pub enum ProviderErrorKind {
 | A11 | 工具结果图像跨协议 | Anthropic 原样渲染；OpenAI 渲染占位并记 trace |
 | A12 | `Part::Refusal` | 两边渲染正确；`StopReason::Refusal` 并存；不丢内容 |
 | A13 | 系统提示不入历史 | 基线 `system` 单独渲染；没有 `Instruction` 时请求中无 system / developer role message |
-| A19 | 追加指令 | 下一个 step 的请求在 `tool_result` 之后含该指令，顶层 `system` 不变；Anthropic 为 `role: "system"` 消息且旧 thinking 原样回放；OpenAI 为 `developer` 消息；Anthropic 退回路径并入顶层并丢弃旧 thinking |
+| A19 | 追加指令 | 下一个 step 的请求在 `tool_result` 之后含该指令，顶层 `system` 不变；Anthropic 为 `role: "system"` 消息且旧 thinking 原样回放；OpenAI 为 `developer` 消息；Anthropic 退回路径并入顶层并丢弃旧 thinking，trace 记 `dropped_items`（reason `system_changed`） |
 | A14 | 原始字节保真 | `raw.json` 的键序、空白、转义在回放后不变 |
 | A15 | `Compaction` 跨协议 | Anthropic user text block；OpenAI 普通 input 文本消息 |
 | A16 | `ProviderOpaque` 回放 | 同 provider 原样；跨 provider 丢弃并记 trace |

@@ -207,3 +207,48 @@ pub fn same_provider_raw_field(
         .and_then(|mut value| value.get_mut(field).map(Value::take))
         .filter(|value| !value.is_null())
 }
+
+/// Receives an adapter's protocol-level trace marks.
+///
+/// The tracing module is not wired in v1 yet; hosts inject a sink (or ignore
+/// marks) until `protocol.dropped_items` / `protocol.rendered_as_text` have a
+/// real span to land on.
+pub trait TraceSink: Send + Sync {
+    fn mark(&self, mark: TraceMark);
+}
+
+/// A protocol-level trace mark emitted while rendering.
+///
+/// `name` is `protocol.dropped_items` or `protocol.rendered_as_text`; `provider`
+/// and `kind` identify the source, `reason` explains the drop or text fallback.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceMark {
+    pub name: &'static str,
+    pub provider: ProviderId,
+    pub kind: String,
+    pub reason: String,
+}
+
+impl TraceMark {
+    pub const DROPPED_ITEMS: &'static str = "protocol.dropped_items";
+    pub const RENDERED_AS_TEXT: &'static str = "protocol.rendered_as_text";
+
+    pub fn dropped(provider: ProviderId, kind: impl Into<String>, reason: &str) -> Self {
+        Self {
+            name: Self::DROPPED_ITEMS,
+            provider,
+            kind: kind.into(),
+            reason: reason.to_owned(),
+        }
+    }
+
+    pub fn rendered_as_text(provider: ProviderId, kind: impl Into<String>, reason: &str) -> Self {
+        Self {
+            name: Self::RENDERED_AS_TEXT,
+            provider,
+            kind: kind.into(),
+            reason: reason.to_owned(),
+        }
+    }
+}

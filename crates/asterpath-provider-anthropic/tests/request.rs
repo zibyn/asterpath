@@ -7,10 +7,13 @@ use asterpath_protocol::{
     RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role, SamplingParams,
     ToolChoice, ToolName,
 };
-use asterpath_provider_anthropic::{AnthropicModelProfile, AnthropicProvider};
+use asterpath_provider_anthropic::{
+    AnthropicModelProfile, AnthropicProvider, TraceMark, TraceSink,
+};
 use common::{
     MockServer, Reply, base_request, descriptor, drain, empty_sse, model, provider, text,
 };
+use std::sync::{Arc, Mutex, PoisonError};
 
 fn request_for(model: &str) -> ModelRequest {
     let mut request = base_request();
@@ -1267,6 +1270,37 @@ async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
     assert!(!asterpath_protocol::Provider::capabilities(&plain, &spec).sampling);
 }
 
+#[derive(Default)]
+struct RecordingSink(Mutex<Vec<TraceMark>>);
+
+impl TraceSink for RecordingSink {
+    fn mark(&self, mark: TraceMark) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(mark);
+    }
+}
+
+impl RecordingSink {
+    fn marks(&self) -> Vec<(&'static str, String, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|mark| (mark.name, mark.kind.clone(), mark.reason.clone()))
+            .collect()
+    }
+}
+
+fn dropped_reasoning(reason: &str) -> Vec<(&'static str, String, String)> {
+    vec![(
+        TraceMark::DROPPED_ITEMS,
+        "reasoning".to_owned(),
+        reason.to_owned(),
+    )]
+}
+
 const THINKING: &str = r#"{"type":"thinking","thinking":"plan","signature":"sig-1"}"#;
 const LATER_THINKING: &str = r#"{"type":"thinking","thinking":"again","signature":"sig-2"}"#;
 
@@ -1363,10 +1397,13 @@ async fn an_instruction_followed_by_user_input_moves_after_it() {
 #[tokio::test]
 async fn without_inline_system_an_instruction_joins_the_top_level_system_and_drops_old_thinking() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
-    let provider = provider(&server).with_model_profile(
-        "claude-opus-5-5",
-        AnthropicModelProfile::latest().with_inline_system(false),
-    );
+    let sink = Arc::new(RecordingSink::default());
+    let provider = provider(&server)
+        .with_model_profile(
+            "claude-opus-5-5",
+            AnthropicModelProfile::latest().with_inline_system(false),
+        )
+        .with_trace_sink(sink.clone());
     let mut request = instructed_request("claude-opus-5-5");
     request
         .items
@@ -1385,6 +1422,7 @@ async fn without_inline_system_an_instruction_joins_the_top_level_system_and_dro
         sent.body.contains(LATER_THINKING),
         "thinking after it is kept"
     );
+    assert_eq!(sink.marks(), dropped_reasoning("system_changed"));
     let body = sent.json_body();
     let system: Vec<&str> = body["system"]
         .as_array()
@@ -1475,11 +1513,15 @@ async fn a_tool_change_renders_inline_and_keeps_the_top_level_tools_and_old_thin
 #[tokio::test]
 async fn without_inline_tools_a_tool_change_rewrites_the_top_level_tools_and_drops_old_thinking() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
-    let provider = provider(&server).with_model_profile(
-        "claude-opus-5-5",
-        AnthropicModelProfile::latest().with_inline_tools(false),
-    );
+    let sink = Arc::new(RecordingSink::default());
+    let provider = provider(&server)
+        .with_model_profile(
+            "claude-opus-5-5",
+            AnthropicModelProfile::latest().with_inline_tools(false),
+        )
+        .with_trace_sink(sink.clone());
     drain(&provider, tools_changed_request("claude-opus-5-5")).await;
+    assert_eq!(sink.marks(), dropped_reasoning("tools_hash_mismatch"));
     let sent = &server.requests()[0];
     assert!(
         !sent.head.to_ascii_lowercase().contains("anthropic-beta"),

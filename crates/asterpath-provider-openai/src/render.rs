@@ -10,47 +10,7 @@ use asterpath_protocol::{
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
-use crate::TraceSink;
-
-/// A protocol-level trace mark emitted while rendering.
-///
-/// `name` is `protocol.dropped_items` or `protocol.rendered_as_text`; `provider`
-/// and `kind` identify the source, `reason` explains the drop or text fallback.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TraceMark {
-    pub name: &'static str,
-    pub provider: ProviderId,
-    pub kind: String,
-    pub reason: String,
-}
-
-impl TraceMark {
-    pub const DROPPED_ITEMS: &'static str = "protocol.dropped_items";
-    pub const RENDERED_AS_TEXT: &'static str = "protocol.rendered_as_text";
-
-    pub(crate) fn dropped(provider: ProviderId, kind: impl Into<String>, reason: &str) -> Self {
-        Self {
-            name: Self::DROPPED_ITEMS,
-            provider,
-            kind: kind.into(),
-            reason: reason.to_owned(),
-        }
-    }
-
-    pub(crate) fn rendered_as_text(
-        provider: ProviderId,
-        kind: impl Into<String>,
-        reason: &str,
-    ) -> Self {
-        Self {
-            name: Self::RENDERED_AS_TEXT,
-            provider,
-            kind: kind.into(),
-            reason: reason.to_owned(),
-        }
-    }
-}
+use asterpath_http::{TraceMark, TraceSink};
 
 /// Serialize the complete request. Deterministic: struct field order, sorted
 /// tool fingerprints and `serde_json`'s ordered maps make repeated renders of

@@ -25,18 +25,9 @@ use asterpath_protocol::{
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+pub use asterpath_http::{TraceMark, TraceSink};
 pub use models::OpenAiModelProfile;
-pub use render::TraceMark;
 use wire::WireContext;
-
-/// Receives the adapter's protocol-level trace marks.
-///
-/// The tracing module is not wired in v1 yet; hosts inject a sink (or ignore
-/// marks) until `protocol.dropped_items` / `protocol.rendered_as_text` have a
-/// real span to land on.
-pub trait TraceSink: Send + Sync {
-    fn mark(&self, mark: TraceMark);
-}
 
 /// OpenAI Responses provider.
 pub struct OpenAiProvider {

@@ -5,7 +5,8 @@
 //! verbatim and is never parsed or re-serialized.
 
 use asterpath_http::{
-    merge_provider_option, provider_option_conflict, provider_options_for, same_provider_raw_field,
+    TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
+    same_provider_raw_field,
 };
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
@@ -194,11 +195,12 @@ pub(crate) fn render(
     provider: &ProviderId,
     rules: &AnthropicModelProfile,
     request: &ModelRequest,
+    trace: Option<&dyn TraceSink>,
 ) -> Result<String, ProviderError> {
     let options = provider_options_for(request, &[])?;
     let top_tools = top_level_tools(rules, request);
     let tools_hash = asterpath_protocol::tools_hash(top_tools);
-    let messages = render_messages(provider, request, &tools_hash, rules)?;
+    let messages = render_messages(provider, request, &tools_hash, rules, trace)?;
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_system {
         // Fallback: appended instructions join the top-level system.
@@ -350,6 +352,7 @@ fn render_messages(
     request: &ModelRequest,
     tools_hash: &str,
     rules: &AnthropicModelProfile,
+    trace: Option<&dyn TraceSink>,
 ) -> Result<String, ProviderError> {
     let inline_system = rules.inline_system;
     // On the fallback path the top-level system holds every instruction, so
@@ -387,12 +390,18 @@ fn render_messages(
                 }
             }
             Item::Reasoning { binding, raw, .. } => {
-                if index >= replay_from && replayable(binding, raw, request, tools_hash) {
-                    messages.push(
+                let reason = drop_reason(binding, raw, request, tools_hash)
+                    .or((index < replay_from).then_some("system_changed"));
+                match (reason, trace) {
+                    (None, _) => messages.push(
                         "assistant",
                         Vec::new(),
                         vec![Frag::Raw(raw.json.as_str().to_owned())],
-                    );
+                    ),
+                    (Some(reason), Some(sink)) => {
+                        sink.mark(TraceMark::dropped(provider.clone(), "reasoning", reason))
+                    }
+                    (Some(_), None) => {}
                 }
             }
             Item::ToolCall {
@@ -567,15 +576,22 @@ fn render_part(provider: &ProviderId, part: &Part) -> Option<Frag> {
     }
 }
 
-fn replayable(
+/// Why a reasoning item may not be replayed into this request, if it may not.
+fn drop_reason(
     binding: &ReasoningBinding,
     raw: &RawProviderData,
     request: &ModelRequest,
     tools_hash: &str,
-) -> bool {
-    binding.provider == request.spec.provider
-        && raw.provider == request.spec.provider
-        && binding.model == request.spec.model
-        && binding.prefix_epoch == request.prefix_epoch
-        && binding.tools_hash == tools_hash
+) -> Option<&'static str> {
+    if binding.provider != request.spec.provider || raw.provider != request.spec.provider {
+        Some("cross_provider")
+    } else if binding.model != request.spec.model {
+        Some("model_mismatch")
+    } else if binding.prefix_epoch != request.prefix_epoch {
+        Some("prefix_epoch_mismatch")
+    } else if binding.tools_hash != tools_hash {
+        Some("tools_hash_mismatch")
+    } else {
+        None
+    }
 }
