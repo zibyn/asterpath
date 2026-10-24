@@ -264,6 +264,7 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     };
     let handle = app.create_session(spec).await.expect("create");
     let session = handle.id();

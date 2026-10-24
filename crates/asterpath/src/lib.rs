@@ -45,7 +45,9 @@ use asterpath_protocol::{
     SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError, UsageError,
     UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
-use asterpath_protocol::{ApprovalGate, Clock, SessionQuery, SessionStore, unique_bytes};
+use asterpath_protocol::{
+    ApprovalGate, CatalogEntry, Clock, SessionQuery, SessionStore, unique_bytes,
+};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -230,6 +232,19 @@ impl Asterpath {
                 message: "system may only contain text parts".to_owned(),
             });
         }
+        // Host metadata limits (storage.md §5).
+        if spec.metadata.len() > 64
+            || spec
+                .metadata
+                .iter()
+                .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+        {
+            return Err(AsterError::Config {
+                message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
+                          up to 4096 bytes"
+                    .to_owned(),
+            });
+        }
         let tools = match &spec.tools {
             ToolSelection::All => self
                 .tools
@@ -253,6 +268,7 @@ impl Asterpath {
         let event = SessionEvent::SessionCreated {
             config: spec.snapshot(tools),
             parent: None,
+            metadata: spec.metadata,
         };
         let entry = asterpath_protocol::encode_entry(
             session,
@@ -298,6 +314,13 @@ impl Asterpath {
     /// store has none).
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
+    }
+
+    /// One page of the session catalog, host metadata included (ADR-0032):
+    /// filtered by parent, newest `(created_at, session)` first, resumed
+    /// after `query.after`. Sorting or filtering by metadata is the host's.
+    pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError> {
+        Ok(self.store.sessions(query).await?)
     }
 
     /// Sessions with unfinished work (ADR-0023): a non-compaction intent is

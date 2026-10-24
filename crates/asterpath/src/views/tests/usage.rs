@@ -238,6 +238,7 @@ impl SessionStore for TestLog {
                 parent: Some(parent),
                 created_at: 0,
                 last_activity: 0,
+                metadata: Default::default(),
             })
             .collect();
         Box::pin(async move { Ok(entries) })

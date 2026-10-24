@@ -15,10 +15,13 @@ use asterpath::protocol::{
     StopReason, SubagentConfig, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
     decode_entry,
 };
-use asterpath::protocol::{Clock, InputId, LogEntry, LogQuery, SessionId, SessionStore};
+use asterpath::protocol::{
+    Clock, InputId, LogEntry, LogQuery, ParentFilter, SessionId, SessionQuery, SessionStore,
+};
 use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
+use std::collections::BTreeMap;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +92,7 @@ fn spec(provider: &str) -> SessionSpec {
         turn: test_turn_config(),
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 
@@ -191,7 +195,7 @@ async fn one_turn_without_tools_commits_the_expected_sequence() {
         .first()
         .map(|entry| decode_entry(entry).unwrap())
         .and_then(|event| match event {
-            SessionEvent::SessionCreated { config, parent } => {
+            SessionEvent::SessionCreated { config, parent, .. } => {
                 assert!(parent.is_none());
                 Some(config)
             }
@@ -641,6 +645,94 @@ async fn pause_turn_continuation_keeps_the_declared_server_tools() {
             Some(&declared)
         );
     }
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+fn named(name: &str) -> SessionSpec {
+    let mut session_spec = spec("p");
+    session_spec.metadata = BTreeMap::from([
+        ("cwd".to_owned(), "/work".to_owned()),
+        ("name".to_owned(), name.to_owned()),
+    ]);
+    session_spec
+}
+
+#[tokio::test]
+async fn sessions_lists_host_metadata_across_a_reopen() {
+    let clock = Arc::new(ManualClock::new());
+    let db = temp_db("catalog");
+    let build = |db: PathBuf| {
+        let clock = clock.clone();
+        async move {
+            Asterpath::builder()
+                .database(db)
+                .providers(vec![Arc::new(ScriptedProvider::new("p"))])
+                .clock(clock)
+                .build()
+                .await
+                .expect("facade builds")
+        }
+    };
+    let asterpath = build(db.clone()).await;
+    let first = asterpath.create_session(named("first")).await.unwrap().id();
+    clock.advance(1);
+    let second = asterpath
+        .create_session(named("second"))
+        .await
+        .unwrap()
+        .id();
+    let created = decoded(&scan(asterpath.store(), first).await).remove(0);
+    let SessionEvent::SessionCreated { metadata, .. } = created else {
+        panic!("log starts with SessionCreated");
+    };
+    assert_eq!(metadata, named("first").metadata);
+    asterpath.shutdown().await.unwrap();
+
+    let reopened = build(db.clone()).await;
+    let page = |after| SessionQuery {
+        parent: ParentFilter::Roots,
+        after,
+        limit: Some(1),
+    };
+    let newest = reopened.sessions(page(None)).await.unwrap();
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].session, second);
+    assert_eq!(newest[0].metadata, named("second").metadata);
+    let older = reopened
+        .sessions(page(Some(newest[0].cursor())))
+        .await
+        .unwrap();
+    assert_eq!(older.len(), 1);
+    assert_eq!(older[0].session, first);
+    assert_eq!(older[0].metadata["name"], "first");
+    reopened.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn oversized_host_metadata_is_a_configuration_error() {
+    let db = temp_db("metadata-limits");
+    let asterpath = open(&db, vec![Arc::new(ScriptedProvider::new("p"))]).await;
+    let too_many = (0..=64).map(|i| (format!("k{i}"), String::new())).collect();
+    let long_key = BTreeMap::from([("k".repeat(129), String::new())]);
+    let long_value = BTreeMap::from([("k".to_owned(), "v".repeat(4097))]);
+    for metadata in [too_many, long_key, long_value] {
+        let mut session_spec = spec("p");
+        session_spec.metadata = metadata;
+        assert!(matches!(
+            asterpath.create_session(session_spec).await.unwrap_err(),
+            AsterError::Config { .. }
+        ));
+    }
+    assert!(
+        asterpath
+            .sessions(SessionQuery::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected spec writes nothing"
+    );
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
 }

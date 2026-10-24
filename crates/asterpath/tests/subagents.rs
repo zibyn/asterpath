@@ -132,6 +132,7 @@ fn spec(max_steps: Option<u32>) -> SessionSpec {
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 
@@ -283,7 +284,11 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
             .respond(assistant("parent done"), StopReason::EndTurn, usage()),
     );
     let asterpath = open(simple_config(&db, vec![provider.clone()], Vec::new())).await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let mut parent_spec = spec(None);
+    parent_spec
+        .metadata
+        .insert("cwd".to_owned(), "/work".to_owned());
+    let handle = asterpath.create_session(parent_spec).await.unwrap();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
@@ -335,12 +340,21 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     );
 
     let child_events = decoded(&child_entries);
-    let SessionEvent::SessionCreated { config, parent } = &child_events[0] else {
+    let SessionEvent::SessionCreated {
+        config,
+        parent,
+        metadata,
+    } = &child_events[0]
+    else {
         panic!("child starts with SessionCreated");
     };
     assert_eq!(
         config, &spawned_config,
         "ChildSessionSpawned.config is field-for-field the child snapshot"
+    );
+    assert!(
+        metadata.is_empty(),
+        "a child never inherits the parent's host metadata"
     );
     assert_eq!(
         parent.as_ref().map(|parent| parent.session),

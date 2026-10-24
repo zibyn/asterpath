@@ -63,6 +63,7 @@ fn spec(system: Vec<Part>) -> SessionSpec {
         },
         compaction: asterpath_protocol::CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

@@ -53,6 +53,7 @@ async fn seed(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
         SessionEvent::SessionCreated {
             config,
             parent: None,
+            metadata: Default::default(),
         },
         Some(dedup::session_created(SESSION)),
     )
@@ -1201,6 +1202,7 @@ async fn seed_child(log: &Arc<InMemoryEventLog>, parent: Option<ParentRef>) {
         SessionEvent::SessionCreated {
             config: config(Vec::new()),
             parent,
+            metadata: Default::default(),
         },
         Some(dedup::session_created(SESSION)),
     )
@@ -1214,6 +1216,7 @@ async fn seed_parent_waiting(log: &Arc<InMemoryEventLog>) {
         SessionEvent::SessionCreated {
             config: config(Vec::new()),
             parent: None,
+            metadata: Default::default(),
         },
         Some(dedup::session_created(PARENT)),
     )

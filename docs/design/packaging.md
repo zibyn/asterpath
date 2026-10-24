@@ -144,6 +144,7 @@ impl Asterpath {
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
+    pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError>;  // 会话目录（ADR-0032）
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 唤醒发现（storage.md §7）
     pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
@@ -167,7 +168,8 @@ impl Asterpath {
 - 没有 `agent` / `executor` 注入：agent 循环与持久等待是引擎内部类型，不可替换（ADR-0026）。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
-- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider` = `AsterError::Config`），再写 `SessionCreated { config, parent: None }`。
+- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、宿主元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
+- `sessions(query)` 是存储目录查询的原样转发：按父会话过滤，按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序或过滤由宿主在结果上完成（ADR-0032）。
 
 ### 3.3 Session 驱动
 
@@ -180,6 +182,7 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+    pub metadata: BTreeMap<String, String>,   // 宿主元数据（ADR-0032），不进 ConfigSnapshot
 }
 
 pub enum ToolSelection { All, Names(Vec<ToolName>) }

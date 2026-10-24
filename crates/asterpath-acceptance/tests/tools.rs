@@ -75,6 +75,7 @@ fn spec() -> SessionSpec {
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

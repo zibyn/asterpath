@@ -92,6 +92,7 @@ async fn new_log(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
         SessionEvent::SessionCreated {
             config,
             parent: None,
+            metadata: Default::default(),
         },
         None,
     )

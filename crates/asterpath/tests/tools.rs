@@ -103,6 +103,7 @@ fn spec(tools: ToolSelection) -> SessionSpec {
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 
