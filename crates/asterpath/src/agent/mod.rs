@@ -1453,7 +1453,7 @@ async fn caught<'a, T>(
     }
 }
 
-/// The effective config at `watermark`; the agent's one config fold.
+/// The effective config at `watermark`, via `effective_config`.
 fn config_at(
     session: SessionId,
     decoded: &[(LogEntry, SessionEvent)],

@@ -192,7 +192,8 @@ pub struct ConfigPatch {
 
 /// The effective configuration at `watermark`: `SessionCreated.config` with
 /// every `ConfigChanged` whose `seq < watermark` applied in log order. `None`
-/// when the records hold no `SessionCreated`. The engine's only config fold.
+/// when the records hold no `SessionCreated`. The engine's only config fold:
+/// the agent, scheduler, trace, facade and CLI all read config through it.
 pub fn effective_config<'a>(
     records: impl IntoIterator<Item = (&'a crate::LogEntry, &'a crate::SessionEvent)>,
     watermark: u64,

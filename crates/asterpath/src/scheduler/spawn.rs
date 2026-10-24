@@ -257,7 +257,7 @@ impl Scheduler {
             let tools = narrow_tools(&parent_config.tools, req.tool_allowlist.as_deref())?;
             let system = match &context {
                 ContextPolicy::Fork { at } => {
-                    fork_system(&parent_events, *at, watermark).map_err(SpawnError::Execution)?
+                    fork_system(&parent_events, *at).map_err(SpawnError::Execution)?
                 }
                 ContextPolicy::Fresh => parent_config.system.clone(),
             };
@@ -704,7 +704,7 @@ impl Scheduler {
         at: LogId,
     ) -> Result<Vec<Item>, ExecutionError> {
         let entries = scan_decoded(&*self.log, parent.session).await?;
-        let (prefix, _) = fork_prefix(&entries, at)?;
+        let prefix = fork_prefix(&entries, at)?;
         let mut items = asterpath_protocol::history(&prefix).map_err(backend)?;
         // The child's created tools are already the narrowed effective set, so
         // copied changes would re-add tools the allowlist removed (ADR-0030).
@@ -874,11 +874,11 @@ fn resolve_context(
     }
 }
 
-/// The parent records a fork at `at` copies, and the seq of `at`.
+/// The parent records a fork at `at` copies.
 fn fork_prefix(
     entries: &[(LogEntry, SessionEvent)],
     at: LogId,
-) -> Result<(Vec<LogEntry>, u64), ExecutionError> {
+) -> Result<Vec<LogEntry>, ExecutionError> {
     let Some(at_seq) = entries
         .iter()
         .find(|(entry, _)| entry.log_id == at)
@@ -896,30 +896,21 @@ fn fork_prefix(
         })
         .map(|(entry, _)| entry.clone())
         .collect();
-    Ok((prefix, at_seq))
+    Ok(prefix)
 }
 
 /// A forked child's system: the parent's baseline at the fork point, since the
-/// copied history already holds the instructions appended before it, plus the
-/// ones appended between the fork point and the spawn step (ADR-0030).
+/// copied history already holds the instructions appended before it. The fork
+/// point is the spawn step's `StepStarted`, so no change falls between it and
+/// the config watermark (ADR-0030).
 fn fork_system(
     entries: &[(LogEntry, SessionEvent)],
     at: LogId,
-    watermark: u64,
 ) -> Result<Vec<Part>, ExecutionError> {
-    let (prefix, at_seq) = fork_prefix(entries, at)?;
-    let mut system = asterpath_protocol::request_history(&prefix)
+    let prefix = fork_prefix(entries, at)?;
+    Ok(asterpath_protocol::request_history(&prefix)
         .map_err(backend)?
-        .system;
-    for (entry, event) in entries {
-        if let SessionEvent::ConfigChanged { patch } = event
-            && entry.seq > at_seq
-            && entry.seq < watermark
-        {
-            system.extend(patch.append_system.iter().cloned());
-        }
-    }
-    Ok(system)
+        .system)
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.
