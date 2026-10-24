@@ -161,7 +161,9 @@ impl Asterpath {
             Arc::clone(&cancellations),
         ));
         let tools = Arc::new(ToolTable::new());
-        tools.register(Arc::new(SpawnTool::new()));
+        if config.spawn_tool {
+            tools.register(Arc::new(SpawnTool::new()));
+        }
         for tool in config.tools {
             tools.register(tool);
         }
