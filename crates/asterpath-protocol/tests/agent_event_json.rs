@@ -2,8 +2,9 @@
 //! snake_case variant names, IDs as hex strings.
 
 use asterpath_protocol::{
-    AgentEvent, ApprovalRequest, JsonString, PartDelta, Provenance, ReplaySafety, SessionId,
-    SideEffect, StepId, ToolCallId, ToolName, ToolResultStatus, TurnEndReason, TurnId,
+    AgentEvent, ApprovalRequest, InputTokens, JsonString, OutputTokens, Part, PartDelta,
+    Provenance, ReplaySafety, SessionId, SideEffect, StepId, ToolCallId, ToolErrorInfo,
+    ToolErrorKind, ToolName, ToolResultStatus, TurnEndReason, TurnId, Usage,
 };
 
 const HEX1: &str = "01010101010101010101010101010101";
@@ -87,9 +88,10 @@ fn tool_started() {
             output_index: 1,
             call: ToolCallId::from_bytes([3; 16]),
             tool: ToolName::new("echo"),
+            args: JsonString::new(r#"{"q":"hi"}"#),
         }),
         format!(
-            r#"{{"type":"tool_started","turn":"{HEX1}","step":"{HEX2}","output_index":1,"call":"{HEX3}","tool":"echo"}}"#
+            r#"{{"type":"tool_started","turn":"{HEX1}","step":"{HEX2}","output_index":1,"call":"{HEX3}","tool":"echo","args":"{{\"q\":\"hi\"}}"}}"#
         )
     );
 }
@@ -102,9 +104,31 @@ fn tool_finished() {
             step: StepId::from_bytes([2; 16]),
             call: ToolCallId::from_bytes([3; 16]),
             status: ToolResultStatus::Completed,
+            output: Some(vec![Part::Text { text: "hi".into() }]),
+            error: None,
         }),
         format!(
-            r#"{{"type":"tool_finished","turn":"{HEX1}","step":"{HEX2}","call":"{HEX3}","status":"Completed"}}"#
+            r#"{{"type":"tool_finished","turn":"{HEX1}","step":"{HEX2}","call":"{HEX3}","status":"Completed","output":[{{"Text":{{"text":"hi"}}}}],"error":null}}"#
+        )
+    );
+}
+
+#[test]
+fn tool_finished_failed() {
+    assert_eq!(
+        json(AgentEvent::ToolFinished {
+            turn: TurnId::from_bytes([1; 16]),
+            step: StepId::from_bytes([2; 16]),
+            call: ToolCallId::from_bytes([3; 16]),
+            status: ToolResultStatus::Failed,
+            output: None,
+            error: Some(ToolErrorInfo {
+                kind: ToolErrorKind::Timeout,
+                message: "slow".into(),
+            }),
+        }),
+        format!(
+            r#"{{"type":"tool_finished","turn":"{HEX1}","step":"{HEX2}","call":"{HEX3}","status":"Failed","output":null,"error":{{"kind":"Timeout","message":"slow"}}}}"#
         )
     );
 }
@@ -138,9 +162,20 @@ fn turn_committed() {
             reason: TurnEndReason::Stopped {
                 reason: "hook".into()
             },
+            usage: Usage {
+                input: InputTokens {
+                    uncached: 1,
+                    cache_read: 2,
+                    cache_write: 3,
+                },
+                output: OutputTokens {
+                    total: 5,
+                    reasoning: 4,
+                },
+            },
         }),
         format!(
-            r#"{{"type":"turn_committed","turn":"{HEX1}","reason":{{"Stopped":{{"reason":"hook"}}}}}}"#
+            r#"{{"type":"turn_committed","turn":"{HEX1}","reason":{{"Stopped":{{"reason":"hook"}}}},"usage":{{"input":{{"uncached":1,"cache_read":2,"cache_write":3}},"output":{{"total":5,"reasoning":4}}}}}}"#
         )
     );
 }

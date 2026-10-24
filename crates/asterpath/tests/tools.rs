@@ -278,6 +278,74 @@ async fn two_step_turn_with_a_tool_call_matches_l1_and_projects_the_result() {
     cleanup(&db);
 }
 
+fn tokens(uncached: u64, output: u64) -> Usage {
+    let mut usage = Usage::default();
+    usage.input.uncached = uncached;
+    usage.output.total = output;
+    usage
+}
+
+#[tokio::test]
+async fn live_events_carry_tool_args_tool_output_and_turn_usage() {
+    let db = temp_db("event-fields");
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(vec![tool_call("echo")], StopReason::ToolUse, tokens(10, 2))
+            .respond(
+                vec![Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("done")],
+                    raw: None,
+                }],
+                StopReason::EndTurn,
+                tokens(30, 5),
+            ),
+    );
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![EchoTool::new("echo") as Arc<dyn Tool>])
+        .build()
+        .await
+        .expect("facade builds");
+    let handle = asterpath
+        .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap();
+    handle.submit_input(input("go")).await.unwrap();
+    let live = drive_all(&handle).await;
+
+    let args: Vec<_> = live
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolStarted { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(args, vec![JsonString::new(r#"{"q":"hi"}"#)]);
+
+    let results: Vec<_> = live
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFinished { output, error, .. } => Some((output.clone(), error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, vec![(Some(vec![text("tool says hi")]), None)]);
+
+    let usage: Vec<_> = live
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TurnCommitted { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage, vec![tokens(40, 7)]);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
 #[tokio::test]
 async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
     let db = temp_db("selection");
