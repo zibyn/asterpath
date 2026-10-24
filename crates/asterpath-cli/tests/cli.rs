@@ -305,6 +305,64 @@ fn inspect_json_prints_the_full_projection() {
     );
 }
 
+/// Pins both `inspect` renderings byte for byte, so moving the projection read
+/// onto the session handle cannot change what the CLI prints.
+#[test]
+fn inspect_output_is_byte_stable() {
+    let (dir, session) = completed_session("inspect-bytes");
+    let config = dir.path.join("asterpath.toml");
+    let inspect = |json: bool| {
+        let mut command = bin();
+        command.arg("inspect");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args(["--config", config.to_str().unwrap(), &session])
+            .output()
+            .expect("run inspect");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("utf-8")
+    };
+
+    assert_eq!(
+        inspect(false),
+        format!(
+            "session: {session}\nstate: idle\nentries: 7\nprojected items: 2\nopen intents: none\n"
+        )
+    );
+    assert_eq!(
+        inspect(true),
+        r#"[
+  {
+    "Message": {
+      "role": "User",
+      "parts": [
+        {
+          "Text": {
+            "text": "hi"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "Message": {
+      "role": "Assistant",
+      "parts": [
+        {
+          "Text": {
+            "text": "Hello from the mock"
+          }
+        }
+      ]
+    }
+  }
+]
+"#
+    );
+}
+
 #[test]
 fn inspect_unknown_session_exits_one() {
     let dir = TestDir::new("inspect-missing");
