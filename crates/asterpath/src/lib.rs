@@ -303,7 +303,7 @@ impl Asterpath {
         let items = snapshot.items;
 
         let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
-        // shortcut: two appends, so a crash between them leaves an empty fork; needs a batch append in SessionStore
+        // shortcut: two appends, so a crash between them leaves an empty fork that, being the newest, a host "continue the last active session" (CLI `--continue`) picks; needs a batch append in SessionStore
         for (key, event) in [
             (
                 dedup::session_created(session),
