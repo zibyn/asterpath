@@ -179,11 +179,11 @@ fn session_created() -> SessionEvent {
 
 fn context_forked() -> SessionEvent {
     SessionEvent::ContextForked {
-        source: asterpath_protocol::ParentRef {
+        source: asterpath_protocol::ForkSource::Spawn(asterpath_protocol::ParentRef {
             session: session(1),
             turn: turn(),
             tool_call: call(1),
-        },
+        }),
         source_log: LogId::from_i64(1),
         items: vec![],
     }

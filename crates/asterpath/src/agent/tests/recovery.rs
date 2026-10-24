@@ -1263,7 +1263,7 @@ async fn fork_child_first_request_is_the_snapshot_plus_the_task() {
         &log,
         SESSION,
         SessionEvent::ContextForked {
-            source: parent_ref(),
+            source: asterpath_protocol::ForkSource::Spawn(parent_ref()),
             source_log: LogId::from_i64(2),
             items: vec![Item::Message {
                 role: Role::User,
@@ -1325,7 +1325,7 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         &log,
         SESSION,
         SessionEvent::ContextForked {
-            source: parent_ref(),
+            source: asterpath_protocol::ForkSource::Spawn(parent_ref()),
             source_log: LogId::from_i64(2),
             items: vec![Item::Message {
                 role: Role::User,
