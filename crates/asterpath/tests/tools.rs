@@ -343,6 +343,120 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
 }
 
 #[tokio::test]
+async fn disabling_the_spawn_tool_removes_it_from_selection() {
+    let db = temp_db("no-spawn");
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![EchoTool::new("alpha") as Arc<dyn Tool>])
+        .spawn_tool(false)
+        .build()
+        .await
+        .expect("facade builds");
+
+    let all = asterpath
+        .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap();
+    let entries = scan(asterpath.store(), all.id()).await;
+    let snapshot = match decode_entry(&entries[0]).unwrap() {
+        SessionEvent::SessionCreated { config, .. } => config,
+        other => panic!("expected snapshot, got {}", other.kind()),
+    };
+    assert_eq!(snapshot.tools, vec![descriptor("alpha")]);
+
+    let error = asterpath
+        .create_session(spec(ToolSelection::Names(vec![ToolName::new(
+            "spawn_agent",
+        )])))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AsterError::Config { .. }));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn a_snapshotted_spawn_call_fails_after_the_tool_is_disabled() {
+    let db = temp_db("spawn-disabled-restart");
+    let first = Asterpath::builder()
+        .database(&db)
+        .providers(vec![
+            Arc::new(ScriptedProvider::new("p")) as Arc<dyn Provider>
+        ])
+        .build()
+        .await
+        .expect("facade builds");
+    let id = first
+        .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap()
+        .id();
+    first.shutdown().await.unwrap();
+
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(
+                vec![Item::ToolCall {
+                    call_id: "call-1".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: JsonString::new(r#"{"prompt":"hi"}"#),
+                    raw: None,
+                }],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(
+                vec![Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("done")],
+                }],
+                StopReason::EndTurn,
+                Usage::default(),
+            ),
+    );
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .spawn_tool(false)
+        .build()
+        .await
+        .expect("facade rebuilds");
+    let handle = asterpath.open_session(id).await.unwrap();
+    handle.submit_input(input("go")).await.unwrap();
+    drive_all(&handle).await;
+
+    let events: Vec<_> = scan(asterpath.store(), id)
+        .await
+        .iter()
+        .map(|entry| decode_entry(entry).unwrap())
+        .collect();
+    let statuses: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, [ToolResultStatus::Failed]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnCommitted { .. })
+    ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
 async fn interleaved_json_args_fragments_reassemble_by_step_and_output_index() {
     let call = |id: &str, args: &str| Item::ToolCall {
         call_id: id.to_owned(),

@@ -332,7 +332,7 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
         temperature: Some(0.25),
         top_p: Some(0.5),
         top_k: None,
-        seed: Some(7),
+        seed: None,
     });
     request.reasoning = Some(asterpath_protocol::ReasoningParams {
         effort: Some(asterpath_protocol::ReasoningEffort::High),
@@ -350,7 +350,12 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
     assert_eq!(body["parallel_tool_calls"], json!(false));
     assert_eq!(body["temperature"], json!(0.25));
     assert_eq!(body["top_p"], json!(0.5));
-    assert_eq!(body["seed"], json!(7));
+    assert!(body.get("seed").is_none());
+    assert_eq!(
+        body["stream"],
+        json!(true),
+        "Responses API only streams SSE when asked"
+    );
     assert_eq!(
         body["reasoning"],
         json!({"effort": "high", "summary": "auto"})
@@ -945,6 +950,11 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
         top_k: Some(5),
         ..Default::default()
     });
+    let mut seed = request(vec![user_text("go")]);
+    seed.sampling = Some(asterpath_protocol::SamplingParams {
+        seed: Some(7),
+        ..Default::default()
+    });
     let mut budget = request(vec![user_text("go")]);
     budget.reasoning = Some(asterpath_protocol::ReasoningParams {
         budget_tokens: Some(1024),
@@ -960,7 +970,7 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
         }],
     }]);
 
-    for request in [top_k, budget, image] {
+    for request in [top_k, seed, budget, image] {
         let events = collect(&provider, request).await;
         let errors: Vec<_> = events
             .iter()
