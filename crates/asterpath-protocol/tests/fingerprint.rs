@@ -32,7 +32,7 @@ fn tools_hash_output_is_pinned() {
         descriptor("echo", json!({"type": "object"})),
     ];
     assert_eq!(
-        tools_hash(&tools),
+        tools_hash(&tools, &[]),
         "6991b469916c8790be8c4be6cd34b233adda190e81776173a6829c4af1d0a1a1"
     );
 }
@@ -42,7 +42,21 @@ fn tools_hash_ignores_tool_order() {
     let first = descriptor("a", json!({}));
     let second = descriptor("b", json!({}));
     assert_eq!(
-        tools_hash(&[first.clone(), second.clone()]),
-        tools_hash(&[second, first])
+        tools_hash(&[first.clone(), second.clone()], &[]),
+        tools_hash(&[second, first], &[])
+    );
+}
+
+#[test]
+fn server_tools_wrap_the_fingerprint_in_an_object() {
+    // Expected value computed independently: SHA-256 of
+    // {"server_tools":[{"name":"web_search","type":"web_search_20250305"}],
+    //  "tools":[{"description":"echo tool","name":"echo","schema":{"type":"object"}}]}
+    // compact, keys sorted.
+    let tools = [descriptor("echo", json!({"type": "object"}))];
+    let server_tools = [json!({"type": "web_search_20250305", "name": "web_search"})];
+    assert_eq!(
+        tools_hash(&tools, &server_tools),
+        "40e9bc43200dd74c9a8901bf4d94e2bae8c94a0a04bdd95186fa8b883b12c4f6"
     );
 }

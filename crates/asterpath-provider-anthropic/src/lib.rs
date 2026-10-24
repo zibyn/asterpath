@@ -120,8 +120,7 @@ impl Provider for AnthropicProvider {
             sampling: rules.sampling,
             reasoning_roundtrip: true,
             citations: false,
-            // Server tools are not expressible in the normalized protocol yet.
-            builtin_tools: false,
+            server_tools: rules.server_tools,
             // The adapter sets its own breakpoints; see request::render.
             cache_control: true,
             image_input: true,
@@ -136,10 +135,11 @@ impl Provider for AnthropicProvider {
             return stream::once(async move { Err(error) }).boxed();
         }
         let provider = self.id();
-        let body = match request::render(&provider, profile, &request, self.trace.as_deref()) {
-            Ok(body) => body,
-            Err(error) => return stream::once(async move { Err(error) }).boxed(),
-        };
+        let (body, tools_hash) =
+            match request::render(&provider, profile, &request, self.trace.as_deref()) {
+                Ok(rendered) => rendered,
+                Err(error) => return stream::once(async move { Err(error) }).boxed(),
+            };
         let decoder = sse::Decoder::new(
             self.client.clone(),
             self.messages_url(),
@@ -147,7 +147,7 @@ impl Provider for AnthropicProvider {
             provider,
             request.spec.model.clone(),
             request.prefix_epoch,
-            asterpath_protocol::tools_hash(request::top_level_tools(profile, &request)),
+            tools_hash,
             body,
             request::beta(profile, &request),
         );

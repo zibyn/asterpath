@@ -30,6 +30,11 @@ pub struct RequestConfig {
     /// Per-provider JSON objects merged into the top level of that provider's
     /// request body; entries for other providers are ignored. Values are host policy.
     pub provider_options: BTreeMap<ProviderId, JsonString>,
+    /// Per-provider server-executed tool definitions (each a JSON object),
+    /// appended verbatim after the function tools in that provider's
+    /// request; entries for other providers are ignored (ADR-0031).
+    #[serde(default)]
+    pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
 }
 
 impl Default for RequestConfig {
@@ -42,6 +47,7 @@ impl Default for RequestConfig {
             reasoning: None,
             stop_sequences: Vec::new(),
             provider_options: BTreeMap::new(),
+            server_tools: BTreeMap::new(),
         }
     }
 }

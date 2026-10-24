@@ -158,14 +158,39 @@ fn capability_check_names_the_unsupported_feature() {
     });
     assert_eq!(none.unsupported_feature(&image), Some("image input"));
 
+    let mut server_tools = capability_request();
+    server_tools.server_tools.insert(
+        ProviderId::new("p"),
+        vec![asterpath_protocol::JsonString::new(
+            r#"{"type":"web_search"}"#,
+        )],
+    );
+    assert_eq!(
+        none.unsupported_feature(&server_tools),
+        Some("server tools")
+    );
+    // Entries for other providers, or an empty list, declare nothing here.
+    let mut elsewhere = capability_request();
+    elsewhere.server_tools.insert(
+        ProviderId::new("other"),
+        vec![asterpath_protocol::JsonString::new(
+            r#"{"type":"web_search"}"#,
+        )],
+    );
+    elsewhere
+        .server_tools
+        .insert(ProviderId::new("p"), Vec::new());
+    assert_eq!(none.unsupported_feature(&elsewhere), None);
+
     let all = ProviderCapabilities {
         forced_tool_choice: true,
         sampling: true,
         parallel_tool_calls: true,
         image_input: true,
+        server_tools: true,
         ..ProviderCapabilities::default()
     };
-    for request in [forced, sampling, serial, image] {
+    for request in [forced, sampling, serial, image, server_tools] {
         assert_eq!(all.unsupported_feature(&request), None);
     }
 }

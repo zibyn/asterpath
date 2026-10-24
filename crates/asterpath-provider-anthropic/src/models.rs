@@ -24,6 +24,12 @@
 //! unrecognized ids (third-party endpoints such as DeepSeek reach
 //! [`UNRECOGNIZED`]): only listed models render inline.
 //!
+//! `server_tools`: the server tool pages (agents-and-tools/tool-use/web-search-tool,
+//! web-fetch-tool, server-tools, checked 2026-10-24) document server tools for
+//! the Claude 4 and later models in this table; they name no per-model
+//! exclusions and defer to the Models API `capabilities.server_tools`. Claude 3
+//! ids and unrecognized ids (third-party endpoints) are not marked.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
 //! (`claude-opus-5`). Ids no row matches get [`UNRECOGNIZED`], so a new model works
@@ -69,11 +75,15 @@ pub struct AnthropicModelProfile {
     /// instruction joins the top-level `system` and a tool change rewrites the
     /// top-level `tools`; thinking from before the change is dropped.
     pub inline_changes: bool,
+    /// Accepts server-executed tools (web search, web fetch, code execution…)
+    /// in `tools`.
+    pub server_tools: bool,
 }
 
 impl AnthropicModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
-    /// inline system messages or tools, which only listed models accept.
+    /// inline system messages or tools, or server tools, which only listed
+    /// models accept.
     pub fn latest() -> Self {
         UNRECOGNIZED
     }
@@ -114,6 +124,12 @@ impl AnthropicModelProfile {
         self
     }
 
+    #[must_use]
+    pub fn with_server_tools(mut self, server_tools: bool) -> Self {
+        self.server_tools = server_tools;
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
     pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
@@ -133,6 +149,7 @@ const fn rules(
         forced_tool_choice: forced,
         sampling,
         inline_changes: false,
+        server_tools: true,
     }
 }
 
@@ -141,14 +158,20 @@ const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile
 }
 
+const fn unlisted(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+    profile.server_tools = false;
+    profile
+}
+
 const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
 const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
-const LATEST: AnthropicModelProfile = inline(UNRECOGNIZED);
-/// Unrecognized ids: [`LATEST`] without inline changes.
-const UNRECOGNIZED: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
+const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
+/// Unrecognized ids: [`LATEST`] without inline changes or server tools.
+const UNRECOGNIZED: AnthropicModelProfile =
+    unlisted(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
 /// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
@@ -157,6 +180,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     forced_tool_choice: true,
     sampling: false,
     inline_changes: true,
+    server_tools: true,
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
@@ -196,7 +220,7 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-haiku-4-5", EXTENDED),
     ("claude-opus-4", EXTENDED),
     ("claude-sonnet-4", EXTENDED),
-    ("claude-3", EXTENDED),
+    ("claude-3", unlisted(EXTENDED)),
 ];
 
 static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;
@@ -259,6 +283,25 @@ mod tests {
             ("claude-3-haiku", false),
         ] {
             assert_eq!(builtin(model).inline_changes, inline, "{model}");
+        }
+    }
+
+    #[test]
+    fn server_tools_are_marked_for_claude_4_and_later_only() {
+        for (model, server_tools) in [
+            ("claude-opus-5-5", true),
+            ("claude-haiku-5-5", true),
+            ("claude-sonnet-5", true),
+            ("claude-mythos-preview", true),
+            ("claude-opus-4-8", true),
+            ("claude-sonnet-4-6", true),
+            ("claude-haiku-4-5", true),
+            ("claude-sonnet-4-20250514", true),
+            ("claude-3-haiku", false),
+            ("claude-next", false),
+            ("deepseek-v4-pro", false),
+        ] {
+            assert_eq!(builtin(model).server_tools, server_tools, "{model}");
         }
     }
 

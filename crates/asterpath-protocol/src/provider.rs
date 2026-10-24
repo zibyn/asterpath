@@ -37,6 +37,8 @@ pub struct ModelRequest {
     pub stop_sequences: Vec<String>,
     /// See [`RequestConfig::provider_options`].
     pub provider_options: BTreeMap<ProviderId, JsonString>,
+    /// See [`RequestConfig::server_tools`].
+    pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
 }
 
 impl ModelRequest {
@@ -65,6 +67,7 @@ impl ModelRequest {
             reasoning: request.reasoning.clone(),
             stop_sequences: request.stop_sequences.clone(),
             provider_options: request.provider_options.clone(),
+            server_tools: request.server_tools.clone(),
         }
     }
 }
@@ -116,7 +119,9 @@ pub struct ProviderCapabilities {
     pub sampling: bool,
     pub reasoning_roundtrip: bool,
     pub citations: bool,
-    pub builtin_tools: bool,
+    /// Accepts `server_tools` declarations; may produce `ServerToolCall` /
+    /// `ServerToolResult` items.
+    pub server_tools: bool,
     pub cache_control: bool,
     pub image_input: bool,
     pub parallel_tool_calls: bool,
@@ -147,6 +152,13 @@ impl ProviderCapabilities {
         });
         if !self.image_input && has_image {
             return Some("image input");
+        }
+        let has_server_tools = request
+            .server_tools
+            .get(&request.spec.provider)
+            .is_some_and(|tools| !tools.is_empty());
+        if !self.server_tools && has_server_tools {
+            return Some("server tools");
         }
         None
     }

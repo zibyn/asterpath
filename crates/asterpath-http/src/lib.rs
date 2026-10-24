@@ -162,6 +162,26 @@ pub fn provider_options_for(
     Ok(options)
 }
 
+/// The `server_tools` entries for `request.spec.provider`, in declaration
+/// order, to append verbatim after the function tools; a non-object entry is
+/// `InvalidRequest`. Contents are not validated (ADR-0031).
+pub fn server_tools_for(request: &ModelRequest) -> Result<Vec<Value>, ProviderError> {
+    let provider = &request.spec.provider;
+    let Some(tools) = request.server_tools.get(provider) else {
+        return Ok(Vec::new());
+    };
+    tools
+        .iter()
+        .map(|tool| match serde_json::from_str(tool.as_str()) {
+            Ok(value @ Value::Object(_)) => Ok(value),
+            _ => Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("server_tools for {provider} must be JSON objects"),
+            )),
+        })
+        .collect()
+}
+
 /// Deep-merge one `provider_options` value into the value the adapter wrote at
 /// `path`: objects merge key by key, new keys are added, and any other overlap
 /// would replace the adapter's value, so it is `Unsupported`.

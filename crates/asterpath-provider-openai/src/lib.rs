@@ -128,8 +128,7 @@ impl Provider for OpenAiProvider {
             sampling: profile.sampling,
             reasoning_roundtrip: true,
             citations: false,
-            // Only `function` tools are rendered today.
-            builtin_tools: false,
+            server_tools: profile.server_tools,
             cache_control: false,
             image_input: true,
             parallel_tool_calls: true,
@@ -146,7 +145,7 @@ impl Provider for OpenAiProvider {
             efforts,
             self.trace.as_deref(),
         );
-        let body = match rendered {
+        let (body, tools_hash) = match rendered {
             Ok(rendered) => rendered,
             Err(error) => return stream::once(async move { Err(error) }).boxed(),
         };
@@ -164,7 +163,7 @@ impl Provider for OpenAiProvider {
             provider: self.id.clone(),
             spec: request.spec,
             prefix_epoch: request.prefix_epoch,
-            tools_hash: asterpath_protocol::tools_hash(&request.tools),
+            tools_hash,
         };
 
         let provider = self.id.clone();

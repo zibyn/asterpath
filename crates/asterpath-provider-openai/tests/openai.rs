@@ -63,6 +63,7 @@ fn request(items: Vec<Item>) -> ModelRequest {
         reasoning: None,
         stop_sequences: Vec::new(),
         provider_options: Default::default(),
+        server_tools: Default::default(),
     }
 }
 
@@ -325,7 +326,7 @@ async fn provider_declares_openai_capabilities() {
             sampling: true,
             reasoning_roundtrip: true,
             citations: false,
-            builtin_tools: false,
+            server_tools: true,
             cache_control: false,
             image_input: true,
             parallel_tool_calls: true,
@@ -1590,7 +1591,7 @@ async fn with_id_names_the_instance_and_gates_replay_by_it() {
     let deepseek = provider(&server).with_id("deepseek");
     assert_eq!(deepseek.id(), ProviderId::new("deepseek"));
 
-    let tools_hash = asterpath_protocol::tools_hash(&[tool("get_weather")]);
+    let tools_hash = asterpath_protocol::tools_hash(&[tool("get_weather")], &[]);
     let mut request = request(vec![
         reasoning_item(
             binding("deepseek-flash", 0, &tools_hash),
@@ -1664,4 +1665,103 @@ async fn an_injected_profile_allows_off_and_sets_capabilities() {
     let pro = injected.capabilities(&spec("deepseek-v4-pro"));
     assert!(!pro.forced_tool_choice);
     assert!(pro.sampling);
+}
+
+const WEB_SEARCH: &str = r#"{"type":"web_search","search_context_size":"low"}"#;
+
+fn with_web_search(mut request: ModelRequest) -> ModelRequest {
+    request
+        .server_tools
+        .insert(ProviderId::new("openai"), vec![JsonString::new(WEB_SEARCH)]);
+    request.server_tools.insert(
+        ProviderId::new("anthropic"),
+        vec![JsonString::new(
+            r#"{"type":"web_search_20250305","name":"web_search"}"#,
+        )],
+    );
+    request
+}
+
+#[tokio::test]
+async fn server_tools_append_after_function_tools_and_enter_the_binding() {
+    let raw_item = r#"{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA"}"#;
+    let mut body = String::new();
+    body.push_str(&event(created(0)));
+    body.push_str(&event(added(
+        1,
+        0,
+        json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+    )));
+    body.push_str(&format!(
+        r#"data: {{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{raw_item}}}"#
+    ));
+    body.push_str("\n\n");
+    body.push_str(&format!(
+        r#"data: {{"type":"response.completed","sequence_number":3,"response":{{"id":"resp_1","status":"completed","output":[{raw_item}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+    ));
+    body.push_str("\n\n");
+    let server = MockServer::start(vec![MockResponse::sse(body)]);
+
+    let events = collect(
+        &provider(&server),
+        with_web_search(request(vec![user_text("search")])),
+    )
+    .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let sent: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    let tools = sent["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 2, "{sent}");
+    assert_eq!(tools[0]["name"], json!("get_weather"));
+    assert_eq!(tools[1], serde_json::from_str::<Value>(WEB_SEARCH).unwrap());
+
+    let binding = completed_items(&events)
+        .into_iter()
+        .find_map(|(_, item)| match item {
+            Item::Reasoning { binding, .. } => Some(binding),
+            _ => None,
+        })
+        .expect("reasoning item");
+    assert_eq!(
+        binding.tools_hash,
+        asterpath_protocol::tools_hash(
+            &[tool("get_weather")],
+            &[serde_json::from_str(WEB_SEARCH).unwrap()]
+        )
+    );
+}
+
+#[tokio::test]
+async fn server_tools_fail_before_http_when_unsupported_or_not_objects() {
+    let server = MockServer::start(Vec::new());
+    let unsupported = with_web_search(request(vec![user_text("hi")]));
+    let provider = provider(&server).with_model_profile(
+        "gpt-5",
+        OpenAiModelProfile::latest().with_server_tools(false),
+    );
+    let events = collect(&provider, unsupported).await;
+    assert!(
+        matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::Unsupported),
+        "{events:?}"
+    );
+
+    let mut not_object = request(vec![user_text("hi")]);
+    not_object
+        .server_tools
+        .insert(ProviderId::new("openai"), vec![JsonString::new("1")]);
+    let events = collect(&self::provider(&server), not_object).await;
+    assert!(
+        matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::InvalidRequest),
+        "{events:?}"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn server_tools_are_advertised_for_listed_models_only() {
+    let provider = OpenAiProvider::new("key");
+    assert!(provider.capabilities(&spec("gpt-5.5")).server_tools);
+    assert!(provider.capabilities(&spec("o3")).server_tools);
+    assert!(!provider.capabilities(&spec("o1")).server_tools);
+    assert!(!provider.capabilities(&spec("deepseek-flash")).server_tools);
 }
