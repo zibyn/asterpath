@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
+use crate::ManualClock;
 use asterpath_protocol::{
-    CatalogEntry, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, ParentFilter,
+    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, ParentFilter,
     RetirementError, SessionId, SessionQuery, SessionStore, SignalId, SignalName, StepId,
     StorageError, ToolCallId, TurnId,
 };
@@ -24,6 +25,8 @@ use serde_json::{Value, json};
 pub trait StoreFactory {
     /// A handle to the backend under test.
     fn open(&self) -> Arc<dyn SessionStore>;
+    /// A fresh, empty store that stamps `recorded_at` from `clock`.
+    fn open_with_clock(&self, clock: Arc<dyn Clock>) -> Arc<dyn SessionStore>;
 }
 
 /// Run the shared store contract against a backend. Retirement cases are
@@ -37,7 +40,8 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     cursor_scan(store).await;
     independent_streams(store).await;
     hard_errors(store).await;
-    catalog(store).await;
+    let clock = Arc::new(ManualClock::new());
+    catalog(&*factory.open_with_clock(clock.clone()), &clock).await;
     retirement(store).await;
 }
 
@@ -605,29 +609,31 @@ async fn parent(log: &dyn SessionStore, session: SessionId) -> Option<SessionId>
 /// The catalog follows `SessionCreated`: every created session (children
 /// included) is listed once, newest `(created_at, session)` first; the tree
 /// matches each parent ref; cursor pages neither repeat nor skip (ADR-0028).
-async fn catalog(log: &dyn SessionStore) {
+async fn catalog(log: &dyn SessionStore, clock: &ManualClock) {
     let root = session(0x81);
     let unknown = session(0x8f);
     create(log, root, None).await;
-    // Children in a tight loop until two share `created_at`, so the cursor's
-    // session tie-break is exercised on every backend.
-    let mut kids: Vec<SessionId> = Vec::new();
-    for byte in 0..=u8::MAX {
-        let mut bytes = [0u8; 16];
-        bytes[0] = 0x84;
-        bytes[1] = byte;
-        let child = SessionId::from_bytes(bytes);
+    clock.advance(1);
+    // The clock stands still, so the children share `created_at` and the
+    // cursor's session tie-break is exercised on every backend.
+    let kids: Vec<SessionId> = (0..3u8)
+        .map(|byte| {
+            let mut bytes = [0u8; 16];
+            bytes[0] = 0x84;
+            bytes[1] = byte;
+            SessionId::from_bytes(bytes)
+        })
+        .collect();
+    for &child in &kids {
         create(log, child, Some(root)).await;
-        kids.push(child);
-        let entries = list(log, by_parent(ParentFilter::ChildrenOf(root))).await;
-        if kids.len() >= 3
-            && entries
-                .windows(2)
-                .any(|pair| pair[0].created_at == pair[1].created_at)
-        {
-            break;
-        }
     }
+    let entries = list(log, by_parent(ParentFilter::ChildrenOf(root))).await;
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].created_at == pair[1].created_at),
+        "children created at one instant tie on created_at"
+    );
     // A replayed SessionCreated does not list the session twice.
     create(log, root, None).await;
 
