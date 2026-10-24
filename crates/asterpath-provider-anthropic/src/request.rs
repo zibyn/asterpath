@@ -34,9 +34,11 @@ impl Frag {
     }
 
     /// Add an ephemeral cache breakpoint. Replayed raw blocks are never
-    /// modified (ADR 0010), so they cannot carry one; returns whether it was set.
+    /// modified (ADR 0010), so they cannot carry one, and the API rejects one
+    /// on an empty text block; returns whether it was set.
     fn set_cache_control(&mut self) -> bool {
         match self {
+            Self::Json(value) if is_empty_text(value) => false,
             Self::Json(Value::Object(map)) => {
                 map.insert("cache_control".to_owned(), ephemeral());
                 true
@@ -48,6 +50,10 @@ impl Frag {
             Self::Json(_) | Self::Raw(_) => false,
         }
     }
+}
+
+fn is_empty_text(block: &Value) -> bool {
+    block["type"] == "text" && block["text"] == ""
 }
 
 fn ephemeral() -> Value {
@@ -152,7 +158,7 @@ pub(crate) fn render(
                 _ => unreachable!("check rejects non-text system parts"),
             })
             .collect();
-        if let Some(last) = blocks.last_mut() {
+        if let Some(last) = blocks.iter_mut().rev().find(|block| !is_empty_text(block)) {
             last["cache_control"] = ephemeral();
         }
         fields.push(("system", Frag::Json(Value::Array(blocks))));
