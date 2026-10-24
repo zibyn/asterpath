@@ -27,6 +27,7 @@ fn spec() -> SessionSpec {
         turn: TurnConfig::default(),
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 
@@ -168,6 +169,7 @@ async fn seed(asterpath: &Asterpath) -> (Vec<SessionId>, Vec<SessionId>) {
             turn: turn(1),
             tool_call: ToolCallId::from_bytes([1; 16]),
         }),
+        metadata: Default::default(),
     };
     append_keyed(
         asterpath,

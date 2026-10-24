@@ -20,15 +20,18 @@ use futures_util::stream;
 
 use crate::contract::StoreFactory;
 
+/// Parent, creation time and host metadata of one live session.
+type SessionRow = (Option<SessionId>, Timestamp, BTreeMap<String, String>);
+
 #[derive(Default)]
 struct State {
     entries: Vec<LogEntry>,
     next_log_id: i64,
     session_seq: HashMap<SessionId, u64>,
     dedup: HashMap<(SessionId, String, Option<String>), LogId>,
-    /// Live sessions, their parents and creation time, like SQLite's
-    /// `sessions` table.
-    sessions: BTreeMap<SessionId, (Option<SessionId>, Timestamp)>,
+    /// Live sessions, their parents, creation time and host metadata, like
+    /// SQLite's `sessions` table.
+    sessions: BTreeMap<SessionId, SessionRow>,
     /// Retired sessions and their last log id.
     retired: HashMap<SessionId, LogId>,
 }
@@ -69,7 +72,7 @@ impl State {
                 })
             };
         }
-        let Some((parent, _)) = self.sessions.get(&session).copied() else {
+        let Some(parent) = self.sessions.get(&session).map(|(parent, ..)| *parent) else {
             return Err(RetirementError::NotFound);
         };
         if !self.is_idle(session)? {
@@ -79,7 +82,7 @@ impl State {
         if actual != Some(expected) {
             return Err(RetirementError::FrontierMoved { expected, actual });
         }
-        if self.sessions.values().any(|(p, _)| *p == Some(session)) {
+        if self.sessions.values().any(|(p, ..)| *p == Some(session)) {
             return Err(RetirementError::HasChildren);
         }
         if let Some(parent) = parent
@@ -97,12 +100,12 @@ impl State {
         let mut entries: Vec<CatalogEntry> = self
             .sessions
             .iter()
-            .filter(|(_, (parent, _))| match query.parent {
+            .filter(|(_, (parent, ..))| match query.parent {
                 ParentFilter::Any => true,
                 ParentFilter::Roots => parent.is_none(),
                 ParentFilter::ChildrenOf(of) => *parent == Some(of),
             })
-            .map(|(session, (parent, created_at))| CatalogEntry {
+            .map(|(session, (parent, created_at, metadata))| CatalogEntry {
                 session: *session,
                 parent: *parent,
                 created_at: *created_at,
@@ -110,6 +113,7 @@ impl State {
                     .log_of(*session)
                     .last()
                     .map_or(*created_at, |entry| entry.recorded_at),
+                metadata: metadata.clone(),
             })
             .filter(|entry| query.after.is_none_or(|after| entry.cursor() < after))
             .collect();
@@ -174,10 +178,17 @@ impl InMemoryEventLog {
         let seq = *seq;
 
         let recorded_at = self.clock.now();
-        if let SessionEvent::SessionCreated { parent, .. } = &event {
+        if let SessionEvent::SessionCreated {
+            parent, metadata, ..
+        } = &event
+        {
             state.sessions.insert(
                 entry.session,
-                (parent.as_ref().map(|parent| parent.session), recorded_at),
+                (
+                    parent.as_ref().map(|parent| parent.session),
+                    recorded_at,
+                    metadata.clone(),
+                ),
             );
         }
         let log_entry = LogEntry {
@@ -238,7 +249,7 @@ impl SessionStore for InMemoryEventLog {
             .state()
             .sessions
             .get(&session)
-            .and_then(|(parent, _)| *parent);
+            .and_then(|(parent, ..)| *parent);
         Box::pin(async move { Ok(parent) })
     }
 

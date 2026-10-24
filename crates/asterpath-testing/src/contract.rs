@@ -6,6 +6,7 @@
 //! Wake discovery is a session-facts fold in the facade (ADR-0023), so it is
 //! tested there, not per backend.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::ManualClock;
@@ -172,6 +173,7 @@ fn session_created() -> SessionEvent {
     SessionEvent::SessionCreated {
         config: config(),
         parent: None,
+        metadata: BTreeMap::new(),
     }
 }
 
@@ -583,6 +585,14 @@ fn turn_committed(turn_id: TurnId) -> SessionEvent {
     }
 }
 
+/// Host metadata of the catalog's root session (ADR-0032).
+fn root_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("cwd".to_owned(), "/work/项目".to_owned()),
+        ("name".to_owned(), "a \"quoted\" name".to_owned()),
+    ])
+}
+
 fn created_under(parent: Option<SessionId>) -> SessionEvent {
     SessionEvent::SessionCreated {
         config: config(),
@@ -591,6 +601,12 @@ fn created_under(parent: Option<SessionId>) -> SessionEvent {
             turn: turn(),
             tool_call: call(1),
         }),
+        // Roots carry the host's metadata; children carry none.
+        metadata: if parent.is_none() {
+            root_metadata()
+        } else {
+            BTreeMap::new()
+        },
     }
 }
 
@@ -697,8 +713,14 @@ async fn catalog(log: &dyn SessionStore, clock: &ManualClock) {
     );
     let root_entry = all.iter().find(|entry| entry.session == root).unwrap();
     assert_eq!(root_entry.parent, None);
+    assert_eq!(
+        root_entry.metadata,
+        root_metadata(),
+        "the entry carries SessionCreated's host metadata"
+    );
     let first_kid = all.iter().find(|entry| entry.session == kids[0]).unwrap();
     assert_eq!(first_kid.parent, Some(root));
+    assert!(first_kid.metadata.is_empty());
     assert!(first_kid.created_at >= root_entry.created_at);
 
     // Parent filters.

@@ -42,7 +42,7 @@ pub struct ParentRef {
 ```rust
 #[non_exhaustive]
 pub enum SessionEvent {
-    SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef> },
+    SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef>, metadata: BTreeMap<String, String> },  // metadata：宿主元数据，ADR-0032
     ContextForked { source: ParentRef, source_log: LogId,
                     items: Vec<Item> },                           // fork 子会话的首个模型可见记录
     StreamResumed { from: LogId, reason: ResumeReason },          // 非模型可见

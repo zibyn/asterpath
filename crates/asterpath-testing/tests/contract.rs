@@ -31,6 +31,7 @@ fn created(parent: Option<SessionId>) -> SessionEvent {
             turn: TurnId::from_bytes([9; 16]),
             tool_call: ToolCallId::from_bytes([8; 16]),
         }),
+        metadata: Default::default(),
     }
 }
 

@@ -156,6 +156,7 @@ pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSp
         turn: turn_config(settings),
         compaction: compaction_config(settings),
         subagents: subagent_config(settings),
+        metadata: Default::default(),
     })
 }
 

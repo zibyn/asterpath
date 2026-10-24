@@ -212,6 +212,7 @@ async fn seeded(backoff: Duration) -> Arc<InMemoryEventLog> {
         SessionEvent::SessionCreated {
             config: config(backoff),
             parent: None,
+            metadata: Default::default(),
         },
         Some(dedup::session_created(SESSION)),
     )

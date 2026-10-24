@@ -139,6 +139,7 @@ fn spec(window: Option<u32>, compaction: CompactionConfig) -> SessionSpec {
         turn: turn(),
         compaction,
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

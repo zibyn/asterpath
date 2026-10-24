@@ -1,5 +1,7 @@
 //! The complete session event enum and the value enums its payloads carry.
 
+use std::collections::BTreeMap;
+
 use crate::{LogId, LogIdRange, SessionId, StepId, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,8 @@ pub enum SessionEvent {
     SessionCreated {
         config: ConfigSnapshot,
         parent: Option<ParentRef>,
+        /// Opaque, immutable host metadata (ADR-0032); empty for children.
+        metadata: BTreeMap<String, String>,
     },
     ContextForked {
         source: ParentRef,

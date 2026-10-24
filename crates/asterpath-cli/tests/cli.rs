@@ -690,6 +690,7 @@ fn prepared_session(
                 turn: TurnConfig::default(),
                 compaction: CompactionConfig::default(),
                 subagents: SubagentConfig::default(),
+                metadata: Default::default(),
             })
             .await
             .expect("create session");

@@ -740,6 +740,7 @@ fn session_spec(fixture: &Fixture, provider: Option<&str>) -> SessionSpec {
         },
         compaction: asterpath_protocol::CompactionConfig::default(),
         subagents: asterpath_protocol::SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

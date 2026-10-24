@@ -89,7 +89,7 @@ pub struct SessionQuery {
 }
 
 /// One live session in the catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub session: SessionId,
     pub parent: Option<SessionId>,
@@ -98,6 +98,8 @@ pub struct CatalogEntry {
     /// `recorded_at` of the session's last committed record; display only,
     /// recovery and wake never read it.
     pub last_activity: Timestamp,
+    /// The host metadata recorded in `SessionCreated` (ADR-0032).
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl CatalogEntry {

@@ -1026,6 +1026,7 @@ mod tests {
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
+            metadata: Default::default(),
         }
     }
 

@@ -1,7 +1,7 @@
 //! Driver-facing values: session spec, run request, live `AgentEvent`
 //! stream and the summed `AgentError`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{
@@ -29,6 +29,9 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+    /// Opaque host metadata, recorded in `SessionCreated` and listed in the
+    /// catalog; never in the snapshot or a model request (ADR-0032).
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

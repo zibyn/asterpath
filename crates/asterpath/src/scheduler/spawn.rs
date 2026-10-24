@@ -735,6 +735,8 @@ impl Scheduler {
                     SessionEvent::SessionCreated {
                         config: config.clone(),
                         parent: Some(parent.clone()),
+                        // Children never inherit host metadata (ADR-0032).
+                        metadata: Default::default(),
                     },
                     Some(dedup::session_created(child)),
                 )

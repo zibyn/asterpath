@@ -92,6 +92,7 @@ fn spec(turn: TurnConfig) -> SessionSpec {
         turn,
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
+        metadata: Default::default(),
     }
 }
 

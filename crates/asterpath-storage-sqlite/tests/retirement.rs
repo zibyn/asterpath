@@ -49,6 +49,7 @@ fn session_created(parent: Option<SessionId>) -> SessionEvent {
             turn: TurnId::from_bytes([1; 16]),
             tool_call: asterpath_protocol::ToolCallId::from_bytes([1; 16]),
         }),
+        metadata: Default::default(),
     }
 }
 
