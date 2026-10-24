@@ -47,7 +47,8 @@ pub(crate) fn http(
         .map(str::to_owned)
         .unwrap_or_else(|| body.clone());
     let kind = classify_status(status, &message);
-    let mut provider_error = ProviderError::new(kind, message);
+    let mut provider_error =
+        not_retryable_if_spend_limited(ProviderError::new(kind, message), error_object);
     if let Some(retry_after) = retry_after(headers) {
         provider_error = provider_error.with_retry_after(retry_after);
     }
@@ -91,13 +92,17 @@ pub(crate) fn sse(
     } else {
         match label {
             "authentication_error" | "permission_error" => ProviderErrorKind::Auth,
-            "invalid_request_error" => ProviderErrorKind::InvalidRequest,
+            "invalid_request_error" | "billing_error" | "not_found_error" | "request_too_large" => {
+                ProviderErrorKind::InvalidRequest
+            }
             "rate_limit_error" => ProviderErrorKind::RateLimited,
             "overloaded_error" => ProviderErrorKind::Overloaded,
+            "timeout_error" => ProviderErrorKind::Timeout,
             _ => ProviderErrorKind::Server,
         }
     };
-    let mut provider_error = ProviderError::new(kind, message);
+    let mut provider_error =
+        not_retryable_if_spend_limited(ProviderError::new(kind, message), error);
     if let Some(request_id) = request_id {
         provider_error = provider_error.with_request_id(request_id);
     }
@@ -123,6 +128,18 @@ pub(crate) fn truncated(request_id: Option<String>, partial_usage: Option<Usage>
     }
     if let Some(usage) = partial_usage {
         error = error.with_partial_usage(usage);
+    }
+    error
+}
+
+/// A spend-limit 429 keeps failing until the next billing period.
+fn not_retryable_if_spend_limited(mut error: ProviderError, body: Option<&Value>) -> ProviderError {
+    if body
+        .and_then(|body| body.pointer("/details/error_code"))
+        .and_then(Value::as_str)
+        == Some("enforced_spend_limit_reached")
+    {
+        error.retryable = false;
     }
     error
 }

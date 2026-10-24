@@ -738,6 +738,84 @@ async fn context_window_messages_map_to_context_exceeded() {
 }
 
 #[tokio::test]
+async fn a_spend_limit_429_is_not_retryable() {
+    let server = MockServer::start(vec![Reply::json(
+        429,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}"#,
+    )]);
+    let error = first_error(drain(&provider(&server), base_request()).await);
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert!(!error.retryable);
+}
+
+#[tokio::test]
+async fn non_transient_error_types_are_not_retryable_on_both_paths() {
+    let cases = [
+        (402, "billing_error", false),
+        (404, "not_found_error", false),
+        (413, "request_too_large", false),
+        (529, "overloaded_error", true),
+        (500, "api_error", true),
+        (504, "timeout_error", true),
+    ];
+    let mut replies = Vec::new();
+    for (status, label, _) in cases {
+        let body =
+            format!(r#"{{"type":"error","error":{{"type":"{label}","message":"{label}"}}}}"#);
+        replies.push(Reply::json(status, body.clone()));
+        replies.push(Reply::sse(sse_body(&[
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m","usage":{}}}"#,
+            ),
+            ("error", &body),
+        ])));
+    }
+    let server = MockServer::start(replies);
+    let provider = provider(&server);
+    for (status, label, retryable) in cases {
+        for path in ["http", "sse"] {
+            let error = first_error(drain(&provider, base_request()).await);
+            assert_eq!(error.retryable, retryable, "{path} {status} {label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn message_delta_cumulative_input_usage_overrides_message_start() {
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2,"output_tokens":1}}}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":30,"cache_read_input_tokens":12,"cache_creation_input_tokens":6,"output_tokens":9}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![Reply::sse(body)]);
+    let events = ok(drain(&provider(&server), base_request()).await);
+    match events.last() {
+        Some(StreamEvent::ResponseEnded { usage, .. }) => assert_eq!(
+            *usage,
+            Usage {
+                input: asterpath_protocol::InputTokens {
+                    uncached: 30,
+                    cache_read: 12,
+                    cache_write: 6,
+                },
+                output: asterpath_protocol::OutputTokens {
+                    total: 9,
+                    reasoning: 0,
+                },
+            }
+        ),
+        other => panic!("expected ResponseEnded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_closed_connection_is_a_retryable_transport_error() {
     let server = MockServer::start(vec![Reply::close()]);
     let events = drain(&provider(&server), base_request()).await;
