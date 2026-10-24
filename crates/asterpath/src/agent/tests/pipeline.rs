@@ -588,6 +588,63 @@ async fn a_tool_that_ignores_its_deadline_fails_timeout() {
     );
 }
 
+/// Returns `Cancelled` as soon as its call is cancelled.
+fn gives_up_on_cancel(timeout: Duration, turn: Option<CancelToken>) -> Arc<dyn Tool> {
+    TestTool::new(
+        ToolDescriptor {
+            timeout: Some(timeout),
+            ..descriptor("quitter")
+        },
+        Arc::default(),
+        move |_args, ctx| {
+            let turn = turn.clone();
+            Box::pin(async move {
+                if let Some(turn) = turn {
+                    turn.cancel();
+                }
+                ctx.cancel.cancelled().await;
+                Err(asterpath_protocol::ToolError::Cancelled {
+                    message: "gave up after partial work".to_owned(),
+                })
+            })
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_tool_that_reports_cancelled_at_its_deadline_fails_timeout() {
+    let mut harness = Harness::new(vec![gives_up_on_cancel(Duration::from_millis(10), None)]).await;
+    harness.config.kill_grace = Duration::from_secs(5);
+
+    harness.run(&[tool_call("call-1", "quitter", "{}")]).await;
+
+    let result = harness.result("call-1").await;
+    assert_eq!(result.status, ToolResultStatus::Failed);
+    let error = result.error.expect("error");
+    assert_eq!(error.kind, ToolErrorKind::Timeout);
+    assert_eq!(error.message, "gave up after partial work");
+}
+
+#[tokio::test]
+async fn a_tool_that_reports_cancelled_under_turn_cancel_stays_cancelled() {
+    let cancel = CancelToken::new();
+    let mut harness = Harness::new(vec![gives_up_on_cancel(
+        Duration::from_secs(5),
+        Some(cancel.clone()),
+    )])
+    .await;
+    harness.cancel_grace = Duration::from_secs(5);
+
+    harness
+        .run_with(&[tool_call("call-1", "quitter", "{}")], false, &cancel)
+        .await;
+
+    assert_eq!(
+        harness.result("call-1").await.error_kind(),
+        Some(ToolErrorKind::Cancelled)
+    );
+}
+
 #[tokio::test]
 async fn a_panicking_tool_fails_alone() {
     let boom = tool_with(descriptor("boom"), || Box::pin(async { panic!("boom") }));
