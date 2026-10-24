@@ -284,6 +284,79 @@ async fn normalizes_the_full_stream_into_s1_to_s10() {
 }
 
 #[tokio::test]
+async fn parallel_tool_use_json_deltas_carry_their_block_output_index() {
+    let tool_use = |index: u32, id: &str| {
+        format!(
+            r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{id}","name":"search","input":{{}}}}}}"#
+        )
+    };
+    let json_delta = |index: u32, partial: &str| {
+        format!(
+            r#"{{"type":"content_block_delta","index":{index},"delta":{{"type":"input_json_delta","partial_json":{}}}}}"#,
+            serde_json::to_string(partial).unwrap()
+        )
+    };
+    let stop = |index: u32| format!(r#"{{"type":"content_block_stop","index":{index}}}"#);
+    let frames = [
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_par","usage":{"input_tokens":1,"output_tokens":1}}}"#.to_owned(),
+        ),
+        ("content_block_start", tool_use(0, "toolu_a")),
+        ("content_block_delta", json_delta(0, r#"{"q":"#)),
+        ("content_block_delta", json_delta(0, r#""a"}"#)),
+        ("content_block_stop", stop(0)),
+        ("content_block_start", tool_use(1, "toolu_b")),
+        ("content_block_delta", json_delta(1, r#"{"q":"#)),
+        ("content_block_delta", json_delta(1, r#""b"}"#)),
+        ("content_block_stop", stop(1)),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}"#.to_owned(),
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#.to_owned()),
+    ];
+    let frames: Vec<(&str, &str)> = frames
+        .iter()
+        .map(|(event, data)| (*event, data.as_str()))
+        .collect();
+    let server = MockServer::start(vec![Reply::sse(sse_body(&frames))]);
+    let events = ok(drain(&provider(&server), base_request()).await);
+
+    let mut fragments: std::collections::BTreeMap<u32, String> = Default::default();
+    let mut calls = std::collections::BTreeMap::new();
+    for event in &events {
+        match event {
+            StreamEvent::PartDelta {
+                output_index,
+                part_index: 0,
+                delta: PartDelta::JsonArgs { fragment },
+                ..
+            } => fragments
+                .entry(*output_index)
+                .or_default()
+                .push_str(fragment),
+            StreamEvent::ItemCompleted {
+                output_index,
+                item: Item::ToolCall {
+                    call_id, raw_args, ..
+                },
+                ..
+            } => {
+                calls.insert(*output_index, (call_id.clone(), raw_args.clone()));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(fragments.len(), 2);
+    for (index, call_id) in [(0, "toolu_a"), (1, "toolu_b")] {
+        assert_eq!(calls[&index].0, call_id);
+        assert_eq!(calls[&index].1.as_str(), fragments[&index]);
+    }
+    assert_eq!(fragments[&1], r#"{"q":"b"}"#);
+}
+
+#[tokio::test]
 async fn maps_server_tools_and_unknown_blocks_to_raw_items() {
     let body = sse_body(&[
         (

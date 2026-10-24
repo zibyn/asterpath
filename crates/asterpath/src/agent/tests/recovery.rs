@@ -1639,8 +1639,14 @@ impl SessionStore for CorruptParentLog {
         self.inner.frontier(session)
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, asterpath_protocol::StorageError>> {
-        self.inner.sessions()
+    fn sessions(
+        &self,
+        query: asterpath_protocol::SessionQuery,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Vec<asterpath_protocol::CatalogEntry>, asterpath_protocol::StorageError>,
+    > {
+        self.inner.sessions(query)
     }
 
     fn parent(
@@ -1648,13 +1654,5 @@ impl SessionStore for CorruptParentLog {
         session: SessionId,
     ) -> BoxFuture<'_, Result<Option<SessionId>, asterpath_protocol::StorageError>> {
         self.inner.parent(session)
-    }
-
-    fn children(
-        &self,
-        session: SessionId,
-    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath_protocol::StorageError>>
-    {
-        self.inner.children(session)
     }
 }

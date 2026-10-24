@@ -132,16 +132,18 @@ impl SessionStore for CommitLog {
         self.inner.frontier(session)
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        self.inner.sessions()
+    fn sessions(
+        &self,
+        query: asterpath_protocol::SessionQuery,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Vec<asterpath_protocol::CatalogEntry>, asterpath_protocol::StorageError>,
+    > {
+        self.inner.sessions(query)
     }
 
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
-    }
-
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        self.inner.children(session)
     }
 
     fn retire(

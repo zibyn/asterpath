@@ -83,6 +83,8 @@ pub enum ScriptedStep {
         error: ProviderError,
     },
     Fail(ProviderError),
+    /// Replay these stream events verbatim, e.g. interleaved deltas.
+    Events(Vec<StreamEvent>),
 }
 
 pub struct ScriptedProvider {
@@ -156,6 +158,11 @@ impl ScriptedProvider {
     #[must_use]
     pub fn fail(self, error: ProviderError) -> Self {
         self.push(ScriptedStep::Fail(error))
+    }
+
+    #[must_use]
+    pub fn stream_events(self, events: Vec<StreamEvent>) -> Self {
+        self.push(ScriptedStep::Events(events))
     }
 
     /// Every request the provider received, in call order.
@@ -234,6 +241,7 @@ impl Provider for ScriptedProvider {
                 events
             }
             Some(ScriptedStep::Fail(error)) => vec![Err(error)],
+            Some(ScriptedStep::Events(events)) => events.into_iter().map(Ok).collect(),
             None => vec![Err(ProviderError::new(
                 ProviderErrorKind::StreamProtocol,
                 "scripted provider script is exhausted",
