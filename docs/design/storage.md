@@ -126,6 +126,7 @@ CREATE TABLE retired_sessions (
 
 - `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions`。
 - 发布前只有一个 DDL 版本（1），不写迁移；旧布局的开发库删掉重建。
+- **日志 schema 版本**：每条记录带写入时的 `schema_version`（`LOG_SCHEMA_VERSION`，当前固定为 1）；读到高于自身支持的版本即拒绝打开，不降级。发布前不承担历史数据兼容：不写 upcaster、不维护历史 fixture、持久 payload 不用 `#[serde(default)]`，形状变化直接改，开发库删掉重建。首个发布版的兼容策略（upcast 位置、逐版本黄金 fixture、兼容性门禁）届时以新 ADR 决定。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。

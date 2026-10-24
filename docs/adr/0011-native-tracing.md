@@ -1,42 +1,36 @@
-# 追踪是事件日志的确定性投影
+# 追踪与用量都是事件日志的确定性投影，成本不在内核
 
-**Status**: accepted (2026-10-22)
-**来源**: [#12](https://github.com/zibyn/asterpath/issues/12)
-**2026-10-23 ADR-0024 修订**: 等待 span 只剩审批与子会话；timer span 与通用 signal span 删除，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
-**2026-10-23 ADR-0025 修订**: 实时导出不再经事件总线；tracing 由引擎 append 入口直接调用，见 [ADR-0025](0025-extension-points-are-typed-hooks.md)。
-**2026-10-23 ADR-0026 修订**: `TraceQuery` / `TraceTap` 不再是 trait，改为 facade 方法 `trace(session)` / `trace_updates()`，见 [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md)。
-**2026-10-23 重审候选 4 修订**: 不提供 span 实时推送（`TraceTap` 删除，facade 无 `trace_updates()`）；trace 只有拉取 `trace(session)`，实时导出由宿主经 `Hooks::on_record` 自行增量折叠。
+**Status**: accepted (2026-10-22)；2026-10-24 整理：并入 ADR-0012
+**来源**: [#12](https://github.com/zibyn/asterpath/issues/12)、[#13](https://github.com/zibyn/asterpath/issues/13)
+**规范**: [tracing.md](../design/tracing.md)、[usage.md](../design/usage.md)
 
 ## Context
 
-Asterpath 要求原生可审计的执行链追踪：不集成第三方 agent/追踪框架，trace 必须能从事务日志重建。事件日志已经是恢复与模型历史的唯一真相源；OTel GenAI 约定（Development）没有 session / turn / step / subagent span，也没有 replay、attempt、去重语义（[#14](../research/otel-genai-conventions.md)）。
-
-难点是时间：`#3` 刻意让信封不含墙钟时间，`seq` 是唯一排序依据，以保证恢复与投影的时间无关（I4）。但 trace 的 span 必须有起止与耗时，否则跨天等待、重试、审批无法审计。
+框架要求原生可审计的执行链追踪与 token 统计，不依赖第三方 agent / 追踪框架，跨崩溃与重放不重复计数。事件日志已经是恢复与模型历史的唯一真相源。OTel GenAI 约定没有 session / turn / step / subagent span，也没有 replay、attempt、去重语义（[调研](../research/otel-genai-conventions.md)）。成本、价格表、预算与告警是宿主策略。
 
 ## Decision
 
-- **trace 是事件日志的确定性投影**。不建独立 trace sink，不落 trace 表；查询时从 `EventLog` 折叠，实时导出由 tracing 模块在事件总线上发出。
-- **`LogEntry` 增加 `recorded_at`（Unix ms）**，由存储层在 append 时写入。它只供 trace/审计计算耗时；恢复、投影、分支逻辑一律不得读取。I4 改写成“时间不影响逻辑，只影响耗时呈现”。
-- **SpanId 由开启记录确定性派生**：`hash(session, opening_log_id, kind)`。恢复复用已存在的开启记录，因此不会为同一逻辑操作产生第二个 span；`TraceId = SessionId`。
-- **一个逻辑模型调用一个 span**，transport attempt 折叠为 span event；timer / signal / approval / child 等待各自成 span；compaction 是独立 span，并以新增的 `CompactionStarted` 意图记录定位起点。
-- **类型进 `asterpath-protocol`，实现进 `asterpath-tracing`**。`TraceQuery`（pull）与 `TraceTap`（push）就是导出 seam；内容只以 `log_range` 引用，采样/过滤/脱敏/格式由 exporter/host 决定。
-- **子会话是独立 trace**，通过 `parent_trace` / `parent_span` 与父 trace 的 spawn tool span 链接，不合并成一条跨天超长 trace。
+- **trace 与 usage 都是日志的纯折叠**：不建独立 sink、不落派生表，查询时从日志折叠；facade 提供 `trace(session)` 与 `usage(scope)`。实时观察经唯一的提交后出口 `Hooks::on_record`（[ADR-0025](0025-extension-points-are-typed-hooks.md)），框架不提供专用推送接口。
+- **`recorded_at` 只用于呈现**：存储在 append 时写墙钟时间，只供 trace 计算耗时与目录展示；恢复、投影、分支逻辑不得读取。
+- **span 身份确定**：由开启记录派生，恢复不会为同一逻辑操作产生第二个 span；一个逻辑模型调用一个 span，transport attempt 折叠为 span event。
+- **子会话是独立 trace**，通过链接指向父 trace 的 spawn span，不合并成一条跨天 trace。
+- **只有 provider 返回值进账**：本地估算永不进入用量；`partial` 单列失败 attempt 的下界，不计入总量。
+- **归因按会话树**：子 usage 只在子流，查询分别返回本会话与后代，不提供含糊的单一父总量。
+- **内核不提供成本、币种、预算类型**：成本模块经钩子观察用量，用 `before_step` 停止回合。
+- **映射到 OTel 等外部格式由 exporter / 宿主负责**；内容只以日志范围引用，采样、过滤、脱敏由宿主决定。
 
 ## Consequences
 
-- 日志每条记录增加 8 字节，换来 trace 的耗时、审批等待、跨天 timer 与崩溃窗口全部可重建。
-- “信封不含时间”的旧表述被修订：时间可以存在，但不许参与决策。S8 拆成“逻辑输出不受时间影响”与“trace 耗时随时间变化”。
-- 恢复不重写历史，也不新建 trace；trace 在与日志相同的 frontier 处自然闭合。未闭合的 span 以 `ended_at = None` 呈现。
-- `CompactionStarted` 补上了压缩的意图记录，符合“意图先提交后执行”；失败 attempt 仍不落日志，只在实时 tap 中可见。
-- `SignalAwaited` 让“已声明等待的 signal”从一句定义变成可记录、可重建的意图；API 由 #17 落地。
-- exporter 需要内容时由 host 注入 `EventLog`；默认导出只有结构、状态、token 与日志引用，内容安全留在边缘。
-- 旧日志若缺少 `recorded_at`，迁移时补 0；此类历史 span 只失去耗时，不失去结构。
+- 恢复不重写历史，也不新建 trace；未闭合的 span 以无结束时间呈现。
+- 查询成本与日志长度线性；需要大规模报表时由宿主物化，而不是引入第二真相源。
+- 已知崩溃窗口：`ResponseEnded` 后、`AssistantMessage` 落盘前的用量丢失。
+- trace 与 usage 是同一日志的两条投影，必须对账；tracing 不拥有统计。
 
 ## Considered alternatives
 
-- **独立 trace sink（自己的表/文件）**：时间与内容都现成，但引入第二真相源和跨 sink 一致性窗口，违背“日志是唯一来源”。
-- **不记录时间，运行时内存采集耗时**：重建后的历史 span 没有耗时，审计跨天等待时只剩空洞；与本票“span 必须具备耗时”冲突。
-- **每次 transport attempt 一个 span**：会重复计时与 usage，OTel 也明确要求自动重试折叠进一个逻辑 span。
-- **一条 trace 覆盖整个会话树**：子会话可独立崩溃、恢复、归档；合并后一条 trace 永远不结束，也与 `TraceId = SessionId` 冲突。
-- **把 OTel SDK/`gen_ai.*` 作为核心模型**：GenAI 约定仍是 Development，且不覆盖 session/turn/step；核心只保留原生类型，映射留在 exporter。
-- **trace 落 SQLite 派生表**：查询更快，但多一份可重建的数据和迁移负担；v1 直接折叠日志，必要时由 exporter 物化。
+- **独立 trace sink / usage 事件或派生表**：第二真相源与一致性窗口。
+- **不记录时间，运行时内存采集耗时**：重建后的历史 span 没有耗时。
+- **每个 transport attempt 一个 span**：重复计时与 usage。
+- **以 OTel SDK / `gen_ai.*` 为核心模型**：约定仍是 Development，且不覆盖 session/turn/step。
+- **本地 tokenizer 估算进账、`partial` 计入总量、父日志复制子 usage**：总量变得半真半假或双计。
+- **成本放进内核**：价格与预算随宿主变化。

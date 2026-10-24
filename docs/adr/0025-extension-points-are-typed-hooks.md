@@ -1,10 +1,9 @@
 # 扩展点是固定的类型化钩子，内核不再有模块宿主与事件总线
 
-**Status**: accepted (2026-10-23)
+**Status**: accepted (2026-10-23)；2026-10-24 整理
 **来源**: [#78](https://github.com/zibyn/asterpath/issues/78)（无 ADR 约束重审候选 1）
-**取代**: [ADR-0022](0022-facade-accepts-host-modules.md)
-**修订**: [ADR-0001](0001-dependency-direction.md) 的内核构成、[ADR-0006](0006-agent-loop-execution-model.md) 的 pre-step gate、[ADR-0007](0007-approval-and-sandbox-layers.md) 的 pre/post-execute 接缝、[ADR-0011](0011-native-tracing.md) 的实时导出、[ADR-0015](0015-packaging-and-stability.md) 的宿主模块口径
-**2026-10-23 重审候选 4 修订**: tracing / usage 不提供专用推送接口；`on_record` 是唯一的提交后观察出口。
+**取代**: [ADR-0001](0001-dependency-direction.md) 的模块宿主与事件总线、[ADR-0022](0022-facade-accepts-host-modules.md)
+**规范**: [module-contracts.md](../design/module-contracts.md)
 
 ## Context
 
@@ -27,7 +26,7 @@ ADR-0001 按 DeepSeek Harness / Cordis 的思路，让内核提供模块宿主�
 - **上下文只带数据**：`StepCtx { session, turn, step_index }`、`ToolCallCtx { session, turn, step, tool_call_id, provider_call_id, tool, provenance, replay }`，两者提供异步 `usage()`（本会话自身与子树）。不提供服务定位器。
 - **调用点与恢复语义与原 waterfall 完全一致**；panic 按该钩子错误处理，`on_record` panic 捕获后记录并继续。
 - `Hooks` 与上下文类型在 protocol；facade 再导出 protocol 与 core 的 id 类型，嵌入者只依赖 `asterpath`。
-- 引擎内部的 tracing / usage 由 append 入口直接调用，不经钩子；其推送接口另行决定。
+- `on_record` 是唯一的提交后观察出口；引擎内部的 tracing / usage 不经钩子，也不提供专用推送接口。
 
 ## Consequences
 

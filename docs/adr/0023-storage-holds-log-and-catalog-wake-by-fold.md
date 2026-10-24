@@ -1,41 +1,35 @@
-# 存储只存日志与会话目录，唤醒由会话事实折叠发现
+# 存储契约只有日志、会话目录与整会话退役；单写者；唤醒由引擎折叠发现
 
-**Status**: accepted (2026-10-23)
-**来源**: [#73](https://github.com/zibyn/asterpath/issues/73)（越界设计审计候选 1）
-**前置**: [ADR-0005](0005-storage-contract-and-sqlite.md)、[ADR-0016](0016-retention-and-archive-seam.md)、[ADR-0022](0022-facade-accepts-host-modules.md)
-**修订**: ADR-0005 的派生索引、ADR-0016 的退役空闲判定、ADR-0022 的服务清单
-**2026-10-23 ADR-0024 修订**: `is_wakeable` 不再含到期 timer（通用 timer 已删除），见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。
-**2026-10-23 #73 扩展修订**: `EventLog`、`SessionCatalog`、`SessionRetirement` 合并为一个 `SessionStore` trait（`retire` 默认 `Unsupported`）；facade 只接收一个 `store`；存储契约套件异步化并覆盖目录与退役，memory 后端实现退役。下文的 `Asterpath::wakeable(now)` 落地为不带参数的 `wakeable()`（通用 timer 删除后不再需要 `now`），`session_catalog` 注入入口落地为 `store`。
-**2026-10-23 ADR-0028 修订**: `sessions()` 改为带过滤与游标的 `sessions(query)`，返回目录项；`children()` 删除，见 [ADR-0028](0028-catalog-entries-and-in-process-pending-approvals.md)。
+**Status**: accepted (2026-10-23)；2026-10-24 整理：并入 ADR-0005、ADR-0016、ADR-0028 的存储原则
+**来源**: [#5](https://github.com/zibyn/asterpath/issues/5)、[#18](https://github.com/zibyn/asterpath/issues/18)、[#32](https://github.com/zibyn/asterpath/issues/32)、[#73](https://github.com/zibyn/asterpath/issues/73)、[#84](https://github.com/zibyn/asterpath/issues/84)
+**规范**: [storage.md](../design/storage.md)、[retention.md](../design/retention.md)
 
 ## Context
 
-ADR-0005 让 SQLite 在 `append` 同事务内维护 `open_intents`、`timers`、`pending_inputs` 三张派生表，供 `Storage::wakeable` / `due_timers` 与 `SessionRetirement::retire` 读取。实现后核对：
-
-- 三张表只被这三个方法读取；`due_timers` 无任何调用方，`wakeable` 只有验收 testdrive 使用，库与参考 CLI 均不调用。
-- 同一套唤醒规则写了三份：sqlite `apply_derived` 等（约 160 行）、memory 后端的折叠（约 100 行）、契约套件的 oracle（约 60 行）。memory 后端用折叠实现 `wakeable`，已证明折叠足够。
-- Pi Durable 由框架在 `resume()` 中发现未完成工作，宿主只决定何时调用；其 README 未描述索引表。
-
-发现“哪些会话未收尾”需要日志语义（意图配对、步骤水位、steering 输入），属于框架机制；何时恢复、恢复哪些属于宿主策略。机制要留在框架内，但不需要物化在存储层。
+日志语义已定（[ADR-0002](0002-log-topology-and-commit-semantics.md)）。剩下的问题：存储后端要实现多少、谁有资格写、哪些结构是真相源、「哪些会话未收尾」由谁发现、保留与删除归谁。早期设计让后端在 append 事务里维护三张派生表供唤醒与退役读取；实现后核对，三张表没有生产读者，同一套唤醒规则写了三份，而 memory 后端用折叠实现已经足够。
 
 ## Decision
 
-- **删除 `Storage` trait**（`wakeable`、`due_timers`、`STORAGE_SERVICE`）。后端契约只剩 `EventLog`、`SessionCatalog` 与可选的 `SessionRetirement`。
-- **`SessionCatalog::sessions()`** 列出全部未退役会话（含子会话）。
-- **唤醒发现归 facade**：`Asterpath::wakeable(now)` 对 `sessions()` 逐个做会话事实折叠，返回集合与原 `Storage::wakeable` 相同。“空闲”与“可唤醒”是会话事实上的判定，facade 与退役共用。
-- **退役在事务内折叠**：`retire` 在同一 `BEGIN IMMEDIATE` 内折叠本会话与父会话日志判定空闲；CAS、墓碑与幂等语义不变。
-- **SQLite 只维护 `sessions` 与 `retired_sessions`**；`migrate_v2` 删除三张派生表。日志 schema 版本不变。
-- facade 注入入口由 `storage` 改为 `session_catalog`；`Asterpath::storage()` 由 `wakeable(now)` 取代。
+- **后端只实现一个 `SessionStore` trait**：追加、扫描、frontier、会话目录（`sessions(query)`、`parent`）和可选的整会话退役（默认 `Unsupported`）。
+- **单进程独占写者**：一个进程持有写者身份，第二个进程打开即失败；没有租约、ack 或调度队列。多进程 / 多 worker 只能作为新后端或新执行模型重新设计。
+- **append 返回即已持久**：生产配置下掉电不丢已返回的记录（「模型可见即已记录」依赖它）。
+- **存储契约不物化派生状态**：「空闲」「可唤醒」是会话事实，由引擎折叠日志得到，`Asterpath::wakeable()` 与退役共用同一判定。何时恢复、恢复哪些由宿主决定。
+- **会话目录只放已有的事实**：父会话、创建时间、最后活动时间，供宿主展示；标题、状态等由宿主折叠或自建。
+- **保留策略归宿主**：框架只提供安全的整会话退役（写墓碑、删日志、frontier CAS、要求空闲且无活子会话），不裁前缀、不级联删除、不内置导出/导入；导出用 `frontier` + `scan`。
+
+SQLite 的 WAL / 同步级别、写者锁、group commit、DDL 与目录排序见 storage.md；退役细节见 retention.md。
 
 ## Consequences
 
-- 唤醒规则只有一份，由会话事实（#64）实现；第三个存储后端只需能追加、扫描、列会话。
-- 启动发现读取全部会话日志，成本随会话总量线性增长。唤醒发现在 facade 内折叠，`SessionStore` 没有唤醒方法，因此加索引必然扩展存储契约；出现实测瓶颈前不做（#84）。
-- 退役读取两个会话的完整日志；退役是低频管理操作，可接受。
-- G5 的唤醒断言从后端契约套件移到 facade 测试（双后端）；契约套件只验证 `sessions()`。
+- 第三个存储后端只需能追加、扫描、列会话。
+- 启动发现读取全部会话日志，成本随会话总量线性增长；出现实测瓶颈时再给契约加索引。
+- 退役读取本会话与父会话的完整日志；退役是低频管理操作。
+- 墓碑永久保留，id 不复用、退役幂等。
 
 ## Considered alternatives
 
-- **保留派生表**：拒绝，三份实现、无生产读者。
-- **删除 `wakeable`，宿主按会话 id 显式恢复**（Codex、Claude Code 的做法）：宿主将被迫重写意图配对规则；拒绝。
-- **`wakeable` 留在每个后端、内部调用折叠**：每个后端仍要接线一次，且存储契约不收缩；拒绝。
+- **在后端维护派生表**：三份实现、无生产读者。
+- **宿主按会话 id 显式恢复，框架不做唤醒发现**（Codex、Claude Code）：宿主被迫重写意图配对规则。
+- **心跳租约 / 多 worker 队列**（Duroxide）：单写者下只是额外故障面。
+- **扩展直接操作数据库删除**：绕过写者与父引用检查。
+- **裁前缀 / 级联删除子树**：制造 seq 洞，或在崩溃时留下删了一半的会话树。

@@ -172,6 +172,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - signal name 只在会话内唯一；signal id 由 `(session, name)` 确定性派生（审批 name 为 `tool.approval.<tool_call_id>`），重复注册/投递不会产生第二个等待。持久等待按 session 作用域等待（#17）。
 - `await_signal` 不写意图记录：open 的 `ToolCallRequested` 已承担意图。审批是唯一的 signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
 - 未注册审批端点时，`Ask` 按 `Deny` 处理（fail closed），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
+- **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序），宿主按 `ApprovalRequest::session` 过滤，供新连上的客户端找回待审批项。等待因任何原因结束（决定、取消、宿主丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：
 
