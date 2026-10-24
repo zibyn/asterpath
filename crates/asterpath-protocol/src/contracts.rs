@@ -90,6 +90,7 @@ pub struct SessionQuery {
 
 /// One live session in the catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CatalogEntry {
     pub session: SessionId,
     pub parent: Option<SessionId>,
@@ -103,6 +104,23 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// For store adapters, which build entries outside this crate.
+    pub fn new(
+        session: SessionId,
+        parent: Option<SessionId>,
+        created_at: Timestamp,
+        last_activity: Timestamp,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            session,
+            parent,
+            created_at,
+            last_activity,
+            metadata,
+        }
+    }
+
     pub fn cursor(&self) -> CatalogCursor {
         CatalogCursor {
             created_at: self.created_at,

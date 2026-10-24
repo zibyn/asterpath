@@ -589,13 +589,13 @@ mod tests {
     use asterpath_protocol::SessionId;
 
     fn entry(byte: u8, last_activity: i64, metadata: &[(&str, &str)]) -> CatalogEntry {
-        let mut entry = CatalogEntry {
-            session: SessionId::from_bytes([byte; 16]),
-            parent: None,
-            created_at: 0,
+        let mut entry = CatalogEntry::new(
+            SessionId::from_bytes([byte; 16]),
+            None,
+            0,
             last_activity,
-            metadata: BTreeMap::new(),
-        };
+            BTreeMap::new(),
+        );
         for (key, value) in metadata {
             entry
                 .metadata
