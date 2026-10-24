@@ -167,6 +167,29 @@ fn capability_check_names_the_unsupported_feature() {
         none.unsupported_feature(&structured),
         Some("structured output")
     );
+    let mut server_tools = capability_request();
+    server_tools.server_tools.insert(
+        ProviderId::new("p"),
+        vec![asterpath_protocol::JsonString::new(
+            r#"{"type":"web_search"}"#,
+        )],
+    );
+    assert_eq!(
+        none.unsupported_feature(&server_tools),
+        Some("server tools")
+    );
+    // Entries for other providers, or an empty list, declare nothing here.
+    let mut elsewhere = capability_request();
+    elsewhere.server_tools.insert(
+        ProviderId::new("other"),
+        vec![asterpath_protocol::JsonString::new(
+            r#"{"type":"web_search"}"#,
+        )],
+    );
+    elsewhere
+        .server_tools
+        .insert(ProviderId::new("p"), Vec::new());
+    assert_eq!(none.unsupported_feature(&elsewhere), None);
 
     let all = ProviderCapabilities {
         forced_tool_choice: true,
@@ -174,9 +197,10 @@ fn capability_check_names_the_unsupported_feature() {
         parallel_tool_calls: true,
         image_input: true,
         structured_output: true,
+        server_tools: true,
         ..ProviderCapabilities::default()
     };
-    for request in [forced, sampling, serial, image, structured] {
+    for request in [forced, sampling, serial, image, structured, server_tools] {
         assert_eq!(all.unsupported_feature(&request), None);
     }
 }

@@ -5,6 +5,11 @@
 //! values in the reasoning guide (api/docs/guides/reasoning). The o-series
 //! pages list no effort set; their row keeps the original `low|medium|high`.
 //!
+//! `server_tools`: built-in tools (web search, file search, code interpreter…)
+//! are documented for the GPT-5 family and o3 / o4 in the Responses tool
+//! guides (api/docs/guides/tools-*, checked 2026-10-24); o1 and unrecognized
+//! ids (third-party endpoints) are not marked.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`gpt-5.5-pro`) before its prefix (`gpt-5.5`),
 //! and `gpt-5` last of the GPT-5 family. Ids no row matches get [`LATEST`], so
@@ -29,15 +34,18 @@ pub struct OpenAiModelProfile {
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p`.
     pub sampling: bool,
+    /// Accepts built-in (server-executed) tools in `tools`.
+    pub server_tools: bool,
     /// `Part::File` media types sent as `input_file`; empty means no file
     /// input.
     pub file_media_types: Cow<'static, [&'static str]>,
 }
 
 impl OpenAiModelProfile {
-    /// The rules unrecognized model ids get: the newest generation's.
+    /// The rules unrecognized model ids get: the newest generation's, without
+    /// built-in tools, which only listed models accept.
     pub fn latest() -> Self {
-        profile(LATEST)
+        LATEST_PROFILE.clone()
     }
 
     #[must_use]
@@ -59,6 +67,12 @@ impl OpenAiModelProfile {
     }
 
     #[must_use]
+    pub fn with_server_tools(mut self, server_tools: bool) -> Self {
+        self.server_tools = server_tools;
+        self
+    }
+
+    #[must_use]
     pub fn with_file_media_types(mut self, types: impl Into<Cow<'static, [&'static str]>>) -> Self {
         self.file_media_types = types.into();
         self
@@ -70,8 +84,14 @@ const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
         efforts: Cow::Borrowed(efforts),
         forced_tool_choice: true,
         sampling: true,
+        server_tools: true,
         file_media_types: Cow::Borrowed(PDF),
     }
+}
+
+const fn unlisted(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
+    profile.server_tools = false;
+    profile
 }
 
 /// PDF input (api/docs/guides/pdf-files) on every vision-capable model; hosts
@@ -103,12 +123,12 @@ static TABLE: &[(&str, OpenAiModelProfile)] = &[
     ("gpt-5.1", profile(&[Off, Low, Medium, High])),
     ("gpt-5-pro", profile(&[High])),
     ("gpt-5", profile(&[Minimal, Low, Medium, High])),
-    ("o1", profile(LOW_TO_HIGH)),
+    ("o1", unlisted(profile(LOW_TO_HIGH))),
     ("o3", profile(LOW_TO_HIGH)),
     ("o4", profile(LOW_TO_HIGH)),
 ];
 
-static LATEST_PROFILE: OpenAiModelProfile = profile(LATEST);
+static LATEST_PROFILE: OpenAiModelProfile = unlisted(profile(LATEST));
 
 /// Host model entries (first prefix match wins), then the host default, then
 /// the built-in table, then [`LATEST`].

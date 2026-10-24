@@ -417,6 +417,27 @@ fn request_config_recorded_before_output_format_decodes_without_it() {
 }
 
 #[test]
+fn model_request_copies_server_tools() {
+    let mut request = RequestConfig::default();
+    request.server_tools.insert(
+        ProviderId::new("anthropic"),
+        vec![JsonString::new(
+            r#"{"type":"web_search_20250305","name":"web_search"}"#,
+        )],
+    );
+    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], vec![], &request);
+    assert_eq!(model_request.server_tools, request.server_tools);
+}
+
+#[test]
+fn request_config_without_server_tools_still_decodes() {
+    let mut json = serde_json::to_value(RequestConfig::default()).expect("serialize");
+    json.as_object_mut().expect("object").remove("server_tools");
+    let back: RequestConfig = serde_json::from_value(json).expect("deserialize");
+    assert!(back.server_tools.is_empty());
+}
+
+#[test]
 fn usage_totals_use_the_exclusive_rule() {
     let usage = Usage {
         input: InputTokens {

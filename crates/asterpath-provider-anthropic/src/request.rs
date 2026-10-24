@@ -6,7 +6,7 @@
 
 use asterpath_http::{
     TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
-    same_provider_raw_field,
+    same_provider_raw_field, server_tools_for,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -206,17 +206,19 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
-/// Render the full Messages request body. Capability checks are the caller's
-/// responsibility so they can run before anything is serialized.
+/// Render the full Messages request body and the `tools_hash` of its
+/// top-level tools. Capability checks are the caller's responsibility so they
+/// can run before anything is serialized.
 pub(crate) fn render(
     provider: &ProviderId,
     rules: &AnthropicModelProfile,
     request: &ModelRequest,
     trace: Option<&dyn TraceSink>,
-) -> Result<String, ProviderError> {
+) -> Result<(String, String), ProviderError> {
     let options = provider_options_for(request, &[])?;
+    let server_tools = server_tools_for(request)?;
     let top_tools = top_level_tools(rules, request);
-    let tools_hash = asterpath_protocol::tools_hash(top_tools);
+    let tools_hash = asterpath_protocol::tools_hash(top_tools, &server_tools);
     let messages = render_messages(provider, request, &tools_hash, rules, trace)?;
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_changes {
@@ -242,11 +244,13 @@ pub(crate) fn render(
         fields.push(("system", Frag::Json(Value::Array(blocks))));
     }
     fields.push(("messages", Frag::Raw(messages)));
-    if !top_tools.is_empty() {
+    if !top_tools.is_empty() || !server_tools.is_empty() {
         let mut tools: Vec<Value> = top_tools.iter().map(tool_definition).collect();
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = ephemeral();
         }
+        // Server tools go last, verbatim; the breakpoint stays on the function tools.
+        tools.extend(server_tools);
         fields.push(("tools", Frag::Json(Value::Array(tools))));
         let mut choice = match &request.tool_choice {
             ToolChoice::Auto => json!({"type": "auto"}),
@@ -305,7 +309,7 @@ pub(crate) fn render(
             None => fields.push((key.as_str(), Frag::Json(value.clone()))),
         }
     }
-    Ok(object(fields))
+    Ok((object(fields), tools_hash))
 }
 
 fn render_reasoning(

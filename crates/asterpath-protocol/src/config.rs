@@ -34,6 +34,11 @@ pub struct RequestConfig {
     /// message text; the framework neither parses nor validates it.
     #[serde(default)]
     pub output_format: Option<OutputFormat>,
+    /// Per-provider server-executed tool definitions (each a JSON object),
+    /// appended verbatim after the function tools in that provider's
+    /// request; entries for other providers are ignored (ADR-0031).
+    #[serde(default)]
+    pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
 }
 
 /// A named JSON schema the model's reply must follow (structured output).
@@ -54,6 +59,7 @@ impl Default for RequestConfig {
             stop_sequences: Vec::new(),
             provider_options: BTreeMap::new(),
             output_format: None,
+            server_tools: BTreeMap::new(),
         }
     }
 }

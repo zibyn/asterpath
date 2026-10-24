@@ -824,13 +824,6 @@ async fn summary_requests_summarized_thinking_display_where_supported() {
     );
 }
 
-#[test]
-fn builtin_tools_are_not_advertised() {
-    use asterpath_protocol::Provider;
-    let provider = asterpath_provider_anthropic::AnthropicProvider::new("key");
-    assert!(!provider.capabilities(&model()).builtin_tools);
-}
-
 #[tokio::test]
 async fn transitional_and_opus_4_5_models_keep_their_documented_shapes() {
     let server = MockServer::start(vec![
@@ -1430,7 +1423,7 @@ fn thinking(model_id: &str, raw: &str) -> Item {
             provider: model().provider,
             model: ModelId::new(model_id),
             prefix_epoch: 0,
-            tools_hash: asterpath_protocol::tools_hash(&[]),
+            tools_hash: asterpath_protocol::tools_hash(&[], &[]),
         },
         raw: RawProviderData {
             provider: model().provider,
@@ -1566,7 +1559,7 @@ fn tools_changed_request(model_id: &str) -> ModelRequest {
     let mut request = instructed_request(model_id);
     request.items.pop();
     if let Item::Reasoning { binding, .. } = &mut request.items[1] {
-        binding.tools_hash = asterpath_protocol::tools_hash(&[descriptor("echo")]);
+        binding.tools_hash = asterpath_protocol::tools_hash(&[descriptor("echo")], &[]);
     }
     request.items.push(Item::ToolsChanged {
         added: vec![descriptor("write")],
@@ -1744,4 +1737,178 @@ async fn tool_strict_is_sent_only_when_set() {
     assert_eq!(body["tools"][0]["strict"], true);
     assert_eq!(body["tools"][1]["strict"], false);
     assert!(body["tools"][2].get("strict").is_none());
+}
+
+const WEB_SEARCH: &str = r#"{"type":"web_search_20250305","name":"web_search","max_uses":3}"#;
+
+fn web_search() -> serde_json::Value {
+    serde_json::from_str(WEB_SEARCH).unwrap()
+}
+
+fn with_web_search(mut request: ModelRequest) -> ModelRequest {
+    request.server_tools.insert(
+        ProviderId::new("anthropic"),
+        vec![JsonString::new(WEB_SEARCH)],
+    );
+    request.server_tools.insert(
+        ProviderId::new("openai"),
+        vec![JsonString::new(r#"{"type":"web_search"}"#)],
+    );
+    request
+}
+
+fn anthropic_raw(kind: &str, json: &str) -> RawProviderData {
+    RawProviderData {
+        provider: ProviderId::new("anthropic"),
+        model: Some(ModelId::new("claude-opus-5-5")),
+        kind: kind.to_owned(),
+        json: JsonString::new(json),
+    }
+}
+
+#[test]
+fn server_tools_are_advertised_for_listed_models_only() {
+    use asterpath_protocol::Provider;
+    let provider = AnthropicProvider::new("key");
+    let spec = |id: &str| asterpath_protocol::ModelSpec {
+        model: ModelId::new(id),
+        ..model()
+    };
+    assert!(provider.capabilities(&spec("claude-opus-5-5")).server_tools);
+    assert!(
+        provider
+            .capabilities(&spec("claude-sonnet-4-5"))
+            .server_tools
+    );
+    assert!(!provider.capabilities(&spec("claude-test")).server_tools);
+    assert!(!provider.capabilities(&spec("deepseek-v4-pro")).server_tools);
+}
+
+#[tokio::test]
+async fn server_tools_append_after_the_baseline_on_the_inline_path_and_keep_old_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = with_web_search(tools_changed_request("claude-opus-5-5"));
+    if let Item::Reasoning { binding, .. } = &mut request.items[1] {
+        binding.tools_hash = asterpath_protocol::tools_hash(&[descriptor("echo")], &[web_search()]);
+    }
+    const CALL: &str =
+        r#"{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}}"#;
+    const RESULT: &str =
+        r#"{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]}"#;
+    request.items.insert(
+        2,
+        Item::ServerToolCall {
+            provider: ProviderId::new("anthropic"),
+            name: "web_search".to_owned(),
+            call_id: Some("srvtoolu_1".to_owned()),
+            raw: anthropic_raw("anthropic.server_tool_use", CALL),
+        },
+    );
+    request.items.insert(
+        3,
+        Item::ServerToolResult {
+            provider: ProviderId::new("anthropic"),
+            call_id: Some("srvtoolu_1".to_owned()),
+            parts: Vec::new(),
+            raw: anthropic_raw("anthropic.web_search_tool_result", RESULT),
+        },
+    );
+
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert!(sent.body.contains(THINKING), "old thinking is replayed");
+    assert!(sent.body.contains(CALL) && sent.body.contains(RESULT));
+    let body = sent.json_body();
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2, "{body}");
+    assert_eq!(tools[0]["name"], "echo");
+    assert_eq!(tools[1], web_search(), "verbatim, no breakpoint added");
+}
+
+#[tokio::test]
+async fn server_tools_append_after_the_effective_tools_on_the_fallback_path() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = with_web_search(request_for("claude-opus-4-7"));
+    request.tools = vec![descriptor("echo")];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(body["tools"][0]["name"], "echo");
+    assert_eq!(body["tools"][1], web_search());
+    assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn server_tools_alone_render_tools_and_tool_choice() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    drain(
+        &provider(&server),
+        with_web_search(request_for("claude-opus-5-5")),
+    )
+    .await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(body["tools"], serde_json::json!([web_search()]));
+    assert_eq!(body["tool_choice"], serde_json::json!({"type": "auto"}));
+}
+
+#[tokio::test]
+async fn reasoning_binds_the_fingerprint_with_server_tools() {
+    let thinking_sse = common::sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":1}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![Reply::sse(thinking_sse)]);
+    let mut request = with_web_search(request_for("claude-opus-5-5"));
+    request.tools = vec![descriptor("echo")];
+    request.baseline_tools = request.tools.clone();
+    let events = drain(&provider(&server), request).await;
+    let binding = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(asterpath_protocol::StreamEvent::ItemCompleted {
+                item: Item::Reasoning { binding, .. },
+                ..
+            }) => Some(binding.clone()),
+            _ => None,
+        })
+        .expect("reasoning item");
+    assert_eq!(
+        binding.tools_hash,
+        asterpath_protocol::tools_hash(&[descriptor("echo")], &[web_search()])
+    );
+}
+
+#[tokio::test]
+async fn server_tools_fail_before_http_when_unsupported_or_not_objects() {
+    let server = MockServer::start(Vec::new());
+    let error = one_request(&server, with_web_search(request_for("claude-test"))).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+
+    let mut not_object = request_for("claude-opus-5-5");
+    not_object.server_tools.insert(
+        ProviderId::new("anthropic"),
+        vec![JsonString::new(r#"["web_search"]"#)],
+    );
+    let error = one_request(&server, not_object).await;
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    assert!(server.requests().is_empty());
 }

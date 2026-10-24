@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use asterpath_http::{merge_provider_option, provider_options_for, same_provider_raw_field};
+use asterpath_http::{
+    merge_provider_option, provider_options_for, same_provider_raw_field, server_tools_for,
+};
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
     ProviderErrorKind, ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
@@ -14,23 +16,26 @@ use asterpath_http::{TraceMark, TraceSink};
 
 use crate::models::OpenAiModelProfile;
 
-/// Serialize the complete request. Deterministic: struct field order, sorted
-/// tool fingerprints and `serde_json`'s ordered maps make repeated renders of
-/// the same `ModelRequest` byte-identical.
+/// Serialize the complete request and the `tools_hash` of its tools.
+/// Deterministic: struct field order, sorted tool fingerprints and
+/// `serde_json`'s ordered maps make repeated renders of the same
+/// `ModelRequest` byte-identical.
 pub(crate) fn render(
     request: &ModelRequest,
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
     profile: &OpenAiModelProfile,
     trace: Option<&dyn TraceSink>,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<(Vec<u8>, String), ProviderError> {
     validate(request, provider, capabilities, profile)?;
     // R1: no server state, written or not.
     let options = provider_options_for(request, &["previous_response_id", "conversation"])?;
 
+    let server_tools = server_tools_for(request)?;
+
     let instructions = system_text(&request.system);
     let input = render_input(request, provider, trace)?;
-    let tools: Vec<Value> = request
+    let mut tools: Vec<Value> = request
         .tools
         .iter()
         .map(|tool| {
@@ -54,6 +59,8 @@ pub(crate) fn render(
             "strict": true,
         }})
     });
+    let tools_hash = asterpath_protocol::tools_hash(&request.tools, &server_tools);
+    tools.extend(server_tools);
 
     #[derive(serde::Serialize)]
     struct Body<'a> {
@@ -100,7 +107,7 @@ pub(crate) fn render(
 
     let bytes = serde_json::to_vec(&body).map_err(not_serializable)?;
     if options.is_empty() {
-        return Ok(bytes);
+        return Ok((bytes, tools_hash));
     }
     // Top-level fields stay raw, so replayed input and f32 sampling bytes are untouched;
     // only a field an option merges into is parsed and re-serialized.
@@ -118,7 +125,10 @@ pub(crate) fn render(
         };
         fields.insert(key, raw(value)?);
     }
-    serde_json::to_vec(&fields).map_err(not_serializable)
+    Ok((
+        serde_json::to_vec(&fields).map_err(not_serializable)?,
+        tools_hash,
+    ))
 }
 
 fn not_serializable(error: serde_json::Error) -> ProviderError {

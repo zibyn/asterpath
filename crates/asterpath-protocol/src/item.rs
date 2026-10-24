@@ -132,8 +132,11 @@ pub struct ReasoningBinding {
 
 /// Deterministic fingerprint of the model-visible tool set (protocol.md §9):
 /// SHA-256 hex of the name-sorted, key-sorted compact JSON array of
-/// `{name, description, schema}`, plus `strict` when set. Persisted in [`ReasoningBinding::tools_hash`].
-pub fn tools_hash(tools: &[crate::ToolDescriptor]) -> String {
+/// `{name, description, schema}`, plus `strict` when set; with server tools, the object
+/// `{"tools": [...], "server_tools": [...]}` (declaration order). Without them
+/// the output is unchanged from before server tools existed (ADR-0031).
+/// Persisted in [`ReasoningBinding::tools_hash`].
+pub fn tools_hash(tools: &[crate::ToolDescriptor], server_tools: &[serde_json::Value]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
@@ -154,8 +157,12 @@ pub fn tools_hash(tools: &[crate::ToolDescriptor]) -> String {
             entry
         })
         .collect();
-    let text = serde_json::to_string(&sort_keys(serde_json::Value::Array(canonical)))
-        .expect("tool fingerprint serializes");
+    let canonical = if server_tools.is_empty() {
+        serde_json::Value::Array(canonical)
+    } else {
+        serde_json::json!({"tools": canonical, "server_tools": server_tools})
+    };
+    let text = serde_json::to_string(&sort_keys(canonical)).expect("tool fingerprint serializes");
     let mut hex = String::with_capacity(64);
     for byte in Sha256::digest(text.as_bytes()) {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");

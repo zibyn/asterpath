@@ -30,6 +30,12 @@
 //! Claude 3 are not listed; unrecognized ids are not assumed to have it, as
 //! with `inline_changes`.
 //!
+//! `server_tools`: the server tool pages (agents-and-tools/tool-use/web-search-tool,
+//! web-fetch-tool, server-tools, checked 2026-10-24) document server tools for
+//! the Claude 4 and later models in this table; they name no per-model
+//! exclusions and defer to the Models API `capabilities.server_tools`. Claude 3
+//! ids and unrecognized ids (third-party endpoints) are not marked.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
 //! (`claude-opus-5`). Ids no row matches get [`UNRECOGNIZED`], so a new model works
@@ -77,6 +83,9 @@ pub struct AnthropicModelProfile {
     pub inline_changes: bool,
     /// Accepts `output_config.format` (structured outputs).
     pub structured_output: bool,
+    /// Accepts server-executed tools (web search, web fetch, code execution…)
+    /// in `tools`.
+    pub server_tools: bool,
     /// `Part::File` media types sent as `document` blocks; empty means no
     /// file input.
     pub file_media_types: Cow<'static, [&'static str]>,
@@ -84,7 +93,8 @@ pub struct AnthropicModelProfile {
 
 impl AnthropicModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
-    /// inline system messages or tools or structured outputs, which only listed
+    /// inline system messages or tools, structured outputs or server tools,
+    /// which only listed
     /// models accept.
     pub fn latest() -> Self {
         UNRECOGNIZED
@@ -133,6 +143,12 @@ impl AnthropicModelProfile {
     }
 
     #[must_use]
+    pub fn with_server_tools(mut self, server_tools: bool) -> Self {
+        self.server_tools = server_tools;
+        self
+    }
+
+    #[must_use]
     pub fn with_file_media_types(mut self, types: impl Into<Cow<'static, [&'static str]>>) -> Self {
         self.file_media_types = types.into();
         self
@@ -158,6 +174,7 @@ const fn rules(
         sampling,
         inline_changes: false,
         structured_output: true,
+        server_tools: true,
         file_media_types: Cow::Borrowed(PDF),
     }
 }
@@ -172,6 +189,11 @@ const fn unstructured(mut profile: AnthropicModelProfile) -> AnthropicModelProfi
     profile
 }
 
+const fn unlisted(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+    profile.server_tools = false;
+    profile
+}
+
 /// PDF support (build-with-claude/pdf-support) covers every current model.
 const PDF: &[&str] = &["application/pdf"];
 const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
@@ -180,9 +202,14 @@ const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
 const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
-/// Unrecognized ids: [`LATEST`] without inline changes or structured outputs.
-const UNRECOGNIZED: AnthropicModelProfile =
-    unstructured(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
+/// Unrecognized ids: [`LATEST`] without inline changes, structured outputs or
+/// server tools.
+const UNRECOGNIZED: AnthropicModelProfile = unlisted(unstructured(rules(
+    Thinking::Adaptive,
+    LOW_TO_MAX,
+    false,
+    false,
+)));
 /// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
@@ -192,6 +219,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     sampling: false,
     inline_changes: true,
     structured_output: true,
+    server_tools: true,
     file_media_types: Cow::Borrowed(PDF),
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
@@ -234,7 +262,7 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-haiku-4-5", EXTENDED),
     ("claude-opus-4", LEGACY),
     ("claude-sonnet-4", LEGACY),
-    ("claude-3", LEGACY),
+    ("claude-3", unlisted(LEGACY)),
 ];
 
 static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;
@@ -297,6 +325,25 @@ mod tests {
             ("claude-3-haiku", false),
         ] {
             assert_eq!(builtin(model).inline_changes, inline, "{model}");
+        }
+    }
+
+    #[test]
+    fn server_tools_are_marked_for_claude_4_and_later_only() {
+        for (model, server_tools) in [
+            ("claude-opus-5-5", true),
+            ("claude-haiku-5-5", true),
+            ("claude-sonnet-5", true),
+            ("claude-mythos-preview", true),
+            ("claude-opus-4-8", true),
+            ("claude-sonnet-4-6", true),
+            ("claude-haiku-4-5", true),
+            ("claude-sonnet-4-20250514", true),
+            ("claude-3-haiku", false),
+            ("claude-next", false),
+            ("deepseek-v4-pro", false),
+        ] {
+            assert_eq!(builtin(model).server_tools, server_tools, "{model}");
         }
     }
 

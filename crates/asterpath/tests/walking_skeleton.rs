@@ -607,6 +607,45 @@ async fn pause_turn_continues_the_turn_and_other_stop_reasons_complete() {
 }
 
 #[tokio::test]
+async fn pause_turn_continuation_keeps_the_declared_server_tools() {
+    // A paused turn may end on a server tool call that has not run yet; the
+    // continuation must declare the same server tools (ADR-0031).
+    let db = temp_db("pause-server-tools");
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(assistant_items("first"), StopReason::PauseTurn, usage(1, 1))
+            .respond(assistant_items("second"), StopReason::EndTurn, usage(1, 1))
+            .with_capabilities(ProviderCapabilities {
+                server_tools: true,
+                ..ProviderCapabilities::default()
+            }),
+    );
+    let asterpath = open(&db, vec![provider.clone()]).await;
+    let mut session_spec = spec("p");
+    let declared = vec![asterpath::protocol::JsonString::new(
+        r#"{"type":"web_search_20250305","name":"web_search"}"#,
+    )];
+    session_spec
+        .request
+        .server_tools
+        .insert(ProviderId::new("p"), declared.clone());
+    let handle = asterpath.create_session(session_spec).await.unwrap();
+    handle.submit_input(input(1, "hi")).await.unwrap();
+    drive_all(&handle).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request.server_tools.get(&ProviderId::new("p")),
+            Some(&declared)
+        );
+    }
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
 async fn zero_max_steps_per_turn_is_a_configuration_error() {
     let db = temp_db("zero-steps");
     let provider = Arc::new(ScriptedProvider::new("p"));

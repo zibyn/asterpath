@@ -40,6 +40,8 @@ pub struct ModelRequest {
     pub provider_options: BTreeMap<ProviderId, JsonString>,
     /// See [`RequestConfig::output_format`].
     pub output_format: Option<OutputFormat>,
+    /// See [`RequestConfig::server_tools`].
+    pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
 }
 
 impl ModelRequest {
@@ -69,6 +71,7 @@ impl ModelRequest {
             stop_sequences: request.stop_sequences.clone(),
             provider_options: request.provider_options.clone(),
             output_format: request.output_format.clone(),
+            server_tools: request.server_tools.clone(),
         }
     }
 }
@@ -120,9 +123,11 @@ pub struct ProviderCapabilities {
     pub sampling: bool,
     pub reasoning_roundtrip: bool,
     pub citations: bool,
-    pub builtin_tools: bool,
     /// Accepts `ModelRequest::output_format`.
     pub structured_output: bool,
+    /// Accepts `server_tools` declarations; may produce `ServerToolCall` /
+    /// `ServerToolResult` items.
+    pub server_tools: bool,
     pub cache_control: bool,
     pub image_input: bool,
     /// Accepts `Part::File`; the accepted media types are in the adapter's
@@ -159,6 +164,13 @@ impl ProviderCapabilities {
         });
         if !self.image_input && has_image {
             return Some("image input");
+        }
+        let has_server_tools = request
+            .server_tools
+            .get(&request.spec.provider)
+            .is_some_and(|tools| !tools.is_empty());
+        if !self.server_tools && has_server_tools {
+            return Some("server tools");
         }
         request.content_parts().find_map(|(role, part)| {
             let file_id = match part {
