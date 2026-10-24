@@ -342,7 +342,7 @@ default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级
 - 环境变量覆盖：`ASTERPATH_CONFIG`、`ASTERPATH_DB`、`ASTERPATH_PROVIDER`、`ASTERPATH_MODEL`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。
 - 未知字段（任一层级）是配置错误（退出码 2）。
-- 沙箱只约束 stdio MCP 服务进程（HTTP 不沙箱）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。
+- 沙箱约束 stdio MCP 服务进程（HTTP 不沙箱）与内置 `bash` 工具启动的进程；没有后端时 `bash` 同样 fail closed（返回 `Denied`，不启动进程）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。
 
 ## 5. 交付清单与里程碑
 
