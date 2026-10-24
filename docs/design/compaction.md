@@ -15,7 +15,8 @@
 - v1 **只做摘要**，不单独折叠旧工具输出。
 - 压缩**不是 step**：`plan` 判定要调用摘要模型后，agent 写 `CompactionStarted` 意图；成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合；append 是唯一提交点，崩溃在 append 前重做，无副作用。
 - 强制压缩在**当前 step 内**完成：不新开 `StepStarted`、不写 `StepCommitted`，压缩后按新投影重试同一 step；每 step 至多一次。
-- 摘要输入是**文本视图**：丢弃 `Reasoning`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
+- 摘要输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
+- 压缩**重新定基线**（ADR-0030）：被替换区间内追加的 system 指令并入基线 system，不进摘要；保留区间里的指令仍按位置投影（§5 投影）。
 - 窗口只有 `ModelSpec.context_window` 一个来源；`CompactionConfig` 不重复定义。
 - 进程重启上限归宿主：内核每次恢复写 `StreamResumed`，宿主据此计数并决定停车；内核不持有恢复计数器。
 - 保留最近一个完整 step，目标为 `0.5 × usable window`；每回合最多 1 次自动压缩。
@@ -140,17 +141,19 @@ project(entries):
   history = []                                   # (origin, items)
   for e in entries by seq:
     if e is CompactionApplied { first_kept, summary, replaces }:
+        baseline += 范围内条目（含尚未落位的）里的 Instruction parts
         history.retain(|(origin, _)| !overlaps(origin, replaces))
         insert (Summary(replaces), summary) 紧邻 first_kept 之前
     else if model_visible(e):
         history.push((Log(e.log_id), items))
-  return history
+  return history, baseline        # baseline 初值为 SessionCreated.config.system
 ```
 
 - `origin` 为 `Log(LogId)` 或 `Summary(LogIdRange)`；`overlaps` 让新压缩丢掉范围内的原始记录**和**旧摘要。
 - 因为 `replaces` 起点固定为流首（或上一条 replaces 起点），只需保留最新一条 summary；更早的 summary 被它的范围覆盖。
 - **投影水位只管模型可见记录**：模型请求仍只投影 `seq < StepStarted.seq` 的模型可见记录，但 `CompactionApplied` 是重写算子，**始终折叠到 frontier**，不受水位限制。强制压缩必然发生在 `StepStarted` 之后，回合内不存在其它压缩来源，所以这个例外只会看到当前 step 的强制压缩。
 - 原始记录始终保留，可扫描；投影是只读折叠（I7）。
+- **重新定基线**：`Instruction` 条目的 origin 是它的 `ConfigChanged`（fork 复制来的则是 `ContextForked`）；落在 `replaces` 内的指令按日志顺序追加到基线 system（`ModelRequest.system`），不交给摘要。压缩本来就让 `prefix_epoch` 加一、旧 reasoning 失效，改写基线不额外付出代价。
 
 ### 手动压缩
 
@@ -231,6 +234,7 @@ pub struct CompactionConfig {
 | C13 | 未配置 `ModelSpec.context_window` | 自动 / 手动压缩返回 `NotConfigured`；错误路径直接 `ContextExhausted` |
 | C14 | 摘要输入含 reasoning / raw / 图片 | 请求中全部剥离；非文本 Part 变占位文本；请求不挂工具、不启用 reasoning |
 | C15 | 强制压缩摘要失败 / `Insufficient` | 分别 `CompactionAborted{SummaryFailed}` + `TurnCommitted(CompactionFailed)`、`CompactionAborted{Insufficient}` + `TurnCommitted(ContextExhausted)`；无 open 压缩意图 |
+| C17 | 被替换区间内有追加指令 | 指令出现在下一次请求的基线 `system` 中，不在摘要输入里，也不再作为 `Instruction` 条目出现；`prefix_epoch` 加一；保留区间里的指令仍在原位 |
 | C16 | 未装配 Compactor（M0） | 自动压缩跳过；手动返回 `NotConfigured`；强制压缩直接 `ContextExhausted`；无压缩事件 |
 
 ## 10. 留给下游

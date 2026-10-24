@@ -165,7 +165,7 @@ run_turn(session):
 - `has_pending_input` = 本回合最后一个 `StepStarted` 之后存在 `InputRecorded`。
 - 工具审批 `Ask` 会让 step 在 `Waiting` 中跨天保持 open；决定记录为 `ApprovalDecided`，恢复与调度见 [tools.md](tools.md)。
 - 工具执行中取消的收尾顺序见 §6。
-- **每 step 折叠配置**（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)）：`config` 是 `SessionCreated.config` 依次应用 `seq < StepStarted.seq` 的 `ConfigChanged` 的结果。本 step 的模型调用、重试、`ModelCallAborted` / `AssistantMessage` 的 `model`、强制压缩都用它；step 内追加的 `ConfigChanged` 等下一个 `StepStarted`，与 steering 同构（§5）。`turn` / `compaction` / `subagents` 不可变，仍是创建时的值。step 之间的阈值压缩与 Idle 的 `compact_now` 按整条日志折叠，用压缩发生时的生效模型。spawn 的子会话继承父会话在 spawn 所在 step 水位的生效配置。
+- **每 step 折叠配置**（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)）：`config` 是 `SessionCreated.config` 依次应用 `seq < StepStarted.seq` 的 `ConfigChanged` 的结果。本 step 的模型调用、重试、`ModelCallAborted` / `AssistantMessage` 的 `model`、强制压缩都用它；step 内追加的 `ConfigChanged` 等下一个 `StepStarted`，与 steering 同构（§5）。`turn` / `compaction` / `subagents` 不可变，仍是创建时的值。step 之间的阈值压缩与 Idle 的 `compact_now` 按整条日志折叠，用压缩发生时的生效模型。spawn 的子会话继承父会话在 spawn 所在 step 水位的生效配置。请求的顶层 `system` 是投影给出的基线 system，不是生效配置的 `system`：追加的指令以 `Instruction` 条目留在历史原位，直到压缩把它并入基线（[protocol.md](protocol.md) §3.3）。
 - 换模型后，旧模型产出的 reasoning 由 adapter 的既有绑定门控丢弃；换回原模型后再次回放。上下文窗口变小在下一个 step 的阈值检查里自然触发压缩，不设专门路径。
 
 ### 4.1 恢复入口

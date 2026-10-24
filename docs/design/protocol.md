@@ -9,7 +9,7 @@
 ## 1. 决策摘要
 
 - **规范历史是扁平有序 `Vec<Item>`**；`Item` 是顶层条目，`Part` 是内容片段。工具调用/结果是顶层 item，不是 message 的 part。
-- **system 不进历史**：它是 `ModelRequest.system`，由 adapter 渲染为 Anthropic 顶层 `system` 或 OpenAI `instructions`。
+- **基线 system 不进历史**：它是 `ModelRequest.system`，由 adapter 渲染为 Anthropic 顶层 `system` 或 OpenAI `instructions`。会话中途追加的指令是历史中的 `Instruction` 条目，落在它生效的位置（ADR-0030，§3.3）。
 - **供应商特有数据按 item 保留为原始 JSON 字符串**；同 provider + model + `prefix_epoch` 时逐字节回放，不 parse/re-serialize。
 - **流式事件规范化**为 `ResponseStarted → ItemStarted / PartDelta / ItemCompleted → ResponseEnded`；只有 `ItemCompleted` 落日志，delta 是瞬态的。
 - **能力标志按 `ModelSpec` 声明**；loop 只按标志分支，不认 provider 身份；请求需要而能力不支持时返回 `Unsupported`，不静默降级。
@@ -83,6 +83,9 @@ pub enum Item {
     Compaction {
         parts: Vec<Part>,
     },
+    Instruction {               // 会话中途追加的 system 指令（§3.3）；只含 Text
+        parts: Vec<Part>,
+    },
     ProviderOpaque {
         provider: ProviderId,
         kind: String,
@@ -149,7 +152,7 @@ pub struct RawProviderData {
 | # | 不变量 |
 | --- | --- |
 | P1 | 历史有序；顺序就是模型看到内容的顺序。adapter 不得改变语义顺序。 |
-| P2 | `Message.role` 只有 `User` / `Assistant`；system 不在历史中。 |
+| P2 | `Message.role` 只有 `User` / `Assistant`；基线 system 不在历史中，追加的指令是 `Instruction` 条目。 |
 | P3 | `Part` 不嵌套 `Item`；`Message.parts`、`ToolResult.parts`、`Compaction.parts` 只含 `Part`。 |
 | P4 | `ToolCall.call_id` 在投影历史内唯一；`ToolResult.call_id` 必须引用较早的 `ToolCall`，投影按 `ToolCall` 的 seq 排序。 |
 | P5 | `ToolCall.raw_args` 是权威值；不存 `parsed_args`，不 re-serialize。 |
@@ -158,6 +161,14 @@ pub struct RawProviderData {
 | P8 | `ProviderOpaque`、`ServerToolCall`、`ServerToolResult` 只在同 provider 请求中回放。 |
 | P9 | `Compaction` 是模型可见摘要；同一时刻投影只保留最新一条。 |
 | P10 | `Part::Refusal` 是模型可见内容；`StopReason::Refusal` 与它并存，不互相替代。 |
+
+### 3.3 指令条目与基线（ADR-0030）
+
+`ConfigChanged.patch.append_system` 非空时，投影生成一条 `Item::Instruction`：
+
+- **位置**：记录之后的第一个 `StepStarted` 处（先输出此前缓冲的工具结果）；扫描在水位处结束时放在末尾。所以它总在所在 step 的 `tool_result` 之后，不会落在 `tool_use` 与 `tool_result` 之间；之后的请求里位置不变。
+- **基线**：`request_history(entries)` 同时返回基线 system 与 items。基线是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）。压缩不把指令交给摘要，而是并入基线（[compaction.md](compaction.md) §5）。
+- `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。
 
 ## 4. 请求模型
 
@@ -182,8 +193,8 @@ pub struct RequestConfig {
 pub struct ModelRequest {
     pub spec: ModelSpec,
     pub prefix_epoch: u32,              // 当前压缩代次
-    pub system: Vec<Part>,              // 只允许 Text
-    pub items: Vec<Item>,               // 完整历史
+    pub system: Vec<Part>,              // 基线 system（§3.3），只允许 Text
+    pub items: Vec<Item>,               // 完整历史，含 Instruction 条目
     pub tools: Vec<ToolDescriptor>,
     pub tool_choice: ToolChoice,
     pub disable_parallel_tool_use: bool,
@@ -232,7 +243,7 @@ pub enum ReasoningEffort {
 | # | 规则 |
 | --- | --- |
 | R1 | `items` 始终是完整投影历史；不使用服务端状态，不发 `previous_response_id` / `conversation`。 |
-| R2 | `system` 只允许 `Part::Text`；其他 part 返回 `InvalidRequest`。 |
+| R2 | `system` 与 `Instruction.parts` 只允许 `Part::Text`；其他 part 返回 `InvalidRequest`。 |
 | R3 | `tools` 由 `ConfigSnapshot.tools`（`Vec<ToolDescriptor>`）渲染，session 内固定；Anthropic 用 `input_schema`，OpenAI 用 `parameters`。 |
 | R4 | `max_output_tokens` 必填；Anthropic 映射 `max_tokens`，OpenAI 映射 `max_output_tokens`。 |
 | R5 | `tool_choice` 的 `Required` / `Tool(_)` 需要 `forced_tool_choice` 能力；否则 `Unsupported`。 |
@@ -597,9 +608,10 @@ pub enum ProviderErrorKind {
 2. **跨 provider**：`Reasoning`、`ServerToolCall/Result`、`ProviderOpaque` 不进入请求；规范可见的 `Message` / `ToolCall` / `ToolResult` / `Compaction` 正常渲染。`Reasoning.summary` 不转成文本。
 3. **epoch 不匹配**（压缩改变了前缀）：`Reasoning` 不进入请求；其他 item 不受影响。
 4. **model 变化但 provider 相同**：视为不匹配，`Reasoning` 不进入请求。
-5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：system 变化与前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
+5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。追加指令不改顶层 `system`（§3.3），因此不使旧 thinking 失效；只有退回路径（规则 8）改写顶层 `system`。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
+8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_system = false`）**：指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
 
 `tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
 
@@ -613,6 +625,7 @@ pub enum ProviderErrorKind {
 | --- | --- | --- |
 | `system: Vec<Part>` | 顶层 `system`（text blocks） | `instructions`（文本拼接） |
 | `items: Vec<Item>` | `messages[]`（按 §10.2 分组） | `input[]`（扁平 item 列表） |
+| `Item::Instruction` | `messages` 中的 `role: "system"` 消息（text blocks），推迟到下一条 assistant 之前或末尾；连续指令合并为一条。模型不支持（`inline_system = false`）时并入顶层 `system`（§9 规则 8） | `role: "developer"` 的 input 消息（`input_text`），原位 |
 | `tools: Vec<ToolDescriptor>` | `tools[{name, description, input_schema}]` | `tools[{type:"function", name, description, parameters}]` |
 | `tool_choice` | `auto` / `any` / `tool` / `none` | `auto` / `required` / `function` / `none` |
 | `disable_parallel_tool_use` | `tool_choice.disable_parallel_tool_use` | `parallel_tool_calls: false` |
@@ -782,7 +795,8 @@ pub enum ProviderErrorKind {
 | A10 | 流协议违规 | 缺 `ResponseEnded` / 顺序错 / `sequence` 回退 → `StreamProtocol`；无 `AssistantMessage` |
 | A11 | 工具结果图像跨协议 | Anthropic 原样渲染；OpenAI 渲染占位并记 trace |
 | A12 | `Part::Refusal` | 两边渲染正确；`StopReason::Refusal` 并存；不丢内容 |
-| A13 | 系统提示不入历史 | `system` 单独渲染；`items` 不变；请求中无 system role message |
+| A13 | 系统提示不入历史 | 基线 `system` 单独渲染；没有 `Instruction` 时请求中无 system / developer role message |
+| A19 | 追加指令 | 下一个 step 的请求在 `tool_result` 之后含该指令，顶层 `system` 不变；Anthropic 为 `role: "system"` 消息且旧 thinking 原样回放；OpenAI 为 `developer` 消息；Anthropic 退回路径并入顶层并丢弃旧 thinking |
 | A14 | 原始字节保真 | `raw.json` 的键序、空白、转义在回放后不变 |
 | A15 | `Compaction` 跨协议 | Anthropic user text block；OpenAI 普通 input 文本消息 |
 | A16 | `ProviderOpaque` 回放 | 同 provider 原样；跨 provider 丢弃并记 trace |

@@ -116,8 +116,16 @@ _Avoid_: 模型配置、模型引用
 _Avoid_: 特性开关、能力矩阵
 
 **条目（Item）**：
-模型历史中的一个有序顶层单元：消息、推理、工具调用/结果、服务端工具调用/结果、压缩摘要或供应商不透明条目。
+模型历史中的一个有序顶层单元：消息、推理、工具调用/结果、服务端工具调用/结果、压缩摘要、指令条目或供应商不透明条目。
 _Avoid_: 消息（作为同义词）、记录
+
+**指令条目（Instruction）**：
+会话中途追加的 system 指令在历史中的位置（`Item::Instruction`），由投影从带 `append_system` 的配置变更生成，落在其后第一个 `StepStarted` 处。Anthropic 渲染为 `role: "system"` 消息，OpenAI 渲染为 `developer` 消息；压缩替换它时并入基线 system。
+_Avoid_: system 消息（作为规范名）、developer 消息、注入提示
+
+**基线 system（Baseline System）**：
+模型请求的顶层 system：会话创建时的 system，加上被压缩替换的全部指令条目（`request_history` 返回，即 `ModelRequest.system`）。与生效配置的 `system` 不同：后者还包含仍在历史中按位置投影的指令。
+_Avoid_: 当前 system、合并 system
 
 **片段（Part）**：
 条目内部的内容单元：文本、图像、拒绝或不透明内容块。
@@ -449,7 +457,7 @@ session 创建时解析并写进 `SessionCreated` 的初始配置；宿主注册
 _Avoid_: session 配置、运行时配置
 
 **配置变更（Config Change）**：
-宿主经 `SessionHandle::update_config` 写入的一条 `ConfigChanged`，只携带变化的字段（`ConfigPatch`）；校验失败不落日志。它是历史中的一个位置，在下一个 `StepStarted` 生效。
+宿主经 `SessionHandle::update_config` 写入的一条 `ConfigChanged`，只携带变化的字段（`ConfigPatch`）；校验失败不落日志。它是历史中的一个位置，在下一个 `StepStarted` 生效。追加 system 的变更必须带宿主选的 `UpdateId` 作 dedup key，重试只记一次。
 _Avoid_: 配置覆盖、热更新
 
 **生效配置（Effective Config）**：

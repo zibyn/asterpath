@@ -72,6 +72,7 @@ pub struct ConfigSnapshot {
   pub struct ConfigPatch {
       pub model: Option<ModelSpec>,
       pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
+      pub append_system: Vec<Part>,       // 追加到 system，只含 Text；不替换已有 system
   }
 
   /// SessionCreated.config 依次应用 seq < watermark 的 ConfigChanged
@@ -81,7 +82,7 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  目前可变的是 `model` 与 `request`；工具集与 system 的变更另开票（#110、#111）。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
+  目前可变的是 `model`、`request` 与追加 system 指令；工具集的变更另开票（#111）。追加的指令在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -204,7 +205,7 @@ impl SessionHandle {
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒该调用的等待。
-- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册，否则 `AsterError::Config`，不落日志），再 append 一条 `ConfigChanged`（不设 dedup key）。`ConfigUpdate` 是 `#[non_exhaustive]` 的字段集合（目前 `model` / `request`），用 `ConfigUpdate::default()` 再赋字段构造。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
+- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` 非空时必须带 `id`，且只含 `Part::Text`；否则 `AsterError::Config`，不落日志），再 append 一条 `ConfigChanged`。`ConfigUpdate` 是 `#[non_exhaustive]` 的字段集合（目前 `id` / `model` / `request` / `append_system`），用 `ConfigUpdate::default()` 再赋字段构造。`id: Option<UpdateId>` 是宿主选的 dedup key：追加不幂等，宿主重试同一次更新时用同一个 `id`，只记一条；只覆盖字段的更新可以不带 `id`。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。

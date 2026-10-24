@@ -82,7 +82,7 @@ pub enum SessionEvent {
                           deadline: Option<Timestamp> },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
     ApprovalDecided { tool_call_id: ToolCallId, decision: ApprovalDecision },
-    ConfigChanged { patch: ConfigPatch },                         // 非模型可见；下一个 StepStarted 生效
+    ConfigChanged { patch: ConfigPatch },                         // 下一个 StepStarted 生效；append_system 投影为 Instruction 条目
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
@@ -119,7 +119,7 @@ pub enum TurnEndReason {
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-protocol` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
 - `ApprovalDecided` 的等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
-- `ConfigChanged` 是宿主经 `update_config` 写入的字段补丁（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)，[packaging.md](packaging.md) §2.1），不是意图，没有终态，不影响 `SessionFacts`。生效配置按水位折叠：模型请求取 `seq < StepStarted.seq` 的变更，所以在 `ConfigChanged` 之后、下一个 `StepStarted` 之前崩溃，恢复渲染出的请求与不崩溃时相同；open step 恢复时沿用原水位，step 内追加的变更仍等下一个 step。
+- `ConfigChanged` 是宿主经 `update_config` 写入的字段补丁（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)，[packaging.md](packaging.md) §2.1），不是意图，没有终态，不影响 `SessionFacts`。生效配置按水位折叠：模型请求取 `seq < StepStarted.seq` 的变更，所以在 `ConfigChanged` 之后、下一个 `StepStarted` 之前崩溃，恢复渲染出的请求与不崩溃时相同；open step 恢复时沿用原水位，step 内追加的变更仍等下一个 step。`append_system` 由投影在下一个 `StepStarted` 处生成 `Instruction` 条目（[protocol.md](protocol.md) §3.3），位置只取决于日志，恢复同样确定。
 - 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0008](../adr/0008-subagent-model.md)）；存储投递归 #5。
 
 ## 4. 信封与幂等键
@@ -163,9 +163,9 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | `CompactionStarted` / `CompactionApplied` / `CompactionAborted` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `ApprovalDecided` | `tool_call_id` |
-| `ConfigChanged` | 无 |
+| `ConfigChanged` | `ConfigUpdate.id`（宿主提供；可缺省，`append_system` 非空时必填） |
 
-表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 也不设：它只由宿主调用写入，恢复从不补写；补丁按字段整体覆盖，宿主重试写下的重复补丁紧邻原记录时折叠结果不变。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
+表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 只由宿主调用写入，恢复从不补写；只覆盖字段的补丁重复写入时折叠结果不变，可以不带键；追加 system 不幂等，所以带 `append_system` 的更新必须带 `id`，宿主重试用同一个 `id`。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
