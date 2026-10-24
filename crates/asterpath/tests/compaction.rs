@@ -50,6 +50,7 @@ fn assistant(value: &str) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }
 }
 
@@ -259,6 +260,7 @@ fn image_and_reasoning() -> Vec<Item> {
                     },
                 },
             ],
+            raw: None,
         },
     ]
 }
@@ -1059,6 +1061,123 @@ async fn manual_states_are_results_not_errors() {
     assert_eq!(
         handle.compact_now().await.expect("nothing to do"),
         asterpath::protocol::CompactResult::NotConfigured
+    );
+    cleanup(&db);
+}
+
+#[cfg(feature = "anthropic")]
+fn anthropic_sse(blocks: &[&str], deltas: &[(usize, &str)]) -> String {
+    let mut body = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"usage\":{\"input_tokens\":1}}}\n\n",
+    );
+    for (index, block) in blocks.iter().enumerate() {
+        body.push_str(&format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{block}}}\n\n"
+        ));
+        for (_, delta) in deltas.iter().filter(|(at, _)| *at == index) {
+            body.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{delta}}}\n\n"
+            ));
+        }
+        body.push_str(&format!(
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
+        ));
+    }
+    body.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n");
+    body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    body
+}
+
+/// #104: the summary request has an empty system, so replaying the session's
+/// Anthropic thinking into it would be rejected. A tool-free session makes the
+/// tools fingerprint match, so only the compactor's text view keeps it out.
+#[cfg(feature = "anthropic")]
+#[tokio::test]
+async fn anthropic_thinking_never_reaches_the_summary_request() {
+    use asterpath_testing::http_mock::{MockServer, Reply};
+
+    let thinking = anthropic_sse(
+        &[
+            r#"{"type":"thinking","thinking":"","signature":""}"#,
+            r#"{"type":"redacted_thinking","data":"opaque=="}"#,
+            r#"{"type":"text","text":""}"#,
+        ],
+        &[
+            (0, r#"{"type":"thinking_delta","thinking":"why"}"#),
+            (0, r#"{"type":"signature_delta","signature":"sig-123"}"#),
+            (2, r#"{"type":"text_delta","text":"first answer"}"#),
+        ],
+    );
+    let plain = |reply: &str| {
+        anthropic_sse(
+            &[r#"{"type":"text","text":""}"#],
+            &[(0, &format!(r#"{{"type":"text_delta","text":"{reply}"}}"#))],
+        )
+    };
+    let server = MockServer::start(vec![
+        Reply::sse(thinking),
+        Reply::sse(plain("second answer")),
+        Reply::sse(plain("the summary")),
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(
+        asterpath::anthropic::AnthropicProvider::new("test-key").with_base_url(server.base_url()),
+    );
+    let compactor: Arc<dyn Compactor> = Arc::new(DefaultCompactor::new(Arc::new(
+        ProviderCatalog::new(vec![Arc::clone(&provider)]).expect("catalog"),
+    )));
+    let db = temp_db("anthropic-thinking");
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider])
+        .compactor(compactor)
+        .build()
+        .await
+        .expect("facade builds");
+    let mut spec = spec(Some(200_000), compaction_config(0));
+    spec.model.provider = ProviderId::new("anthropic");
+    spec.model.model = ModelId::new("claude-test");
+    spec.tools = ToolSelection::Names(Vec::new());
+    let handle = asterpath.create_session(spec).await.expect("session");
+    handle.submit_input(input(1, "first")).await.expect("input");
+    drive_all(&handle).await;
+    handle
+        .submit_input(input(2, "second"))
+        .await
+        .expect("input");
+    drive_all(&handle).await;
+    assert!(matches!(
+        handle.compact_now().await.expect("compact_now"),
+        asterpath::protocol::CompactResult::Applied(_)
+    ));
+
+    let block_types = |body: &serde_json::Value| -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .filter_map(|block| block["type"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    // The normal session request still replays both reasoning blocks.
+    let session = block_types(&requests[1].json_body());
+    assert!(session.iter().any(|kind| kind == "thinking"), "{session:?}");
+    assert!(
+        session.iter().any(|kind| kind == "redacted_thinking"),
+        "{session:?}"
+    );
+    // The summary request has no system and carries neither block.
+    let summary_body = requests[2].json_body();
+    assert!(summary_body.get("system").is_none(), "{summary_body}");
+    let summary = block_types(&summary_body);
+    assert!(
+        !summary
+            .iter()
+            .any(|kind| kind == "thinking" || kind == "redacted_thinking"),
+        "{summary:?}"
     );
     cleanup(&db);
 }

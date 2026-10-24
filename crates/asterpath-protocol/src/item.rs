@@ -16,6 +16,10 @@ pub enum Item {
     Message {
         role: Role,
         parts: Vec<Part>,
+        /// Provider message data. Replay still renders `parts`; only the
+        /// same provider merges known fields from it (ADR 0010).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<RawProviderData>,
     },
     Reasoning {
         summary: Vec<Part>,

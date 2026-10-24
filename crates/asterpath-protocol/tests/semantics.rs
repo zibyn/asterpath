@@ -67,6 +67,7 @@ fn assistant(text_value: &str) -> SessionEvent {
         items: vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text(text_value)],
+            raw: None,
         }],
         raw: None,
         model: model(),
@@ -255,6 +256,7 @@ fn projection_folds_compaction_and_keeps_the_raw_log() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("latest")],
+            raw: None,
         }]
     );
 
@@ -276,6 +278,7 @@ fn projection_orders_by_seq_not_by_input_order() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("first")],
+            raw: None,
         }]
     );
     assert_eq!(
@@ -283,6 +286,7 @@ fn projection_orders_by_seq_not_by_input_order() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("second")],
+            raw: None,
         }]
     );
 }
@@ -338,6 +342,7 @@ fn projection_turns_input_and_tool_results_into_items() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("run it")],
+            raw: None,
         }]
     );
     assert_eq!(
@@ -362,6 +367,7 @@ fn user_input_projection_uses_a_user_message() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("hello")],
+            raw: None,
         }]
     );
 }

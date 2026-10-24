@@ -106,6 +106,7 @@ fn assistant(turn: TurnId, step: StepId, parts: Vec<Part>) -> SessionEvent {
         items: vec![Item::Message {
             role: Role::Assistant,
             parts,
+            raw: None,
         }],
         raw: None,
         model: model(),

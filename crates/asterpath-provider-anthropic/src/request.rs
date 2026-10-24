@@ -249,11 +249,24 @@ fn render_messages(
     let mut messages: Vec<PendingMessage> = Vec::new();
     for item in &request.items {
         match item {
-            Item::Message { role, parts } => {
-                let blocks: Vec<Frag> = parts
+            Item::Message { role, parts, raw } => {
+                let mut blocks: Vec<Frag> = parts
                     .iter()
                     .filter_map(|part| render_part(provider, part))
                     .collect();
+                // Only the text block's `citations` are merged from same-provider raw (ADR 0010).
+                if let Some(citations) = raw
+                    .as_ref()
+                    .filter(|raw| &raw.provider == provider)
+                    .and_then(|raw| serde_json::from_str::<Value>(raw.json.as_str()).ok())
+                    .and_then(|mut value| value.get_mut("citations").map(Value::take))
+                    .filter(|citations| citations.as_array().is_some_and(|list| !list.is_empty()))
+                    && let Some(Frag::Json(block)) = blocks
+                        .iter_mut()
+                        .find(|block| matches!(block, Frag::Json(value) if value["type"] == "text"))
+                {
+                    block["citations"] = citations;
+                }
                 if !blocks.is_empty() {
                     push_blocks(&mut messages, role_name(*role), Vec::new(), blocks);
                 }

@@ -43,6 +43,7 @@ fn assistant(value: &str) -> asterpath::protocol::Item {
     asterpath::protocol::Item::Message {
         role: asterpath::protocol::Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }
 }
 

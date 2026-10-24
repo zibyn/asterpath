@@ -48,6 +48,7 @@ fn assistant_items(text_value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(text_value)],
+        raw: None,
     }]
 }
 
@@ -229,6 +230,7 @@ async fn one_turn_without_tools_commits_the_expected_sequence() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("hi")],
+            raw: None,
         }]
     );
     assert!(
@@ -484,6 +486,7 @@ async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved(
                 parts: vec![Part::Refusal {
                     text: "no".to_owned(),
                 }],
+                raw: None,
             }],
             StopReason::Refusal,
         ),
