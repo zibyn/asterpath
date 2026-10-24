@@ -93,9 +93,8 @@ pub struct AnthropicModelProfile {
 
 impl AnthropicModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
-    /// inline system messages or tools, structured outputs or server tools,
-    /// which only listed
-    /// models accept.
+    /// inline system messages or tools, structured outputs, server tools or
+    /// file input, which only listed models accept.
     pub fn latest() -> Self {
         UNRECOGNIZED
     }
@@ -184,12 +183,12 @@ const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile
 }
 
-const fn unstructured(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+const fn without_structured_output(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile.structured_output = false;
     profile
 }
 
-const fn unlisted(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+const fn without_server_tools(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile.server_tools = false;
     profile
 }
@@ -202,14 +201,19 @@ const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
 const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
-/// Unrecognized ids: [`LATEST`] without inline changes, structured outputs or
-/// server tools.
-const UNRECOGNIZED: AnthropicModelProfile = unlisted(unstructured(rules(
-    Thinking::Adaptive,
-    LOW_TO_MAX,
-    false,
-    false,
-)));
+/// Unrecognized ids: [`LATEST`] without inline changes, structured outputs,
+/// server tools or file input (protocol.md §5: unknown means false).
+const UNRECOGNIZED: AnthropicModelProfile = AnthropicModelProfile {
+    thinking: Thinking::Adaptive,
+    efforts: Cow::Borrowed(LOW_TO_MAX),
+    thinking_default_on: false,
+    forced_tool_choice: false,
+    sampling: false,
+    inline_changes: false,
+    structured_output: false,
+    server_tools: false,
+    file_media_types: Cow::Borrowed(&[]),
+};
 /// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
@@ -240,7 +244,7 @@ const EXTENDED: AnthropicModelProfile = rules(Thinking::Extended, &[Off], true, 
 const EXTENDED_EFFORT: AnthropicModelProfile =
     rules(Thinking::Extended, &[Off, Low, Medium, High], true, true);
 /// Opus 4 / 4.1, Sonnet 4 and Claude 3: no structured outputs.
-const LEGACY: AnthropicModelProfile = unstructured(EXTENDED);
+const LEGACY: AnthropicModelProfile = without_structured_output(EXTENDED);
 
 static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-opus-5-5", LATEST),
@@ -262,7 +266,7 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-haiku-4-5", EXTENDED),
     ("claude-opus-4", LEGACY),
     ("claude-sonnet-4", LEGACY),
-    ("claude-3", unlisted(LEGACY)),
+    ("claude-3", without_server_tools(LEGACY)),
 ];
 
 static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;

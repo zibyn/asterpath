@@ -332,16 +332,13 @@ fn pdf(source: FileSource) -> Part {
 }
 
 fn anthropic_file(id: &str) -> ProviderFileId {
-    ProviderFileId {
-        provider: ProviderId::new("anthropic"),
-        id: id.to_owned(),
-    }
+    ProviderFileId::new(ProviderId::new("anthropic"), id)
 }
 
 #[tokio::test]
 async fn files_render_as_document_blocks() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
-    let mut request = base_request();
+    let mut request = request_for("claude-opus-5-5");
     request.items = vec![
         user_message(vec![
             pdf(FileSource::Base64 {
@@ -390,10 +387,7 @@ async fn files_render_as_document_blocks() {
 #[tokio::test]
 async fn unrenderable_files_fail_before_any_http() {
     let server = MockServer::start(Vec::new());
-    let other = ProviderFileId {
-        provider: ProviderId::new("openai"),
-        id: "file-x".to_owned(),
-    };
+    let other = ProviderFileId::new(ProviderId::new("openai"), "file-x");
     let cases = [
         // Media type the model rules do not accept.
         user_message(vec![Part::File {
@@ -420,7 +414,7 @@ async fn unrenderable_files_fail_before_any_http() {
         },
     ];
     for item in cases {
-        let mut request = base_request();
+        let mut request = request_for("claude-opus-5-5");
         request.items = vec![item];
         let error = one_request(&server, request).await;
         assert_eq!(error.kind, ProviderErrorKind::Unsupported, "{error:?}");
@@ -429,7 +423,7 @@ async fn unrenderable_files_fail_before_any_http() {
     // A profile that accepts no file types has no file input at all.
     let provider = provider(&server)
         .with_default_profile(AnthropicModelProfile::latest().with_file_media_types(Vec::new()));
-    let mut request = base_request();
+    let mut request = request_for("claude-opus-5-5");
     request.items = vec![user_message(vec![pdf(FileSource::Base64 {
         data: "JVBE".to_owned(),
     })])];
@@ -919,6 +913,23 @@ async fn unrecognized_model_ids_are_treated_as_the_latest_generation() {
     assert_eq!(body["model"], "claude-test");
     assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
     assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+}
+
+#[tokio::test]
+async fn unrecognized_model_ids_have_no_file_input() {
+    // protocol.md §5: unknown means false.
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    for id in ["claude-test", "deepseek-v4-pro"] {
+        let mut request = request_for(id);
+        assert!(!provider.capabilities(&request.spec).file_input, "{id}");
+        request.items = vec![user_message(vec![pdf(FileSource::Base64 {
+            data: "JVBE".to_owned(),
+        })])];
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported, "{id}");
+    }
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]
@@ -1662,15 +1673,15 @@ async fn without_inline_changes_a_tool_change_rewrites_the_top_level_tools_and_d
 }
 
 fn answer_format() -> Option<asterpath_protocol::OutputFormat> {
-    Some(asterpath_protocol::OutputFormat {
-        name: "answer".to_owned(),
-        schema: serde_json::json!({
+    Some(asterpath_protocol::OutputFormat::new(
+        "answer",
+        serde_json::json!({
             "type": "object",
             "properties": {"answer": {"type": "string"}},
             "required": ["answer"],
             "additionalProperties": false
         }),
-    })
+    ))
 }
 
 #[tokio::test]

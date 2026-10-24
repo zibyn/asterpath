@@ -348,10 +348,7 @@ fn pdf(source: FileSource) -> Part {
 }
 
 fn openai_file(id: &str) -> ProviderFileId {
-    ProviderFileId {
-        provider: ProviderId::new("openai"),
-        id: id.to_owned(),
-    }
+    ProviderFileId::new(ProviderId::new("openai"), id)
 }
 
 #[tokio::test]
@@ -440,10 +437,7 @@ async fn tool_results_with_files_render_a_content_array() {
 #[tokio::test]
 async fn unrenderable_files_fail_before_http() {
     let server = MockServer::start(Vec::new());
-    let other = ProviderFileId {
-        provider: ProviderId::new("anthropic"),
-        id: "file_x".to_owned(),
-    };
+    let other = ProviderFileId::new(ProviderId::new("anthropic"), "file_x");
     let user = |parts| Item::Message {
         role: Role::User,
         parts,
@@ -588,10 +582,10 @@ async fn output_format_renders_as_strict_text_format_and_tool_strict_only_when_s
     let server = MockServer::start(vec![MockResponse::sse(completed_text_body("{}"))]);
     let provider = provider(&server);
     let mut request = request(vec![user_text("hello")]);
-    request.output_format = Some(asterpath_protocol::OutputFormat {
-        name: "answer".to_owned(),
-        schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-    });
+    request.output_format = Some(asterpath_protocol::OutputFormat::new(
+        "answer",
+        json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    ));
     let mut strict = tool("strict_tool");
     strict.strict = Some(true);
     let mut loose = tool("loose_tool");
@@ -1974,4 +1968,66 @@ fn server_tools_are_advertised_for_listed_models_only() {
     assert!(provider.capabilities(&spec("o3")).server_tools);
     assert!(!provider.capabilities(&spec("o1")).server_tools);
     assert!(!provider.capabilities(&spec("deepseek-flash")).server_tools);
+}
+
+#[tokio::test]
+async fn unrecognized_model_ids_have_no_file_input_or_structured_output() {
+    // protocol.md §5: unknown means false.
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    let capabilities = provider.capabilities(&spec("deepseek-flash"));
+    assert!(!capabilities.file_input);
+    assert!(!capabilities.structured_output);
+
+    let mut files = request(vec![Item::Message {
+        role: Role::User,
+        parts: vec![pdf(FileSource::Base64 {
+            data: "JVBE".to_owned(),
+        })],
+        raw: None,
+    }]);
+    files.spec = spec("deepseek-flash");
+    let events = collect(&provider, files).await;
+    assert!(
+        matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::Unsupported),
+        "{events:?}"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn output_format_is_unsupported_before_http_where_the_model_lacks_it() {
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    // The model pages for gpt-5.4-pro, gpt-5.2-pro and o1-mini do not list
+    // structured outputs; unrecognized ids are not assumed to have them.
+    for model in [
+        "gpt-5.4-pro",
+        "gpt-5.2-pro-2026-01-01",
+        "o1-mini",
+        "deepseek-flash",
+    ] {
+        assert!(
+            !provider.capabilities(&spec(model)).structured_output,
+            "{model}"
+        );
+        let mut request = request(vec![user_text("hello")]);
+        request.spec = spec(model);
+        request.output_format = Some(asterpath_protocol::OutputFormat::new(
+            "answer",
+            json!({"type": "object"}),
+        ));
+        let events = collect(&provider, request).await;
+        assert!(
+            matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::Unsupported),
+            "{model}: {events:?}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    for model in ["gpt-6.1-sol", "gpt-5.5-pro", "gpt-5", "o1", "o3", "o4-mini"] {
+        assert!(
+            provider.capabilities(&spec(model)).structured_output,
+            "{model}"
+        );
+    }
 }

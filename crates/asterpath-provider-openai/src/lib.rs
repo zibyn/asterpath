@@ -128,7 +128,7 @@ impl Provider for OpenAiProvider {
             sampling: profile.sampling,
             reasoning_roundtrip: true,
             citations: false,
-            structured_output: true,
+            structured_output: profile.structured_output,
             server_tools: profile.server_tools,
             cache_control: false,
             image_input: true,

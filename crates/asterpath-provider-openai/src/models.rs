@@ -5,10 +5,15 @@
 //! values in the reasoning guide (api/docs/guides/reasoning). The o-series
 //! pages list no effort set; their row keeps the original `low|medium|high`.
 //!
-//! `server_tools`: built-in tools (web search, file search, code interpreter…)
+//! `server_tools`: server tools (web search, file search, code interpreter…)
 //! are documented for the GPT-5 family and o3 / o4 in the Responses tool
 //! guides (api/docs/guides/tools-*, checked 2026-10-24); o1 and unrecognized
 //! ids (third-party endpoints) are not marked.
+//!
+//! `structured_output`: `structured_outputs` in the "Supported features" list
+//! of each model page (api/docs/models/<id>, checked 2026-10-24). Every row
+//! lists it except gpt-5.4-pro, gpt-5.2-pro and o1-mini. Unrecognized ids
+//! are not assumed to have it, nor file input (protocol.md §5).
 //!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`gpt-5.5-pro`) before its prefix (`gpt-5.5`),
@@ -34,8 +39,10 @@ pub struct OpenAiModelProfile {
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p`.
     pub sampling: bool,
-    /// Accepts built-in (server-executed) tools in `tools`.
+    /// Accepts server-executed tools in `tools`.
     pub server_tools: bool,
+    /// Accepts `text.format` `json_schema` (structured outputs).
+    pub structured_output: bool,
     /// `Part::File` media types sent as `input_file`; empty means no file
     /// input.
     pub file_media_types: Cow<'static, [&'static str]>,
@@ -43,7 +50,8 @@ pub struct OpenAiModelProfile {
 
 impl OpenAiModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
-    /// built-in tools, which only listed models accept.
+    /// server tools, structured outputs or file input, which only listed
+    /// models accept.
     pub fn latest() -> Self {
         LATEST_PROFILE.clone()
     }
@@ -73,6 +81,12 @@ impl OpenAiModelProfile {
     }
 
     #[must_use]
+    pub fn with_structured_output(mut self, structured: bool) -> Self {
+        self.structured_output = structured;
+        self
+    }
+
+    #[must_use]
     pub fn with_file_media_types(mut self, types: impl Into<Cow<'static, [&'static str]>>) -> Self {
         self.file_media_types = types.into();
         self
@@ -85,12 +99,18 @@ const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
         forced_tool_choice: true,
         sampling: true,
         server_tools: true,
+        structured_output: true,
         file_media_types: Cow::Borrowed(PDF),
     }
 }
 
-const fn unlisted(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
+const fn without_server_tools(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
     profile.server_tools = false;
+    profile
+}
+
+const fn without_structured_output(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
+    profile.structured_output = false;
     profile
 }
 
@@ -114,21 +134,32 @@ static TABLE: &[(&str, OpenAiModelProfile)] = &[
     ("gpt-5.6", profile(NONE_TO_MAX)),
     ("gpt-5.5-pro", profile(PRO)),
     ("gpt-5.5", profile(NONE_TO_XHIGH)),
-    ("gpt-5.4-pro", profile(PRO)),
+    ("gpt-5.4-pro", without_structured_output(profile(PRO))),
     ("gpt-5.4", profile(NONE_TO_XHIGH)),
     ("gpt-5.3-codex", profile(LOW_TO_XHIGH)),
     ("gpt-5.2-codex", profile(LOW_TO_XHIGH)),
-    ("gpt-5.2-pro", profile(PRO)),
+    ("gpt-5.2-pro", without_structured_output(profile(PRO))),
     ("gpt-5.2", profile(NONE_TO_XHIGH)),
     ("gpt-5.1", profile(&[Off, Low, Medium, High])),
     ("gpt-5-pro", profile(&[High])),
     ("gpt-5", profile(&[Minimal, Low, Medium, High])),
-    ("o1", unlisted(profile(LOW_TO_HIGH))),
+    (
+        "o1-mini",
+        without_structured_output(without_server_tools(profile(LOW_TO_HIGH))),
+    ),
+    ("o1", without_server_tools(profile(LOW_TO_HIGH))),
     ("o3", profile(LOW_TO_HIGH)),
     ("o4", profile(LOW_TO_HIGH)),
 ];
 
-static LATEST_PROFILE: OpenAiModelProfile = unlisted(profile(LATEST));
+static LATEST_PROFILE: OpenAiModelProfile = OpenAiModelProfile {
+    efforts: Cow::Borrowed(LATEST),
+    forced_tool_choice: true,
+    sampling: true,
+    server_tools: false,
+    structured_output: false,
+    file_media_types: Cow::Borrowed(&[]),
+};
 
 /// Host model entries (first prefix match wins), then the host default, then
 /// the built-in table, then [`LATEST`].
