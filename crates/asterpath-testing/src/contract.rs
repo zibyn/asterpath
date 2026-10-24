@@ -380,8 +380,9 @@ async fn monotonic_seq(log: &dyn SessionStore) {
     );
 }
 
-/// `ConfigChanged` has no dedup key: every change is its own record and
-/// decodes back to the same patch.
+/// A `ConfigChanged` without an `UpdateId` has no dedup key: every change is
+/// its own record and decodes back to the same patch. One with an id is keyed
+/// by it, so a retried change is recorded once.
 async fn config_changes(log: &dyn SessionStore) {
     let sid = session(35);
     let mut patch = asterpath_protocol::ConfigPatch::default();
@@ -404,6 +405,28 @@ async fn config_changes(log: &dyn SessionStore) {
             event
         );
     }
+
+    let keyed = session(36);
+    let id = asterpath_protocol::UpdateId::from_bytes([36; 16]);
+    let mut patch = asterpath_protocol::ConfigPatch::default();
+    patch.id = Some(id);
+    patch.append_system = vec![asterpath_protocol::Part::Text {
+        text: "more".to_owned(),
+    }];
+    let event = SessionEvent::ConfigChanged { patch };
+    let key = || Some(asterpath_protocol::dedup::config_changed(id));
+    let first = append(log, keyed, &event, key()).await;
+    let retried = append(log, keyed, &event, key()).await;
+    assert_eq!(
+        first, retried,
+        "a ConfigChanged with an UpdateId is deduplicated"
+    );
+    let entries = scan(log, keyed).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        asterpath_protocol::decode_entry(&entries[0]).expect("decode"),
+        event
+    );
 }
 
 async fn cursor_scan(log: &dyn SessionStore) {
