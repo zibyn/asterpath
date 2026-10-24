@@ -222,14 +222,14 @@ pub struct SamplingParams {
 }
 
 pub struct ReasoningParams {
-    pub effort: Option<ReasoningEffort>, // OpenAI reasoning.effort
+    pub effort: Option<ReasoningEffort>, // OpenAI reasoning.effort；Anthropic output_config.effort
     pub budget_tokens: Option<u32>,      // Anthropic thinking.budget_tokens
     pub summary: bool,                   // OpenAI reasoning.summary；Anthropic 忽略
 }
 
 #[non_exhaustive]
 pub enum ReasoningEffort {
-    Off,      // OpenAI none；Anthropic 不发 thinking 与 effort
+    Off,      // OpenAI none；Anthropic 不发 effort，thinking 默认开启的模型发 disabled
     Minimal,
     Low,
     Medium,
@@ -251,7 +251,7 @@ pub enum ReasoningEffort {
 | R5 | `tool_choice` 的 `Required` / `Tool(_)` 需要 `forced_tool_choice` 能力；否则 `Unsupported`。 |
 | R6 | `sampling` 非空时需要 `sampling` 能力；不支持返回 `Unsupported`，不静默丢弃字段。 |
 | R7 | `disable_parallel_tool_use = true` 需要 `parallel_tool_calls` 能力；否则 `Unsupported`。 |
-| R8 | `reasoning` 非空时按 provider 映射；不支持的字段（如 Anthropic 的 `effort`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
+| R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
 | R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。 |
 
@@ -263,7 +263,7 @@ pub enum ReasoningEffort {
 | 字段 | Anthropic | OpenAI |
 | --- | --- | --- |
 | `budget_tokens` | `thinking: {type:"enabled", budget_tokens}` | 不支持；非空 → `Unsupported` |
-| `effort` | 不支持；非空 → `Unsupported` | `reasoning.effort` |
+| `effort` | `output_config.effort`（`xhigh` / `max` 按模型）；`Off` 不发 effort，thinking 默认开启的模型发 `thinking: {type:"disabled"}`，无法关闭的模型 → `Unsupported`；`Minimal` → `Unsupported` | `reasoning.effort`（`Off` → `none`）；模型不接受的档位 → `Unsupported` |
 | `summary` | 忽略（thinking 文本照常返回） | `reasoning.summary = "auto"`；false 时不请求摘要 |
 
 ## 5. 能力标志
