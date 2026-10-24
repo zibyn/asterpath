@@ -668,8 +668,12 @@ impl Agent {
                         break;
                     }
                     event = stream.next() => match event {
-                        Some(Ok(StreamEvent::PartDelta { delta, .. })) => {
-                            events.push(Ok(AgentEvent::ModelDelta { turn, step, delta }));
+                        Some(Ok(StreamEvent::PartDelta {
+                            output_index, part_index, delta, ..
+                        })) => {
+                            events.push(Ok(AgentEvent::ModelDelta {
+                                turn, step, output_index, part_index, delta,
+                            }));
                         }
                         Some(Ok(StreamEvent::ItemCompleted {
                             output_index, item, ..
@@ -708,6 +712,7 @@ impl Agent {
             }
 
             if let Some((stop_reason, usage)) = terminal {
+                let output_indices: Vec<u32> = completed.keys().copied().collect();
                 let items: Vec<Item> = completed.into_values().collect();
                 self.append(
                     session,
@@ -727,7 +732,17 @@ impl Agent {
                 let had_calls = has_tool_calls(&items);
                 if had_calls {
                     let outcome = self
-                        .run_tools(session, config, turn, step, &items, false, cancel, events)
+                        .run_tools(
+                            session,
+                            config,
+                            turn,
+                            step,
+                            &items,
+                            &output_indices,
+                            false,
+                            cancel,
+                            events,
+                        )
                         .await?;
                     if outcome == ToolOutcome::Cancelled {
                         self.commit_step(session, turn, step).await?;
@@ -900,10 +915,23 @@ impl Agent {
                 detail: "open step has no AssistantMessage".to_owned(),
             })?;
 
+        // shortcut: the log keeps no output_index, so a resumed step reports
+        // item positions; this step's live deltas went to an earlier process.
+        let output_indices: Vec<u32> = (0..items.len() as u32).collect();
         let had_calls = has_tool_calls(&items);
         if had_calls {
             let outcome = self
-                .run_tools(session, config, turn, step, &items, true, cancel, events)
+                .run_tools(
+                    session,
+                    config,
+                    turn,
+                    step,
+                    &items,
+                    &output_indices,
+                    true,
+                    cancel,
+                    events,
+                )
                 .await?;
             if outcome == ToolOutcome::Cancelled {
                 self.commit_step(session, turn, step).await?;
@@ -929,6 +957,7 @@ impl Agent {
         turn: TurnId,
         step: StepId,
         items: &[Item],
+        output_indices: &[u32],
         recovering: bool,
         cancel: &CancelToken,
         events: &EventSink,
@@ -950,7 +979,9 @@ impl Agent {
             events,
             spawn,
         };
-        self.pipeline.run(&step, items, cancel).await
+        self.pipeline
+            .run(&step, items, output_indices, cancel)
+            .await
     }
 
     async fn commit_step(

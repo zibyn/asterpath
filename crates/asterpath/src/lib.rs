@@ -42,9 +42,9 @@ use crate::views::usage::UsageService;
 use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProviderCatalog,
-    RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span,
-    SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
+    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProjectedEntry,
+    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState,
+    Span, SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
 use asterpath_protocol::{
@@ -163,7 +163,9 @@ impl Asterpath {
             Arc::clone(&cancellations),
         ));
         let tools = Arc::new(ToolTable::new());
-        tools.register(Arc::new(SpawnTool::new()));
+        if config.spawn_tool {
+            tools.register(Arc::new(SpawnTool::new()));
+        }
         for tool in config.tools {
             tools.register(tool);
         }
@@ -440,6 +442,18 @@ impl SessionHandle {
         let entries = scan_all(&*self.store, self.session).await?;
         SessionFacts::fold(&entries).map_err(|error| {
             AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
+                session: self.session,
+                detail: error.to_string(),
+            })
+        })
+    }
+
+    /// The model-visible projection folded from the log, not driver memory.
+    /// Each entry keeps its origin so hosts can map items back to log ids.
+    pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
+        let entries = scan_all(&*self.store, self.session).await?;
+        asterpath_protocol::project(&entries).map_err(|error| {
+            AsterError::Agent(AgentError::Corrupt {
                 session: self.session,
                 detail: error.to_string(),
             })

@@ -1,6 +1,7 @@
 //! End-to-end tool pipeline through the facade: two-step turn (L1), tool
 //! selection resolution and descriptors in the session snapshot.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,10 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use asterpath::protocol::{
     AgentEvent, CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part,
-    Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
-    StopReason, SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput,
-    decode_entry,
+    PartDelta, Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec,
+    SideEffect, StopReason, StreamEvent, SubagentConfig, Tool, ToolArgs, ToolContext,
+    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig,
+    TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
 use asterpath::{AsterError, Asterpath, SessionHandle};
@@ -336,6 +337,251 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
         .await
         .unwrap_err();
     assert!(matches!(error, AsterError::Config { .. }));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn disabling_the_spawn_tool_removes_it_from_selection() {
+    let db = temp_db("no-spawn");
+    let provider = Arc::new(ScriptedProvider::new("p"));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![EchoTool::new("alpha") as Arc<dyn Tool>])
+        .spawn_tool(false)
+        .build()
+        .await
+        .expect("facade builds");
+
+    let all = asterpath
+        .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap();
+    let entries = scan(asterpath.store(), all.id()).await;
+    let snapshot = match decode_entry(&entries[0]).unwrap() {
+        SessionEvent::SessionCreated { config, .. } => config,
+        other => panic!("expected snapshot, got {}", other.kind()),
+    };
+    assert_eq!(snapshot.tools, vec![descriptor("alpha")]);
+
+    let error = asterpath
+        .create_session(spec(ToolSelection::Names(vec![ToolName::new(
+            "spawn_agent",
+        )])))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AsterError::Config { .. }));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn a_snapshotted_spawn_call_fails_after_the_tool_is_disabled() {
+    let db = temp_db("spawn-disabled-restart");
+    let first = Asterpath::builder()
+        .database(&db)
+        .providers(vec![
+            Arc::new(ScriptedProvider::new("p")) as Arc<dyn Provider>
+        ])
+        .build()
+        .await
+        .expect("facade builds");
+    let id = first
+        .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap()
+        .id();
+    first.shutdown().await.unwrap();
+
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(
+                vec![Item::ToolCall {
+                    call_id: "call-1".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: JsonString::new(r#"{"prompt":"hi"}"#),
+                    raw: None,
+                }],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(
+                vec![Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("done")],
+                }],
+                StopReason::EndTurn,
+                Usage::default(),
+            ),
+    );
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .spawn_tool(false)
+        .build()
+        .await
+        .expect("facade rebuilds");
+    let handle = asterpath.open_session(id).await.unwrap();
+    handle.submit_input(input("go")).await.unwrap();
+    drive_all(&handle).await;
+
+    let events: Vec<_> = scan(asterpath.store(), id)
+        .await
+        .iter()
+        .map(|entry| decode_entry(entry).unwrap())
+        .collect();
+    let statuses: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, [ToolResultStatus::Failed]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnCommitted { .. })
+    ));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn interleaved_json_args_fragments_reassemble_by_step_and_output_index() {
+    let call = |id: &str, args: &str| Item::ToolCall {
+        call_id: id.to_owned(),
+        provider_item_id: None,
+        name: ToolName::new("echo"),
+        raw_args: JsonString::new(args),
+        raw: None,
+    };
+    let fragment = |sequence, output_index, fragment: &str| StreamEvent::PartDelta {
+        sequence,
+        output_index,
+        part_index: output_index + 10,
+        delta: PartDelta::JsonArgs {
+            fragment: fragment.to_owned(),
+        },
+    };
+    // Sparse indices completed out of order: the agent must report
+    // `output_index`, not the item's position in the step.
+    let db = temp_db("interleaved");
+    let tool = EchoTool::new("echo");
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .stream_events(vec![
+                StreamEvent::ResponseStarted {
+                    sequence: 0,
+                    request_id: None,
+                },
+                StreamEvent::ItemStarted {
+                    sequence: 1,
+                    output_index: 3,
+                },
+                StreamEvent::ItemStarted {
+                    sequence: 2,
+                    output_index: 7,
+                },
+                fragment(3, 7, r#"{"b":"#),
+                fragment(4, 3, r#"{"a":"#),
+                fragment(5, 3, "1}"),
+                fragment(6, 7, "2}"),
+                StreamEvent::ItemCompleted {
+                    sequence: 7,
+                    output_index: 7,
+                    item: call("call-b", r#"{"b":2}"#),
+                },
+                StreamEvent::ItemCompleted {
+                    sequence: 8,
+                    output_index: 3,
+                    item: call("call-a", r#"{"a":1}"#),
+                },
+                StreamEvent::ResponseEnded {
+                    sequence: 9,
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                },
+            ])
+            .respond(
+                vec![Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("done")],
+                }],
+                StopReason::EndTurn,
+                Usage::default(),
+            ),
+    );
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![tool as Arc<dyn Tool>])
+        .build()
+        .await
+        .expect("facade builds");
+    let handle = asterpath
+        .create_session(spec(ToolSelection::Names(vec![ToolName::new("echo")])))
+        .await
+        .unwrap();
+    handle.submit_input(input("go")).await.unwrap();
+    let live = drive_all(&handle).await;
+
+    let mut fragments: HashMap<_, String> = HashMap::new();
+    let mut indices = Vec::new();
+    let mut started = Vec::new();
+    for event in &live {
+        match event {
+            AgentEvent::ModelDelta {
+                step,
+                output_index,
+                part_index,
+                delta: PartDelta::JsonArgs { fragment },
+                ..
+            } => {
+                indices.push((*output_index, *part_index));
+                fragments
+                    .entry((*step, *output_index))
+                    .or_default()
+                    .push_str(fragment);
+            }
+            AgentEvent::ToolStarted {
+                step,
+                output_index,
+                call,
+                ..
+            } => started.push(((*step, *output_index), *call)),
+            _ => {}
+        }
+    }
+    // Indices pass through from the provider's PartDelta unchanged.
+    assert_eq!(indices, [(7, 17), (3, 13), (3, 13), (7, 17)]);
+    assert_eq!(started.len(), 2);
+
+    // Each call's recorded arguments, by its kernel id.
+    let entries = scan(asterpath.store(), handle.id()).await;
+    let args: HashMap<_, _> = entries
+        .iter()
+        .filter_map(|entry| match decode_entry(entry).unwrap() {
+            SessionEvent::ToolCallRequested {
+                tool_call_id,
+                raw_args,
+                ..
+            } => Some((tool_call_id, raw_args)),
+            _ => None,
+        })
+        .collect();
+    for (key, call) in started {
+        assert_eq!(fragments[&key], args[&call].as_str());
+    }
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
