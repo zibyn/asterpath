@@ -48,6 +48,7 @@ fn assistant_items(text_value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(text_value)],
+        raw: None,
     }]
 }
 
@@ -229,6 +230,7 @@ async fn one_turn_without_tools_commits_the_expected_sequence() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("hi")],
+            raw: None,
         }]
     );
     assert!(
@@ -324,6 +326,14 @@ async fn dropping_the_stream_does_not_cancel_or_close_the_session() {
     assert!(matches!(first, AgentEvent::TurnStarted { .. }));
     drop(stream);
 
+    // The turn only advances while polled (ADR-0006), and appends yield
+    // (#97), so the dropped stream leaves the turn open; a re-drive resumes
+    // it from the log instead of starting over.
+    let events = drive_all(&handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCommitted { .. })
+    ));
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
     let entries = scan(asterpath.store(), handle.id()).await;
     assert!(matches!(
@@ -333,6 +343,11 @@ async fn dropping_the_stream_does_not_cancel_or_close_the_session() {
             ..
         })
     ));
+    let turns = decoded(&entries)
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::TurnStarted { .. }))
+        .count();
+    assert_eq!(turns, 1, "the dropped turn is resumed, not restarted");
     // The session is still drivable: a later drive sees an idle session.
     let events = drive_all(&handle).await;
     assert_eq!(
@@ -471,6 +486,7 @@ async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved(
                 parts: vec![Part::Refusal {
                     text: "no".to_owned(),
                 }],
+                raw: None,
             }],
             StopReason::Refusal,
         ),

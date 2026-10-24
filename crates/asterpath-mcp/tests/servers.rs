@@ -85,9 +85,41 @@ fn sse_headers() -> BTreeMap<String, String> {
     BTreeMap::from([("Accept".to_owned(), "text/event-stream".to_owned())])
 }
 
-fn free_addr() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick a free port");
-    listener.local_addr().expect("local addr").to_string()
+/// A fixed local URL relaying each connection to the current backend, so a
+/// test can swap fixtures without freeing a port another test could take.
+struct Relay {
+    addr: String,
+    backend: Arc<std::sync::Mutex<String>>,
+}
+
+impl Relay {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr").to_string();
+        let backend = Arc::new(std::sync::Mutex::new(String::new()));
+        let current = Arc::clone(&backend);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = current.lock().expect("relay backend").clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        Self { addr, backend }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+
+    fn point_at(&self, fixture: &HttpFixture) {
+        *self.backend.lock().expect("relay backend") = fixture.addr.clone();
+    }
 }
 
 /// A real HTTP fixture child. `kill_on_drop` keeps a panicking test leak-free.
@@ -98,12 +130,8 @@ struct HttpFixture {
 
 impl HttpFixture {
     async fn spawn(args: &[&str]) -> Self {
-        Self::spawn_at("127.0.0.1:0", args).await
-    }
-
-    async fn spawn_at(addr: &str, args: &[&str]) -> Self {
         let mut child = Command::new(fixture_bin())
-            .args(["--http", addr])
+            .args(["--http", "127.0.0.1:0"])
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -729,18 +757,20 @@ async fn m3_http_request_scoped_sse_ignores_notifications() {
 
 #[tokio::test]
 async fn m11_sse_interruption_fails_only_that_call() {
-    let addr = free_addr();
+    let relay = Relay::start().await;
     let host = host(None, SandboxPolicy::FullAccess);
 
-    let healthy = HttpFixture::spawn_at(&addr, &[]).await;
+    let healthy = HttpFixture::spawn(&[]).await;
+    relay.point_at(&healthy);
     let servers = host
-        .load(vec![http_config("weather", &healthy.url(), sse_headers())])
+        .load(vec![http_config("weather", &relay.url(), sse_headers())])
         .await
         .expect("load");
     healthy.stop().await;
 
     // Same endpoint, now closing each SSE stream before the response.
-    let interrupted = HttpFixture::spawn_at(&addr, &["--fault-sse-interrupt"]).await;
+    let interrupted = HttpFixture::spawn(&["--fault-sse-interrupt"]).await;
+    relay.point_at(&interrupted);
     let error = invoke(&servers, "weather__echo", json!({}))
         .await
         .unwrap_err();
@@ -748,7 +778,8 @@ async fn m11_sse_interruption_fails_only_that_call() {
     interrupted.stop().await;
 
     // The adapter is not dead: the next call reaches a healthy server.
-    let recovered = HttpFixture::spawn_at(&addr, &[]).await;
+    let recovered = HttpFixture::spawn(&[]).await;
+    relay.point_at(&recovered);
     let output = invoke(&servers, "weather__echo", json!({"text": "again"}))
         .await
         .expect("next call succeeds");

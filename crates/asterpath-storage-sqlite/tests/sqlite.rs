@@ -534,3 +534,19 @@ fn a_new_database_is_created_at_v2() {
         vec!["log", "retired_sessions", "sessions", "sqlite_sequence"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Writer thread: group commit with a savepoint per record (#97).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reopening_right_after_drop_keeps_committed_records() {
+    let dir = TempDir::new("drop-reopen");
+    let storage = open(dir.db()).expect("open");
+    for _ in 0..3 {
+        append(storage.as_ref(), entry(session(5), &input_recorded(), None)).expect("append");
+    }
+    drop(storage);
+    let storage = open(dir.db()).expect("reopen in the same process");
+    assert_eq!(scan(storage.as_ref(), session(5)).len(), 3);
+}

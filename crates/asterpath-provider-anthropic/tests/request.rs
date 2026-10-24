@@ -35,6 +35,7 @@ fn user_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::User,
         parts,
+        raw: None,
     }
 }
 
@@ -42,6 +43,7 @@ fn assistant_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts,
+        raw: None,
     }
 }
 
@@ -521,6 +523,115 @@ async fn reasoning_raw_json_is_replayed_byte_for_byte() {
 }
 
 #[tokio::test]
+async fn xhigh_and_max_render_on_models_that_accept_them() {
+    let cases = [
+        (ReasoningEffort::XHigh, "claude-opus-5-5", "xhigh"),
+        (ReasoningEffort::XHigh, "claude-opus-4-7", "xhigh"),
+        (ReasoningEffort::Max, "claude-sonnet-4-6", "max"),
+        (ReasoningEffort::Max, "claude-mythos-preview", "max"),
+    ];
+    let server = MockServer::start(cases.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for (level, model, _) in cases {
+        let mut request = request_for(model);
+        request.reasoning = effort(level);
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), cases.len());
+    for (recorded, (_, model, wire)) in recorded.iter().zip(cases) {
+        assert_eq!(
+            recorded.json_body()["output_config"],
+            serde_json::json!({"effort": wire}),
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn off_sends_neither_thinking_nor_effort_where_thinking_defaults_off() {
+    let models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"];
+    let server = MockServer::start(models.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for model in models {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            effort: Some(ReasoningEffort::Off),
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), models.len());
+    for (recorded, model) in recorded.iter().zip(models) {
+        let body = recorded.json_body();
+        assert!(body.get("thinking").is_none(), "{model}: {body}");
+        assert!(body.get("output_config").is_none(), "{model}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn off_sends_disabled_thinking_where_thinking_defaults_on() {
+    let models = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"];
+    let server = MockServer::start(models.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for model in models {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            effort: Some(ReasoningEffort::Off),
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), models.len());
+    for (recorded, model) in recorded.iter().zip(models) {
+        let body = recorded.json_body();
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "disabled"}),
+            "{model}"
+        );
+        assert!(body.get("output_config").is_none(), "{model}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
+    let server = MockServer::start(Vec::new());
+    for (level, model) in [
+        // Every Anthropic model: there is no `minimal`.
+        (ReasoningEffort::Minimal, "claude-opus-5-5"),
+        // Thinking cannot be disabled (always on, or `disabled` rejected).
+        (ReasoningEffort::Off, "claude-opus-5-5"),
+        (ReasoningEffort::Off, "claude-sonnet-5-5"),
+        (ReasoningEffort::Off, "claude-fable-5"),
+        (ReasoningEffort::Off, "claude-mythos-preview"),
+        (ReasoningEffort::Off, "claude-test"),
+        // `max` without `xhigh`.
+        (ReasoningEffort::XHigh, "claude-opus-4-6"),
+        (ReasoningEffort::XHigh, "claude-mythos-preview"),
+        // Opus 4.5 documents only low, medium and high.
+        (ReasoningEffort::Max, "claude-opus-4-5-20251101"),
+        // No effort at all.
+        (ReasoningEffort::Low, "claude-sonnet-4-5"),
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = effort(level);
+        let error = one_request(&server, request).await;
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::Unsupported,
+            "{model} {level:?}"
+        );
+        assert!(error.message.contains(&format!("{level:?}")), "{error:?}");
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+#[tokio::test]
 async fn current_models_render_adaptive_thinking_with_effort() {
     let server = MockServer::start(vec![
         Reply::sse(empty_sse()),
@@ -869,4 +980,101 @@ async fn breakpoint_skips_replayed_raw_blocks_and_leaves_them_byte_identical() {
 
     assert!(recorded[1].body.contains(raw), "{}", recorded[1].body);
     assert_eq!(breakpoints(&recorded[1].json_body()), 0);
+}
+
+#[tokio::test]
+async fn renders_stop_sequences_and_same_provider_options_at_top_level() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.stop_sequences = vec!["END".to_owned(), "\n\nHuman:".to_owned()];
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"service_tier":"standard_only","metadata":{"user_id":"u-1"}}"#),
+    );
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":"k"}"#),
+    );
+
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["stop_sequences"],
+        serde_json::json!(["END", "\n\nHuman:"])
+    );
+    assert_eq!(body["service_tier"], "standard_only");
+    assert_eq!(body["metadata"], serde_json::json!({"user_id": "u-1"}));
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "other provider ignored"
+    );
+}
+
+#[tokio::test]
+async fn empty_stop_sequences_are_not_sent() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    drain(&provider(&server), base_request()).await;
+    assert!(
+        server.requests()[0]
+            .json_body()
+            .get("stop_sequences")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn provider_options_deep_merge_into_objects_the_adapter_writes() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = request_for("claude-opus-5-5");
+    request.reasoning = effort(ReasoningEffort::High);
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"output_config":{"format":{"type":"json_schema"}}}"#),
+    );
+
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["output_config"],
+        serde_json::json!({"effort": "high", "format": {"type": "json_schema"}})
+    );
+}
+
+#[tokio::test]
+async fn provider_options_may_not_replace_a_nested_value_the_adapter_writes() {
+    let server = MockServer::start(Vec::new());
+    let mut request = request_for("claude-opus-5-5");
+    request.reasoning = effort(ReasoningEffort::High);
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"output_config":{"effort":"low"}}"#),
+    );
+
+    let error = one_request(&server, request).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(error.message.contains("output_config.effort"), "{error:?}");
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+#[tokio::test]
+async fn provider_options_conflicting_or_non_object_fail_before_http() {
+    let server = MockServer::start(Vec::new());
+    for (options, kind) in [
+        (r#"{"model":"other"}"#, ProviderErrorKind::Unsupported),
+        (r#"{"messages":[]}"#, ProviderErrorKind::Unsupported),
+        (r#"{"max_tokens":1}"#, ProviderErrorKind::Unsupported),
+        (r#"{"stream":false}"#, ProviderErrorKind::Unsupported),
+        (r#"{"system":"other"}"#, ProviderErrorKind::Unsupported),
+        (r#"["service_tier"]"#, ProviderErrorKind::InvalidRequest),
+        ("not json", ProviderErrorKind::InvalidRequest),
+    ] {
+        let mut request = base_request();
+        request
+            .provider_options
+            .insert(ProviderId::new("anthropic"), JsonString::new(options));
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, kind, "{options}: {error:?}");
+        assert!(!error.retryable);
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
 }

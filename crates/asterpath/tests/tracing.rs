@@ -60,6 +60,7 @@ fn response() -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text("hello")],
+        raw: None,
     }]
 }
 

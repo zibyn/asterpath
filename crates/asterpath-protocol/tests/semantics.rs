@@ -67,6 +67,7 @@ fn assistant(text_value: &str) -> SessionEvent {
         items: vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text(text_value)],
+            raw: None,
         }],
         raw: None,
         model: model(),
@@ -255,6 +256,7 @@ fn projection_folds_compaction_and_keeps_the_raw_log() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("latest")],
+            raw: None,
         }]
     );
 
@@ -276,6 +278,7 @@ fn projection_orders_by_seq_not_by_input_order() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("first")],
+            raw: None,
         }]
     );
     assert_eq!(
@@ -283,6 +286,7 @@ fn projection_orders_by_seq_not_by_input_order() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("second")],
+            raw: None,
         }]
     );
 }
@@ -338,6 +342,7 @@ fn projection_turns_input_and_tool_results_into_items() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("run it")],
+            raw: None,
         }]
     );
     assert_eq!(
@@ -362,6 +367,7 @@ fn user_input_projection_uses_a_user_message() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("hello")],
+            raw: None,
         }]
     );
 }
@@ -372,6 +378,32 @@ fn config_snapshot_round_trips_through_json() {
     let json = serde_json::to_value(&snapshot).expect("serialize");
     let back: ConfigSnapshot = serde_json::from_value(json).expect("deserialize");
     assert_eq!(back, snapshot);
+}
+
+#[test]
+fn config_snapshot_without_stop_sequences_or_provider_options_decodes_empty() {
+    let mut json = serde_json::to_value(config()).expect("serialize");
+    let request = json["request"].as_object_mut().expect("request object");
+    request.remove("stop_sequences");
+    request.remove("provider_options");
+    let back: ConfigSnapshot = serde_json::from_value(json).expect("old snapshot decodes");
+    assert!(back.request.stop_sequences.is_empty());
+    assert!(back.request.provider_options.is_empty());
+}
+
+#[test]
+fn model_request_copies_stop_sequences_and_provider_options() {
+    let mut request = RequestConfig {
+        stop_sequences: vec!["END".to_owned()],
+        ..RequestConfig::default()
+    };
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"service_tier":"flex"}"#),
+    );
+    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], &request);
+    assert_eq!(model_request.stop_sequences, request.stop_sequences);
+    assert_eq!(model_request.provider_options, request.provider_options);
 }
 
 #[test]

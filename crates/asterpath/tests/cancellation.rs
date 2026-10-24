@@ -53,6 +53,7 @@ fn assistant_items(value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }]
 }
 
@@ -181,6 +182,7 @@ impl Provider for BlockingProvider {
                     item: Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("done")],
+                        raw: None,
                     },
                 }),
                 Ok(StreamEvent::ResponseEnded {
@@ -643,6 +645,7 @@ async fn steering_enters_the_next_step_projection_in_seq_order() {
                 Item::Message {
                     role: Role::User,
                     parts,
+                    ..
                 } => Some(parts),
                 _ => None,
             })
@@ -716,7 +719,7 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
     let contains_steer = requests[1].items.iter().any(|item| {
         matches!(
             item,
-            Item::Message { role: Role::User, parts }
+            Item::Message { role: Role::User, parts, .. }
                 if parts.iter().any(|part| matches!(part, Part::Text { text } if text == "steer"))
         )
     });

@@ -22,7 +22,7 @@
 | --- | --- | --- | --- |
 | `asterpath-protocol` | protocol | ID、日志信封与存储契约（`SessionStore`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy` / `SandboxProvider` 及沙箱类型，ADR-0027）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
 | `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite` |
-| `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；不属于稳定面（ADR-0026 修订） | `protocol` |
+| `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；`provider_options` 深合并与同 provider raw 字段提取（#101、#103）；不属于稳定面（ADR-0026 修订） | `protocol` |
 | `asterpath-provider-anthropic` | adapter | Anthropic Messages adapter | `protocol`, `http` |
 | `asterpath-provider-openai` | adapter | OpenAI Responses adapter | `protocol`, `http` |
 | `asterpath-storage-sqlite` | adapter | `SessionStore`（含退役）的 SQLite 实现 | `protocol` |
@@ -324,7 +324,7 @@ max_output_tokens = 8192      # RequestConfig；缺省字段用 Default
 tool_choice = "auto"          # auto | none | required | <tool name>
 disable_parallel_tool_use = false
 # [request.sampling] temperature / top_p / top_k / seed
-# [request.reasoning] effort / budget_tokens / summary
+# [request.reasoning] effort（off | minimal | low | medium | high | xhigh | max）/ budget_tokens / summary
 
 [tools]
 max_parallel_calls = 8        # ToolConfig；缺省字段用 Default

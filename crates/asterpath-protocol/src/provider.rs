@@ -10,7 +10,7 @@ use futures_core::stream::BoxStream;
 use crate::config::{
     ModelSpec, ReasoningParams, RequestConfig, SamplingParams, ToolChoice, ToolDescriptor,
 };
-use crate::ids::ProviderId;
+use crate::ids::{JsonString, ProviderId};
 use crate::item::{Item, Part, RawProviderData};
 use crate::usage::Usage;
 
@@ -30,6 +30,9 @@ pub struct ModelRequest {
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,
     pub reasoning: Option<ReasoningParams>,
+    pub stop_sequences: Vec<String>,
+    /// See [`RequestConfig::provider_options`].
+    pub provider_options: BTreeMap<ProviderId, JsonString>,
 }
 
 impl ModelRequest {
@@ -54,6 +57,8 @@ impl ModelRequest {
             sampling: request.sampling.clone(),
             max_output_tokens: request.max_output_tokens.get(),
             reasoning: request.reasoning.clone(),
+            stop_sequences: request.stop_sequences.clone(),
+            provider_options: request.provider_options.clone(),
         }
     }
 }

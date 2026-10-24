@@ -15,6 +15,15 @@ fn ok(events: Vec<Result<StreamEvent, ProviderError>>) -> Vec<StreamEvent> {
         .collect()
 }
 
+fn text_raw(json: &str) -> asterpath_protocol::RawProviderData {
+    asterpath_protocol::RawProviderData {
+        provider: model().provider,
+        model: Some(model().model),
+        kind: "anthropic.text".to_owned(),
+        json: asterpath_protocol::JsonString::new(json),
+    }
+}
+
 fn first_error(events: Vec<Result<StreamEvent, ProviderError>>) -> ProviderError {
     events
         .into_iter()
@@ -218,6 +227,7 @@ async fn normalizes_the_full_stream_into_s1_to_s10() {
             parts: vec![Part::Text {
                 text: "Hello, world".to_owned()
             }],
+            raw: Some(text_raw(r#"{"text":"Hello, world","type":"text"}"#)),
         }
     );
     match items[2] {
@@ -562,6 +572,7 @@ async fn refusal_stop_reason_coexists_with_visible_content() {
             parts: vec![Part::Text {
                 text: "I cannot".to_owned()
             }],
+            raw: Some(text_raw(r#"{"text":"I cannot","type":"text"}"#)),
         }]
     );
     assert!(matches!(
@@ -950,6 +961,108 @@ impl asterpath_testing::ProviderWire for AnthropicWire {
             json!({"type": "message_stop"}),
         ]
     }
+}
+
+#[tokio::test]
+async fn text_citations_are_kept_in_raw_and_replayed_only_to_the_same_provider() {
+    let citation = r#"{"type":"char_location","cited_text":"sky is blue","document_index":0,"document_title":"Doc","start_char_index":0,"end_char_index":11}"#;
+    let delta = format!(
+        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"citations_delta","citation":{citation}}}}}"#
+    );
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_cite","usage":{"input_tokens":2}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":[]}}"#,
+        ),
+        ("content_block_delta", &delta),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The sky is blue."}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![
+        Reply::sse(body),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ]);
+    let provider = provider(&server);
+    let message = ok(drain(&provider, base_request()).await)
+        .into_iter()
+        .find_map(|event| match event {
+            StreamEvent::ItemCompleted { item, .. } => Some(item),
+            _ => None,
+        })
+        .expect("text item");
+    let citation: serde_json::Value = serde_json::from_str(citation).unwrap();
+    let Item::Message {
+        raw: Some(raw),
+        parts,
+        ..
+    } = &message
+    else {
+        panic!("text item carries raw: {message:?}");
+    };
+    assert_eq!(
+        parts,
+        &[Part::Text {
+            text: "The sky is blue.".to_owned()
+        }]
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(raw.json.as_str()).unwrap(),
+        serde_json::json!({"type": "text", "text": "The sky is blue.", "citations": [citation]})
+    );
+
+    let replayed_block = |request: usize| {
+        let body = server.requests()[request].json_body();
+        let messages = body["messages"].as_array().unwrap().clone();
+        messages.last().unwrap()["content"][0].clone()
+    };
+
+    let mut replay = base_request();
+    replay.items.push(message.clone());
+    let _ = drain(&provider, replay).await;
+    let block = replayed_block(1);
+    assert_eq!(block["text"], "The sky is blue.");
+    assert_eq!(block["citations"], serde_json::json!([citation]));
+
+    let mut rewritten = message.clone();
+    if let Item::Message { parts, .. } = &mut rewritten {
+        *parts = vec![Part::Text {
+            text: "Compacted.".to_owned(),
+        }];
+    }
+    let mut replay = base_request();
+    replay.items.push(rewritten);
+    let _ = drain(&provider, replay).await;
+    let block = replayed_block(2);
+    assert_eq!(block["text"], "Compacted.");
+    assert_eq!(block["citations"], serde_json::json!([citation]));
+
+    let mut foreign = message;
+    if let Item::Message { raw: Some(raw), .. } = &mut foreign {
+        raw.provider = asterpath_protocol::ProviderId::new("other");
+    }
+    let mut replay = base_request();
+    replay.items.push(foreign);
+    let _ = drain(&provider, replay).await;
+    let block = replayed_block(3);
+    assert_eq!(block["text"], "The sky is blue.");
+    assert!(block.get("citations").is_none(), "{block}");
 }
 
 #[tokio::test]

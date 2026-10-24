@@ -7,7 +7,7 @@ use asterpath_protocol::{
     CancelToken, JsonString, Part, ReplaySafety, SessionId, SideEffect, StepId, Tool, ToolCallId,
     ToolContext, ToolError, TurnId,
 };
-use asterpath_tools::{coding, read_only};
+use asterpath_tools::{DEFAULT_BASH_TIMEOUT, coding, read_only};
 
 fn ctx(cancel: CancelToken) -> ToolContext {
     ToolContext::new(
@@ -61,6 +61,7 @@ fn full_access(root: &Path) -> Vec<Arc<dyn Tool>> {
         root.to_path_buf(),
         None,
         asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
     )
     .expect("absolute root")
 }
@@ -72,7 +73,8 @@ fn a_relative_root_fails_construction() {
         coding(
             PathBuf::from("rel"),
             None,
-            asterpath_protocol::SandboxPolicy::FullAccess
+            asterpath_protocol::SandboxPolicy::FullAccess,
+            DEFAULT_BASH_TIMEOUT
         )
         .is_err()
     );
@@ -242,7 +244,13 @@ async fn bash_spawns_through_the_sandbox_provider_in_the_root() {
     let policy = asterpath_protocol::SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![root.clone()],
     };
-    let bash = asterpath_tools::bash(root.clone(), Some(sandbox.clone()), policy.clone()).unwrap();
+    let bash = asterpath_tools::bash(
+        root.clone(),
+        Some(sandbox.clone()),
+        policy.clone(),
+        DEFAULT_BASH_TIMEOUT,
+    )
+    .unwrap();
 
     let output = call(
         &bash,
@@ -275,6 +283,7 @@ async fn bash_without_a_provider_fails_closed_unless_full_access() {
         asterpath_protocol::SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![root.clone()],
         },
+        DEFAULT_BASH_TIMEOUT,
     )
     .unwrap();
 
@@ -288,6 +297,7 @@ async fn bash_without_a_provider_fails_closed_unless_full_access() {
         root.clone(),
         None,
         asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
     )
     .unwrap();
     call(&bash, serde_json::json!({ "command": "touch ran" }))
@@ -341,6 +351,186 @@ async fn cancelling_bash_kills_the_process() {
         }
     }
     panic!("process {pid} still running after cancel");
+}
+
+#[cfg(target_os = "linux")]
+async fn read_pid(path: &Path) -> String {
+    for _ in 0..500 {
+        if let Ok(pid) = std::fs::read_to_string(path)
+            && pid.ends_with('\n')
+        {
+            return pid.trim().to_owned();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{} never written", path.display());
+}
+
+/// Gone or a zombie awaiting the reaper.
+#[cfg(target_os = "linux")]
+fn is_dead(pid: &str) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat.contains(") Z "),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_dead(pids: &[String]) {
+    for _ in 0..200 {
+        if pids.iter().all(|pid| is_dead(pid)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let alive: Vec<_> = pids.iter().filter(|pid| !is_dead(pid)).collect();
+    panic!("processes {alive:?} still running");
+}
+
+/// Spawns `command` through `bash` and returns once every file in `pid_files`
+/// has been written; the handle resolves to the tool result.
+#[cfg(target_os = "linux")]
+async fn start(
+    bash: Arc<dyn Tool>,
+    root: &Path,
+    command: &str,
+    pid_files: &[&str],
+    cancel: CancelToken,
+) -> (
+    tokio::task::JoinHandle<Result<String, ToolError>>,
+    Vec<String>,
+) {
+    let args = serde_json::json!({ "command": command });
+    let running = tokio::spawn(async move { call_with(&bash, args, cancel).await });
+    let mut pids = Vec::new();
+    for file in pid_files {
+        pids.push(read_pid(&root.join(file)).await);
+    }
+    (running, pids)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelling_bash_kills_backgrounded_children_too() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let cancel = CancelToken::new();
+    let (running, pids) = start(
+        bash,
+        &root,
+        "sleep 100 & echo $! > bg; echo $$ > fg; exec sleep 100",
+        &["bg", "fg"],
+        cancel.clone(),
+    )
+    .await;
+
+    cancel.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), running)
+        .await
+        .expect("returns promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Cancelled { .. }), "{error:?}");
+    assert_dead(&pids).await;
+}
+
+/// Wraps the command in `sh -c` the way a sandbox backend wraps it in its own
+/// launcher; the wrapper stays alive as the parent.
+#[cfg(target_os = "linux")]
+struct ShWrapper;
+
+#[cfg(target_os = "linux")]
+impl asterpath_protocol::SandboxProvider for ShWrapper {
+    fn confine(
+        &self,
+        request: &asterpath_protocol::SpawnRequest<'_>,
+    ) -> Result<asterpath_protocol::ConfinedSpawn, asterpath_protocol::SandboxError> {
+        let mut confined = asterpath_protocol::ConfinedSpawn::unconfined(request);
+        let mut args = vec![
+            "-c".into(),
+            "echo $$ > wrapper; \"$0\" \"$@\"; echo wrapper done".into(),
+            confined.program,
+        ];
+        args.append(&mut confined.args);
+        confined.program = "sh".into();
+        confined.args = args;
+        Ok(confined)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelling_bash_kills_the_sandbox_wrapper_and_its_descendants() {
+    let (_dir, root) = root();
+    let bash = asterpath_tools::bash(
+        root.clone(),
+        Some(Arc::new(ShWrapper)),
+        asterpath_protocol::SandboxPolicy::FullAccess,
+        DEFAULT_BASH_TIMEOUT,
+    )
+    .unwrap();
+    let cancel = CancelToken::new();
+    let (running, pids) = start(
+        bash,
+        &root,
+        "sleep 100 & echo $! > bg; echo $$ > fg; wait",
+        &["wrapper", "bg", "fg"],
+        cancel.clone(),
+    )
+    .await;
+
+    cancel.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), running)
+        .await
+        .expect("returns promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Cancelled { .. }), "{error:?}");
+    assert_dead(&pids).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_a_running_bash_call_kills_its_process_group() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let (running, pids) = start(
+        bash,
+        &root,
+        "sleep 100 & echo $! > bg; echo $$ > fg; wait",
+        &["bg", "fg"],
+        CancelToken::new(),
+    )
+    .await;
+
+    running.abort();
+    let _ = running.await;
+    assert_dead(&pids).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bash_returns_soon_after_exit_while_a_background_process_holds_the_output() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let started = std::time::Instant::now();
+    let output = call(
+        &bash,
+        serde_json::json!({ "command": "echo hi; sleep 100 & echo $! > bg" }),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    let bg = read_pid(&root.join("bg")).await;
+    let alive = !is_dead(&bg);
+    // SAFETY: kill(2) on the background sleep this test started.
+    unsafe { libc::kill(bg.parse().unwrap(), libc::SIGKILL) };
+
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert!(output.starts_with("hi\n"), "{output}");
+    assert!(output.contains("stopped reading"), "{output}");
+    assert!(output.contains("[exit status: exit status: 0]"), "{output}");
+    assert!(alive, "background process survives a successful exit");
 }
 
 /// Larger than the 1 MiB cap every tool reads or returns.
@@ -454,4 +644,200 @@ async fn write_and_edit_replace_the_file_atomically_and_keep_its_mode() {
         .map(|entry| entry.expect("entry").file_name())
         .collect();
     assert_eq!(names, ["run.sh"], "temp files left behind");
+}
+
+#[test]
+fn coding_gives_bash_the_host_timeout() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    assert_eq!(
+        bash.descriptor().timeout,
+        Some(std::time::Duration::from_secs(120))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelled_bash_reports_the_tail_of_its_output() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let cancel = CancelToken::new();
+    // 2-byte chars, so a 4 KiB cut from an odd total lands mid-character.
+    let (running, _) = start(
+        bash,
+        &root,
+        "printf '#'; printf 'é%.0s' $(seq 5000); echo end >&2; echo 1 > ready; exec sleep 100",
+        &["ready"],
+        cancel.clone(),
+    )
+    .await;
+
+    cancel.cancel();
+    let error = running.await.unwrap().unwrap_err();
+    let ToolError::Cancelled { message } = error else {
+        panic!("{error:?}");
+    };
+    assert!(message.ends_with("[stderr]\nend\n"), "{}", tail(&message));
+    assert!(message.contains("éé"), "{}", tail(&message));
+    assert!(!message.contains('#'), "only the tail is kept");
+    assert!(message.len() <= 4096 + 100, "{} bytes", message.len());
+}
+
+fn is_denied(result: &Result<String, ToolError>) -> bool {
+    matches!(result, Err(ToolError::Denied { .. }))
+}
+
+#[tokio::test]
+async fn any_symlink_on_the_path_is_denied_even_inside_the_root() {
+    let (dir, root) = root();
+    std::fs::create_dir(root.join("real")).unwrap();
+    std::fs::write(root.join("real/f.txt"), "inside").unwrap();
+    std::fs::create_dir(dir.path().join("out")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("in_dir")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("out"), root.join("out_dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("real/f.txt"), root.join("in_file")).unwrap();
+    let tools = full_access(&root);
+
+    for path in ["in_dir/f.txt", "out_dir/f.txt", "in_file"] {
+        let read = call(
+            &tool(&tools, "read_file"),
+            serde_json::json!({ "path": path }),
+        )
+        .await;
+        assert!(is_denied(&read), "read {path}: {read:?}");
+        let write = call(
+            &tool(&tools, "write_file"),
+            serde_json::json!({ "path": path, "content": "x" }),
+        )
+        .await;
+        assert!(is_denied(&write), "write {path}: {write:?}");
+        let edit = call(
+            &tool(&tools, "edit_file"),
+            serde_json::json!({ "path": path, "old_string": "inside", "new_string": "x" }),
+        )
+        .await;
+        assert!(is_denied(&edit), "edit {path}: {edit:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("real/f.txt")).unwrap(),
+        "inside"
+    );
+    assert!(
+        std::fs::read_dir(dir.path().join("out"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("in_file"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[tokio::test]
+async fn write_file_creates_missing_parent_directories() {
+    let (_dir, root) = root();
+    let tools = full_access(&root);
+    call(
+        &tool(&tools, "write_file"),
+        serde_json::json!({ "path": "a/b/c/f.txt", "content": "deep" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a/b/c/f.txt")).unwrap(),
+        "deep"
+    );
+}
+
+#[tokio::test]
+async fn grep_and_list_dir_do_not_enter_symlinked_directories() {
+    let (dir, root) = root();
+    let outside = dir.path().join("out");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("s.txt"), "needle\n").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    std::fs::write(root.join("a.txt"), "needle\n").unwrap();
+    let tools = read_only(root.clone()).unwrap();
+    let grep = tool(&tools, "grep");
+    let list = tool(&tools, "list_dir");
+
+    assert_eq!(
+        call(&grep, serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap(),
+        "a.txt:1: needle\n"
+    );
+    assert_eq!(
+        call(&list, serde_json::json!({})).await.unwrap(),
+        "a.txt\nlink"
+    );
+    let grep_link = call(
+        &grep,
+        serde_json::json!({ "pattern": "needle", "path": "link" }),
+    )
+    .await;
+    assert!(is_denied(&grep_link), "{grep_link:?}");
+    let list_link = call(&list, serde_json::json!({ "path": "link" })).await;
+    assert!(is_denied(&list_link), "{list_link:?}");
+}
+
+/// A background thread keeps swapping an intermediate directory with a
+/// symlink to outside the root while the tools run; nothing outside is ever
+/// read or written.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn swapping_a_directory_for_a_symlink_mid_call_never_escapes() {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (dir, root) = root();
+    let outside = dir.path().join("out");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    std::fs::create_dir(root.join("mid")).unwrap();
+    std::fs::write(root.join("mid/secret.txt"), "inside").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("swap")).unwrap();
+    let tools = full_access(&root);
+    let read = tool(&tools, "read_file");
+    let write = tool(&tools, "write_file");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = std::thread::spawn({
+        let (stop, root) = (stop.clone(), root.clone());
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                renameat_with(
+                    CWD,
+                    root.join("mid"),
+                    CWD,
+                    root.join("swap"),
+                    RenameFlags::EXCHANGE,
+                )
+                .unwrap();
+            }
+        }
+    });
+    for _ in 0..2000 {
+        let read = call(&read, serde_json::json!({ "path": "mid/secret.txt" })).await;
+        assert!(
+            matches!(&read, Ok(text) if text == "inside") || is_denied(&read),
+            "{read:?}"
+        );
+        let write = call(
+            &write,
+            serde_json::json!({ "path": "mid/new.txt", "content": "x" }),
+        )
+        .await;
+        assert!(write.is_ok() || is_denied(&write), "{write:?}");
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+
+    let names: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["secret.txt"]);
 }

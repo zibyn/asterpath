@@ -84,6 +84,7 @@ impl Scenario {
                     vec![Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("done")],
+                        raw: None,
                     }],
                     StopReason::EndTurn,
                     Usage::default(),

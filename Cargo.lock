@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-protocol",
  "reqwest",
+ "serde_json",
 ]
 
 [[package]]
@@ -233,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-protocol",
  "asterpath-testing",
+ "futures-channel",
  "futures-core",
  "futures-executor",
  "futures-util",
@@ -262,6 +264,8 @@ dependencies = [
  "asterpath-protocol",
  "asterpath-testing",
  "futures-core",
+ "libc",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

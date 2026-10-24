@@ -57,6 +57,7 @@ fn assistant(value: &str) -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }]
 }
 
@@ -371,6 +372,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
         vec![Item::Message {
             role: Role::User,
             parts: vec![text("summarize the file")],
+            raw: None,
         }]
     );
     assert_eq!(requests[1].system, vec![text("inherited system")]);
@@ -405,6 +407,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
                     Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("working")],
+                        raw: None,
                     },
                     tool_call("echo", r#"{"q":"hi"}"#),
                 ],
@@ -416,6 +419,7 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
                     Item::Message {
                         role: Role::Assistant,
                         parts: vec![text("still working")],
+                        raw: None,
                     },
                     tool_call("echo", r#"{"q":"again"}"#),
                 ],
@@ -683,6 +687,7 @@ impl Provider for RoutingProvider {
             Item::Message {
                 role: Role::User,
                 parts,
+                ..
             } => parts.iter().find_map(|part| match part {
                 Part::Text { text } if text.starts_with("task-") => Some(text.clone()),
                 _ => None,
@@ -1093,6 +1098,15 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
                 == 2
     })
     .await;
+    // Appends yield (#97), so wait until the child is materialized and its
+    // turn is open; cancelling earlier drops the spawn before the child runs.
+    let child = wait_for_child(&asterpath, parent).await;
+    wait_for(&asterpath, child, "the child's open turn", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnStarted { .. }))
+    })
+    .await;
     handle.cancel().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), driver)
         .await
@@ -1135,7 +1149,7 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
     ));
 
     // The child got the cancellation and closed its own turn.
-    let child = spawned_children(&entries)[0];
+    assert_eq!(spawned_children(&entries), [child]);
     let child_events = decoded(&scan(asterpath.store(), child).await);
     assert!(matches!(
         child_events.last(),

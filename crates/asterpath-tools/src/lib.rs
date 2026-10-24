@@ -4,12 +4,20 @@
 //! Each tool is built for one absolute root directory; every path argument is
 //! resolved against it and anything that leaves it is `Denied`. A host serving
 //! several projects builds one tool set (and one `Asterpath`) per project.
+//!
+//! The file tools open each path component by component beneath the root
+//! without following symlinks, and read and write through those descriptors,
+//! so a path swapped for a symlink mid-call cannot escape. Any symlink on a
+//! path argument is therefore `Denied`, even one pointing inside the root;
+//! `list_dir` and `grep` show or skip symlinks but never enter them. On
+//! non-Unix platforms the file tools always return `Denied`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use asterpath_protocol::{
     ConfinedSpawn, Parallelism, Part, Provenance, ReplaySafety, SandboxPolicy, SandboxProvider,
@@ -19,6 +27,9 @@ use asterpath_protocol::{
 use futures_core::future::BoxFuture;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+#[cfg(unix)]
+mod fs;
 
 /// Construction failed because the root is not an absolute path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,16 +54,17 @@ pub fn read_only(root: PathBuf) -> Tools {
     ])
 }
 
-/// [`read_only`] plus `write_file`, `edit_file` and `bash`.
+/// [`read_only`] plus `write_file`, `edit_file` and `bash` (see [`bash`] for `timeout`).
 pub fn coding(
     root: PathBuf,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
+    timeout: Duration,
 ) -> Tools {
     let mut tools = read_only(root.clone())?;
     tools.push(write_file(root.clone())?);
     tools.push(edit_file(root.clone())?);
-    tools.push(bash(root, sandbox, policy)?);
+    tools.push(bash(root, sandbox, policy, timeout)?);
     Ok(tools)
 }
 
@@ -142,14 +154,31 @@ pub fn edit_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 
 /// Runs `bash -c <command>` in the root through `sandbox`. Without a provider
 /// only `FullAccess` starts a process; any other policy fails closed.
+///
+/// On Unix the process (the sandbox launcher, if any) leads its own process
+/// group. Cancelling sends the group SIGTERM, then SIGKILL after 500ms;
+/// dropping the call mid-run SIGKILLs the group. After bash exits the pipes
+/// are read for at most 1s more, so a background process holding them cannot
+/// hang the call; the output then says reading stopped. After a successful
+/// exit, background processes keep running and are no longer subject to
+/// cancellation. Elsewhere only bash itself is killed.
+///
+/// `timeout` becomes the descriptor's deadline: the engine cancels the call
+/// when it expires and records a `Timeout` carrying the tail of the output.
+/// The model cannot change it.
 pub fn bash(
     root: PathBuf,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
+    timeout: Duration,
 ) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Bash { sandbox, policy },
+        Op::Bash {
+            sandbox,
+            policy,
+            timeout,
+        },
         "bash",
         "Run a bash command with the project root as the working directory. Returns stdout, stderr and the exit status.",
         serde_json::json!({
@@ -160,6 +189,9 @@ pub fn bash(
         }),
     )
 }
+
+/// A host default for [`bash`]'s `timeout`.
+pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on what any tool reads into memory or returns; the pipeline
 /// truncates further to `ToolConfig::max_output_bytes`.
@@ -179,6 +211,7 @@ enum Op {
     Bash {
         sandbox: Option<Arc<dyn SandboxProvider>>,
         policy: SandboxPolicy,
+        timeout: Duration,
     },
 }
 
@@ -220,7 +253,10 @@ impl RootTool {
                 SideEffect::Mutating
             },
             provenance: Provenance::InProcess,
-            timeout: None,
+            timeout: match &op {
+                Op::Bash { timeout, .. } => Some(*timeout),
+                Op::Fs(_) => None,
+            },
             max_output_bytes: None,
         };
         Ok(Arc::new(Self {
@@ -240,114 +276,36 @@ impl RootTool {
                         message: format!("tool task failed: {error}"),
                     })?
             }
-            Op::Bash { sandbox, policy } => {
-                // shortcut: no default timeout, so a command that never exits runs until the host cancels; set descriptor.timeout once a policy for unattended hosts is decided.
+            Op::Bash {
+                sandbox, policy, ..
+            } => {
                 let args: BashArgs = parse(&args)?;
-                let root = resolve(&self.root, ".")?;
+                let root = self
+                    .root
+                    .canonicalize()
+                    .map_err(|error| ToolError::Internal {
+                        message: format!(
+                            "cannot open project root {}: {error}",
+                            self.root.display()
+                        ),
+                    })?;
                 run_bash(&root, &args.command, sandbox.as_deref(), policy, &ctx).await
             }
         }
     }
 }
 
-/// Resolve `relative` inside the root. The deepest existing ancestor is
-/// canonicalized, so `..`, absolute paths and symlinks that leave the root
-/// are all caught; the not-yet-existing tail is plain names only.
-// shortcut: check-then-use, so a symlink swapped in between can escape; open with O_NOFOLLOW per component if hosts run untrusted concurrent writers.
-fn resolve(root: &Path, relative: &str) -> Result<PathBuf, ToolError> {
-    let denied = || ToolError::Denied {
-        message: format!("path is outside the project root: {relative}"),
-    };
-    let relative = Path::new(relative);
-    if relative
-        .components()
-        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(denied());
-    }
-    let root = root.canonicalize().map_err(|error| ToolError::Internal {
-        message: format!("cannot open project root {}: {error}", root.display()),
-    })?;
-    let path = root.join(relative);
-    let mut existing = path.as_path();
-    while existing.symlink_metadata().is_err() {
-        existing = existing.parent().ok_or_else(denied)?;
-    }
-    // A dangling symlink fails to canonicalize: deny rather than follow it.
-    let real = existing.canonicalize().map_err(|_| denied())?;
-    if !real.starts_with(&root) {
-        return Err(denied());
-    }
-    let tail = path.strip_prefix(existing).expect("ancestor of path");
-    // `join("")` would append a trailing slash and make a file look like a directory.
-    Ok(if tail.as_os_str().is_empty() {
-        real
-    } else {
-        real.join(tail)
-    })
-}
+#[cfg(unix)]
+use fs::run as run_fs;
 
-fn run_fs(root: &Path, op: FsOp, args: &ToolArgs, ctx: &ToolContext) -> Result<String, ToolError> {
-    match op {
-        FsOp::Read => {
-            let args: PathArgs = parse(args)?;
-            read_capped(&resolve(root, &args.path)?, &args.path)
-        }
-        FsOp::List => {
-            let args: ListArgs = parse(args)?;
-            let relative = args.path.as_deref().unwrap_or(".");
-            list(&resolve(root, relative)?, relative)
-        }
-        FsOp::Grep => {
-            let args: GrepArgs = parse(args)?;
-            if args.pattern.is_empty() {
-                return Err(invalid("pattern must not be empty"));
-            }
-            let relative = args.path.as_deref().unwrap_or(".");
-            let start = resolve(root, relative)?;
-            let root = resolve(root, ".")?;
-            let mut out = String::new();
-            search(&root, &start, &args.pattern, ctx, &mut out)?;
-            if out.len() >= MAX_BYTES {
-                out.push_str("[output truncated]\n");
-            }
-            Ok(out)
-        }
-        FsOp::Write => {
-            let args: WriteArgs = parse(args)?;
-            let path = resolve(root, &args.path)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| io(&args.path, error))?;
-            }
-            replace_file(&path, args.content.as_bytes()).map_err(|error| io(&args.path, error))?;
-            Ok(format!(
-                "wrote {} bytes to {}",
-                args.content.len(),
-                args.path
-            ))
-        }
-        FsOp::Edit => {
-            let args: EditArgs = parse(args)?;
-            if args.old_string.is_empty() {
-                return Err(invalid("old_string must not be empty"));
-            }
-            let path = resolve(root, &args.path)?;
-            let content = read_text(&path, &args.path)?;
-            match content.matches(&args.old_string).count() {
-                1 => {}
-                0 => return Err(invalid(format!("old_string not found in {}", args.path))),
-                count => {
-                    return Err(invalid(format!(
-                        "old_string occurs {count} times in {}; it must be unique",
-                        args.path
-                    )));
-                }
-            }
-            let updated = content.replacen(&args.old_string, &args.new_string, 1);
-            replace_file(&path, updated.as_bytes()).map_err(|error| io(&args.path, error))?;
-            Ok(format!("edited {}", args.path))
-        }
-    }
+/// File tools need `openat(O_NOFOLLOW)` to stay beneath the root; without it
+/// they fail closed (ADR-0019).
+// shortcut: non-Unix hosts get no file tools, add a handle-relative backend when one ships there.
+#[cfg(not(unix))]
+fn run_fs(_: &Path, _: FsOp, _: &ToolArgs, _: &ToolContext) -> Result<String, ToolError> {
+    Err(ToolError::Denied {
+        message: "file tools are only supported on Unix".to_owned(),
+    })
 }
 
 impl Tool for RootTool {
@@ -428,138 +386,6 @@ fn io(relative: &str, error: std::io::Error) -> ToolError {
     }
 }
 
-fn read_text(path: &Path, relative: &str) -> Result<String, ToolError> {
-    let bytes = std::fs::read(path).map_err(|error| io(relative, error))?;
-    String::from_utf8(bytes).map_err(|_| invalid(format!("{relative} is not valid UTF-8")))
-}
-
-/// The first [`MAX_BYTES`] of a UTF-8 file, with a marker when it is longer.
-fn read_capped(path: &Path, relative: &str) -> Result<String, ToolError> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|error| io(relative, error))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io(relative, error))?;
-    let truncated = bytes.len() > MAX_BYTES;
-    bytes.truncate(MAX_BYTES);
-    let mut text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        // Only a character cut by the cap may be incomplete; anything else is not UTF-8.
-        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
-            let valid = error.utf8_error().valid_up_to();
-            let mut bytes = error.into_bytes();
-            bytes.truncate(valid);
-            String::from_utf8(bytes).expect("valid prefix")
-        }
-        Err(_) => return Err(invalid(format!("{relative} is not valid UTF-8"))),
-    };
-    if truncated {
-        text.push_str(&format!(
-            "\n[truncated: {relative} is larger than {MAX_BYTES} bytes]"
-        ));
-    }
-    Ok(text)
-}
-
-/// Write `contents` to a temp file beside `path`, then rename it over `path`,
-/// so a crash leaves either the old or the new file. Keeps an existing mode.
-fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut name = OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let temp = path.with_file_name(name);
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(contents)?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            file.set_permissions(meta.permissions())?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&temp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
-fn list(path: &Path, relative: &str) -> Result<String, ToolError> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(|error| io(relative, error))? {
-        let entry = entry.map_err(|error| io(relative, error))?;
-        let mut name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            name.push('/');
-        }
-        names.push(name);
-    }
-    names.sort();
-    Ok(names.join("\n"))
-}
-
-/// Depth-first literal search. Symlinks are not followed, so the walk never
-/// leaves the root; `.git` and files that are not UTF-8 are skipped. Stops
-/// once `out` reaches [`MAX_BYTES`].
-fn search(
-    root: &Path,
-    path: &Path,
-    pattern: &str,
-    ctx: &ToolContext,
-    out: &mut String,
-) -> Result<(), ToolError> {
-    if ctx.cancel.is_cancelled() {
-        return Err(ToolError::Cancelled {
-            message: "grep cancelled".to_owned(),
-        });
-    }
-    if out.len() >= MAX_BYTES || path.file_name() == Some(OsStr::new(".git")) {
-        return Ok(());
-    }
-    let display = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
-    let kind = path
-        .symlink_metadata()
-        .map_err(|error| io(&display, error))?
-        .file_type();
-    if kind.is_dir() {
-        let mut children: Vec<PathBuf> = std::fs::read_dir(path)
-            .map_err(|error| io(&display, error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
-        children.sort();
-        for child in children {
-            search(root, &child, pattern, ctx, out)?;
-        }
-    } else if kind.is_file()
-        && let Ok(text) = std::fs::read_to_string(path)
-    {
-        for (number, line) in text.lines().enumerate() {
-            if out.len() >= MAX_BYTES {
-                break;
-            }
-            if line.contains(pattern) {
-                out.push_str(&format!("{display}:{}: {line}\n", number + 1));
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn run_bash(
     root: &Path,
     command: &str,
@@ -590,27 +416,100 @@ async fn run_bash(
         .envs(&confined.env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
+    // Own process group (the sandbox launcher's, if any), so killpg reaches every descendant.
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(not(unix))]
+    process.kill_on_drop(true);
     if let Some(cwd) = &confined.cwd {
         process.current_dir(cwd);
     }
-    // shortcut: kill_on_drop signals only the direct child; put it in its own process group and killpg if backgrounded grandchildren must die too.
     let mut child = process.spawn().map_err(|error| ToolError::Internal {
         message: format!("cannot start bash: {error}"),
     })?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let output = async { tokio::try_join!(drain(stdout), drain(stderr), child.wait()) };
-    let ((stdout, stdout_cut), (stderr, stderr_cut), status) = tokio::select! {
-        output = output => output.map_err(|error| ToolError::Internal {
-            message: format!("bash failed: {error}"),
-        })?,
-        () = ctx.cancel.cancelled() => {
-            return Err(ToolError::Cancelled { message: "bash cancelled".to_owned() });
+    let mut group = GroupGuard(child.id());
+    let out_pipe = child.stdout.take().expect("piped stdout");
+    let err_pipe = child.stderr.take().expect("piped stderr");
+    let (mut stdout, mut stdout_cut, mut stderr, mut stderr_cut) =
+        (Vec::new(), false, Vec::new(), false);
+    let failed = |error: std::io::Error| ToolError::Internal {
+        message: format!("bash failed: {error}"),
+    };
+    let mut read_done = false;
+    let output = {
+        let mut reads = std::pin::pin!(async {
+            tokio::try_join!(
+                drain(out_pipe, &mut stdout, &mut stdout_cut),
+                drain(err_pipe, &mut stderr, &mut stderr_cut)
+            )
+        });
+        let output = async {
+            let status = tokio::select! {
+                read = &mut reads => {
+                    read_done = true;
+                    read?;
+                    child.wait().await?
+                }
+                status = child.wait() => {
+                    group.disarm();
+                    let status = status?;
+                    // A background process that inherited the pipes may hold them open forever.
+                    // shortcut: such a process outlives a successful bash exit and its output
+                    // after READ_AFTER_EXIT is lost; kill the group on exit if hosts need that.
+                    match tokio::time::timeout(READ_AFTER_EXIT, &mut reads).await {
+                        Ok(read) => {
+                            read_done = true;
+                            read.map(|_| ())?
+                        }
+                        Err(_) => return Ok((status, false)),
+                    }
+                    status
+                }
+            };
+            group.disarm();
+            Ok::<_, std::io::Error>((status, true))
+        };
+        tokio::select! {
+            output = output => Some(output),
+            () = ctx.cancel.cancelled() => {
+                if let Some(pid) = group.0.take() {
+                    signal_group(pid, Signal::Term, true);
+                    let exited = tokio::time::timeout(KILL_WAIT, child.wait()).await.is_ok();
+                    // Even if bash exited, a descendant may have ignored SIGTERM. Once bash
+                    // is reaped its pid may be reused, so only the group is signalled.
+                    signal_group(pid, Signal::Kill, !exited);
+                }
+                // Keep what was already written: the pipes reach EOF once the group is dead.
+                if !read_done {
+                    let _ = tokio::time::timeout(KILL_WAIT, &mut reads).await;
+                }
+                None
+            }
         }
     };
+    let Some(output) = output else {
+        let mut message = String::from("bash stopped before exiting");
+        let mut seen = String::from_utf8_lossy(&stdout).into_owned();
+        if !stderr.is_empty() {
+            seen.push_str("\n[stderr]\n");
+            seen.push_str(&String::from_utf8_lossy(&stderr));
+        }
+        if !seen.is_empty() {
+            let mut start = seen.len().saturating_sub(CANCEL_TAIL);
+            while !seen.is_char_boundary(start) {
+                start += 1;
+            }
+            message.push_str("; last output:\n");
+            message.push_str(&seen[start..]);
+        }
+        return Err(ToolError::Cancelled { message });
+    };
+    let (status, drained) = output.map_err(failed)?;
     let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    if !drained {
+        text.push_str("\n[a background process still holds the output; stopped reading]");
+    }
     if stdout_cut {
         text.push_str("\n[stdout truncated]");
     }
@@ -627,18 +526,74 @@ async fn run_bash(
 
 /// Read `pipe` to the end, keeping the first [`MAX_BYTES`] / 2 bytes; draining
 /// the rest keeps the child from blocking on a full pipe.
-async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, bool)> {
+/// Writes into `kept`/`cut` as it goes, so a read abandoned midway keeps what arrived.
+async fn drain(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    kept: &mut Vec<u8>,
+    cut: &mut bool,
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut kept = Vec::new();
-    let mut cut = false;
     let mut buf = [0u8; 8192];
     loop {
         let read = pipe.read(&mut buf).await?;
         if read == 0 {
-            return Ok((kept, cut));
+            return Ok(());
         }
         let room = (MAX_BYTES / 2).saturating_sub(kept.len());
         kept.extend_from_slice(&buf[..read.min(room)]);
-        cut |= read > room;
+        *cut |= read > room;
     }
 }
+
+/// Bytes of captured output kept in the error when a run is cancelled.
+const CANCEL_TAIL: usize = 4096;
+/// How long to keep reading the pipes after bash exits.
+const READ_AFTER_EXIT: Duration = Duration::from_secs(1);
+/// Grace between SIGTERM and SIGKILL on cancel.
+const KILL_WAIT: Duration = Duration::from_millis(500);
+
+/// SIGKILLs bash's process group when dropped while armed (the `invoke`
+/// future was dropped mid-run); disarmed once bash has exited.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            signal_group(pid, Signal::Kill, true);
+        }
+    }
+}
+
+enum Signal {
+    Term,
+    Kill,
+}
+
+/// Signals the process group led by `pid`; if the group is already gone and
+/// `pid_fallback` (bash is not yet reaped, so `pid` is still ours), signals `pid`.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: Signal, pid_fallback: bool) {
+    // `kill(0)` would signal our own group; never do that.
+    if pid == 0 {
+        return;
+    }
+    let signal = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: kill(2) with our own child's pid and a valid signal.
+    if unsafe { libc::kill(-(pid as libc::pid_t), signal) } != 0 && pid_fallback {
+        // SAFETY: same child, direct-pid fallback.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+}
+
+/// Without process groups, dropping the child (`kill_on_drop`) kills bash only.
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: Signal, _pid_fallback: bool) {}

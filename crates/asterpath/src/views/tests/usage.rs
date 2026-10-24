@@ -37,6 +37,7 @@ fn assistant_items() -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text("hi")],
+        raw: None,
     }]
 }
 

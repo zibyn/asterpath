@@ -25,6 +25,7 @@ fn assistant_message(text: &str) -> Item {
         parts: vec![Part::Text {
             text: text.to_owned(),
         }],
+        raw: None,
     }
 }
 

@@ -4,15 +4,20 @@
 //! bytes. Persisted provider raw JSON is spliced into the content arrays
 //! verbatim and is never parsed or re-serialized.
 
+use asterpath_http::{
+    merge_provider_option, provider_option_conflict, provider_options_for, same_provider_raw_field,
+};
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
+    ToolChoice,
 };
 
-use crate::models::{Thinking, rules_for};
+use crate::models::{ModelRules, Thinking, rules_for};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// One rendered JSON fragment: ordinary values are serialized compactly,
 /// replayed provider raw data is inserted exactly as persisted.
 enum Frag {
@@ -110,8 +115,18 @@ pub(crate) fn check(
     }
     if let Some(reasoning) = &request.reasoning {
         let rules = rules_for(request.spec.model.as_str());
-        if reasoning.effort.is_some() && !rules.effort {
-            return Err(unsupported("reasoning.effort"));
+        if let Some(effort) = reasoning.effort
+            && !rules.efforts.contains(&effort)
+        {
+            return Err(unsupported(&format!(
+                "reasoning.effort {effort:?} on {}",
+                request.spec.model
+            )));
+        }
+        if reasoning.effort == Some(ReasoningEffort::Off) && reasoning.budget_tokens.is_some() {
+            return Err(invalid_request(
+                "reasoning.effort Off contradicts reasoning.budget_tokens",
+            ));
         }
         if reasoning.budget_tokens.is_some() {
             if rules.thinking == Thinking::Adaptive {
@@ -142,6 +157,7 @@ pub(crate) fn render(
     provider: &ProviderId,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
+    let options = provider_options_for(request, &[])?;
     let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let messages = render_messages(provider, request, &tools_hash)?;
 
@@ -211,28 +227,56 @@ pub(crate) fn render(
     if let Some(reasoning) = &request.reasoning {
         // check() has rejected combinations the model does not accept.
         let rules = rules_for(request.spec.model.as_str());
-        let thinking = match (reasoning.budget_tokens, rules.thinking) {
-            (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
-            (None, Thinking::Extended) => None,
-            (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
-        };
-        if let Some(mut thinking) = thinking {
-            if reasoning.summary && rules.thinking_display() {
-                thinking["display"] = json!("summarized");
+        if reasoning.effort == Some(ReasoningEffort::Off) {
+            if rules.thinking_default_on {
+                fields.push(("thinking", Frag::Json(json!({"type": "disabled"}))));
             }
-            fields.push(("thinking", Frag::Json(thinking)));
-        }
-        if let Some(effort) = reasoning.effort {
-            let effort = match effort {
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
-            };
-            fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+        } else {
+            render_reasoning(&mut fields, reasoning, rules);
         }
     }
+    if !request.stop_sequences.is_empty() {
+        fields.push(("stop_sequences", Frag::Json(json!(request.stop_sequences))));
+    }
     fields.push(("stream", Frag::Json(json!(true))));
+    for (key, value) in &options {
+        match fields.iter_mut().find(|(name, _)| name == key) {
+            Some((_, Frag::Json(existing))) => merge_provider_option(existing, value.clone(), key)?,
+            // Raw fragments (messages, f32 sampling values) are never merged into.
+            Some(_) => return Err(provider_option_conflict(key)),
+            None => fields.push((key.as_str(), Frag::Json(value.clone()))),
+        }
+    }
     Ok(object(fields))
+}
+
+fn render_reasoning(
+    fields: &mut Vec<(&str, Frag)>,
+    reasoning: &ReasoningParams,
+    rules: ModelRules,
+) {
+    let thinking = match (reasoning.budget_tokens, rules.thinking) {
+        (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
+        (None, Thinking::Extended) => None,
+        (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
+    };
+    if let Some(mut thinking) = thinking {
+        if reasoning.summary && rules.thinking_display() {
+            thinking["display"] = json!("summarized");
+        }
+        fields.push(("thinking", Frag::Json(thinking)));
+    }
+    if let Some(effort) = reasoning.effort {
+        let effort = match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+            _ => unreachable!("check rejects efforts missing from the model table"),
+        };
+        fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+    }
 }
 
 struct PendingMessage {
@@ -249,11 +293,22 @@ fn render_messages(
     let mut messages: Vec<PendingMessage> = Vec::new();
     for item in &request.items {
         match item {
-            Item::Message { role, parts } => {
-                let blocks: Vec<Frag> = parts
+            Item::Message { role, parts, raw } => {
+                let mut blocks: Vec<Frag> = parts
                     .iter()
                     .filter_map(|part| render_part(provider, part))
                     .collect();
+                // Only the text block's `citations` are merged from same-provider raw (ADR 0010).
+                if let Some(citations) =
+                    same_provider_raw_field(raw.as_ref(), provider, "citations").filter(
+                        |citations| citations.as_array().is_some_and(|list| !list.is_empty()),
+                    )
+                    && let Some(Frag::Json(block)) = blocks
+                        .iter_mut()
+                        .find(|block| matches!(block, Frag::Json(value) if value["type"] == "text"))
+                {
+                    block["citations"] = citations;
+                }
                 if !blocks.is_empty() {
                     push_blocks(&mut messages, role_name(*role), Vec::new(), blocks);
                 }

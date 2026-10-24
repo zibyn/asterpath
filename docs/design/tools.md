@@ -200,6 +200,8 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 
 - 单次调用取 `ToolDescriptor.timeout`；`None` 时进程内工具不设超时，external adapter 用默认 `120s`。
 - 到期：发取消信号 → 宽限 `kill_grace`（默认 5s）→ drop future / SIGKILL；写 `ToolResult{Failed, Timeout}`。
+- 到期时若回合与该调用都未被取消，工具在宽限内自报的 `Err(Cancelled)` 记为 `Failed{Timeout}`，保留工具的 message（工具只看到取消，引擎知道原因是 deadline）；回合取消引起的 `Cancelled` 不变。`Ok` 或其他错误照常记录。
+- 内置 `bash`（`asterpath-tools`）的 `timeout` 由宿主传入（`DEFAULT_BASH_TIMEOUT` = 120s），模型不能修改；被取消时 message 带已捕获输出的末尾（stdout/stderr 合计约 4 KiB），超时结果因此含部分输出。
 - 超时不重试。
 
 **取消**
