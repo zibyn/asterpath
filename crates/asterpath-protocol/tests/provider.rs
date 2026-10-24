@@ -153,6 +153,7 @@ fn capability_check_names_the_unsupported_feature() {
                 url: "https://example.invalid/x.png".to_owned(),
             },
         }],
+        raw: None,
     });
     assert_eq!(none.unsupported_feature(&image), Some("image input"));
 

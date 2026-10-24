@@ -219,6 +219,7 @@ fn completed() -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text("done")],
+        raw: None,
     }]
 }
 
@@ -337,6 +338,7 @@ async fn usage_survives_the_recovered_step() {
             items: vec![Item::Message {
                 role: Role::Assistant,
                 parts: vec![text("answer")],
+                raw: None,
             }],
             raw: None,
             model: model(),
@@ -1267,6 +1269,7 @@ async fn fork_child_first_request_is_the_snapshot_plus_the_task() {
             items: vec![Item::Message {
                 role: Role::User,
                 parts: vec![text("parent context")],
+                raw: None,
             }],
         },
         Some(dedup::context_forked(SESSION)),
@@ -1302,10 +1305,12 @@ async fn fork_child_first_request_is_the_snapshot_plus_the_task() {
             Item::Message {
                 role: Role::User,
                 parts: vec![text("parent context")],
+                raw: None,
             },
             Item::Message {
                 role: Role::User,
                 parts: vec![text("do the task")],
+                raw: None,
             },
         ],
         "the first request is the fork snapshot plus the task, nothing else"
@@ -1326,6 +1331,7 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
             items: vec![Item::Message {
                 role: Role::User,
                 parts: vec![text("parent context")],
+                raw: None,
             }],
         },
         Some(dedup::context_forked(SESSION)),

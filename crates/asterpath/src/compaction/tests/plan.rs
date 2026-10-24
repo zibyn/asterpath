@@ -20,6 +20,7 @@ fn message(role: Role, value: &str) -> Vec<Item> {
     vec![Item::Message {
         role,
         parts: vec![text(value)],
+        raw: None,
     }]
 }
 
@@ -253,6 +254,7 @@ fn summary_input_is_text_only() {
                             },
                         },
                     ],
+                    raw: None,
                 },
                 Item::ToolCall {
                     call_id: "call-1".to_owned(),

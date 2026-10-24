@@ -451,7 +451,11 @@ impl Normalizer {
                     Some("user") => Role::User,
                     _ => Role::Assistant,
                 };
-                Ok(Item::Message { role, parts })
+                Ok(Item::Message {
+                    role,
+                    parts,
+                    raw: Some(self.raw_data("openai.message", raw.get())),
+                })
             }
             "function_call" => {
                 let provider_item_id = item.id;

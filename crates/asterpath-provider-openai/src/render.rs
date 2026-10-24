@@ -2,12 +2,13 @@
 
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use crate::TraceSink;
+use crate::models::efforts_for;
 
 /// A protocol-level trace mark emitted while rendering.
 ///
@@ -159,6 +160,14 @@ fn validate(
     {
         return Err(unsupported("reasoning budget_tokens"));
     }
+    if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
+        && !efforts_for(request.spec.model.as_str()).contains(&effort)
+    {
+        return Err(unsupported(&format!(
+            "reasoning effort {effort:?} on {}",
+            request.spec.model
+        )));
+    }
     Ok(())
 }
 
@@ -188,9 +197,14 @@ fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
         object.insert(
             "effort".to_owned(),
             json!(match effort {
-                asterpath_protocol::ReasoningEffort::Low => "low",
-                asterpath_protocol::ReasoningEffort::Medium => "medium",
-                asterpath_protocol::ReasoningEffort::High => "high",
+                ReasoningEffort::Off => "none",
+                ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+                ReasoningEffort::XHigh => "xhigh",
+                ReasoningEffort::Max => "max",
+                _ => unreachable!("validate rejects efforts missing from the model table"),
             }),
         );
     }
@@ -209,8 +223,22 @@ fn render_input(
     let mut input = Vec::with_capacity(request.items.len());
     for item in &request.items {
         match item {
-            Item::Message { role, parts } => {
-                input.push(raw(message_item(*role, parts, provider, trace)?)?);
+            Item::Message {
+                role,
+                parts,
+                raw: data,
+            } => {
+                let mut message = message_item(*role, parts, provider, trace)?;
+                // Only `phase` is merged from same-provider raw; the id is never replayed (ADR 0010).
+                if let Some(phase) = data
+                    .as_ref()
+                    .filter(|data| &data.provider == provider)
+                    .and_then(|data| serde_json::from_str::<Value>(data.json.as_str()).ok())
+                    .and_then(|mut value| value.get_mut("phase").map(Value::take))
+                {
+                    message["phase"] = phase;
+                }
+                input.push(raw(message)?);
             }
             Item::Reasoning {
                 binding, raw: data, ..

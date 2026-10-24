@@ -67,6 +67,7 @@ fn request(wire_provider: &dyn Provider) -> ModelRequest {
             parts: vec![Part::Text {
                 text: "hi".to_owned(),
             }],
+            raw: None,
         }],
         Vec::new(),
         &RequestConfig::default(),

@@ -83,6 +83,7 @@ fn user_text(text: &str) -> Item {
         parts: vec![Part::Text {
             text: text.to_owned(),
         }],
+        raw: None,
     }
 }
 
@@ -236,13 +237,21 @@ fn completed_text_body(text: &str) -> String {
     ])
 }
 
-fn completed_item(text: &str) -> Item {
-    Item::Message {
-        role: Role::Assistant,
-        parts: vec![Part::Text {
-            text: text.to_owned(),
-        }],
+fn assistant_parts(item: &Item) -> &[Part] {
+    match item {
+        Item::Message {
+            role: Role::Assistant,
+            parts,
+            ..
+        } => parts,
+        other => panic!("expected an assistant message, got {other:?}"),
     }
+}
+
+fn texts(text: &str) -> Vec<Part> {
+    vec![Part::Text {
+        text: text.to_owned(),
+    }]
 }
 
 fn response_ended(events: &[Result<StreamEvent, ProviderError>]) -> (StopReason, Usage) {
@@ -344,6 +353,7 @@ async fn user_images_render_as_input_image() {
                 },
             },
         ],
+        raw: None,
     }]);
     let events = collect(&provider, image).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
@@ -422,8 +432,8 @@ async fn interleaved_items_are_normalized_by_output_index() {
     assert_eq!(completed[0].0, 1, "provider completion order is preserved");
     assert_eq!(completed[1].0, 0);
     let by_index: std::collections::BTreeMap<u32, Item> = completed.into_iter().collect();
-    assert_eq!(by_index[&0], completed_item("first"));
-    assert_eq!(by_index[&1], completed_item("second"));
+    assert_eq!(assistant_parts(&by_index[&0]), texts("first"));
+    assert_eq!(assistant_parts(&by_index[&1]), texts("second"));
 
     let mut last_sequence = None;
     for event in events {
@@ -910,13 +920,10 @@ async fn refusal_parts_survive_with_a_refusal_stop_reason() {
     ]))]);
     let events = collect(&provider(&server), request(vec![user_text("go")])).await;
     assert_eq!(
-        completed_items(&events)[0].1,
-        Item::Message {
-            role: Role::Assistant,
-            parts: vec![Part::Refusal {
-                text: "I cannot do that".to_owned()
-            }],
-        }
+        assistant_parts(&completed_items(&events)[0].1),
+        [Part::Refusal {
+            text: "I cannot do that".to_owned()
+        }]
     );
     assert_eq!(response_ended(&events).0, StopReason::Refusal);
 }
@@ -1007,6 +1014,7 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
                 data: "AAAA".to_owned(),
             },
         }],
+        raw: None,
     }]);
 
     for request in [top_k, seed, budget, image] {
@@ -1211,4 +1219,163 @@ impl asterpath_testing::ProviderWire for OpenAiWire {
 #[tokio::test]
 async fn openai_satisfies_the_provider_contract() {
     asterpath_testing::provider_contract(&OpenAiWire).await;
+}
+
+fn assistant_with_raw(text: &str, raw: Option<RawProviderData>) -> Item {
+    Item::Message {
+        role: Role::Assistant,
+        parts: vec![Part::Text {
+            text: text.to_owned(),
+        }],
+        raw,
+    }
+}
+
+async fn rendered_input(item: Item) -> Value {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
+    let events = collect(&provider(&server), request(vec![item])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    body["input"][0].clone()
+}
+
+#[tokio::test]
+async fn message_phase_round_trips_to_the_same_provider_without_its_id() {
+    let mut item = message_item("msg_1", "Looking into it");
+    item["phase"] = json!("commentary");
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, item.clone()),
+        done(2, 0, item.clone()),
+        completed(3, vec![item.clone()], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("hi")])).await;
+    let (_, parsed) = completed_items(&events).remove(0);
+    let Item::Message { raw: Some(raw), .. } = &parsed else {
+        panic!("message carries raw: {parsed:?}");
+    };
+    assert_eq!(raw.provider, ProviderId::new("openai"));
+    assert_eq!(
+        serde_json::from_str::<Value>(raw.json.as_str()).unwrap(),
+        item
+    );
+
+    let rendered = rendered_input(parsed).await;
+    assert_eq!(rendered["phase"], json!("commentary"));
+    assert!(rendered.get("id").is_none(), "{rendered}");
+    assert_eq!(rendered["content"][0]["text"], json!("Looking into it"));
+}
+
+#[tokio::test]
+async fn message_raw_without_phase_renders_like_no_raw() {
+    let raw = raw_data(
+        "openai",
+        "openai.message",
+        &message_item("msg_1", "old").to_string(),
+    );
+    assert_eq!(
+        rendered_input(assistant_with_raw("hello", Some(raw))).await,
+        rendered_input(assistant_with_raw("hello", None)).await
+    );
+}
+
+#[tokio::test]
+async fn rewritten_message_text_wins_over_raw() {
+    let mut item = message_item("msg_1", "old text");
+    item["phase"] = json!("final_answer");
+    let raw = raw_data("openai", "openai.message", &item.to_string());
+    let rendered = rendered_input(assistant_with_raw("new text", Some(raw))).await;
+    assert_eq!(rendered["content"][0]["text"], json!("new text"));
+    assert_eq!(rendered["phase"], json!("final_answer"));
+    assert!(!rendered.to_string().contains("old text"));
+}
+
+#[tokio::test]
+async fn message_raw_from_another_provider_is_ignored() {
+    let mut item = message_item("msg_1", "hello");
+    item["phase"] = json!("commentary");
+    let raw = raw_data("other", "other.message", &item.to_string());
+    assert_eq!(
+        rendered_input(assistant_with_raw("hello", Some(raw))).await,
+        rendered_input(assistant_with_raw("hello", None)).await
+    );
+}
+
+fn with_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> ModelRequest {
+    let mut request = request(vec![user_text("hello")]);
+    request.spec = spec(model);
+    request.reasoning = Some(asterpath_protocol::ReasoningParams {
+        effort: Some(effort),
+        ..asterpath_protocol::ReasoningParams::default()
+    });
+    request
+}
+
+#[tokio::test]
+async fn every_effort_renders_its_wire_value_on_a_model_that_accepts_it() {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Max, Medium, Minimal, Off, XHigh};
+    let cases = [
+        ("gpt-6-luna", Off, "none"),
+        ("gpt-5", Minimal, "minimal"),
+        ("gpt-6.1-sol", Low, "low"),
+        ("gpt-6.1-sol", Medium, "medium"),
+        ("gpt-5", High, "high"),
+        ("gpt-5.5", XHigh, "xhigh"),
+        ("gpt-6-astra", Max, "max"),
+    ];
+    let server = MockServer::start(
+        cases
+            .iter()
+            .map(|_| MockResponse::sse(completed_text_body("Hi")))
+            .collect(),
+    );
+    let provider = provider(&server);
+    for (model, effort, _) in cases {
+        let events = collect(&provider, with_effort(model, effort)).await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "{model} {effort:?}: {events:?}"
+        );
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), cases.len());
+    for (recorded, (model, _, wire)) in recorded.iter().zip(cases) {
+        let body: Value = serde_json::from_str(&recorded.body).expect("request json");
+        assert_eq!(body["reasoning"], json!({"effort": wire}), "{model}");
+    }
+}
+
+#[tokio::test]
+async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Max, Minimal, Off, XHigh};
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    for (model, effort) in [
+        ("gpt-6.1-sol", Off),
+        ("gpt-6.1-sol", Minimal),
+        ("gpt-6-astra", Off),
+        ("gpt-5", Off),
+        ("gpt-5", XHigh),
+        ("gpt-5.5", Max),
+        ("gpt-5.1", Minimal),
+        ("gpt-5-pro", Low),
+        ("gpt-5.5-pro", Low),
+        ("gpt-5.4-pro", Off),
+        // Unknown ids get the newest rules (GPT-6.1 Sol): no `none`.
+        ("gpt-next", Off),
+    ] {
+        let events = collect(&provider, with_effort(model, effort)).await;
+        let error = events[0].as_ref().expect_err("unsupported");
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::Unsupported,
+            "{model} {effort:?}"
+        );
+        assert!(error.message.contains(&format!("{effort:?}")), "{error:?}");
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let events = collect(&self::provider(&server), with_effort("gpt-next", High)).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
 }

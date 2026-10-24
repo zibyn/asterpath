@@ -59,6 +59,7 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
                     vec![Item::Message {
                         role: crate::item::Role::User,
                         parts: input,
+                        raw: None,
                     }],
                 );
             }

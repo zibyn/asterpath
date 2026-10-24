@@ -64,6 +64,7 @@ pub enum Item {
     Message {
         role: Role,
         parts: Vec<Part>,
+        raw: Option<RawProviderData>,   // 同 provider 回放只合并 phase / citations（ADR 0010）
     },
     Reasoning {
         summary: Vec<Part>,             // 模型可见的摘要/思考文本；可空
@@ -226,11 +227,17 @@ pub struct ReasoningParams {
     pub summary: bool,                   // OpenAI reasoning.summary；Anthropic 忽略
 }
 
+#[non_exhaustive]
 pub enum ReasoningEffort {
+    Off,      // OpenAI none；Anthropic 不发 thinking 与 effort
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
+// 模型不接受该档位 → Unsupported，不就近映射（各 adapter 的 models.rs 规则表）
 ```
 
 请求规则：
@@ -629,7 +636,7 @@ pub enum ProviderErrorKind {
 
 | Anthropic | 规范 |
 | --- | --- |
-| `text` | `Item::Message { role: Assistant, parts: [Text] }` |
+| `text` | `Item::Message { role: Assistant, parts: [Text], raw }`；raw 为完整 block（含累积的 `citations`） |
 | `thinking` | `Item::Reasoning { summary: [Text], binding, raw }` |
 | `redacted_thinking` | `Item::Reasoning { summary: [], binding, raw }` |
 | `tool_use` | `Item::ToolCall`；`call_id = tool_use.id` |
@@ -645,7 +652,7 @@ pub enum ProviderErrorKind {
 
 | OpenAI | 规范 |
 | --- | --- |
-| `message` + `output_text` | `Item::Message { role: Assistant, parts: [Text] }` |
+| `message` + `output_text` | `Item::Message { role: Assistant, parts: [Text], raw }`；raw 为原始 output item（含 `phase`） |
 | `message` + `refusal` | `Part::Refusal` |
 | `function_call` | `Item::ToolCall`；`call_id = call_id`，`provider_item_id = id` |
 | `reasoning` | `Item::Reasoning`；`summary` 来自 summary 文本，`raw` 含 `encrypted_content` |

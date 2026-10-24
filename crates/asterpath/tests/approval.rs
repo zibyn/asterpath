@@ -169,6 +169,7 @@ async fn dropped_stream_redrive_requests_the_same_approval_again() {
                 vec![Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("done")],
+                    raw: None,
                 }],
                 StopReason::EndTurn,
                 Usage::default(),
@@ -247,6 +248,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
                 vec![Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("done")],
+                    raw: None,
                 }],
                 StopReason::EndTurn,
                 Usage::default(),
@@ -476,6 +478,7 @@ async fn recorded_decision_is_reused_without_reprompting() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("done")],
+            raw: None,
         }],
         StopReason::EndTurn,
         Usage::default(),
@@ -582,6 +585,7 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("done")],
+            raw: None,
         }],
         StopReason::EndTurn,
         Usage::default(),
@@ -813,6 +817,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text(value)],
+            raw: None,
         }]
     };
     let provider = Arc::new(

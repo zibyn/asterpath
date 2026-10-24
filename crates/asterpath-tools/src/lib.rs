@@ -4,11 +4,18 @@
 //! Each tool is built for one absolute root directory; every path argument is
 //! resolved against it and anything that leaves it is `Denied`. A host serving
 //! several projects builds one tool set (and one `Asterpath`) per project.
+//!
+//! The file tools open each path component by component beneath the root
+//! without following symlinks, and read and write through those descriptors,
+//! so a path swapped for a symlink mid-call cannot escape. Any symlink on a
+//! path argument is therefore `Denied`, even one pointing inside the root;
+//! `list_dir` and `grep` show or skip symlinks but never enter them. On
+//! non-Unix platforms the file tools always return `Denied`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +27,9 @@ use asterpath_protocol::{
 use futures_core::future::BoxFuture;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+#[cfg(unix)]
+mod fs;
 
 /// Construction failed because the root is not an absolute path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,111 +280,31 @@ impl RootTool {
                 sandbox, policy, ..
             } => {
                 let args: BashArgs = parse(&args)?;
-                let root = resolve(&self.root, ".")?;
+                let root = self
+                    .root
+                    .canonicalize()
+                    .map_err(|error| ToolError::Internal {
+                        message: format!(
+                            "cannot open project root {}: {error}",
+                            self.root.display()
+                        ),
+                    })?;
                 run_bash(&root, &args.command, sandbox.as_deref(), policy, &ctx).await
             }
         }
     }
 }
 
-/// Resolve `relative` inside the root. The deepest existing ancestor is
-/// canonicalized, so `..`, absolute paths and symlinks that leave the root
-/// are all caught; the not-yet-existing tail is plain names only.
-// shortcut: check-then-use, so a symlink swapped in between can escape; open with O_NOFOLLOW per component if hosts run untrusted concurrent writers.
-fn resolve(root: &Path, relative: &str) -> Result<PathBuf, ToolError> {
-    let denied = || ToolError::Denied {
-        message: format!("path is outside the project root: {relative}"),
-    };
-    let relative = Path::new(relative);
-    if relative
-        .components()
-        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(denied());
-    }
-    let root = root.canonicalize().map_err(|error| ToolError::Internal {
-        message: format!("cannot open project root {}: {error}", root.display()),
-    })?;
-    let path = root.join(relative);
-    let mut existing = path.as_path();
-    while existing.symlink_metadata().is_err() {
-        existing = existing.parent().ok_or_else(denied)?;
-    }
-    // A dangling symlink fails to canonicalize: deny rather than follow it.
-    let real = existing.canonicalize().map_err(|_| denied())?;
-    if !real.starts_with(&root) {
-        return Err(denied());
-    }
-    let tail = path.strip_prefix(existing).expect("ancestor of path");
-    // `join("")` would append a trailing slash and make a file look like a directory.
-    Ok(if tail.as_os_str().is_empty() {
-        real
-    } else {
-        real.join(tail)
-    })
-}
+#[cfg(unix)]
+use fs::run as run_fs;
 
-fn run_fs(root: &Path, op: FsOp, args: &ToolArgs, ctx: &ToolContext) -> Result<String, ToolError> {
-    match op {
-        FsOp::Read => {
-            let args: PathArgs = parse(args)?;
-            read_capped(&resolve(root, &args.path)?, &args.path)
-        }
-        FsOp::List => {
-            let args: ListArgs = parse(args)?;
-            let relative = args.path.as_deref().unwrap_or(".");
-            list(&resolve(root, relative)?, relative)
-        }
-        FsOp::Grep => {
-            let args: GrepArgs = parse(args)?;
-            if args.pattern.is_empty() {
-                return Err(invalid("pattern must not be empty"));
-            }
-            let relative = args.path.as_deref().unwrap_or(".");
-            let start = resolve(root, relative)?;
-            let root = resolve(root, ".")?;
-            let mut out = String::new();
-            search(&root, &start, &args.pattern, ctx, &mut out)?;
-            if out.len() >= MAX_BYTES {
-                out.push_str("[output truncated]\n");
-            }
-            Ok(out)
-        }
-        FsOp::Write => {
-            let args: WriteArgs = parse(args)?;
-            let path = resolve(root, &args.path)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| io(&args.path, error))?;
-            }
-            replace_file(&path, args.content.as_bytes()).map_err(|error| io(&args.path, error))?;
-            Ok(format!(
-                "wrote {} bytes to {}",
-                args.content.len(),
-                args.path
-            ))
-        }
-        FsOp::Edit => {
-            let args: EditArgs = parse(args)?;
-            if args.old_string.is_empty() {
-                return Err(invalid("old_string must not be empty"));
-            }
-            let path = resolve(root, &args.path)?;
-            let content = read_text(&path, &args.path)?;
-            match content.matches(&args.old_string).count() {
-                1 => {}
-                0 => return Err(invalid(format!("old_string not found in {}", args.path))),
-                count => {
-                    return Err(invalid(format!(
-                        "old_string occurs {count} times in {}; it must be unique",
-                        args.path
-                    )));
-                }
-            }
-            let updated = content.replacen(&args.old_string, &args.new_string, 1);
-            replace_file(&path, updated.as_bytes()).map_err(|error| io(&args.path, error))?;
-            Ok(format!("edited {}", args.path))
-        }
-    }
+/// File tools need `openat(O_NOFOLLOW)` to stay beneath the root; without it
+/// they fail closed (ADR-0019).
+#[cfg(not(unix))]
+fn run_fs(_: &Path, _: FsOp, _: &ToolArgs, _: &ToolContext) -> Result<String, ToolError> {
+    Err(ToolError::Denied {
+        message: "file tools are only supported on Unix".to_owned(),
+    })
 }
 
 impl Tool for RootTool {
@@ -453,138 +383,6 @@ fn io(relative: &str, error: std::io::Error) -> ToolError {
             message: format!("{relative}: {error}"),
         },
     }
-}
-
-fn read_text(path: &Path, relative: &str) -> Result<String, ToolError> {
-    let bytes = std::fs::read(path).map_err(|error| io(relative, error))?;
-    String::from_utf8(bytes).map_err(|_| invalid(format!("{relative} is not valid UTF-8")))
-}
-
-/// The first [`MAX_BYTES`] of a UTF-8 file, with a marker when it is longer.
-fn read_capped(path: &Path, relative: &str) -> Result<String, ToolError> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|error| io(relative, error))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io(relative, error))?;
-    let truncated = bytes.len() > MAX_BYTES;
-    bytes.truncate(MAX_BYTES);
-    let mut text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        // Only a character cut by the cap may be incomplete; anything else is not UTF-8.
-        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
-            let valid = error.utf8_error().valid_up_to();
-            let mut bytes = error.into_bytes();
-            bytes.truncate(valid);
-            String::from_utf8(bytes).expect("valid prefix")
-        }
-        Err(_) => return Err(invalid(format!("{relative} is not valid UTF-8"))),
-    };
-    if truncated {
-        text.push_str(&format!(
-            "\n[truncated: {relative} is larger than {MAX_BYTES} bytes]"
-        ));
-    }
-    Ok(text)
-}
-
-/// Write `contents` to a temp file beside `path`, then rename it over `path`,
-/// so a crash leaves either the old or the new file. Keeps an existing mode.
-fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut name = OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let temp = path.with_file_name(name);
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(contents)?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            file.set_permissions(meta.permissions())?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&temp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
-fn list(path: &Path, relative: &str) -> Result<String, ToolError> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(|error| io(relative, error))? {
-        let entry = entry.map_err(|error| io(relative, error))?;
-        let mut name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            name.push('/');
-        }
-        names.push(name);
-    }
-    names.sort();
-    Ok(names.join("\n"))
-}
-
-/// Depth-first literal search. Symlinks are not followed, so the walk never
-/// leaves the root; `.git` and files that are not UTF-8 are skipped. Stops
-/// once `out` reaches [`MAX_BYTES`].
-fn search(
-    root: &Path,
-    path: &Path,
-    pattern: &str,
-    ctx: &ToolContext,
-    out: &mut String,
-) -> Result<(), ToolError> {
-    if ctx.cancel.is_cancelled() {
-        return Err(ToolError::Cancelled {
-            message: "grep cancelled".to_owned(),
-        });
-    }
-    if out.len() >= MAX_BYTES || path.file_name() == Some(OsStr::new(".git")) {
-        return Ok(());
-    }
-    let display = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
-    let kind = path
-        .symlink_metadata()
-        .map_err(|error| io(&display, error))?
-        .file_type();
-    if kind.is_dir() {
-        let mut children: Vec<PathBuf> = std::fs::read_dir(path)
-            .map_err(|error| io(&display, error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
-        children.sort();
-        for child in children {
-            search(root, &child, pattern, ctx, out)?;
-        }
-    } else if kind.is_file()
-        && let Ok(text) = std::fs::read_to_string(path)
-    {
-        for (number, line) in text.lines().enumerate() {
-            if out.len() >= MAX_BYTES {
-                break;
-            }
-            if line.contains(pattern) {
-                out.push_str(&format!("{display}:{}: {line}\n", number + 1));
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn run_bash(

@@ -93,6 +93,7 @@ fn done() -> Vec<Item> {
         parts: vec![Part::Text {
             text: "done".to_owned(),
         }],
+        raw: None,
     }]
 }
 

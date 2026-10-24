@@ -35,6 +35,7 @@ fn user_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::User,
         parts,
+        raw: None,
     }
 }
 
@@ -42,6 +43,7 @@ fn assistant_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts,
+        raw: None,
     }
 }
 
@@ -518,6 +520,87 @@ async fn reasoning_raw_json_is_replayed_byte_for_byte() {
     wrong_provider.items = vec![other_provider];
     drain(&provider, wrong_provider).await;
     assert!(!server.requests()[6].body.contains(raw));
+}
+
+#[tokio::test]
+async fn xhigh_and_max_render_on_models_that_accept_them() {
+    let cases = [
+        (ReasoningEffort::XHigh, "claude-opus-5-5", "xhigh"),
+        (ReasoningEffort::XHigh, "claude-opus-4-7", "xhigh"),
+        (ReasoningEffort::Max, "claude-sonnet-4-6", "max"),
+        (ReasoningEffort::Max, "claude-mythos-preview", "max"),
+    ];
+    let server = MockServer::start(cases.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for (level, model, _) in cases {
+        let mut request = request_for(model);
+        request.reasoning = effort(level);
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), cases.len());
+    for (recorded, (_, model, wire)) in recorded.iter().zip(cases) {
+        assert_eq!(
+            recorded.json_body()["output_config"],
+            serde_json::json!({"effort": wire}),
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn off_sends_neither_thinking_nor_effort_where_thinking_defaults_off() {
+    let models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"];
+    let server = MockServer::start(models.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for model in models {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            effort: Some(ReasoningEffort::Off),
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), models.len());
+    for (recorded, model) in recorded.iter().zip(models) {
+        let body = recorded.json_body();
+        assert!(body.get("thinking").is_none(), "{model}: {body}");
+        assert!(body.get("output_config").is_none(), "{model}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
+    let server = MockServer::start(Vec::new());
+    for (level, model) in [
+        // Every Anthropic model: there is no `minimal`.
+        (ReasoningEffort::Minimal, "claude-opus-5-5"),
+        // Thinking is on by default or always on: omitting it does not turn it off.
+        (ReasoningEffort::Off, "claude-opus-5-5"),
+        (ReasoningEffort::Off, "claude-haiku-5-5"),
+        (ReasoningEffort::Off, "claude-mythos-preview"),
+        (ReasoningEffort::Off, "claude-test"),
+        // `max` without `xhigh`.
+        (ReasoningEffort::XHigh, "claude-opus-4-6"),
+        (ReasoningEffort::XHigh, "claude-mythos-preview"),
+        // Opus 4.5 documents only low, medium and high.
+        (ReasoningEffort::Max, "claude-opus-4-5-20251101"),
+        // No effort at all.
+        (ReasoningEffort::Low, "claude-sonnet-4-5"),
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = effort(level);
+        let error = one_request(&server, request).await;
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::Unsupported,
+            "{model} {level:?}"
+        );
+        assert!(error.message.contains(&format!("{level:?}")), "{error:?}");
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
 }
 
 #[tokio::test]

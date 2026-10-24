@@ -12,6 +12,7 @@
 // `ProviderError` is the fixed protocol shape; boxing it would change the contract.
 #![allow(clippy::result_large_err)]
 
+mod models;
 mod render;
 mod wire;
 

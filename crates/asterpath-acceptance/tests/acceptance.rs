@@ -323,7 +323,7 @@ fn visible_projection(items: &[Item]) -> Vec<Value> {
     items
         .iter()
         .filter_map(|item| match item {
-            Item::Message { role, parts } => Some(json!({
+            Item::Message { role, parts, .. } => Some(json!({
                 "kind": "message",
                 "role": role,
                 "parts": parts.iter().filter_map(visible_part).collect::<Vec<_>>(),
@@ -382,6 +382,7 @@ fn final_assistant_text(items: &[Item]) -> Option<String> {
         Item::Message {
             role: Role::Assistant,
             parts,
+            ..
         } => Some(
             parts
                 .iter()
