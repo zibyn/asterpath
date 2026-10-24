@@ -309,7 +309,7 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     let snapshot = session_snapshot(&settings, session).await?;
     let approval = effective_approval(settings.approval, args.common.approval, tty())?;
 
-    // The session's model provider is fixed at creation; the flag cannot move it.
+    // The session's model provider comes from its log; the flag cannot move it.
     let mut settings = settings;
     settings.provider = Some(snapshot.model.provider.as_str().to_owned());
     let providers = config::providers(&settings).map_err(CliError::config)?;
@@ -604,12 +604,15 @@ async fn session_snapshot(
     let entries = scan(asterpath.store(), session)
         .await
         .map_err(CliError::run)?;
-    let snapshot = entries
+    let decoded: Vec<_> = entries
         .iter()
-        .find_map(|entry| match decode_entry(entry).ok()? {
-            asterpath_protocol::SessionEvent::SessionCreated { config, .. } => Some(config),
-            _ => None,
-        });
+        .filter_map(|entry| Some((entry, decode_entry(entry).ok()?)))
+        .collect();
+    // The effective config: `resume` registers the provider the next step uses.
+    let snapshot = asterpath_protocol::effective_config(
+        decoded.iter().map(|(entry, event)| (*entry, event)),
+        u64::MAX,
+    );
     asterpath.shutdown().await.map_err(aster_error)?;
     snapshot.ok_or_else(|| CliError::run(format!("session {session:?} has no SessionCreated")))
 }
