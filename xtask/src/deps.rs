@@ -402,6 +402,7 @@ mod tests {
             ("asterpath-provider-openai", Role::Adapter),
             ("asterpath-mcp", Role::Adapter),
             ("asterpath-skills", Role::Adapter),
+            ("asterpath-tools", Role::Adapter),
             ("asterpath-testing", Role::Adapter),
             ("asterpath", Role::Engine),
             ("asterpath-cli", Role::App),

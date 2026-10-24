@@ -29,6 +29,7 @@
 | `asterpath-mcp` | adapter | MCP 工具来源：`McpServerConfig`、`McpServers::load` / `tools()` / `statuses()` / `shutdown()`，stdio 与 HTTP adapter 为 crate 私有（[plugins.md](plugins.md)、[mcp.md](mcp.md)，ADR-0027） | `protocol`, `http` |
 | `asterpath-sandbox-linux` | adapter | Linux bwrap 参考后端（实现 protocol 的 `SandboxProvider`） | `protocol` |
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
+| `asterpath-tools` | adapter | 按根目录构造的 `read_file` / `list_dir` / `grep` / `write_file` / `edit_file` / `bash` 工具与 `read_only` / `coding` 预设（#83） | `protocol` |
 | `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件、`FakeSandboxProvider` | `protocol` |
 | `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
@@ -38,6 +39,7 @@
 - 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`app` / `tool` 只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
 - `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-skills` 是 M6（post-v1）新增的可选适配器；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。技能不新增事件，日志 schema 不变。
+- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核、`ToolContext` 或日志；多项目宿主每个项目一个 `Asterpath` 实例。
 - `asterpath-testing` **不得**依赖 facade；需要组装真实引擎的测试放 facade 的 `tests/` 或 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：任何 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件或引擎内部测试，`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 
@@ -276,6 +278,7 @@ pub enum AsterError {
 - 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。策略取 `--approval` > `[approval] default` > `ask`。TTY 上 `ask` 提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 上来自配置或缺省的 `ask` 一律降级为 `deny`（无法提示），而显式 `--approval ask` 是用法错误（退出码 2）。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 - MCP（ADR-0027）：`run` / `resume` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。外部工具（`<id>__<tool>`）默认 `Ask`，走上面的审批路径。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
+- 内置工具（#83）：`run` 默认以工作目录为根、按 `[sandbox]` 策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 或 `run --tools a,b` 选子集（flag 优先），`run --no-tools` 全关，未知工具名是配置错误（退出码 2）。`resume` 总是注册全部六个，模型可见的子集由 `SessionCreated` 快照决定。`ask` 模式下 `SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）在端点打开时 `Ask`、关闭时以 `NO_APPROVAL_ENDPOINT` 拒绝；其余按框架默认策略。
 - 压缩：`run` / `resume` 总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
 
 ### 4.1 配置
@@ -321,6 +324,7 @@ disable_parallel_tool_use = false
 
 [tools]
 max_parallel_calls = 8        # ToolConfig；缺省字段用 Default
+# enabled = ["read_file", "list_dir", "grep"]   # 新 session 的内置工具；省略 = 全部六个
 
 [model_aliases.fast]          # 宿主提供的 alias 集合，spawn 用它收窄模型
 provider = "anthropic"
@@ -342,7 +346,7 @@ default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级
 - 环境变量覆盖：`ASTERPATH_CONFIG`、`ASTERPATH_DB`、`ASTERPATH_PROVIDER`、`ASTERPATH_MODEL`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。
 - 未知字段（任一层级）是配置错误（退出码 2）。
-- 沙箱只约束 stdio MCP 服务进程（HTTP 不沙箱）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。
+- 沙箱约束 stdio MCP 服务进程（HTTP 不沙箱）与内置 `bash` 工具启动的进程；没有后端时 `bash` 同样 fail closed（返回 `Denied`，不启动进程）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。
 
 ## 5. 交付清单与里程碑
 

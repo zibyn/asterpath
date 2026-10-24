@@ -9,7 +9,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
+use asterpath::{
+    AsterError, Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor, SessionHandle,
+};
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
@@ -57,6 +59,12 @@ struct RunArgs {
     /// Skip skill discovery for this new session.
     #[arg(long)]
     no_skills: bool,
+    /// Register only these built-in tools (comma-separated).
+    #[arg(long, value_delimiter = ',', conflicts_with = "no_tools")]
+    tools: Option<Vec<String>>,
+    /// Register no built-in tools.
+    #[arg(long)]
+    no_tools: bool,
     /// User input for the new session.
     prompt: String,
 }
@@ -208,6 +216,7 @@ async fn config_check(args: CheckArgs) -> CliResult<()> {
     for diagnostic in discovery.diagnostics.iter().chain(&budget) {
         println!("skill: {diagnostic}");
     }
+    builtin_tools(&settings, settings.tool_names())?;
     // Loading is the only way to report a server's status; stop them again.
     let mcp = load_mcp(&settings).await?;
     for line in mcp_status_lines(&settings, &mcp)? {
@@ -221,6 +230,12 @@ async fn config_check(args: CheckArgs) -> CliResult<()> {
 async fn run(args: RunArgs) -> CliResult<()> {
     let settings = load(&args.common)?;
     let approval = effective_approval(settings.approval, args.common.approval, tty())?;
+    let selection = if args.no_tools {
+        Some(&[][..])
+    } else {
+        args.tools.as_deref().or(settings.tool_names())
+    };
+    let builtin = builtin_tools(&settings, selection)?;
     let mut skills = skill_setup(&settings, args.no_skills);
     for diagnostic in skills
         .diagnostics
@@ -231,7 +246,8 @@ async fn run(args: RunArgs) -> CliResult<()> {
     }
     let mcp = load_mcp(&settings).await?;
     report_mcp_failures(&settings, &mcp)?;
-    let mut tools = skills.tools();
+    let mut tools = builtin;
+    tools.extend(skills.tools());
     tools.extend(mcp.tools());
     let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
     if let Some(index) = skills.index.take() {
@@ -293,7 +309,10 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     // `[skills] enabled` switch only governs new sessions.
     let mcp = load_mcp(&settings).await?;
     report_mcp_failures(&settings, &mcp)?;
-    let mut tools = vec![Arc::new(LoadSkillTool::new(skill_roots(&settings))) as Arc<dyn Tool>];
+    // The frozen snapshot decides what the model sees; register every
+    // built-in tool so any subset chosen at `run` still resolves.
+    let mut tools = builtin_tools(&settings, None)?;
+    tools.push(Arc::new(LoadSkillTool::new(skill_roots(&settings))));
     tools.extend(mcp.tools());
     let asterpath = assemble(&settings, providers, approval, tools).await?;
     let handle = asterpath.open_session(session).await.map_err(aster_error)?;
@@ -640,6 +659,31 @@ fn skill_roots(settings: &config::Settings) -> Vec<SkillRoot> {
     roots
 }
 
+/// `asterpath-tools` rooted at the working directory under the `[sandbox]`
+/// policy, filtered to `selection` (`None` = all) in the order given.
+fn builtin_tools(
+    settings: &config::Settings,
+    selection: Option<&[String]>,
+) -> CliResult<Vec<Arc<dyn Tool>>> {
+    let root = std::env::current_dir()
+        .map_err(|error| CliError::config(format!("cannot read working directory: {error}")))?;
+    let policy = settings.sandbox_policy();
+    let all = asterpath_tools::coding(root, sandbox_provider(&policy), policy)
+        .map_err(|error| CliError::config(error.to_string()))?;
+    let Some(selection) = selection else {
+        return Ok(all);
+    };
+    selection
+        .iter()
+        .map(|name| {
+            all.iter()
+                .find(|tool| tool.descriptor().name.as_str() == name)
+                .cloned()
+                .ok_or_else(|| CliError::config(format!("unknown tool {name}")))
+        })
+        .collect()
+}
+
 async fn assemble(
     settings: &config::Settings,
     providers: Vec<Arc<dyn asterpath_protocol::Provider>>,
@@ -649,18 +693,20 @@ async fn assemble(
     // Sessions without a context window still report `NotConfigured`.
     let catalog = ProviderCatalog::new(providers.clone())
         .map_err(|error| CliError::config(error.to_string()))?;
-    let mut builder = Asterpath::builder()
+    let config = AsterpathConfig::default();
+    let approval = config::approval_policy(approval, Arc::clone(&config.gate));
+    AsterpathBuilder::from_config(config)
         .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
         .database(&settings.db)
         .providers(providers)
         .tools(tools)
         .tool(config::tool_config(settings))
         .max_live_children(config::max_live_children(settings))
-        .model_aliases(config::model_aliases(settings));
-    if let Some(policy) = config::approval_policy(approval) {
-        builder = builder.approval(policy);
-    }
-    builder.build().await.map_err(aster_error)
+        .model_aliases(config::model_aliases(settings))
+        .approval(approval)
+        .build()
+        .await
+        .map_err(aster_error)
 }
 
 /// Start every configured MCP server under the `[sandbox]` policy. A
@@ -1119,6 +1165,70 @@ mod tests {
 
         asterpath.shutdown().await.unwrap();
         cleanup(&db);
+    }
+
+    /// The CLI `ask` policy over a real `bash` tool that would create `ran`.
+    async fn ask_bash(db: &Path, root: &Path) -> Asterpath {
+        let provider = Arc::new(ScriptedProvider::new("p").respond(
+            vec![Item::ToolCall {
+                call_id: "call-1".to_owned(),
+                provider_item_id: None,
+                name: ToolName::new("bash"),
+                raw_args: JsonString::new(r#"{"command":"touch ran"}"#),
+                raw: None,
+            }],
+            StopReason::ToolUse,
+            Usage::default(),
+        ));
+        let bash = asterpath_tools::bash(root.to_path_buf(), None, SandboxPolicy::FullAccess)
+            .expect("absolute root");
+        let config = AsterpathConfig::default();
+        let policy = config::approval_policy(config::ApprovalMode::Ask, Arc::clone(&config.gate));
+        AsterpathBuilder::from_config(config)
+            .database(db)
+            .providers(vec![provider as Arc<dyn Provider>])
+            .tools(vec![bash])
+            .approval(policy)
+            .build()
+            .await
+            .expect("build")
+    }
+
+    #[tokio::test]
+    async fn ask_mode_asks_before_bash_and_closed_gate_denies_without_spawning() {
+        for open in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("ask.db");
+            let asterpath = ask_bash(&db, dir.path()).await;
+            let _endpoint = open.then(|| asterpath.approval_gate().register());
+            let handle = asterpath.create_session(spec()).await.unwrap();
+            handle
+                .submit_input(UserInput {
+                    id: InputId::from_bytes([1; 16]),
+                    parts: vec![Part::Text { text: "go".into() }],
+                })
+                .await
+                .unwrap();
+
+            let mut io = PromptIo {
+                reader: Cursor::new(b"n\n"),
+                writer: Vec::new(),
+            };
+            drive(&handle, Some(&mut io)).await.expect("drive");
+
+            let asked = String::from_utf8(io.writer).unwrap().contains("tool: bash");
+            assert_eq!(asked, open, "ApprovalRequested only while the gate is open");
+            assert!(!dir.path().join("ran").exists(), "bash never started");
+            let values = tool_result_values(&asterpath, handle.id()).await;
+            assert_eq!(values.len(), 1, "{values:?}");
+            let reason = if open {
+                "tool call denied"
+            } else {
+                asterpath_protocol::NO_APPROVAL_ENDPOINT
+            };
+            assert!(values[0].contains(reason), "{values:?}");
+            asterpath.shutdown().await.unwrap();
+        }
     }
 
     async fn signal_count(asterpath: &Asterpath, session: SessionId) -> usize {
