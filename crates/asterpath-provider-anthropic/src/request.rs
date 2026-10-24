@@ -329,7 +329,7 @@ struct PendingMessage {
 #[derive(Default)]
 struct Messages {
     list: Vec<PendingMessage>,
-    system: Vec<Frag>,
+    pending_system: Vec<Frag>,
 }
 
 impl Messages {
@@ -341,8 +341,8 @@ impl Messages {
     }
 
     fn flush_system(&mut self) {
-        if !self.system.is_empty() {
-            let system = std::mem::take(&mut self.system);
+        if !self.pending_system.is_empty() {
+            let system = std::mem::take(&mut self.pending_system);
             push_blocks(&mut self.list, "system", Vec::new(), system);
         }
     }
@@ -482,19 +482,19 @@ fn render_messages(
             }
             Item::Instruction { parts } if inline_system => {
                 messages
-                    .system
+                    .pending_system
                     .extend(parts.iter().filter_map(|part| render_part(provider, part)));
             }
             // Rendered into the top-level system by `render`.
             Item::Instruction { .. } => {}
             Item::ToolsChanged { added, removed } if rules.inline_tools => {
-                messages.system.extend(added.iter().map(|tool| {
+                messages.pending_system.extend(added.iter().map(|tool| {
                     Frag::Json(json!({
                         "type": "tool_addition",
                         "tool": {"type": "tool_definition", "definition": tool_definition(tool)},
                     }))
                 }));
-                messages.system.extend(removed.iter().map(|name| {
+                messages.pending_system.extend(removed.iter().map(|name| {
                     Frag::Json(json!({
                         "type": "tool_removal",
                         "tool": {"type": "tool_reference", "name": name.as_str()},
