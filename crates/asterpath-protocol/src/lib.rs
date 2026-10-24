@@ -66,7 +66,10 @@ pub use ids::{
     InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
     SessionId, StepId, ToolArgs, ToolCallId, ToolName, TurnId, UpdateId,
 };
-pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
+pub use item::{
+    FileSource, ImageSource, Item, Part, ProviderFileId, RawProviderData, ReasoningBinding, Role,
+    tools_hash,
+};
 pub use names::{
     ToolNameError, external_tool_name, sanitize_tool_name, validate_external_tool_name,
     validate_server_id, validate_tool_name,

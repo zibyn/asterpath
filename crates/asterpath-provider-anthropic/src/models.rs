@@ -77,6 +77,9 @@ pub struct AnthropicModelProfile {
     pub inline_changes: bool,
     /// Accepts `output_config.format` (structured outputs).
     pub structured_output: bool,
+    /// `Part::File` media types sent as `document` blocks; empty means no
+    /// file input.
+    pub file_media_types: Cow<'static, [&'static str]>,
 }
 
 impl AnthropicModelProfile {
@@ -129,6 +132,12 @@ impl AnthropicModelProfile {
         self
     }
 
+    #[must_use]
+    pub fn with_file_media_types(mut self, types: impl Into<Cow<'static, [&'static str]>>) -> Self {
+        self.file_media_types = types.into();
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
     pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
@@ -149,6 +158,7 @@ const fn rules(
         sampling,
         inline_changes: false,
         structured_output: true,
+        file_media_types: Cow::Borrowed(PDF),
     }
 }
 
@@ -162,6 +172,8 @@ const fn unstructured(mut profile: AnthropicModelProfile) -> AnthropicModelProfi
     profile
 }
 
+/// PDF support (build-with-claude/pdf-support) covers every current model.
+const PDF: &[&str] = &["application/pdf"];
 const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
 const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
@@ -180,6 +192,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     sampling: false,
     inline_changes: true,
     structured_output: true,
+    file_media_types: Cow::Borrowed(PDF),
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {

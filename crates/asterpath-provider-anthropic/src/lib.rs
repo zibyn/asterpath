@@ -126,6 +126,7 @@ impl Provider for AnthropicProvider {
             // The adapter sets its own breakpoints; see request::render.
             cache_control: true,
             image_input: true,
+            file_input: !rules.file_media_types.is_empty(),
             parallel_tool_calls: true,
         }
     }

@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 
 use asterpath_http::{merge_provider_option, provider_options_for, same_provider_raw_field};
 use asterpath_protocol::{
-    ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
+    FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
+    ProviderErrorKind, ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use asterpath_http::{TraceMark, TraceSink};
+
+use crate::models::OpenAiModelProfile;
 
 /// Serialize the complete request. Deterministic: struct field order, sorted
 /// tool fingerprints and `serde_json`'s ordered maps make repeated renders of
@@ -19,10 +21,10 @@ pub(crate) fn render(
     request: &ModelRequest,
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
-    efforts: &[ReasoningEffort],
+    profile: &OpenAiModelProfile,
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<u8>, ProviderError> {
-    validate(request, provider, capabilities, efforts)?;
+    validate(request, provider, capabilities, profile)?;
     // R1: no server state, written or not.
     let options = provider_options_for(request, &["previous_response_id", "conversation"])?;
 
@@ -130,10 +132,19 @@ fn validate(
     request: &ModelRequest,
     provider: &ProviderId,
     capabilities: ProviderCapabilities,
-    efforts: &[ReasoningEffort],
+    profile: &OpenAiModelProfile,
 ) -> Result<(), ProviderError> {
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
+    }
+    if let Some(media_type) = request
+        .file_media_types()
+        .find(|media_type| !profile.file_media_types.contains(media_type))
+    {
+        return Err(unsupported(&format!(
+            "file media type {media_type} on {}",
+            request.spec.model
+        )));
     }
     if request.spec.provider != *provider {
         return Err(invalid_request(format!(
@@ -169,7 +180,7 @@ fn validate(
         return Err(unsupported("reasoning budget_tokens"));
     }
     if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
-        && !efforts.contains(&effort)
+        && !profile.efforts.contains(&effort)
     {
         return Err(unsupported(&format!(
             "reasoning effort {effort:?} on {}",
@@ -340,12 +351,22 @@ fn message_item(
             Part::Text { text } => content.push(json!({"type": text_type, "text": text})),
             Part::Refusal { text } => content.push(json!({"type": "refusal", "refusal": text})),
             Part::Image { media_type, source } if role == Role::User => {
-                let image_url = match source {
-                    ImageSource::Url { url } => url.clone(),
-                    ImageSource::Base64 { data } => format!("data:{media_type};base64,{data}"),
-                };
-                content.push(json!({"type": "input_image", "image_url": image_url}));
+                content.push(match source {
+                    ImageSource::Url { url } => json!({"type": "input_image", "image_url": url}),
+                    ImageSource::Base64 { data } => json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{media_type};base64,{data}"),
+                    }),
+                    ImageSource::ProviderFile(file) => {
+                        json!({"type": "input_image", "file_id": file.id})
+                    }
+                });
             }
+            Part::File {
+                media_type,
+                filename,
+                source,
+            } => content.push(input_file(media_type, filename.as_ref(), source)),
             // Responses assistant output content does not accept images.
             Part::Image { .. } => return Err(unsupported("image input")),
             Part::ProviderOpaque {
@@ -364,47 +385,77 @@ fn message_item(
     Ok(json!({"type": "message", "role": role_name(role), "content": content}))
 }
 
-/// Tool output is text-only on the v1 OpenAI path; non-text parts become
-/// placeholders and a trace mark.
+/// Tool output is a string unless it carries a `File`, which needs the
+/// content-array form (protocol.md §10.4). Images and opaque parts become
+/// placeholders and a trace mark either way.
 fn tool_output(
     parts: &[Part],
     is_error: bool,
     provider: &ProviderId,
     trace: Option<&dyn TraceSink>,
-) -> String {
-    let mut text = String::new();
-    for part in parts {
-        match part {
-            Part::Text { text: value } | Part::Refusal { text: value } => text.push_str(value),
-            Part::Image { media_type, .. } => {
-                mark(
-                    trace,
-                    TraceMark::rendered_as_text(
-                        provider.clone(),
-                        media_type.clone(),
-                        "tool output is not text",
-                    ),
-                );
-                text.push_str(&format!("[image omitted: {media_type}]"));
+) -> Value {
+    let prefix = if is_error { "[tool error] " } else { "" };
+    if !parts.iter().any(|part| matches!(part, Part::File { .. })) {
+        let text: String = parts
+            .iter()
+            .map(|part| tool_output_text(part, provider, trace))
+            .collect();
+        return json!(format!("{prefix}{text}"));
+    }
+    let mut content: Vec<Value> = parts
+        .iter()
+        .map(|part| match part {
+            Part::File {
+                media_type,
+                filename,
+                source,
+            } => input_file(media_type, filename.as_ref(), source),
+            _ => json!({"type": "input_text", "text": tool_output_text(part, provider, trace)}),
+        })
+        .collect();
+    if is_error {
+        match content.iter_mut().find(|item| item["type"] == "input_text") {
+            Some(item) => {
+                item["text"] = json!(format!(
+                    "{prefix}{}",
+                    item["text"].as_str().unwrap_or_default()
+                ))
             }
-            Part::ProviderOpaque { kind, .. } => {
-                mark(
-                    trace,
-                    TraceMark::rendered_as_text(
-                        provider.clone(),
-                        kind.clone(),
-                        "tool output is not text",
-                    ),
-                );
-                text.push_str(&format!("[opaque omitted: {kind}]"));
-            }
+            None => content.insert(0, json!({"type": "input_text", "text": prefix})),
         }
     }
-    if is_error {
-        format!("[tool error] {text}")
-    } else {
-        text
+    Value::Array(content)
+}
+
+/// The text a non-file tool output part renders as.
+fn tool_output_text(part: &Part, provider: &ProviderId, trace: Option<&dyn TraceSink>) -> String {
+    let (kind, placeholder) = match part {
+        Part::Text { text } | Part::Refusal { text } => return text.clone(),
+        Part::Image { media_type, .. } => (media_type, format!("[image omitted: {media_type}]")),
+        Part::File { media_type, .. } => (media_type, format!("[file omitted: {media_type}]")),
+        Part::ProviderOpaque { kind, .. } => (kind, format!("[opaque omitted: {kind}]")),
+    };
+    mark(
+        trace,
+        TraceMark::rendered_as_text(provider.clone(), kind.clone(), "tool output is not text"),
+    );
+    placeholder
+}
+
+/// A `Part::File` as an `input_file` content item.
+fn input_file(media_type: &str, filename: Option<&String>, source: &FileSource) -> Value {
+    let mut item = json!({"type": "input_file"});
+    if let Some(filename) = filename {
+        item["filename"] = json!(filename);
     }
+    match source {
+        FileSource::Base64 { data } => {
+            item["file_data"] = json!(format!("data:{media_type};base64,{data}"));
+        }
+        FileSource::Url { url } => item["file_url"] = json!(url),
+        FileSource::ProviderFile(file) => item["file_id"] = json!(file.id),
+    }
+    item
 }
 
 fn text_content(
@@ -417,7 +468,7 @@ fn text_content(
         match part {
             Part::Text { text } => content.push(json!({"type": "input_text", "text": text})),
             Part::Refusal { text } => content.push(json!({"type": "input_text", "text": text})),
-            Part::Image { media_type, .. } => {
+            Part::Image { media_type, .. } | Part::File { media_type, .. } => {
                 mark(
                     trace,
                     TraceMark::rendered_as_text(
@@ -426,9 +477,14 @@ fn text_content(
                         "compaction content is text-only",
                     ),
                 );
+                let noun = if matches!(part, Part::File { .. }) {
+                    "file"
+                } else {
+                    "image"
+                };
                 content.push(json!({
                     "type": "input_text",
-                    "text": format!("[image omitted: {media_type}]"),
+                    "text": format!("[{noun} omitted: {media_type}]"),
                 }));
             }
             Part::ProviderOpaque { kind, .. } => {

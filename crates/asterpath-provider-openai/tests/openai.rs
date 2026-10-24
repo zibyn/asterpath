@@ -4,9 +4,10 @@ use std::time::Duration;
 use asterpath_testing::http_mock::{MockServer, Reply as MockResponse};
 
 use asterpath_protocol::{
-    ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
-    ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
-    ReasoningBinding, Role, StopReason, StreamEvent, ToolChoice, ToolDescriptor, ToolName, Usage,
+    FileSource, ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, PartDelta,
+    Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderFileId, ProviderId,
+    RawProviderData, ReasoningBinding, Role, StopReason, StreamEvent, ToolChoice, ToolDescriptor,
+    ToolName, Usage,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -331,9 +332,174 @@ async fn provider_declares_openai_capabilities() {
             structured_output: true,
             cache_control: false,
             image_input: true,
+            file_input: true,
             parallel_tool_calls: true,
         }
     );
+}
+
+fn pdf(source: FileSource) -> Part {
+    Part::File {
+        media_type: "application/pdf".to_owned(),
+        filename: Some("report.pdf".to_owned()),
+        source,
+    }
+}
+
+fn openai_file(id: &str) -> ProviderFileId {
+    ProviderFileId {
+        provider: ProviderId::new("openai"),
+        id: id.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn user_files_render_as_input_file() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server);
+    let files = request(vec![Item::Message {
+        role: Role::User,
+        parts: vec![
+            pdf(FileSource::Base64 {
+                data: "JVBE".to_owned(),
+            }),
+            pdf(FileSource::Url {
+                url: "https://example.invalid/r.pdf".to_owned(),
+            }),
+            pdf(FileSource::ProviderFile(openai_file("file-a"))),
+            Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::ProviderFile(openai_file("file-b")),
+            },
+        ],
+        raw: None,
+    }]);
+    let events = collect(&provider, files).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([
+            {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,JVBE"},
+            {"type": "input_file", "filename": "report.pdf", "file_url": "https://example.invalid/r.pdf"},
+            {"type": "input_file", "filename": "report.pdf", "file_id": "file-a"},
+            {"type": "input_image", "file_id": "file-b"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn tool_results_with_files_render_a_content_array() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
+    let provider = provider(&server);
+    let events = collect(
+        &provider,
+        request(vec![
+            Item::ToolCall {
+                call_id: "call_1".to_owned(),
+                provider_item_id: None,
+                name: ToolName::new("get_weather"),
+                raw_args: JsonString::new("{}"),
+                raw: None,
+            },
+            Item::ToolResult {
+                call_id: "call_1".to_owned(),
+                provider_item_id: None,
+                parts: vec![
+                    pdf(FileSource::ProviderFile(openai_file("file-a"))),
+                    Part::Text {
+                        text: "partial".to_owned(),
+                    },
+                    Part::Image {
+                        media_type: "image/png".to_owned(),
+                        source: ImageSource::Url {
+                            url: "https://example.test/x.png".to_owned(),
+                        },
+                    },
+                ],
+                is_error: true,
+                raw: None,
+            },
+        ]),
+    )
+    .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["input"][1]["output"],
+        json!([
+            {"type": "input_file", "filename": "report.pdf", "file_id": "file-a"},
+            {"type": "input_text", "text": "[tool error] partial"},
+            {"type": "input_text", "text": "[image omitted: image/png]"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn unrenderable_files_fail_before_http() {
+    let server = MockServer::start(Vec::new());
+    let other = ProviderFileId {
+        provider: ProviderId::new("anthropic"),
+        id: "file_x".to_owned(),
+    };
+    let user = |parts| Item::Message {
+        role: Role::User,
+        parts,
+        raw: None,
+    };
+    let cases = [
+        user(vec![Part::File {
+            media_type: "application/x-unknown".to_owned(),
+            filename: None,
+            source: FileSource::Base64 {
+                data: "YQ==".to_owned(),
+            },
+        }]),
+        Item::Message {
+            role: Role::Assistant,
+            parts: vec![pdf(FileSource::Base64 {
+                data: "JVBE".to_owned(),
+            })],
+            raw: None,
+        },
+        user(vec![pdf(FileSource::ProviderFile(other.clone()))]),
+        user(vec![Part::Image {
+            media_type: "image/png".to_owned(),
+            source: ImageSource::ProviderFile(other.clone()),
+        }]),
+        Item::ToolResult {
+            call_id: "call_1".to_owned(),
+            provider_item_id: None,
+            parts: vec![pdf(FileSource::ProviderFile(other))],
+            is_error: false,
+            raw: None,
+        },
+    ];
+    let provider = provider(&server);
+    for item in cases {
+        let events = collect(&provider, request(vec![item])).await;
+        assert!(
+            matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::Unsupported),
+            "{events:?}"
+        );
+    }
+
+    let no_files = provider
+        .with_default_profile(OpenAiModelProfile::latest().with_file_media_types(Vec::new()));
+    assert!(!no_files.capabilities(&spec("gpt-5")).file_input);
+    let events = collect(
+        &no_files,
+        request(vec![user(vec![pdf(FileSource::Base64 {
+            data: "JVBE".to_owned(),
+        })])]),
+    )
+    .await;
+    assert!(
+        matches!(&events[..], [Err(error)] if error.kind == ProviderErrorKind::Unsupported),
+        "{events:?}"
+    );
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]
