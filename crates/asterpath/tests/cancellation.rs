@@ -495,9 +495,14 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
     while let Some(event) = stream.next().await {
         let event = event.expect("drive");
         if matches!(event, AgentEvent::ApprovalRequested(_)) {
+            assert_eq!(asterpath.approval_gate().pending().len(), 1);
             handle.cancel().await.unwrap();
         }
     }
+    assert!(
+        asterpath.approval_gate().pending().is_empty(),
+        "a cancelled wait is no longer pending"
+    );
 
     let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "cancel skips the tool");

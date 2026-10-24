@@ -7,13 +7,13 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::views::usage::UsageService;
 use asterpath_protocol::{
+    CatalogEntry, DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter, SessionId,
+    SessionQuery, SessionStore, StepId, StorageError, Timestamp, TurnId,
+};
+use asterpath_protocol::{
     CompactionTrigger, InputTokens, Item, ModelId, ModelSpec, OutputTokens, Part, ProviderId, Role,
     SessionEvent, StopReason, Usage, UsageBucket, UsageError, UsageFilter, UsageScope, dedup,
     encode_entry,
-};
-use asterpath_protocol::{
-    DedupKey, LogEntry, LogId, LogQuery, NewEntry, SessionId, SessionStore, StepId, StorageError,
-    Timestamp, TurnId,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -213,8 +213,32 @@ impl SessionStore for TestLog {
         Box::pin(async move { Ok(frontier) })
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        Box::pin(async { Ok(Vec::new()) })
+    /// Only `ChildrenOf`, from a tree set by the test; it may list a child
+    /// with no log (U16).
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
+        let ParentFilter::ChildrenOf(parent) = query.parent else {
+            return Box::pin(async { Ok(Vec::new()) });
+        };
+        let children = self
+            .children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&parent)
+            .cloned()
+            .unwrap_or_default();
+        let entries = children
+            .into_iter()
+            .map(|session| CatalogEntry {
+                session,
+                parent: Some(parent),
+                created_at: 0,
+                last_activity: 0,
+            })
+            .collect();
+        Box::pin(async move { Ok(entries) })
     }
 
     fn parent(
@@ -222,21 +246,6 @@ impl SessionStore for TestLog {
         _session: SessionId,
     ) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         Box::pin(async { Ok(None) })
-    }
-
-    /// A tree set by the test; it may list a child with no log (U16).
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        futures_util::stream::iter(
-            self.children
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&session)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(Ok),
-        )
-        .boxed()
     }
 }
 

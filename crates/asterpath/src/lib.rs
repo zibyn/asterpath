@@ -47,7 +47,9 @@ use asterpath_protocol::{
     Span, SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
-use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SignalDelivery, unique_bytes};
+use asterpath_protocol::{
+    ApprovalGate, Clock, SessionQuery, SessionStore, SignalDelivery, unique_bytes,
+};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -306,7 +308,11 @@ impl Asterpath {
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
         // shortcut: folds every session on each call; index inside the sqlite module once session counts grow
         let mut wakeable = Vec::new();
-        for session in self.store.sessions().await? {
+        let catalog = self.store.sessions(SessionQuery::default()).await?;
+        // Id order, as before the catalog listed newest first.
+        let mut sessions: Vec<SessionId> = catalog.iter().map(|entry| entry.session).collect();
+        sessions.sort();
+        for session in sessions {
             let entries = scan_all(&*self.store, session).await?;
             let facts = SessionFacts::fold(&entries).map_err(|error| {
                 AsterError::Agent(AgentError::Corrupt {

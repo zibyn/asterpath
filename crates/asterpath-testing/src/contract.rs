@@ -9,13 +9,14 @@
 use std::sync::Arc;
 
 use asterpath_protocol::{
+    CatalogEntry, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, ParentFilter,
+    RetirementError, SessionId, SessionQuery, SessionStore, SignalId, SignalName, StepId,
+    StorageError, ToolCallId, TurnId,
+};
+use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
     JsonString, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, Part, Provenance, ProviderId,
     ReplaySafety, SessionEvent, ToolName, ToolResultStatus, Usage, dedup,
-};
-use asterpath_protocol::{
-    DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, RetirementError, SessionId,
-    SessionStore, SignalId, SignalName, StepId, StorageError, ToolCallId, TurnId,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -555,16 +556,46 @@ async fn create(log: &dyn SessionStore, session: SessionId, parent: Option<Sessi
     .await
 }
 
-async fn sessions(log: &dyn SessionStore) -> Vec<SessionId> {
-    log.sessions().await.expect("sessions should succeed")
+async fn list(log: &dyn SessionStore, query: SessionQuery) -> Vec<CatalogEntry> {
+    log.sessions(query).await.expect("sessions should succeed")
 }
 
-async fn children(log: &dyn SessionStore, session: SessionId) -> Vec<SessionId> {
-    let results: Vec<Result<SessionId, StorageError>> = log.children(session).collect().await;
-    results
-        .into_iter()
-        .map(|result| result.expect("children should succeed"))
+fn by_parent(parent: ParentFilter) -> SessionQuery {
+    SessionQuery {
+        parent,
+        ..SessionQuery::default()
+    }
+}
+
+async fn listed(log: &dyn SessionStore, parent: ParentFilter) -> Vec<SessionId> {
+    list(log, by_parent(parent))
+        .await
+        .iter()
+        .map(|entry| entry.session)
         .collect()
+}
+
+/// Every page of `parent`, `limit` entries at a time, concatenated.
+async fn paged(log: &dyn SessionStore, parent: ParentFilter, limit: usize) -> Vec<CatalogEntry> {
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let page = list(
+            log,
+            SessionQuery {
+                parent,
+                after,
+                limit: Some(limit),
+            },
+        )
+        .await;
+        assert!(page.len() <= limit, "a page respects limit");
+        let Some(last) = page.last() else {
+            return all;
+        };
+        after = Some(last.cursor());
+        all.extend(page);
+    }
 }
 
 async fn parent(log: &dyn SessionStore, session: SessionId) -> Option<SessionId> {
@@ -572,41 +603,90 @@ async fn parent(log: &dyn SessionStore, session: SessionId) -> Option<SessionId>
 }
 
 /// The catalog follows `SessionCreated`: every created session (children
-/// included) is listed once, in id order; the tree matches each parent ref.
+/// included) is listed once, newest `(created_at, session)` first; the tree
+/// matches each parent ref; cursor pages neither repeat nor skip (ADR-0028).
 async fn catalog(log: &dyn SessionStore) {
     let root = session(0x81);
-    let late = session(0x83);
-    let early = session(0x82);
     let unknown = session(0x8f);
     create(log, root, None).await;
-    create(log, late, Some(root)).await;
-    create(log, early, Some(root)).await;
+    // Children in a tight loop until two share `created_at`, so the cursor's
+    // session tie-break is exercised on every backend.
+    let mut kids: Vec<SessionId> = Vec::new();
+    for byte in 0..=u8::MAX {
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0x84;
+        bytes[1] = byte;
+        let child = SessionId::from_bytes(bytes);
+        create(log, child, Some(root)).await;
+        kids.push(child);
+        let entries = list(log, by_parent(ParentFilter::ChildrenOf(root))).await;
+        if kids.len() >= 3
+            && entries
+                .windows(2)
+                .any(|pair| pair[0].created_at == pair[1].created_at)
+        {
+            break;
+        }
+    }
     // A replayed SessionCreated does not list the session twice.
     create(log, root, None).await;
 
-    let listed = sessions(log).await;
-    for session in [root, early, late] {
+    let all = list(log, SessionQuery::default()).await;
+    for session in kids.iter().chain([&root]) {
         assert_eq!(
-            listed.iter().filter(|listed| **listed == session).count(),
+            all.iter().filter(|entry| entry.session == *session).count(),
             1,
             "sessions() lists every created session once, children included"
         );
     }
-    assert!(!listed.contains(&unknown));
+    assert!(!all.iter().any(|entry| entry.session == unknown));
     assert!(
-        listed.windows(2).all(|pair| pair[0] < pair[1]),
-        "sessions() is ordered by id"
+        all.windows(2)
+            .all(|pair| pair[0].cursor() > pair[1].cursor()),
+        "sessions() is ordered by (created_at, session) descending"
+    );
+    let root_entry = all.iter().find(|entry| entry.session == root).unwrap();
+    assert_eq!(root_entry.parent, None);
+    let first_kid = all.iter().find(|entry| entry.session == kids[0]).unwrap();
+    assert_eq!(first_kid.parent, Some(root));
+    assert!(first_kid.created_at >= root_entry.created_at);
+
+    // Parent filters.
+    let mut children = listed(log, ParentFilter::ChildrenOf(root)).await;
+    children.sort();
+    assert_eq!(children, kids, "ChildrenOf lists exactly the children");
+    assert!(
+        listed(log, ParentFilter::ChildrenOf(kids[0]))
+            .await
+            .is_empty()
+    );
+    let roots = listed(log, ParentFilter::Roots).await;
+    assert!(roots.contains(&root));
+    assert!(
+        !kids.iter().any(|kid| roots.contains(kid)),
+        "Roots skips children"
     );
 
+    // Cursor pages, ties included, add up to the unpaged list.
+    let unpaged = list(log, by_parent(ParentFilter::ChildrenOf(root))).await;
+    assert_eq!(paged(log, ParentFilter::ChildrenOf(root), 1).await, unpaged);
+    assert_eq!(paged(log, ParentFilter::Any, 2).await, all);
+
+    // last_activity is the recorded_at of the last committed record.
+    let kid = kids[0];
+    append(log, kid, &input_recorded(), Some(DedupKey::new("catalog"))).await;
+    let last = scan(log, kid).await.last().unwrap().recorded_at;
+    let entry = list(log, SessionQuery::default())
+        .await
+        .into_iter()
+        .find(|entry| entry.session == kid)
+        .unwrap();
+    assert_eq!(entry.last_activity, last, "last_activity follows append");
+    assert!(entry.last_activity >= entry.created_at);
+
     assert_eq!(parent(log, root).await, None);
-    assert_eq!(parent(log, late).await, Some(root));
+    assert_eq!(parent(log, kid).await, Some(root));
     assert_eq!(parent(log, unknown).await, None);
-    assert_eq!(
-        children(log, root).await,
-        vec![early, late],
-        "children are ordered by id"
-    );
-    assert!(children(log, late).await.is_empty());
 }
 
 async fn retire(
@@ -635,9 +715,13 @@ async fn retirement(log: &dyn SessionStore) {
     retire(log, target, captured).await.expect("retire");
     assert!(frontier(log, target).await.is_none());
     assert!(scan(log, target).await.is_empty());
-    assert!(!sessions(log).await.contains(&target));
+    assert!(!listed(log, ParentFilter::Any).await.contains(&target));
     assert_eq!(parent(log, target).await, None);
-    assert!(children(log, parent_id).await.is_empty());
+    assert!(
+        listed(log, ParentFilter::ChildrenOf(parent_id))
+            .await
+            .is_empty()
+    );
     retire(log, target, captured)
         .await
         .expect("same-frontier retry is idempotent");

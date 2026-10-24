@@ -16,8 +16,8 @@ use asterpath_protocol::{
     dedup,
 };
 use asterpath_protocol::{
-    DedupKey, LogEntry, LogId, LogQuery, NewEntry, SessionId, SessionStore, StorageError,
-    ToolCallId, TurnId,
+    DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter, SessionId, SessionQuery,
+    SessionStore, StorageError, ToolCallId, TurnId,
 };
 use asterpath_storage_sqlite::open;
 use common::TempDir;
@@ -25,6 +25,21 @@ use futures_util::StreamExt;
 
 const HELPER_MODE: &str = "ASTERPATH_STORAGE_HELPER_MODE";
 const HELPER_DB: &str = "ASTERPATH_STORAGE_HELPER_DB";
+
+/// Catalog sessions under `parent`, in id order.
+fn listed(storage: &dyn SessionStore, parent: ParentFilter) -> Vec<SessionId> {
+    let query = SessionQuery {
+        parent,
+        ..SessionQuery::default()
+    };
+    let entries = block_on(storage.sessions(query)).expect("sessions");
+    sorted(entries.iter().map(|entry| entry.session).collect())
+}
+
+fn sorted(mut sessions: Vec<SessionId>) -> Vec<SessionId> {
+    sessions.sort();
+    sessions
+}
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     futures_executor::block_on(future)
@@ -392,11 +407,10 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
             Some(parent)
         );
         assert_eq!(block_on(storage.parent(parent)).expect("parent"), None);
-        let children: Vec<SessionId> = block_on(storage.children(parent).collect::<Vec<_>>())
-            .into_iter()
-            .map(|result| result.expect("child"))
-            .collect();
-        assert_eq!(children, vec![child, retired]);
+        assert_eq!(
+            listed(storage.as_ref(), ParentFilter::ChildrenOf(parent)),
+            sorted(vec![child, retired])
+        );
     }
 
     // Tombstone the retired child while leaving its sessions row in place:
@@ -418,15 +432,14 @@ fn catalog_reports_parents_and_hides_retired_sessions() {
         "retired sessions are invisible"
     );
     assert_eq!(
-        block_on(storage.sessions()).expect("sessions"),
-        vec![parent, child],
+        listed(storage.as_ref(), ParentFilter::Any),
+        sorted(vec![parent, child]),
         "sessions() hides tombstoned rows"
     );
-    let children: Vec<SessionId> = block_on(storage.children(parent).collect::<Vec<_>>())
-        .into_iter()
-        .map(|result| result.expect("child"))
-        .collect();
-    assert_eq!(children, vec![child]);
+    assert_eq!(
+        listed(storage.as_ref(), ParentFilter::ChildrenOf(parent)),
+        vec![child]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -495,10 +508,7 @@ fn a_v1_database_migrates_to_v2_and_keeps_its_log() {
     let entries = scan(storage.as_ref(), target);
     assert_eq!(entries.len(), 1, "the log survives the migration");
     assert!(entries[0].is_ok());
-    assert_eq!(
-        block_on(storage.sessions()).expect("sessions"),
-        vec![target]
-    );
+    assert_eq!(listed(storage.as_ref(), ParentFilter::Any), vec![target]);
     drop(storage);
 
     let conn = rusqlite::Connection::open(&db).expect("raw open");

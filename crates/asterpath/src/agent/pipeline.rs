@@ -680,6 +680,8 @@ impl ToolPipeline {
                 if !self.gate.is_open() {
                     return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
                 }
+                // Listed until this wait ends for any reason, including drop.
+                let _pending = self.gate.wait_for(request.clone());
                 step.events.push(Ok(AgentEvent::ApprovalRequested(request)));
                 // A signal recorded after this step's read is still returned here.
                 let wait = self.waits.await_signal(AwaitSignal {

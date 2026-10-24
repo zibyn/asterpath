@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 
+use crate::agent::ApprovalRequest;
 use crate::error::{RetirementError, StorageError};
 use crate::ids::{LogId, SessionId, SignalId};
 use crate::time::Timestamp;
@@ -82,22 +84,69 @@ pub struct LogQuery {
     pub limit: Option<usize>,
 }
 
+/// Which sessions a catalog query lists, by parent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParentFilter {
+    #[default]
+    Any,
+    Roots,
+    ChildrenOf(SessionId),
+}
+
+/// Position in the catalog order: the last entry of the previous page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CatalogCursor {
+    pub created_at: Timestamp,
+    pub session: SessionId,
+}
+
+/// A page request over the session catalog (ADR-0028).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub parent: ParentFilter,
+    /// Exclusive cursor: the page starts after this entry.
+    pub after: Option<CatalogCursor>,
+    pub limit: Option<usize>,
+}
+
+/// One live session in the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub session: SessionId,
+    pub parent: Option<SessionId>,
+    /// `recorded_at` of the session's `SessionCreated`.
+    pub created_at: Timestamp,
+    /// `recorded_at` of the session's last committed record; display only,
+    /// recovery and wake never read it.
+    pub last_activity: Timestamp,
+}
+
+impl CatalogEntry {
+    pub fn cursor(&self) -> CatalogCursor {
+        CatalogCursor {
+            created_at: self.created_at,
+            session: self.session,
+        }
+    }
+}
+
 /// The one storage adapter (ADR-0023): the append-only per-session event log
-/// plus the session catalog (`sessions` / `parent` / `children`) and optional
+/// plus the session catalog (`sessions` / `parent`) and optional
 /// whole-session retirement. Retired sessions are invisible to every read.
 pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 
-    /// Every session that has a `SessionCreated` and is not retired,
-    /// children included, ordered by id.
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
+    /// Sessions that have a `SessionCreated` and are not retired, filtered by
+    /// parent, ordered by `(created_at, session)` descending (ADR-0028).
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>>;
     /// The parent recorded in `SessionCreated`; `None` for a root or unknown
     /// session.
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
-    /// Live children of `session`, ordered by id.
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>>;
 
     /// Write the tombstone and delete the session's log and catalog row.
     /// `expected_frontier` must equal the current last log id. Backends
@@ -153,11 +202,19 @@ pub enum WakeCause {
     ChildCompleted(SessionId),
 }
 
-/// Liveness declaration for approval responders: the kernel mechanism only
-/// tells the pipeline whether anyone can answer.
+/// Liveness declaration for approval responders, plus the requests waiting
+/// for a decision in this process (ADR-0028). Nothing here is durable:
+/// recovery re-emits `ApprovalRequested` after a restart.
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalGate {
     open: Arc<AtomicUsize>,
+    pending: Arc<Mutex<PendingRequests>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingRequests {
+    next: u64,
+    waiting: BTreeMap<u64, ApprovalRequest>,
 }
 
 impl ApprovalGate {
@@ -175,6 +232,46 @@ impl ApprovalGate {
 
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::SeqCst) > 0
+    }
+
+    /// Every request still waiting for a decision, across all sessions, in
+    /// the order they were requested.
+    pub fn pending(&self) -> Vec<ApprovalRequest> {
+        self.lock().waiting.values().cloned().collect()
+    }
+
+    /// Lists `request` as pending until the returned guard drops, however the
+    /// wait ends: a decision, a cancel or a dropped drive stream.
+    pub fn wait_for(&self, request: ApprovalRequest) -> PendingApproval {
+        let mut pending = self.lock();
+        let key = pending.next;
+        pending.next += 1;
+        pending.waiting.insert(key, request);
+        PendingApproval {
+            pending: Arc::clone(&self.pending),
+            key,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingRequests> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// RAII listing of one waiting request; see `ApprovalGate::wait_for`.
+#[derive(Debug)]
+pub struct PendingApproval {
+    pending: Arc<Mutex<PendingRequests>>,
+    key: u64,
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+            .remove(&self.key);
     }
 }
 

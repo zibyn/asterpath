@@ -10,7 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use asterpath_protocol::{
-    DedupKey, LogEntry, LogQuery, SessionId, SessionStore, StepId, StorageError, TurnId,
+    DedupKey, LogEntry, LogQuery, ParentFilter, SessionId, SessionQuery, SessionStore, StepId,
+    StorageError, TurnId,
 };
 use asterpath_protocol::{
     Usage, UsageBucket, UsageEntry, UsageError, UsageFilter, UsageRecord, UsageReport, UsageScope,
@@ -56,9 +57,15 @@ impl UsageService {
         let mut sessions = vec![root];
         let mut queue = VecDeque::from([root]);
         while let Some(parent) = queue.pop_front() {
-            let mut children = self.log.children(parent);
-            while let Some(child) = children.next().await {
-                let child = child.map_err(|error| UsageError::Backend(error.to_string()))?;
+            let children = self
+                .log
+                .sessions(SessionQuery {
+                    parent: ParentFilter::ChildrenOf(parent),
+                    ..SessionQuery::default()
+                })
+                .await
+                .map_err(|error| UsageError::Backend(error.to_string()))?;
+            for child in children.into_iter().map(|entry| entry.session) {
                 if self.live(child).await? {
                     sessions.push(child);
                     queue.push_back(child);
