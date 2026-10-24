@@ -455,3 +455,162 @@ async fn write_and_edit_replace_the_file_atomically_and_keep_its_mode() {
         .collect();
     assert_eq!(names, ["run.sh"], "temp files left behind");
 }
+
+fn is_denied(result: &Result<String, ToolError>) -> bool {
+    matches!(result, Err(ToolError::Denied { .. }))
+}
+
+#[tokio::test]
+async fn any_symlink_on_the_path_is_denied_even_inside_the_root() {
+    let (dir, root) = root();
+    std::fs::create_dir(root.join("real")).unwrap();
+    std::fs::write(root.join("real/f.txt"), "inside").unwrap();
+    std::fs::create_dir(dir.path().join("out")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("in_dir")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("out"), root.join("out_dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("real/f.txt"), root.join("in_file")).unwrap();
+    let tools = full_access(&root);
+
+    for path in ["in_dir/f.txt", "out_dir/f.txt", "in_file"] {
+        let read = call(
+            &tool(&tools, "read_file"),
+            serde_json::json!({ "path": path }),
+        )
+        .await;
+        assert!(is_denied(&read), "read {path}: {read:?}");
+        let write = call(
+            &tool(&tools, "write_file"),
+            serde_json::json!({ "path": path, "content": "x" }),
+        )
+        .await;
+        assert!(is_denied(&write), "write {path}: {write:?}");
+        let edit = call(
+            &tool(&tools, "edit_file"),
+            serde_json::json!({ "path": path, "old_string": "inside", "new_string": "x" }),
+        )
+        .await;
+        assert!(is_denied(&edit), "edit {path}: {edit:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("real/f.txt")).unwrap(),
+        "inside"
+    );
+    assert!(
+        std::fs::read_dir(dir.path().join("out"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("in_file"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[tokio::test]
+async fn write_file_creates_missing_parent_directories() {
+    let (_dir, root) = root();
+    let tools = full_access(&root);
+    call(
+        &tool(&tools, "write_file"),
+        serde_json::json!({ "path": "a/b/c/f.txt", "content": "deep" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a/b/c/f.txt")).unwrap(),
+        "deep"
+    );
+}
+
+#[tokio::test]
+async fn grep_and_list_dir_do_not_enter_symlinked_directories() {
+    let (dir, root) = root();
+    let outside = dir.path().join("out");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("s.txt"), "needle\n").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    std::fs::write(root.join("a.txt"), "needle\n").unwrap();
+    let tools = read_only(root.clone()).unwrap();
+    let grep = tool(&tools, "grep");
+    let list = tool(&tools, "list_dir");
+
+    assert_eq!(
+        call(&grep, serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap(),
+        "a.txt:1: needle\n"
+    );
+    assert_eq!(
+        call(&list, serde_json::json!({})).await.unwrap(),
+        "a.txt\nlink"
+    );
+    let grep_link = call(
+        &grep,
+        serde_json::json!({ "pattern": "needle", "path": "link" }),
+    )
+    .await;
+    assert!(is_denied(&grep_link), "{grep_link:?}");
+    let list_link = call(&list, serde_json::json!({ "path": "link" })).await;
+    assert!(is_denied(&list_link), "{list_link:?}");
+}
+
+/// A background thread keeps swapping an intermediate directory with a
+/// symlink to outside the root while the tools run; nothing outside is ever
+/// read or written.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn swapping_a_directory_for_a_symlink_mid_call_never_escapes() {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (dir, root) = root();
+    let outside = dir.path().join("out");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    std::fs::create_dir(root.join("mid")).unwrap();
+    std::fs::write(root.join("mid/secret.txt"), "inside").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("swap")).unwrap();
+    let tools = full_access(&root);
+    let read = tool(&tools, "read_file");
+    let write = tool(&tools, "write_file");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = std::thread::spawn({
+        let (stop, root) = (stop.clone(), root.clone());
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                renameat_with(
+                    CWD,
+                    root.join("mid"),
+                    CWD,
+                    root.join("swap"),
+                    RenameFlags::EXCHANGE,
+                )
+                .unwrap();
+            }
+        }
+    });
+    for _ in 0..2000 {
+        let read = call(&read, serde_json::json!({ "path": "mid/secret.txt" })).await;
+        assert!(
+            matches!(&read, Ok(text) if text == "inside") || is_denied(&read),
+            "{read:?}"
+        );
+        let write = call(
+            &write,
+            serde_json::json!({ "path": "mid/new.txt", "content": "x" }),
+        )
+        .await;
+        assert!(write.is_ok() || is_denied(&write), "{write:?}");
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+
+    let names: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["secret.txt"]);
+}
