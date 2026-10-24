@@ -142,10 +142,11 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
             system: Vec::new(),
             tools: ToolSelection::Names(vec![ToolName::new("switch")]),
             request: RequestConfig::default(),
-            turn: TurnConfig {
-                initial_backoff: Duration::ZERO,
-                max_backoff: Duration::ZERO,
-                ..TurnConfig::default()
+            turn: {
+                let mut config = TurnConfig::default();
+                config.initial_backoff = Duration::ZERO;
+                config.max_backoff = Duration::ZERO;
+                config
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
@@ -250,10 +251,11 @@ async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
             }],
             tools: ToolSelection::Names(vec![ToolName::new("append")]),
             request: RequestConfig::default(),
-            turn: TurnConfig {
-                initial_backoff: Duration::ZERO,
-                max_backoff: Duration::ZERO,
-                ..TurnConfig::default()
+            turn: {
+                let mut config = TurnConfig::default();
+                config.initial_backoff = Duration::ZERO;
+                config.max_backoff = Duration::ZERO;
+                config
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),
@@ -478,10 +480,11 @@ async fn run_equip_turn(
             }],
             tools: ToolSelection::Names(vec![ToolName::new("equip")]),
             request: RequestConfig::default(),
-            turn: TurnConfig {
-                initial_backoff: Duration::ZERO,
-                max_backoff: Duration::ZERO,
-                ..TurnConfig::default()
+            turn: {
+                let mut config = TurnConfig::default();
+                config.initial_backoff = Duration::ZERO;
+                config.max_backoff = Duration::ZERO;
+                config
             },
             compaction: CompactionConfig::default(),
             subagents: SubagentConfig::default(),

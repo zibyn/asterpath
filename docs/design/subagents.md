@@ -378,6 +378,7 @@ recover(child):
 数值是 `SubagentConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct SubagentConfig {
     pub default_context: ContextPolicy,         // Fresh
     pub max_depth: u8,                          // 3

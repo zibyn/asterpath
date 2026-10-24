@@ -79,11 +79,10 @@ impl Hooks for RedactOutput {
 // --- fixtures -------------------------------------------------------------
 
 fn tool_config() -> ToolConfig {
-    ToolConfig {
-        // Timeout tests must not sit in the default 5s kill grace.
-        kill_grace: Duration::ZERO,
-        ..ToolConfig::default()
-    }
+    let mut config = ToolConfig::default();
+    // Timeout tests must not sit in the default 5s kill grace.
+    config.kill_grace = Duration::ZERO;
+    config
 }
 
 async fn new_log(config: ConfigSnapshot) -> Arc<InMemoryEventLog> {
@@ -402,11 +401,9 @@ async fn the_step_cap_truncates_later_completions() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let config = ToolConfig {
-        max_output_bytes: 1000,
-        max_output_bytes_per_step: 150,
-        ..tool_config()
-    };
+    let mut config = tool_config();
+    config.max_output_bytes = 1000;
+    config.max_output_bytes_per_step = 150;
     let agent = agent(log.clone(), provider, registry, config, Vec::new());
     drive(&agent).await;
 
@@ -672,10 +669,8 @@ async fn max_parallel_calls_queues_excess_tools() {
         StopReason::ToolUse,
         assistant_text("done"),
     );
-    let config = ToolConfig {
-        max_parallel_calls: std::num::NonZeroUsize::new(2).expect("non-zero"),
-        ..tool_config()
-    };
+    let mut config = tool_config();
+    config.max_parallel_calls = std::num::NonZeroUsize::new(2).expect("non-zero");
     let agent = agent(log, provider, registry, config, Vec::new());
     drive(&agent).await;
 

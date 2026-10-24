@@ -22,17 +22,15 @@ fn request_for(model: &str) -> ModelRequest {
 }
 
 fn effort(effort: ReasoningEffort) -> Option<ReasoningParams> {
-    Some(ReasoningParams {
-        effort: Some(effort),
-        ..ReasoningParams::default()
-    })
+    let mut params = ReasoningParams::default();
+    params.effort = Some(effort);
+    Some(params)
 }
 
 fn budget(tokens: u32) -> Option<ReasoningParams> {
-    Some(ReasoningParams {
-        budget_tokens: Some(tokens),
-        ..ReasoningParams::default()
-    })
+    let mut params = ReasoningParams::default();
+    params.budget_tokens = Some(tokens);
+    Some(params)
 }
 
 fn user_message(parts: Vec<Part>) -> Item {
@@ -73,16 +71,14 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
     request.baseline_tools = request.tools.clone();
     request.tool_choice = ToolChoice::Required;
     request.disable_parallel_tool_use = true;
-    request.sampling = Some(SamplingParams {
-        temperature: Some(0.4),
-        top_p: Some(0.9),
-        top_k: Some(5),
-        seed: None,
-    });
-    request.reasoning = Some(ReasoningParams {
-        budget_tokens: Some(2048),
-        ..ReasoningParams::default()
-    });
+    let mut sampling = SamplingParams::default();
+    sampling.temperature = Some(0.4);
+    sampling.top_p = Some(0.9);
+    sampling.top_k = Some(5);
+    request.sampling = Some(sampling);
+    let mut reasoning = ReasoningParams::default();
+    reasoning.budget_tokens = Some(2048);
+    request.reasoning = Some(reasoning);
     request.max_output_tokens = 512;
 
     drain(&provider(&server), request).await;
@@ -441,20 +437,18 @@ async fn unsupported_request_fields_fail_before_any_http() {
     let server = MockServer::start(Vec::new());
 
     let mut seed = base_request();
-    seed.sampling = Some(SamplingParams {
-        seed: Some(7),
-        ..SamplingParams::default()
-    });
+    let mut sampling = SamplingParams::default();
+    sampling.seed = Some(7);
+    seed.sampling = Some(sampling);
     let error = one_request(&server, seed).await;
     assert_eq!(error.kind, ProviderErrorKind::Unsupported);
     assert!(!error.retryable);
 
     // Effort is documented only for Opus 4.5 among extended-thinking-only models.
     let mut effort = request_for("claude-sonnet-4-5");
-    effort.reasoning = Some(ReasoningParams {
-        effort: Some(ReasoningEffort::High),
-        ..ReasoningParams::default()
-    });
+    let mut reasoning = ReasoningParams::default();
+    reasoning.effort = Some(ReasoningEffort::High);
+    effort.reasoning = Some(reasoning);
     let error = one_request(&server, effort).await;
     assert_eq!(error.kind, ProviderErrorKind::Unsupported);
 
@@ -676,11 +670,10 @@ async fn off_sends_neither_thinking_nor_effort_where_thinking_defaults_off() {
     let provider = provider(&server);
     for model in models {
         let mut request = request_for(model);
-        request.reasoning = Some(ReasoningParams {
-            effort: Some(ReasoningEffort::Off),
-            summary: true,
-            ..ReasoningParams::default()
-        });
+        let mut reasoning = ReasoningParams::default();
+        reasoning.effort = Some(ReasoningEffort::Off);
+        reasoning.summary = true;
+        request.reasoning = Some(reasoning);
         drain(&provider, request).await;
     }
     let recorded = server.requests();
@@ -699,11 +692,10 @@ async fn off_sends_disabled_thinking_where_thinking_defaults_on() {
     let provider = provider(&server);
     for model in models {
         let mut request = request_for(model);
-        request.reasoning = Some(ReasoningParams {
-            effort: Some(ReasoningEffort::Off),
-            summary: true,
-            ..ReasoningParams::default()
-        });
+        let mut reasoning = ReasoningParams::default();
+        reasoning.effort = Some(ReasoningEffort::Off);
+        reasoning.summary = true;
+        request.reasoning = Some(reasoning);
         drain(&provider, request).await;
     }
     let recorded = server.requests();
@@ -795,11 +787,10 @@ async fn summary_requests_summarized_thinking_display_where_supported() {
         ("claude-sonnet-4-5", Some(2048)),
     ] {
         let mut request = request_for(model);
-        request.reasoning = Some(ReasoningParams {
-            budget_tokens,
-            summary: true,
-            ..ReasoningParams::default()
-        });
+        let mut reasoning = ReasoningParams::default();
+        reasoning.budget_tokens = budget_tokens;
+        reasoning.summary = true;
+        request.reasoning = Some(reasoning);
         drain(&provider, request).await;
     }
     let recorded = server.requests();
@@ -836,11 +827,10 @@ async fn transitional_and_opus_4_5_models_keep_their_documented_shapes() {
     drain(&provider, extended).await;
     // Opus 4.5 is extended-thinking-only but documents effort alongside the budget.
     let mut opus_4_5 = request_for("claude-opus-4-5-20251101");
-    opus_4_5.reasoning = Some(ReasoningParams {
-        effort: Some(ReasoningEffort::Low),
-        budget_tokens: Some(2048),
-        ..ReasoningParams::default()
-    });
+    let mut reasoning = ReasoningParams::default();
+    reasoning.effort = Some(ReasoningEffort::Low);
+    reasoning.budget_tokens = Some(2048);
+    opus_4_5.reasoning = Some(reasoning);
     drain(&provider, opus_4_5).await;
 
     let recorded = server.requests();
@@ -879,10 +869,9 @@ async fn current_models_reject_budget_forced_tool_choice_and_sampling_before_htt
     named.baseline_tools = named.tools.clone();
     named.tool_choice = ToolChoice::Tool(ToolName::new("search"));
     let mut sampled = request_for("claude-opus-4-7");
-    sampled.sampling = Some(SamplingParams {
-        temperature: Some(0.2),
-        ..SamplingParams::default()
-    });
+    let mut sampling = SamplingParams::default();
+    sampling.temperature = Some(0.2);
+    sampled.sampling = Some(sampling);
 
     for request in [with_budget, forced, named, sampled] {
         let error = one_request(&server, request).await;

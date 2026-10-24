@@ -68,11 +68,10 @@ fn usage(input: u64, output: u64) -> Usage {
 }
 
 fn test_turn_config() -> TurnConfig {
-    TurnConfig {
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-        ..TurnConfig::default()
-    }
+    let mut config = TurnConfig::default();
+    config.initial_backoff = Duration::ZERO;
+    config.max_backoff = Duration::ZERO;
+    config
 }
 
 fn spec(provider: &str) -> SessionSpec {
@@ -687,10 +686,9 @@ async fn capability_mismatch_is_rejected_before_the_response_is_used() {
     );
     let asterpath = open(&db, vec![provider.clone()]).await;
     let mut session_spec = spec("p");
-    session_spec.request.sampling = Some(SamplingParams {
-        temperature: Some(0.4),
-        ..SamplingParams::default()
-    });
+    let mut sampling = SamplingParams::default();
+    sampling.temperature = Some(0.4);
+    session_spec.request.sampling = Some(sampling);
     let handle = asterpath.create_session(session_spec).await.unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;

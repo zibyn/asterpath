@@ -248,6 +248,7 @@ pub enum ToolChoice {
     Tool(ToolName),
 }
 
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct SamplingParams {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -255,6 +256,7 @@ pub struct SamplingParams {
     pub seed: Option<u64>,
 }
 
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct ReasoningParams {
     pub effort: Option<ReasoningEffort>, // OpenAI reasoning.effort；Anthropic output_config.effort
     pub budget_tokens: Option<u32>,      // Anthropic thinking.budget_tokens

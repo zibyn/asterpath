@@ -380,9 +380,10 @@ async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
     ));
     let asterpath = build(&db, provider, vec![tool], None).await;
     let handle = asterpath
-        .create_session(spec(TurnConfig {
-            cancel_grace: Duration::ZERO,
-            ..TurnConfig::default()
+        .create_session(spec({
+            let mut config = TurnConfig::default();
+            config.cancel_grace = Duration::ZERO;
+            config
         }))
         .await
         .unwrap();
@@ -441,9 +442,10 @@ async fn cancel_with_grace_keeps_a_tool_result_that_returns_in_time() {
     ));
     let asterpath = build(&db, provider, vec![tool], None).await;
     let handle = asterpath
-        .create_session(spec(TurnConfig {
-            cancel_grace: Duration::from_secs(1),
-            ..TurnConfig::default()
+        .create_session(spec({
+            let mut config = TurnConfig::default();
+            config.cancel_grace = Duration::from_secs(1);
+            config
         }))
         .await
         .unwrap();
@@ -538,9 +540,10 @@ async fn idempotent_cancel_during_a_tool_and_idle_cancel_is_a_no_op() {
     ));
     let asterpath = build(&db, provider, vec![tool], None).await;
     let handle = asterpath
-        .create_session(spec(TurnConfig {
-            cancel_grace: Duration::ZERO,
-            ..TurnConfig::default()
+        .create_session(spec({
+            let mut config = TurnConfig::default();
+            config.cancel_grace = Duration::ZERO;
+            config
         }))
         .await
         .unwrap();
@@ -754,9 +757,10 @@ async fn max_steps_per_turn_ends_with_max_steps_exceeded() {
     );
     let asterpath = build(&db, provider.clone(), vec![tool], None).await;
     let handle = asterpath
-        .create_session(spec(TurnConfig {
-            max_steps_per_turn: Some(1),
-            ..TurnConfig::default()
+        .create_session(spec({
+            let mut config = TurnConfig::default();
+            config.max_steps_per_turn = Some(1);
+            config
         }))
         .await
         .unwrap();
@@ -844,10 +848,11 @@ async fn cancel_interrupts_the_retry_backoff_sleep() {
     );
     let asterpath = build(&db, provider.clone(), Vec::new(), None).await;
     let handle = asterpath
-        .create_session(spec(TurnConfig {
-            initial_backoff: Duration::from_secs(10),
-            max_backoff: Duration::from_secs(30),
-            ..TurnConfig::default()
+        .create_session(spec({
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::from_secs(10);
+            config.max_backoff = Duration::from_secs(30);
+            config
         }))
         .await
         .unwrap();

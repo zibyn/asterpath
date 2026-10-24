@@ -280,6 +280,7 @@ pub enum ToolErrorKind {
 数值是 `ToolConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct ToolConfig {
     pub max_parallel_calls: NonZeroUsize,       // 8
     pub max_output_bytes: usize,                // 64 KiB

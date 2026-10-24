@@ -529,17 +529,14 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
     let mut request = request(vec![user_text("hello")]);
     request.tool_choice = ToolChoice::Tool(ToolName::new("get_weather"));
     request.disable_parallel_tool_use = true;
-    request.sampling = Some(asterpath_protocol::SamplingParams {
-        temperature: Some(0.25),
-        top_p: Some(0.5),
-        top_k: None,
-        seed: None,
-    });
-    request.reasoning = Some(asterpath_protocol::ReasoningParams {
-        effort: Some(asterpath_protocol::ReasoningEffort::High),
-        budget_tokens: None,
-        summary: true,
-    });
+    let mut sampling = asterpath_protocol::SamplingParams::default();
+    sampling.temperature = Some(0.25);
+    sampling.top_p = Some(0.5);
+    request.sampling = Some(sampling);
+    let mut reasoning = asterpath_protocol::ReasoningParams::default();
+    reasoning.effort = Some(asterpath_protocol::ReasoningEffort::High);
+    reasoning.summary = true;
+    request.reasoning = Some(reasoning);
     let events = collect(&provider, request).await;
     assert!(events.iter().all(Result::is_ok), "{events:?}");
 
@@ -1264,20 +1261,17 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
     let provider = provider(&server);
 
     let mut top_k = request(vec![user_text("go")]);
-    top_k.sampling = Some(asterpath_protocol::SamplingParams {
-        top_k: Some(5),
-        ..Default::default()
-    });
+    let mut sampling = asterpath_protocol::SamplingParams::default();
+    sampling.top_k = Some(5);
+    top_k.sampling = Some(sampling);
     let mut seed = request(vec![user_text("go")]);
-    seed.sampling = Some(asterpath_protocol::SamplingParams {
-        seed: Some(7),
-        ..Default::default()
-    });
+    let mut sampling = asterpath_protocol::SamplingParams::default();
+    sampling.seed = Some(7);
+    seed.sampling = Some(sampling);
     let mut budget = request(vec![user_text("go")]);
-    budget.reasoning = Some(asterpath_protocol::ReasoningParams {
-        budget_tokens: Some(1024),
-        ..Default::default()
-    });
+    let mut reasoning = asterpath_protocol::ReasoningParams::default();
+    reasoning.budget_tokens = Some(1024);
+    budget.reasoning = Some(reasoning);
     // Responses assistant output content does not accept images.
     let image = request(vec![Item::Message {
         role: Role::Assistant,
@@ -1588,10 +1582,9 @@ async fn message_raw_from_another_provider_is_ignored() {
 fn with_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> ModelRequest {
     let mut request = request(vec![user_text("hello")]);
     request.spec = spec(model);
-    request.reasoning = Some(asterpath_protocol::ReasoningParams {
-        effort: Some(effort),
-        ..asterpath_protocol::ReasoningParams::default()
-    });
+    let mut reasoning = asterpath_protocol::ReasoningParams::default();
+    reasoning.effort = Some(effort);
+    request.reasoning = Some(reasoning);
     request
 }
 

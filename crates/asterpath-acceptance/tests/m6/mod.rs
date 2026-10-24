@@ -55,10 +55,11 @@ fn spec(system: Vec<Part>) -> SessionSpec {
         system,
         tools: ToolSelection::All,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: asterpath_protocol::CompactionConfig::default(),
         subagents: SubagentConfig::default(),

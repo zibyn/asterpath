@@ -33,11 +33,12 @@ const MAX_ATTEMPTS: u32 = 3;
 
 fn config(backoff: Duration) -> ConfigSnapshot {
     ConfigSnapshot {
-        turn: TurnConfig {
-            max_attempts: MAX_ATTEMPTS.try_into().expect("non-zero"),
-            initial_backoff: backoff,
-            max_backoff: backoff,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.max_attempts = MAX_ATTEMPTS.try_into().expect("non-zero");
+            config.initial_backoff = backoff;
+            config.max_backoff = backoff;
+            config
         },
         ..support::config(Vec::new())
     }

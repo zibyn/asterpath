@@ -84,6 +84,7 @@ pub enum ToolChoice {
     Tool(ToolName),
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: Option<f32>,
@@ -92,6 +93,7 @@ pub struct SamplingParams {
     pub seed: Option<u64>,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningParams {
     pub effort: Option<ReasoningEffort>,
@@ -116,6 +118,7 @@ pub enum ReasoningEffort {
     Max,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnConfig {
     pub max_steps_per_turn: Option<u32>,
@@ -140,6 +143,7 @@ impl Default for TurnConfig {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionConfig {
     /// `None`: `min(8192, context_window / 4)`.
@@ -163,6 +167,7 @@ impl Default for CompactionConfig {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentConfig {
     pub default_context: ContextPolicy,
@@ -419,6 +424,7 @@ pub enum TransportKind {
 }
 
 /// Pipeline concurrency, truncation and external-tool timeout defaults.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolConfig {
     pub max_parallel_calls: NonZeroUsize,

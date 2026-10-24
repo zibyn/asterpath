@@ -54,10 +54,11 @@ fn spec() -> SessionSpec {
         system: vec![text("be helpful")],
         tools: ToolSelection::Names(Vec::new()),
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
@@ -532,11 +533,12 @@ async fn a_forked_child_sees_an_appended_instruction_once() {
     let handle = asterpath
         .create_session(SessionSpec {
             tools: ToolSelection::All,
-            subagents: SubagentConfig {
-                default_context: ContextPolicy::Fork {
+            subagents: {
+                let mut config = SubagentConfig::default();
+                config.default_context = ContextPolicy::Fork {
                     at: LogId::from_i64(0),
-                },
-                ..SubagentConfig::default()
+                };
+                config
             },
             ..spec()
         })
@@ -993,11 +995,12 @@ async fn a_forked_child_starts_from_the_effective_tools_without_change_items() {
     let handle = asterpath
         .create_session(SessionSpec {
             tools: ToolSelection::Names(vec![ToolName::new("spawn_agent")]),
-            subagents: SubagentConfig {
-                default_context: ContextPolicy::Fork {
+            subagents: {
+                let mut config = SubagentConfig::default();
+                config.default_context = ContextPolicy::Fork {
                     at: LogId::from_i64(0),
-                },
-                ..SubagentConfig::default()
+                };
+                config
             },
             ..spec()
         })

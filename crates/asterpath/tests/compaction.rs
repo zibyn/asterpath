@@ -120,11 +120,10 @@ impl Tool for BigTool {
 }
 
 fn turn() -> TurnConfig {
-    TurnConfig {
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-        ..TurnConfig::default()
-    }
+    let mut config = TurnConfig::default();
+    config.initial_backoff = Duration::ZERO;
+    config.max_backoff = Duration::ZERO;
+    config
 }
 
 fn spec(window: Option<u32>, compaction: CompactionConfig) -> SessionSpec {
@@ -144,10 +143,9 @@ fn spec(window: Option<u32>, compaction: CompactionConfig) -> SessionSpec {
 }
 
 fn compaction_config(max_auto: u32) -> CompactionConfig {
-    CompactionConfig {
-        max_auto_compactions_per_turn: max_auto,
-        ..CompactionConfig::default()
-    }
+    let mut config = CompactionConfig::default();
+    config.max_auto_compactions_per_turn = max_auto;
+    config
 }
 
 fn compactor(provider: &Arc<ScriptedProvider>) -> Arc<dyn Compactor> {

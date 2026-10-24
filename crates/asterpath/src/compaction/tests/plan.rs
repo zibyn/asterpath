@@ -40,13 +40,12 @@ fn model(window: Option<u32>) -> ModelSpec {
 }
 
 fn config() -> CompactionConfig {
-    CompactionConfig {
-        reserve_output_tokens: Some(0),
-        target_ratio: 0.5,
-        max_auto_compactions_per_turn: 1,
-        max_summary_tokens: 2048,
-        summary_model: None,
-    }
+    let mut config = CompactionConfig::default();
+    config.reserve_output_tokens = Some(0);
+    config.target_ratio = 0.5;
+    config.max_auto_compactions_per_turn = 1;
+    config.max_summary_tokens = 2048;
+    config
 }
 
 fn input(

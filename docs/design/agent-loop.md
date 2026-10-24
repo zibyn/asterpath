@@ -319,6 +319,7 @@ C5 重试每 step 至多一次，且不占 `max_attempts` 预算：即使超限�
 数值是 `TurnConfig` 的默认值，不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct TurnConfig {
     pub max_steps_per_turn: Option<u32>,   // None
     pub max_attempts: NonZeroU32,          // 3

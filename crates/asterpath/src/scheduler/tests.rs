@@ -59,9 +59,10 @@ fn config(max_depth: u8) -> ConfigSnapshot {
         request: RequestConfig::default(),
         turn: TurnConfig::default(),
         compaction: CompactionConfig::default(),
-        subagents: SubagentConfig {
-            max_depth,
-            ..SubagentConfig::default()
+        subagents: {
+            let mut config = SubagentConfig::default();
+            config.max_depth = max_depth;
+            config
         },
     }
 }
@@ -1634,11 +1635,10 @@ fn config_with(max_depth: u8, subagents: SubagentConfig) -> ConfigSnapshot {
 }
 
 fn limit(per_parent: usize) -> SubagentConfig {
-    SubagentConfig {
-        max_concurrent_children: NonZeroUsize::new(per_parent).expect("non-zero"),
-        cancel_grace: Duration::ZERO,
-        ..SubagentConfig::default()
-    }
+    let mut config = SubagentConfig::default();
+    config.max_concurrent_children = NonZeroUsize::new(per_parent).expect("non-zero");
+    config.cancel_grace = Duration::ZERO;
+    config
 }
 
 async fn seed_parent_with(
@@ -1981,13 +1981,11 @@ async fn spawn_uses_the_parent_snapshot_fresh_default_context() {
 #[tokio::test]
 async fn spawn_honours_a_fork_default_context_at_the_step_watermark() {
     let log = Arc::new(InMemoryEventLog::new());
-    let subagents = SubagentConfig {
-        // The watermark in the default is a placeholder; the spawn step's
-        // `StepStarted` is authoritative.
-        default_context: ContextPolicy::Fork {
-            at: LogId::from_i64(0),
-        },
-        ..SubagentConfig::default()
+    let mut subagents = SubagentConfig::default();
+    // The watermark in the default is a placeholder; the spawn step's
+    // `StepStarted` is authoritative.
+    subagents.default_context = ContextPolicy::Fork {
+        at: LogId::from_i64(0),
     };
     let (caused_by, at) = seed_fork_parent(&*log, &subagents).await;
     let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
@@ -2077,10 +2075,8 @@ impl SessionStore for CompletesInGrace {
 async fn a_child_terminal_landing_in_the_timeout_grace_wins() {
     let log = Arc::new(InMemoryEventLog::new());
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
-    let subagents = SubagentConfig {
-        cancel_grace: Duration::from_millis(50),
-        ..SubagentConfig::default()
-    };
+    let mut subagents = SubagentConfig::default();
+    subagents.cancel_grace = Duration::from_millis(50);
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
     let child = SessionId::from_bytes([9; 16]);
     append(
@@ -2165,13 +2161,11 @@ fn spawn_with_deadline(
     SessionEvent::ChildSessionSpawned {
         child,
         task: vec![text("task")],
-        config: config_with(
-            3,
-            SubagentConfig {
-                cancel_grace: Duration::from_millis(20),
-                ..SubagentConfig::default()
-            },
-        ),
+        config: config_with(3, {
+            let mut config = SubagentConfig::default();
+            config.cancel_grace = Duration::from_millis(20);
+            config
+        }),
         context: ContextPolicy::Fresh,
         parent_tool_call_id: tool_call,
         caused_by,

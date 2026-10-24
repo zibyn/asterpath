@@ -139,10 +139,9 @@ fn capability_mismatch_fails_before_the_script_is_used() {
             Usage::default(),
         );
     let mut request_config = RequestConfig::default();
-    request_config.sampling = Some(SamplingParams {
-        temperature: Some(0.2),
-        ..SamplingParams::default()
-    });
+    let mut sampling = SamplingParams::default();
+    sampling.temperature = Some(0.2);
+    request_config.sampling = Some(sampling);
 
     let events: Vec<_> = futures::executor::block_on(async {
         use futures_util::StreamExt;

@@ -194,6 +194,7 @@ project(entries):
 数值是 `CompactionConfig` 的默认值（`bytes/3` 除外，它是实现常量），不是不变量（[packaging.md](packaging.md) §5.1）。
 
 ```rust
+#[non_exhaustive]                // Default + 赋字段构造
 pub struct CompactionConfig {
     pub reserve_output_tokens: Option<u32>,   // None：min(8192, ModelSpec.context_window / 4)
     pub target_ratio: f32,                    // 0.5

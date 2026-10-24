@@ -50,12 +50,11 @@ fn usage(input: u64, output: u64) -> Usage {
 }
 
 fn turn() -> TurnConfig {
-    TurnConfig {
-        max_attempts: NonZeroU32::new(2).expect("non-zero"),
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-        ..TurnConfig::default()
-    }
+    let mut config = TurnConfig::default();
+    config.max_attempts = NonZeroU32::new(2).expect("non-zero");
+    config.initial_backoff = Duration::ZERO;
+    config.max_backoff = Duration::ZERO;
+    config
 }
 
 fn job(usable: u32, retained: u64) -> CompactionJob {

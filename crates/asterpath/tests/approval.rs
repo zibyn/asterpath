@@ -77,10 +77,11 @@ fn spec() -> SessionSpec {
         system: vec![text("be helpful")],
         tools: ToolSelection::All,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
@@ -724,9 +725,10 @@ async fn cancel_before_deadline_wins_over_timeout() {
         .database(&db)
         .providers(vec![provider as Arc<dyn Provider>])
         .tools(vec![stubborn])
-        .tool(ToolConfig {
-            kill_grace: Duration::from_millis(20),
-            ..ToolConfig::default()
+        .tool({
+            let mut config = ToolConfig::default();
+            config.kill_grace = Duration::from_millis(20);
+            config
         })
         .build()
         .await
@@ -775,9 +777,10 @@ async fn real_result_within_grace_beats_cancellation() {
         .database(&db)
         .providers(vec![provider as Arc<dyn Provider>])
         .tools(vec![cooperative])
-        .tool(ToolConfig {
-            kill_grace: Duration::from_millis(100),
-            ..ToolConfig::default()
+        .tool({
+            let mut config = ToolConfig::default();
+            config.kill_grace = Duration::from_millis(100);
+            config
         })
         .build()
         .await

@@ -470,9 +470,10 @@ async fn assemble(
         .providers(vec![provider])
         .tools(tools)
         .clock(clock)
-        .tool(ToolConfig {
-            kill_grace: args.kill_grace,
-            ..ToolConfig::default()
+        .tool({
+            let mut config = ToolConfig::default();
+            config.kill_grace = args.kill_grace;
+            config
         });
     if !args.mcp_configs.is_empty() {
         // External tools are `Ask` by default and there is no approval endpoint
@@ -731,10 +732,11 @@ fn session_spec(fixture: &Fixture, provider: Option<&str>) -> SessionSpec {
         system: fixture.system.clone(),
         tools: ToolSelection::Names(fixture.tools.clone()),
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: asterpath_protocol::CompactionConfig::default(),
         subagents: asterpath_protocol::SubagentConfig::default(),

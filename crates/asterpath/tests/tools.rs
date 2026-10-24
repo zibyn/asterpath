@@ -95,10 +95,11 @@ fn spec(tools: ToolSelection) -> SessionSpec {
         system: vec![text("be helpful")],
         tools,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: std::time::Duration::ZERO,
-            max_backoff: std::time::Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = std::time::Duration::ZERO;
+            config.max_backoff = std::time::Duration::ZERO;
+            config
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),

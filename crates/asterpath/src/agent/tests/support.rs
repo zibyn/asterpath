@@ -41,10 +41,11 @@ pub(super) fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
         system: vec![text("be helpful")],
         tools,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),

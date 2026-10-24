@@ -160,10 +160,9 @@ pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSp
 }
 
 pub fn turn_config(settings: &Settings) -> TurnConfig {
-    TurnConfig {
-        max_steps_per_turn: settings.file.turn.max_steps_per_turn,
-        ..TurnConfig::default()
-    }
+    let mut config = TurnConfig::default();
+    config.max_steps_per_turn = settings.file.turn.max_steps_per_turn;
+    config
 }
 
 pub fn compaction_config(settings: &Settings) -> CompactionConfig {
@@ -799,49 +798,41 @@ impl FileConfig {
             || sampling.top_k.is_some()
             || sampling.seed.is_some()
         {
-            config.sampling = Some(SamplingParams {
-                temperature: sampling.temperature,
-                top_p: sampling.top_p,
-                top_k: sampling.top_k,
-                seed: sampling.seed,
-            });
+            let mut params = SamplingParams::default();
+            params.temperature = sampling.temperature;
+            params.top_p = sampling.top_p;
+            params.top_k = sampling.top_k;
+            params.seed = sampling.seed;
+            config.sampling = Some(params);
         }
         if reasoning.effort.is_some()
             || reasoning.budget_tokens.is_some()
             || reasoning.summary.is_some()
         {
-            config.reasoning = Some(ReasoningParams {
-                effort: reasoning.effort.as_deref().map(parse_effort).transpose()?,
-                budget_tokens: reasoning.budget_tokens,
-                summary: reasoning.summary.unwrap_or(false),
-            });
+            let mut params = ReasoningParams::default();
+            params.effort = reasoning.effort.as_deref().map(parse_effort).transpose()?;
+            params.budget_tokens = reasoning.budget_tokens;
+            params.summary = reasoning.summary.unwrap_or(false);
+            config.reasoning = Some(params);
         }
         Ok(config)
     }
 
     fn compaction_config(&self) -> CompactionConfig {
-        let default = CompactionConfig::default();
-        CompactionConfig {
-            reserve_output_tokens: self
-                .compaction
-                .reserve_output_tokens
-                .or(default.reserve_output_tokens),
-            target_ratio: self.compaction.target_ratio.unwrap_or(default.target_ratio),
-            max_auto_compactions_per_turn: self
-                .compaction
-                .max_auto_compactions_per_turn
-                .unwrap_or(default.max_auto_compactions_per_turn),
-            max_summary_tokens: self
-                .compaction
-                .max_summary_tokens
-                .unwrap_or(default.max_summary_tokens),
-            summary_model: self
-                .compaction
-                .summary_model
-                .as_ref()
-                .map(ModelItem::spec)
-                .or(default.summary_model),
-        }
+        let mut config = CompactionConfig::default();
+        let file = &self.compaction;
+        config.reserve_output_tokens = file.reserve_output_tokens.or(config.reserve_output_tokens);
+        config.target_ratio = file.target_ratio.unwrap_or(config.target_ratio);
+        config.max_auto_compactions_per_turn = file
+            .max_auto_compactions_per_turn
+            .unwrap_or(config.max_auto_compactions_per_turn);
+        config.max_summary_tokens = file.max_summary_tokens.unwrap_or(config.max_summary_tokens);
+        config.summary_model = file
+            .summary_model
+            .as_ref()
+            .map(ModelItem::spec)
+            .or(config.summary_model);
+        config
     }
 
     /// Process-wide; maps to the facade, not the per-session snapshot.
@@ -852,21 +843,19 @@ impl FileConfig {
     }
 
     fn subagent_config(&self) -> SubagentConfig {
-        let default = SubagentConfig::default();
-        SubagentConfig {
-            default_context: self
-                .subagents
-                .default_context
-                .clone()
-                .unwrap_or(default.default_context),
-            max_depth: self.subagents.max_depth.unwrap_or(default.max_depth),
-            max_concurrent_children: self
-                .subagents
-                .max_concurrent_children
-                .unwrap_or(default.max_concurrent_children),
-            spawn_timeout: self.subagents.spawn_timeout.or(default.spawn_timeout),
-            cancel_grace: self.subagents.cancel_grace.unwrap_or(default.cancel_grace),
-        }
+        let mut config = SubagentConfig::default();
+        let file = &self.subagents;
+        config.default_context = file
+            .default_context
+            .clone()
+            .unwrap_or(config.default_context);
+        config.max_depth = file.max_depth.unwrap_or(config.max_depth);
+        config.max_concurrent_children = file
+            .max_concurrent_children
+            .unwrap_or(config.max_concurrent_children);
+        config.spawn_timeout = file.spawn_timeout.or(config.spawn_timeout);
+        config.cancel_grace = file.cancel_grace.unwrap_or(config.cancel_grace);
+        config
     }
 }
 

@@ -53,14 +53,16 @@ fn spec() -> SessionSpec {
         system: vec![text("be helpful")],
         tools: ToolSelection::All,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
-        compaction: CompactionConfig {
-            max_auto_compactions_per_turn: 0,
-            ..CompactionConfig::default()
+        compaction: {
+            let mut config = CompactionConfig::default();
+            config.max_auto_compactions_per_turn = 0;
+            config
         },
         subagents: SubagentConfig::default(),
     }

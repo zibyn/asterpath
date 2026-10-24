@@ -123,11 +123,12 @@ fn spec(max_steps: Option<u32>) -> SessionSpec {
         system: vec![text("inherited system")],
         tools: ToolSelection::All,
         request: RequestConfig::default(),
-        turn: TurnConfig {
-            max_steps_per_turn: max_steps,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..TurnConfig::default()
+        turn: {
+            let mut config = TurnConfig::default();
+            config.max_steps_per_turn = max_steps;
+            config.initial_backoff = Duration::ZERO;
+            config.max_backoff = Duration::ZERO;
+            config
         },
         compaction: CompactionConfig::default(),
         subagents: SubagentConfig::default(),
@@ -968,9 +969,10 @@ async fn the_ninth_spawn_queues_until_a_slot_is_released() {
         quota: Some(Arc::clone(&quota)),
     });
     let config = AsterpathConfig {
-        tool: ToolConfig {
-            max_parallel_calls: NonZeroUsize::new(16).expect("non-zero"),
-            ..ToolConfig::default()
+        tool: {
+            let mut config = ToolConfig::default();
+            config.max_parallel_calls = NonZeroUsize::new(16).expect("non-zero");
+            config
         },
         ..simple_config(&db, vec![provider as Arc<dyn Provider>], Vec::new())
     };
@@ -1054,11 +1056,9 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
         child,
         quota: Some(Arc::clone(&quota)),
     });
-    let subagents = SubagentConfig {
-        max_concurrent_children: NonZeroUsize::new(1).expect("non-zero"),
-        cancel_grace: Duration::from_millis(100),
-        ..SubagentConfig::default()
-    };
+    let mut subagents = SubagentConfig::default();
+    subagents.max_concurrent_children = NonZeroUsize::new(1).expect("non-zero");
+    subagents.cancel_grace = Duration::from_millis(100);
     let asterpath = open(simple_config(
         &db,
         vec![provider as Arc<dyn Provider>],
@@ -1066,13 +1066,11 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
     ))
     .await;
     let handle = asterpath
-        .create_session(spec_with(
-            subagents,
-            TurnConfig {
-                cancel_grace: Duration::from_millis(300),
-                ..TurnConfig::default()
-            },
-        ))
+        .create_session(spec_with(subagents, {
+            let mut config = TurnConfig::default();
+            config.cancel_grace = Duration::from_millis(300);
+            config
+        }))
         .await
         .unwrap();
     let parent = handle.id();
@@ -1171,10 +1169,8 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
         child,
         quota: Some(Arc::clone(&quota)),
     });
-    let subagents = SubagentConfig {
-        cancel_grace: Duration::ZERO,
-        ..SubagentConfig::default()
-    };
+    let mut subagents = SubagentConfig::default();
+    subagents.cancel_grace = Duration::ZERO;
     let asterpath = open(simple_config(
         &db,
         vec![provider as Arc<dyn Provider>],
@@ -1182,13 +1178,11 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
     ))
     .await;
     let handle = asterpath
-        .create_session(spec_with(
-            subagents,
-            TurnConfig {
-                cancel_grace: Duration::ZERO,
-                ..TurnConfig::default()
-            },
-        ))
+        .create_session(spec_with(subagents, {
+            let mut config = TurnConfig::default();
+            config.cancel_grace = Duration::ZERO;
+            config
+        }))
         .await
         .unwrap();
     let parent = handle.id();
@@ -1256,10 +1250,8 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
         child,
         quota: Some(Arc::clone(&quota)),
     });
-    let subagents = SubagentConfig {
-        cancel_grace: Duration::from_millis(100),
-        ..SubagentConfig::default()
-    };
+    let mut subagents = SubagentConfig::default();
+    subagents.cancel_grace = Duration::from_millis(100);
     let asterpath = open(simple_config(
         &db,
         vec![provider as Arc<dyn Provider>],

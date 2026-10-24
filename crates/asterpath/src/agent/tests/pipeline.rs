@@ -58,9 +58,10 @@ impl Harness {
             tools,
             policy: None,
             hooks: Vec::new(),
-            config: ToolConfig {
-                kill_grace: Duration::ZERO,
-                ..ToolConfig::default()
+            config: {
+                let mut config = ToolConfig::default();
+                config.kill_grace = Duration::ZERO;
+                config
             },
             cancel_grace: Duration::ZERO,
         }
