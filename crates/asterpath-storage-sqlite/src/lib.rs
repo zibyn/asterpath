@@ -117,6 +117,8 @@ pub fn open_with_clock(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(backend)?;
+    // shortcut: unbounded queue, no backpressure when appends outrun fsync; switch to a
+    // bounded channel with an async send when a host can outrun the disk.
     let (commands, queue) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("asterpath-sqlite-writer".to_owned())
