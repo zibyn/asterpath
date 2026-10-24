@@ -10,7 +10,7 @@ use crate::event::SessionEvent;
 
 /// Shape/semantic version of every persisted `SessionEvent` payload graph.
 /// Bump for any persisted shape change, including new optional fields.
-pub const LOG_SCHEMA_VERSION: u16 = 1;
+pub const LOG_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -53,13 +53,23 @@ pub fn decode_payload(
     })
 }
 
-/// Pure, stepwise payload upcasters. v1 is the first schema, so no step has a
-/// conversion yet; add one arm per version bump.
-fn upcast(from: u16, _payload: Value) -> Result<Value, LogDecodeError> {
-    // shortcut: no historical schema versions exist yet; add arms when LOG_SCHEMA_VERSION grows.
-    Err(LogDecodeError::Upcast {
-        from,
-        to: from + 1,
-        detail: "no upcaster for this schema version".to_owned(),
-    })
+/// Pure, stepwise payload upcasters; one arm per version bump.
+fn upcast(from: u16, mut payload: Value) -> Result<Value, LogDecodeError> {
+    match from {
+        // v2 (#107): `ModelCallAborted` gained `error`; v1 never recorded one.
+        1 => {
+            if let Some(aborted) = payload
+                .get_mut("ModelCallAborted")
+                .and_then(Value::as_object_mut)
+            {
+                aborted.insert("error".to_owned(), Value::Null);
+            }
+            Ok(payload)
+        }
+        _ => Err(LogDecodeError::Upcast {
+            from,
+            to: from + 1,
+            detail: "no upcaster for this schema version".to_owned(),
+        }),
+    }
 }

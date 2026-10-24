@@ -9,7 +9,9 @@ use crate::{LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId}
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ModelSpec, Provenance, ReplaySafety, SideEffect};
-use crate::event::{AbortKind, ChildOutcome, CompactionTrigger, ResumeReason, StopReason};
+use crate::event::{
+    AbortKind, ChildOutcome, CompactionTrigger, ProviderErrorInfo, ResumeReason, StopReason,
+};
 use crate::ids::ToolName;
 use crate::usage::Usage;
 
@@ -219,6 +221,8 @@ pub struct AttemptEvent {
     pub partial_usage: Option<Usage>,
     /// This attempt happened after a `StreamResumed`.
     pub replayed: bool,
+    /// The provider's error, when the log recorded one.
+    pub error: Option<ProviderErrorInfo>,
 }
 
 /// A `StreamResumed` record carried as an event on the session span.

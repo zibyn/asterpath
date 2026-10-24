@@ -168,3 +168,59 @@ fn capability_check_names_the_unsupported_feature() {
         assert_eq!(all.unsupported_feature(&request), None);
     }
 }
+
+#[test]
+fn model_call_aborted_carries_provider_error_info_and_v1_logs_upcast_without_it() {
+    use asterpath_protocol::{ModelId, ModelSpec, ProviderErrorInfo, StepId, TurnId};
+
+    let error = ProviderError::new(ProviderErrorKind::Unsupported, "effort Off on m")
+        .with_request_id("req-1");
+    let event = SessionEvent::ModelCallAborted {
+        turn_id: TurnId::from_bytes([1; 16]),
+        step_id: StepId::from_bytes([2; 16]),
+        attempt: 1,
+        kind: asterpath_protocol::AbortKind::Rejected,
+        partial: None,
+        model: ModelSpec {
+            provider: ProviderId::new("p"),
+            model: ModelId::new("m"),
+            context_window: None,
+        },
+        backoff_ms: 0,
+        usage: None,
+        error: Some(ProviderErrorInfo::from(&error)),
+    };
+    let entry = encode_entry(SessionId::from_bytes([7; 16]), None, &event).unwrap();
+    let mut payload = entry.payload.clone();
+    let log_entry = |payload| asterpath_protocol::LogEntry {
+        log_id: asterpath_protocol::LogId::from_i64(1),
+        session: entry.session,
+        seq: 1,
+        recorded_at: 0,
+        schema_version: entry.schema_version,
+        dedup_key: None,
+        payload,
+    };
+    assert_eq!(
+        decode_entry(&log_entry(entry.payload.clone())).unwrap(),
+        event
+    );
+    assert_eq!(
+        payload["ModelCallAborted"]["error"],
+        serde_json::json!({"kind": "Unsupported", "message": "effort Off on m", "request_id": "req-1"})
+    );
+
+    // A v1 record, written before the field existed, upcasts to `None`.
+    payload["ModelCallAborted"]
+        .as_object_mut()
+        .unwrap()
+        .remove("error");
+    let v1 = asterpath_protocol::LogEntry {
+        schema_version: 1,
+        ..log_entry(payload)
+    };
+    match decode_entry(&v1).unwrap() {
+        SessionEvent::ModelCallAborted { error, .. } => assert_eq!(error, None),
+        other => panic!("unexpected {other:?}"),
+    }
+}

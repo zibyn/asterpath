@@ -410,6 +410,7 @@ async fn transport_abort_retries_without_adding_a_crash_abort() {
             model: model(),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     )
@@ -446,6 +447,7 @@ async fn recovered_transport_exhaustion_fails_without_another_call() {
             model: model(),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     )
@@ -485,6 +487,7 @@ async fn recovered_forced_compaction_retries_the_same_step() {
             model: model(),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     )
@@ -554,6 +557,7 @@ async fn cancelled_abort_finishes_the_turn_without_calling_the_model() {
             model: model(),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     )
@@ -586,6 +590,7 @@ async fn rejected_abort_finishes_the_turn_failed() {
             model: model(),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     )

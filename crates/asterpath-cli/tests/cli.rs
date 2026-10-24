@@ -866,8 +866,29 @@ fn a_vendor_model_entry_replaces_the_vendor_default() {
     };
 
     // The default lists no `off`: rejected before any HTTP.
-    assert!(!run("deepseek-flash").status.success());
+    let rejected = run("deepseek-flash");
+    assert!(!rejected.status.success());
     assert!(deepseek.requests().is_empty());
+    // The provider's error reaches stderr and the trace, not just `Failed`.
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("turn ended with Failed: Unsupported: "),
+        "stderr: {stderr}"
+    );
+    let trace = bin()
+        .args([
+            "trace",
+            "--config",
+            config.to_str().unwrap(),
+            &session_from_stderr(&stderr),
+        ])
+        .output()
+        .expect("run trace");
+    let trace = String::from_utf8_lossy(&trace.stdout);
+    assert!(
+        trace.contains("deepseek-flash [error] Unsupported: "),
+        "trace: {trace}"
+    );
     // The longer prefix wins over `deepseek-v4` though it sorts after it.
     let output = run("deepseek-v4-pro-0601");
     assert!(

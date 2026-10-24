@@ -26,10 +26,10 @@ use asterpath_protocol::{
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
     Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, OpenStep,
-    ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorKind, ResumeReason, RunRequest,
-    SessionEvent, SessionFacts, SessionState, StepCtx, StopReason, StreamEvent, ToolConfig,
-    ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageLookup, decode_entry,
-    dedup,
+    ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorInfo, ProviderErrorKind,
+    ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx, StopReason,
+    StreamEvent, ToolConfig, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor,
+    UsageLookup, decode_entry, dedup,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
@@ -314,6 +314,7 @@ impl Agent {
                             model: config.model.clone(),
                             backoff_ms: 0,
                             usage: None,
+                            error: None,
                         },
                         None,
                     )
@@ -790,6 +791,7 @@ impl Agent {
                     model: config.model.clone(),
                     backoff_ms: backoff.as_millis() as u64,
                     usage: error.partial_usage,
+                    error: Some(ProviderErrorInfo::from(&error)),
                 },
                 None,
             )
@@ -866,6 +868,7 @@ impl Agent {
                 model: config.model.clone(),
                 backoff_ms: 0,
                 usage: None,
+                error: None,
             },
             None,
         )

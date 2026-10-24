@@ -516,6 +516,7 @@ async fn aborted(log: &InMemoryEventLog, attempt: u32, kind: AbortKind, backoff_
             model: model(),
             backoff_ms,
             usage: None,
+            error: None,
         },
         None,
     )

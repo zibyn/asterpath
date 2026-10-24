@@ -9,11 +9,11 @@ use crate::views::trace::TracingQuery;
 use asterpath_protocol::{
     AbortKind, ApprovalDecision, ChildOutcome, CompactionTrigger, ConfigSnapshot, ContextPolicy,
     ErrorType, InputTokens, Item, JsonString, ModelId, ModelSpec, OutputTokens, Parallelism,
-    ParentRef, Part, Provenance, ProviderId, ReplaySafety, RequestConfig, ResumeReason, Role,
-    SessionEvent, SideEffect, Span, SpanAttributes, SpanFilter, SpanKind, SpanStatus, StopReason,
-    SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolName, ToolResultStatus,
-    TraceError, TurnConfig, TurnEndReason, Usage, WaitKind, approval_signal_id,
-    approval_signal_name, decode_entry, dedup, encode_entry,
+    ParentRef, Part, Provenance, ProviderErrorInfo, ProviderErrorKind, ProviderId, ReplaySafety,
+    RequestConfig, ResumeReason, Role, SessionEvent, SideEffect, Span, SpanAttributes, SpanFilter,
+    SpanKind, SpanStatus, StopReason, SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind,
+    ToolName, ToolResultStatus, TraceError, TurnConfig, TurnEndReason, Usage, WaitKind,
+    approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
     DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
@@ -131,6 +131,7 @@ fn aborted(
         model: model(),
         backoff_ms,
         usage: None,
+        error: None,
     }
 }
 
@@ -1832,4 +1833,46 @@ async fn forced_compaction_retry_keeps_the_model_call_ok() {
         span_of(&spans, SpanKind::Compaction).parent_span,
         Some(span_of(&spans, SpanKind::Step).span)
     );
+}
+
+#[tokio::test]
+async fn a_rejected_attempt_keeps_the_provider_error_on_its_attempt_event() {
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
+    let session = sid(0x71);
+    let t = turn();
+    let s = step(0x71);
+    let error = ProviderErrorInfo {
+        kind: ProviderErrorKind::Unsupported,
+        message: "reasoning effort Off on m".to_owned(),
+        request_id: Some("req-9".to_owned()),
+    };
+    let mut rejected = aborted(t, s, 1, AbortKind::Rejected, 0);
+    if let SessionEvent::ModelCallAborted { error: slot, .. } = &mut rejected {
+        *slot = Some(error.clone());
+    }
+    append(
+        &*log,
+        session,
+        &created(session),
+        Some(dedup::session_created(session)),
+    )
+    .await;
+    for event in [
+        SessionEvent::TurnStarted { turn_id: t },
+        SessionEvent::StepStarted {
+            turn_id: t,
+            step_id: s,
+        },
+        rejected,
+    ] {
+        append(&*log, session, &event, None).await;
+    }
+
+    let spans = fold(&log, session).await;
+    let models = all_of(&spans, SpanKind::ModelCall);
+    assert_eq!(models[0].status, SpanStatus::Error);
+    let SpanAttributes::ModelCall(attrs) = &models[0].attributes else {
+        panic!("model attrs");
+    };
+    assert_eq!(attrs.attempts[0].error, Some(error));
 }

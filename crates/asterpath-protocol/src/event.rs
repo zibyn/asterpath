@@ -8,6 +8,7 @@ use crate::ids::JsonString;
 use crate::ids::JsonValue;
 use crate::ids::ToolName;
 use crate::item::{Item, Part, RawProviderData};
+use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::usage::Usage;
 
 /// One committed record in a session log. Only terminal records are logged.
@@ -56,6 +57,8 @@ pub enum SessionEvent {
         /// Actual backoff before the next attempt; 0 when not retried.
         backoff_ms: u64,
         usage: Option<Usage>,
+        /// Why the attempt failed; `None` for cancels, crashes and v1 logs.
+        error: Option<ProviderErrorInfo>,
     },
     ToolCallRequested {
         turn_id: TurnId,
@@ -200,6 +203,24 @@ pub enum ToolResultStatus {
 pub struct ToolErrorInfo {
     pub kind: ToolErrorKind,
     pub message: String,
+}
+
+/// The loggable part of a `ProviderError`; `raw` stays out of the log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderErrorInfo {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+    pub request_id: Option<String>,
+}
+
+impl From<&ProviderError> for ProviderErrorInfo {
+    fn from(error: &ProviderError) -> Self {
+        Self {
+            kind: error.kind,
+            message: error.message.clone(),
+            request_id: error.request_id.clone(),
+        }
+    }
 }
 
 #[non_exhaustive]

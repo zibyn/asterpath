@@ -595,6 +595,7 @@ pub enum ProviderErrorKind {
 - `request_id` 来自响应头或响应 id；`raw` 保存错误 body 的原始文本。
 - `partial_usage` 是 adapter 的 best-effort：只填 provider 已明确给出的部分（例如 Anthropic `message_start` 的输入侧），缺的部分按 0，不估算。loop 原样写入 `ModelCallAborted.usage`（#13）。
 - 流中途失败前已 `ItemCompleted` 的 item 由 loop 组成 `ModelCallAborted.partial`；不写 `AssistantMessage`（#6 I9）。
+- loop 把每次失败的 `kind` / `message` / `request_id` 写入 `ModelCallAborted.error`（`ProviderErrorInfo`，#107）；`raw` 不入日志。取消与崩溃补写为 `None`。该字段使 `LOG_SCHEMA_VERSION` 升到 2（ADR-0004），v1 日志由 upcaster 补 `error: null`。脱敏、截断归宿主。
 
 ## 9. 原始 JSON 保留与回放
 

@@ -50,8 +50,8 @@ pub use encode::encode_entry;
 pub use error::{ExecutionError, RetirementError, StorageError};
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,
-    ParentRef, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo, ToolErrorKind,
-    ToolResultStatus, TurnEndReason,
+    ParentRef, ProviderErrorInfo, ResumeReason, SessionEvent, StopReason, Summary, ToolErrorInfo,
+    ToolErrorKind, ToolResultStatus, TurnEndReason,
 };
 pub use facts::{
     OpenChild, OpenCompaction, OpenIntent, OpenStep, OpenTool, SessionFacts, SessionState,

@@ -413,8 +413,9 @@ async fn retryable_failures_retry_the_same_step_with_partial_usage_kept_diagnost
                 backoff_ms,
                 usage,
                 partial: failed_partial,
+                error,
                 ..
-            } => aborts.push((attempt, kind, backoff_ms, usage, failed_partial)),
+            } => aborts.push((attempt, kind, backoff_ms, usage, failed_partial, error)),
             SessionEvent::AssistantMessage { usage, .. } => assistant = Some(usage),
             _ => {}
         }
@@ -426,6 +427,23 @@ async fn retryable_failures_retry_the_same_step_with_partial_usage_kept_diagnost
     assert_eq!(aborts[0].2, 0, "test backoff is zero");
     assert_eq!(aborts[0].3, Some(partial), "partial usage is diagnostic");
     assert!(aborts[0].4.is_none());
+    let messages: Vec<_> = aborts
+        .iter()
+        .map(|abort| {
+            abort
+                .5
+                .as_ref()
+                .map(|error| (error.kind, error.message.as_str()))
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            Some((ProviderErrorKind::Transport, "reset")),
+            Some((ProviderErrorKind::Transport, "reset again")),
+        ],
+        "every attempt keeps its own error"
+    );
     assert_eq!(
         assistant,
         Some(usage(11, 5)),
@@ -650,10 +668,14 @@ async fn capability_mismatch_is_rejected_before_the_response_is_used() {
         ]
     );
     let abort = decoded(&entries).into_iter().find_map(|event| match event {
-        SessionEvent::ModelCallAborted { kind, .. } => Some(kind),
+        SessionEvent::ModelCallAborted { kind, error, .. } => Some((kind, error)),
         _ => None,
     });
-    assert_eq!(abort, Some(AbortKind::Rejected));
+    let (kind, error) = abort.expect("an abort");
+    assert_eq!(kind, AbortKind::Rejected);
+    let error = error.expect("the abort records the provider error");
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(error.message.contains("sampling"), "{}", error.message);
     assert_eq!(provider.remaining(), 1, "no scripted response was consumed");
     let last = decoded(&entries).pop().unwrap();
     assert!(matches!(

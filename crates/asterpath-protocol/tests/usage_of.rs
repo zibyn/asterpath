@@ -57,6 +57,7 @@ fn aborted(usage: Option<Usage>) -> SessionEvent {
         model: model(),
         backoff_ms: 0,
         usage,
+        error: None,
     }
 }
 

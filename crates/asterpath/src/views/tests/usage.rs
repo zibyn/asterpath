@@ -85,6 +85,7 @@ fn aborted(model_name: &str, turn: TurnId, step: StepId, usage: Option<Usage>) -
         model: model(model_name),
         backoff_ms: 0,
         usage,
+        error: None,
     }
 }
 
@@ -405,6 +406,7 @@ async fn u4_cancelled_without_assistant_message_only_partial() {
             model: model("m"),
             backoff_ms: 0,
             usage: Some(usage(4, 0)),
+            error: None,
         },
         None,
     );
@@ -438,6 +440,7 @@ async fn u5_cancelled_after_assistant_message_keeps_one_model_call() {
             model: model("m"),
             backoff_ms: 0,
             usage: None,
+            error: None,
         },
         None,
     );

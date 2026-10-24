@@ -397,6 +397,7 @@ impl Folder {
                 model,
                 backoff_ms,
                 usage,
+                error: provider_error,
                 ..
             } => {
                 let Some(index) = self.models.get(&(*turn_id, *step_id)).copied() else {
@@ -418,6 +419,7 @@ impl Folder {
                         backoff_before_ms: backoff_before,
                         partial_usage: *usage,
                         replayed,
+                        error: provider_error.clone(),
                     });
                     attrs.attempt_count = 1 + attrs.attempts.len() as u32;
                     attrs.request_model = model.clone();

@@ -249,7 +249,7 @@ impl ProviderError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProviderErrorKind {
     Unsupported,
     Auth,

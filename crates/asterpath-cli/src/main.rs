@@ -16,8 +16,9 @@ use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ConfigSnapshot, Item, Part, ProviderCatalog,
-    Role, SandboxPolicy, SandboxProvider, SessionState, Span, SpanId, SpanKind, SpanStatus, Tool,
-    TurnEndReason, UsageScope, UsageTotals, UserInput, decode_entry, history,
+    ProviderErrorInfo, Role, SandboxPolicy, SandboxProvider, SessionEvent, SessionState, Span,
+    SpanAttributes, SpanId, SpanKind, SpanStatus, Tool, TurnEndReason, UsageScope, UsageTotals,
+    UserInput, decode_entry, history,
 };
 use asterpath_protocol::{
     Clock, InputId, LogEntry, SessionId, SessionStore, SystemClock, unique_bytes,
@@ -279,9 +280,12 @@ async fn finish(
     outcome: DriveOutcome,
     print_idle: bool,
 ) -> CliResult<()> {
+    let entries = scan(asterpath.store(), handle.id())
+        .await
+        .map_err(CliError::run)?;
     if print_idle && outcome.idle {
         println!("idle");
-    } else if let Some(text) = final_text(&asterpath, handle).await? {
+    } else if let Some(text) = final_assistant_text(&entries) {
         println!("{text}");
     }
     // Engine first, then the MCP servers its tools call (ADR-0027).
@@ -291,6 +295,10 @@ async fn finish(
 
     match outcome.reason {
         None | Some(TurnEndReason::Completed) => Ok(()),
+        Some(TurnEndReason::Failed) => Err(CliError::run(match last_provider_error(&entries) {
+            Some(error) => format!("turn ended with Failed: {}", describe(&error)),
+            None => "turn ended with Failed".to_owned(),
+        })),
         Some(other) => Err(CliError::run(format!("turn ended with {other:?}"))),
     }
 }
@@ -445,6 +453,12 @@ fn render_tree(spans: &[Span]) -> String {
                 out.push_str(" [");
                 out.push_str(&format!("{:?}", span.status).to_lowercase());
                 out.push(']');
+                if let SpanAttributes::ModelCall(attrs) = &span.attributes
+                    && let Some(error) = attrs.attempts.last().and_then(|a| a.error.as_ref())
+                {
+                    out.push(' ');
+                    out.push_str(&describe(error));
+                }
             }
             out.push('\n');
             walk(spans, Some(span.span), depth + 1, out);
@@ -554,11 +568,25 @@ fn prompt_decision<R: BufRead, W: Write>(
     }
 }
 
-async fn final_text(asterpath: &Asterpath, handle: &SessionHandle) -> CliResult<Option<String>> {
-    let entries = scan(asterpath.store(), handle.id())
-        .await
-        .map_err(CliError::run)?;
-    Ok(final_assistant_text(&entries))
+/// The error of the last model-call abort in the latest turn, if it recorded one.
+fn last_provider_error(entries: &[LogEntry]) -> Option<ProviderErrorInfo> {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| match decode_entry(entry).ok()? {
+            SessionEvent::ModelCallAborted { error, .. } => Some(error),
+            // Stop at the turn boundary: an older turn's error is not this failure.
+            SessionEvent::TurnStarted { .. } => Some(None),
+            _ => None,
+        })
+        .flatten()
+}
+
+fn describe(error: &ProviderErrorInfo) -> String {
+    match &error.request_id {
+        Some(id) => format!("{:?}: {} (request_id {id})", error.kind, error.message),
+        None => format!("{:?}: {}", error.kind, error.message),
+    }
 }
 
 async fn session_snapshot(
