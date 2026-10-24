@@ -324,7 +324,7 @@ max_output_tokens = 8192      # RequestConfig；缺省字段用 Default
 tool_choice = "auto"          # auto | none | required | <tool name>
 disable_parallel_tool_use = false
 # [request.sampling] temperature / top_p / top_k / seed
-# [request.reasoning] effort / budget_tokens / summary
+# [request.reasoning] effort（off | minimal | low | medium | high | xhigh | max）/ budget_tokens / summary
 
 [tools]
 max_parallel_calls = 8        # ToolConfig；缺省字段用 Default

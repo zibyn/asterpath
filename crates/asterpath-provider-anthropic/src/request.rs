@@ -6,10 +6,11 @@
 
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
+    ToolChoice,
 };
 
-use crate::models::{Thinking, rules_for};
+use crate::models::{ModelRules, Thinking, rules_for};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -218,38 +219,48 @@ pub(crate) fn render(
             fields.push(("top_k", Frag::Json(json!(top_k))));
         }
     }
-    if let Some(reasoning) = request
-        .reasoning
-        .as_ref()
-        .filter(|reasoning| reasoning.effort != Some(ReasoningEffort::Off))
-    {
+    if let Some(reasoning) = &request.reasoning {
         // check() has rejected combinations the model does not accept.
         let rules = rules_for(request.spec.model.as_str());
-        let thinking = match (reasoning.budget_tokens, rules.thinking) {
-            (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
-            (None, Thinking::Extended) => None,
-            (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
-        };
-        if let Some(mut thinking) = thinking {
-            if reasoning.summary && rules.thinking_display() {
-                thinking["display"] = json!("summarized");
+        if reasoning.effort == Some(ReasoningEffort::Off) {
+            if rules.thinking_default_on {
+                fields.push(("thinking", Frag::Json(json!({"type": "disabled"}))));
             }
-            fields.push(("thinking", Frag::Json(thinking)));
-        }
-        if let Some(effort) = reasoning.effort {
-            let effort = match effort {
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
-                ReasoningEffort::XHigh => "xhigh",
-                ReasoningEffort::Max => "max",
-                _ => unreachable!("check rejects efforts missing from the model table"),
-            };
-            fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+        } else {
+            render_reasoning(&mut fields, reasoning, rules);
         }
     }
     fields.push(("stream", Frag::Json(json!(true))));
     Ok(object(fields))
+}
+
+fn render_reasoning(
+    fields: &mut Vec<(&'static str, Frag)>,
+    reasoning: &ReasoningParams,
+    rules: ModelRules,
+) {
+    let thinking = match (reasoning.budget_tokens, rules.thinking) {
+        (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
+        (None, Thinking::Extended) => None,
+        (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
+    };
+    if let Some(mut thinking) = thinking {
+        if reasoning.summary && rules.thinking_display() {
+            thinking["display"] = json!("summarized");
+        }
+        fields.push(("thinking", Frag::Json(thinking)));
+    }
+    if let Some(effort) = reasoning.effort {
+        let effort = match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+            _ => unreachable!("check rejects efforts missing from the model table"),
+        };
+        fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+    }
 }
 
 struct PendingMessage {

@@ -5,8 +5,10 @@
 //! (build-with-claude/effort), "Forced tool use not supported" (api/errors) and
 //! the Opus 5.5 migration guide (sampling parameters removed from 4.7 on).
 //! Effort levels per model: the `xhigh` / `max` rows of the effort levels table
-//! (build-with-claude/effort, as of 2026-10-24). `Off` sends no `thinking` and
-//! no effort, so it is accepted only where the thinking table's default is Off.
+//! (build-with-claude/effort, as of 2026-10-24). `Off` sends no effort; where
+//! the thinking table (as of 2026-10-24) defaults to Off it sends no `thinking`
+//! either, where it defaults to On it sends `thinking: {type: "disabled"}`, and
+//! models that are Always on or reject `"disabled"` (Sonnet 5.5) do not accept it.
 //!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
@@ -32,6 +34,8 @@ pub(crate) struct ModelRules {
     /// Accepted `ReasoningEffort` levels; every one but `Off` is sent as
     /// `output_config.effort`.
     pub efforts: &'static [ReasoningEffort],
+    /// Thinking runs when `thinking` is omitted, so `Off` must send `disabled`.
+    pub thinking_default_on: bool,
     /// Accepts `tool_choice` `any` / `tool`.
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p` / `top_k`.
@@ -54,6 +58,7 @@ const fn rules(
     ModelRules {
         thinking,
         efforts,
+        thinking_default_on: false,
         forced_tool_choice: forced,
         sampling,
     }
@@ -65,8 +70,13 @@ const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1 and unrecognized ids.
 pub(crate) const LATEST: ModelRules = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
-/// The 5 generation and Haiku 5.5: thinking is on by default.
-const ADAPTIVE: ModelRules = rules(Thinking::Adaptive, LOW_TO_MAX, true, false);
+/// Opus 5, Sonnet 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
+const ADAPTIVE: ModelRules = ModelRules {
+    thinking_default_on: true,
+    ..rules(Thinking::Adaptive, OFF_TO_MAX, true, false)
+};
+/// Fable 5 and Mythos 5: thinking is always on.
+const ALWAYS_ON: ModelRules = rules(Thinking::Adaptive, LOW_TO_MAX, true, false);
 /// Opus 4.7 / 4.8: thinking is off by default.
 const ADAPTIVE_OFF: ModelRules = rules(Thinking::Adaptive, OFF_TO_MAX, true, false);
 const MYTHOS_PREVIEW: ModelRules = rules(Thinking::Both, NO_XHIGH, true, true);
@@ -83,8 +93,8 @@ const TABLE: &[(&str, ModelRules)] = &[
     ("claude-haiku-5-5", ADAPTIVE),
     ("claude-opus-5", ADAPTIVE),
     ("claude-sonnet-5", ADAPTIVE),
-    ("claude-fable-5", ADAPTIVE),
-    ("claude-mythos-5", ADAPTIVE),
+    ("claude-fable-5", ALWAYS_ON),
+    ("claude-mythos-5", ALWAYS_ON),
     ("claude-mythos-preview", MYTHOS_PREVIEW),
     ("claude-opus-4-8", ADAPTIVE_OFF),
     ("claude-opus-4-7", ADAPTIVE_OFF),
