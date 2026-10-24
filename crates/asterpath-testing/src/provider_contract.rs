@@ -70,6 +70,7 @@ fn request(wire_provider: &dyn Provider) -> ModelRequest {
             raw: None,
         }],
         Vec::new(),
+        Vec::new(),
         &RequestConfig::default(),
     )
 }

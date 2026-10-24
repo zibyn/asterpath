@@ -218,6 +218,7 @@ fn fixture_parses_and_replays_after_a_committed_prefix() {
         vec![],
         vec![],
         vec![],
+        vec![],
         &asterpath_protocol::RequestConfig::default(),
     );
     let events: Vec<_> = futures::executor::block_on(async {

@@ -1014,16 +1014,15 @@ impl Agent {
                 session,
                 detail: error.to_string(),
             })?;
-        let mut request = ModelRequest::new(
+        Ok(ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
             history.system,
             history.items,
             config.tools.clone(),
+            history.tools,
             &config.request,
-        );
-        request.baseline_tools = history.tools;
-        Ok(request)
+        ))
     }
 
     async fn commit_turn(

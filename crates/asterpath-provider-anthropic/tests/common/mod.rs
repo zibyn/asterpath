@@ -59,6 +59,7 @@ pub fn base_request() -> ModelRequest {
         vec![text("be helpful")],
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         &RequestConfig::default(),
     )
 }

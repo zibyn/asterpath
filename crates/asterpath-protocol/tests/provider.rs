@@ -115,6 +115,7 @@ fn capability_request() -> asterpath_protocol::ModelRequest {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         &asterpath_protocol::RequestConfig::default(),
     )
 }

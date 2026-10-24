@@ -16,7 +16,7 @@ fn spec() -> ModelSpec {
 }
 
 fn request(request_config: &RequestConfig) -> ModelRequest {
-    ModelRequest::new(spec(), 0, vec![], vec![], vec![], request_config)
+    ModelRequest::new(spec(), 0, vec![], vec![], vec![], vec![], request_config)
 }
 
 fn assistant_message(text: &str) -> Item {
@@ -90,6 +90,7 @@ fn records_the_received_request() {
                 vec![Part::Text {
                     text: "be brief".to_owned(),
                 }],
+                vec![],
                 vec![],
                 vec![],
                 &request_config,

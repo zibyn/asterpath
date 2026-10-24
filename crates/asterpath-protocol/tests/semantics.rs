@@ -388,7 +388,7 @@ fn model_request_copies_stop_sequences_and_provider_options() {
         ProviderId::new("openai"),
         JsonString::new(r#"{"service_tier":"flex"}"#),
     );
-    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], &request);
+    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], vec![], &request);
     assert_eq!(model_request.stop_sequences, request.stop_sequences);
     assert_eq!(model_request.provider_options, request.provider_options);
 }

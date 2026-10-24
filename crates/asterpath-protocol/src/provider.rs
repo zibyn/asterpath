@@ -48,6 +48,7 @@ impl ModelRequest {
         system: Vec<Part>,
         items: Vec<Item>,
         tools: Vec<ToolDescriptor>,
+        baseline_tools: Vec<ToolDescriptor>,
         request: &RequestConfig,
     ) -> Self {
         Self {
@@ -55,8 +56,8 @@ impl ModelRequest {
             prefix_epoch,
             system,
             items,
-            baseline_tools: tools.clone(),
             tools,
+            baseline_tools,
             tool_choice: request.tool_choice.clone(),
             disable_parallel_tool_use: request.disable_parallel_tool_use,
             sampling: request.sampling.clone(),
