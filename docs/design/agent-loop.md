@@ -97,6 +97,7 @@ run_turn(session):
 
         step = next_step_id()
         append(StepStarted{turn, step})
+        config = effective_config(log, watermark = StepStarted.seq)       # 本 step 的模型与请求参数
         projection = project(frontier, visible_before = StepStarted.seq)  # CompactionApplied 不受水位限制
         force_compacted = false
 
@@ -164,13 +165,15 @@ run_turn(session):
 - `has_pending_input` = 本回合最后一个 `StepStarted` 之后存在 `InputRecorded`。
 - 工具审批 `Ask` 会让 step 在 `Waiting` 中跨天保持 open；决定记录为 `ApprovalDecided`，恢复与调度见 [tools.md](tools.md)。
 - 工具执行中取消的收尾顺序见 §6。
+- **每 step 折叠配置**（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)）：`config` 是 `SessionCreated.config` 依次应用 `seq < StepStarted.seq` 的 `ConfigChanged` 的结果。本 step 的模型调用、重试、`ModelCallAborted` / `AssistantMessage` 的 `model`、强制压缩都用它；step 内追加的 `ConfigChanged` 等下一个 `StepStarted`，与 steering 同构（§5）。`turn` / `compaction` / `subagents` 不可变，仍是创建时的值。step 之间的阈值压缩与 Idle 的 `compact_now` 按整条日志折叠，用压缩发生时的生效模型。spawn 的子会话继承父会话在 spawn 所在 step 水位的生效配置。
+- 换模型后，旧模型产出的 reasoning 由 adapter 的既有绑定门控丢弃；换回原模型后再次回放。上下文窗口变小在下一个 step 的阈值检查里自然触发压缩，不设专门路径。
 
 ### 4.1 恢复入口
 
 驱动方对已打开的回合调用同一管线，但：
 
 - 不重复写 `TurnStarted`。
-- 若 frontier 落在 open step 内，不重复写 `StepStarted`，复用原 `StepStarted.seq` 作为投影水位。
+- 若 frontier 落在 open step 内，不重复写 `StepStarted`，复用原 `StepStarted.seq` 作为投影水位与配置水位，因此恢复渲染出与崩溃前相同的请求。补写的 `ModelCallAborted{Crash}` 的 `model` 也取该水位的生效值。
 - 若该 step 已有 `AssistantMessage`，跳过模型调用，直接执行未终结的工具。已存在的 `ToolCallRequested` 按 `provider_call_id` 对回 `AssistantMessage` 的 `ToolCall`；其 effective args 是权威值，不重跑 `before_tool`。只有尚无意图的调用才重跑 `before_tool`。恢复的未完成 step 不再调用 `before_step`；框架补写的 `Interrupted` 不经过 `after_tool`。
 - 若该 step 无 `AssistantMessage`，把本 step 的尝试历史（`ModelCallAborted` 与本 step 内的强制压缩记录，按 `seq`）交给**尝试策略**（§7.1）重放，按它给出的下一动作继续：重试（带编号）、强制压缩或提交 step 并结束回合。一条 abort 都没有时先补写 `ModelCallAborted{attempt: 1, Crash}`，再按 `Crash` 询问。
 - 若 frontier 之后存在未闭合的 `CompactionStarted`，先按 [event-log-recovery.md](event-log-recovery.md) §2b 补终态（`ProviderError` 触发的按开放 step 的水位线重做，与实时一致），再由尝试策略决定是否重试同一 step。

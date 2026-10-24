@@ -415,8 +415,8 @@ impl SessionHandle {
         let event = SessionEvent::ConfigChanged {
             patch: update.patch(),
         };
-        // No dedup key: a patch overrides whole fields, so a repeated write
-        // folds to the same config.
+        // No dedup key: a patch overrides whole fields, so a host retry that
+        // lands next to the original folds to the same config.
         let entry =
             asterpath_protocol::encode_entry(self.session, None, &event).map_err(|error| {
                 AsterError::Config {

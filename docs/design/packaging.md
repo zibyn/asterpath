@@ -65,6 +65,23 @@ pub struct ConfigSnapshot {
 - `ReasoningBinding.tools_hash` 按快照 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9），因此同一 session 内稳定，fork 收窄工具集时自然不匹配。
 - 审批策略不进快照：它是宿主代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
 - MCP 服务配置不进快照：它是宿主装配；进快照的是 MCP 工具解析后的描述符。会话中途增减工具见 [#108](https://github.com/zibyn/asterpath/issues/108)。
+- 快照是**初始配置**。会话中途的改动记成 `ConfigChanged { patch: ConfigPatch }`（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)），生效配置是折叠：
+
+  ```rust
+  #[non_exhaustive]
+  pub struct ConfigPatch {
+      pub model: Option<ModelSpec>,
+      pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
+  }
+
+  /// SessionCreated.config 依次应用 seq < watermark 的 ConfigChanged
+  pub fn effective_config<'a>(
+      records: impl IntoIterator<Item = (&'a LogEntry, &'a SessionEvent)>,
+      watermark: u64,
+  ) -> Option<ConfigSnapshot>;
+  ```
+
+  目前可变的是 `model` 与 `request`；工具集与 system 的变更另开票（#110、#111）。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -174,6 +191,7 @@ impl SessionHandle {
     pub async fn facts(&self) -> Result<SessionFacts, AsterError>;
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError>;
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
+    pub async fn update_config(&self, update: ConfigUpdate) -> Result<(), AsterError>;
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
     ) -> Result<(), AsterError>;
@@ -186,6 +204,7 @@ impl SessionHandle {
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒该调用的等待。
+- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册，否则 `AsterError::Config`，不落日志），再 append 一条 `ConfigChanged`（不设 dedup key）。`ConfigUpdate` 是 `#[non_exhaustive]` 的字段集合（目前 `model` / `request`），用 `ConfigUpdate::default()` 再赋字段构造。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。

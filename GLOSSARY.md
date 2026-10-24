@@ -445,8 +445,16 @@ _Avoid_: SDK、入口库
 _Avoid_: 公共 API
 
 **配置快照（Config Snapshot）**：
-session 创建时解析并持久化的配置投影；之后宿主配置变化不影响该 session。
+session 创建时解析并写进 `SessionCreated` 的初始配置；宿主注册表与装配的后续变化不影响它。会话中途的改动不改写快照，而是记成配置变更（ADR-0030）。
 _Avoid_: session 配置、运行时配置
+
+**配置变更（Config Change）**：
+宿主经 `SessionHandle::update_config` 写入的一条 `ConfigChanged`，只携带变化的字段（`ConfigPatch`）；校验失败不落日志。它是历史中的一个位置，在下一个 `StepStarted` 生效。
+_Avoid_: 配置覆盖、热更新
+
+**生效配置（Effective Config）**：
+配置快照依次应用水位之前全部配置变更的折叠结果（`effective_config`）。模型调用按 step 的 `StepStarted.seq` 取值，恢复、调度、trace 用同一个折叠。
+_Avoid_: 当前配置、运行时配置
 
 **验收场景（Acceptance Scenario）**：
 以真实进程、真实日志与真实副作用验证恢复、协议与子会话不变量的一段可执行测试。

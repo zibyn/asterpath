@@ -200,10 +200,10 @@ ContextForked {
 
 ## 5. 配置继承
 
-- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父快照的拷贝（字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析）。`system` / `request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（宿主代码，不持久化）。
+- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父会话在 spawn 所在 step 水位（该 step 的 `StepStarted.seq`）的生效配置的拷贝（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)；父之后的 `ConfigChanged` 不影响子，子也可以有自己的变更；字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析）。`system` / `request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（宿主代码，不持久化）。
 - 之后父配置变化不影响已 spawn 的子；子配置变化也不回写父。
 - 模型可见的 spawn 参数只能收窄：
-  - `model_alias` 必须来自宿主提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（v1 provider 在 session 创建时快照，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
+  - `model_alias` 必须来自宿主提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
   - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
 - 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
