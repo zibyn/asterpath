@@ -1046,6 +1046,39 @@ fn tool_results(events: Vec<SessionEvent>) -> Vec<ToolResultStatus> {
 }
 
 #[tokio::test]
+async fn trace_describes_a_call_by_the_tools_of_its_step() {
+    let tool = Arc::new(Lookup {
+        descriptor: ToolDescriptor {
+            side_effect: SideEffect::Mutating,
+            ..lookup()
+        },
+        calls: AtomicUsize::new(0),
+    });
+    let provider = removing_caller();
+    let asterpath =
+        assemble_with_lookup(Arc::new(InMemoryEventLog::new()), provider.clone(), tool).await;
+    let handle = asterpath
+        .create_session(with_lookup())
+        .await
+        .expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let effects: Vec<SideEffect> = asterpath
+        .trace(handle.id())
+        .await
+        .expect("trace")
+        .into_iter()
+        .filter_map(|span| match span.attributes {
+            SpanAttributes::ToolCall(attrs) => Some(attrs.side_effect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(effects, [SideEffect::Mutating]);
+}
+
+#[tokio::test]
 async fn a_resumed_step_runs_its_calls_under_the_config_it_started_with() {
     let live = removing_caller();
     let asterpath = assemble_with_lookup(

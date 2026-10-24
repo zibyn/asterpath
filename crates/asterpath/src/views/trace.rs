@@ -14,7 +14,7 @@ use asterpath_protocol::{
     ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span, SpanAttributes,
     SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs, ToolErrorKind,
     ToolResultStatus, TraceError, TraceId, TurnAttrs, TurnEndReason, WaitAttrs, WaitKind,
-    decode_entry,
+    decode_entry, effective_config,
 };
 use asterpath_protocol::{
     Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, StepId, Timestamp, ToolCallId,
@@ -93,6 +93,17 @@ async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<
 
     let mut folder = Folder::new(session, &config, created_entry, parent_session);
     for (entry, event) in &decoded {
+        // A step sees the config at its `StepStarted.seq`, as the agent does,
+        // so a change recorded inside a step never redescribes its calls
+        // (ADR-0030); a compaction sees the changes recorded before it.
+        if matches!(
+            event,
+            SessionEvent::StepStarted { .. } | SessionEvent::CompactionStarted { .. }
+        ) && let Some(effective) =
+            effective_config(decoded.iter().map(|(entry, event)| (entry, event)), entry.seq)
+        {
+            folder.config = effective;
+        }
         folder.apply(entry, event);
     }
     folder.resolve_child_root(log).await;
@@ -277,10 +288,7 @@ impl Folder {
             at: entry.recorded_at,
         };
         match event {
-            SessionEvent::SessionCreated { .. } => {}
-            // Folded in log order, so each `StepStarted` sees the config in
-            // effect at its seq, as the agent does (ADR-0030).
-            SessionEvent::ConfigChanged { patch } => self.config.apply(patch),
+            SessionEvent::SessionCreated { .. } | SessionEvent::ConfigChanged { .. } => {}
             SessionEvent::ContextForked { source_log, .. } => {
                 if let SpanAttributes::Session(attrs) =
                     &mut self.spans[self.session_span].attributes
