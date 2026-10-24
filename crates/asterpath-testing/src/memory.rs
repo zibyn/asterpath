@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    Clock, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore,
-    StorageError, SystemClock,
+    CatalogEntry, Clock, LogEntry, LogId, LogQuery, NewEntry, ParentFilter, RetirementError,
+    SessionId, SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
@@ -26,8 +26,9 @@ struct State {
     next_log_id: i64,
     session_seq: HashMap<SessionId, u64>,
     dedup: HashMap<(SessionId, String, Option<String>), LogId>,
-    /// Live sessions and their parents, like SQLite's `sessions` table.
-    sessions: BTreeMap<SessionId, Option<SessionId>>,
+    /// Live sessions, their parents and creation time, like SQLite's
+    /// `sessions` table.
+    sessions: BTreeMap<SessionId, (Option<SessionId>, Timestamp)>,
     /// Retired sessions and their last log id.
     retired: HashMap<SessionId, LogId>,
 }
@@ -68,7 +69,7 @@ impl State {
                 })
             };
         }
-        let Some(parent) = self.sessions.get(&session).copied() else {
+        let Some((parent, _)) = self.sessions.get(&session).copied() else {
             return Err(RetirementError::NotFound);
         };
         if !self.is_idle(session)? {
@@ -78,7 +79,7 @@ impl State {
         if actual != Some(expected) {
             return Err(RetirementError::FrontierMoved { expected, actual });
         }
-        if self.sessions.values().any(|p| *p == Some(session)) {
+        if self.sessions.values().any(|(p, _)| *p == Some(session)) {
             return Err(RetirementError::HasChildren);
         }
         if let Some(parent) = parent
@@ -90,6 +91,31 @@ impl State {
         self.sessions.remove(&session);
         self.entries.retain(|entry| entry.session != session);
         Ok(())
+    }
+
+    fn catalog(&self, query: SessionQuery) -> Vec<CatalogEntry> {
+        let mut entries: Vec<CatalogEntry> = self
+            .sessions
+            .iter()
+            .filter(|(_, (parent, _))| match query.parent {
+                ParentFilter::Any => true,
+                ParentFilter::Roots => parent.is_none(),
+                ParentFilter::ChildrenOf(of) => *parent == Some(of),
+            })
+            .map(|(session, (parent, created_at))| CatalogEntry {
+                session: *session,
+                parent: *parent,
+                created_at: *created_at,
+                last_activity: self
+                    .log_of(*session)
+                    .last()
+                    .map_or(*created_at, |entry| entry.recorded_at),
+            })
+            .filter(|entry| query.after.is_none_or(|after| entry.cursor() < after))
+            .collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.cursor()));
+        entries.truncate(query.limit.unwrap_or(usize::MAX));
+        entries
     }
 }
 
@@ -142,16 +168,18 @@ impl InMemoryEventLog {
         *seq += 1;
         let seq = *seq;
 
+        let recorded_at = self.clock.now();
         if let SessionEvent::SessionCreated { parent, .. } = &event {
-            state
-                .sessions
-                .insert(entry.session, parent.as_ref().map(|parent| parent.session));
+            state.sessions.insert(
+                entry.session,
+                (parent.as_ref().map(|parent| parent.session), recorded_at),
+            );
         }
         let log_entry = LogEntry {
             log_id,
             session: entry.session,
             seq,
-            recorded_at: self.clock.now(),
+            recorded_at,
             schema_version: entry.schema_version,
             dedup_key: entry.dedup_key,
             payload: entry.payload,
@@ -192,25 +220,21 @@ impl SessionStore for InMemoryEventLog {
         Box::pin(async move { Ok(frontier) })
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        let sessions = self.state().sessions.keys().copied().collect();
-        Box::pin(async move { Ok(sessions) })
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
+        let entries = self.state().catalog(query);
+        Box::pin(async move { Ok(entries) })
     }
 
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
-        let parent = self.state().sessions.get(&session).copied().flatten();
-        Box::pin(async move { Ok(parent) })
-    }
-
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        let children: Vec<SessionId> = self
+        let parent = self
             .state()
             .sessions
-            .iter()
-            .filter(|(_, parent)| **parent == Some(session))
-            .map(|(child, _)| *child)
-            .collect();
-        stream::iter(children.into_iter().map(Ok)).boxed()
+            .get(&session)
+            .and_then(|(parent, _)| *parent);
+        Box::pin(async move { Ok(parent) })
     }
 
     /// Idle check, frontier CAS, delete and tombstone under one lock.

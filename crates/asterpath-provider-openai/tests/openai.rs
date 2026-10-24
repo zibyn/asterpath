@@ -4,7 +4,7 @@ use std::time::Duration;
 use asterpath_testing::http_mock::{MockServer, Reply as MockResponse};
 
 use asterpath_protocol::{
-    ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, Provider,
+    ImageSource, Item, JsonString, ModelId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
     ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
     ReasoningBinding, Role, StopReason, StreamEvent, ToolChoice, ToolDescriptor, ToolName, Usage,
 };
@@ -313,7 +313,7 @@ async fn provider_declares_openai_capabilities() {
             sampling: true,
             reasoning_roundtrip: true,
             citations: false,
-            builtin_tools: true,
+            builtin_tools: false,
             cache_control: false,
             image_input: false,
             parallel_tool_calls: true,
@@ -332,7 +332,7 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
         temperature: Some(0.25),
         top_p: Some(0.5),
         top_k: None,
-        seed: Some(7),
+        seed: None,
     });
     request.reasoning = Some(asterpath_protocol::ReasoningParams {
         effort: Some(asterpath_protocol::ReasoningEffort::High),
@@ -350,7 +350,12 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
     assert_eq!(body["parallel_tool_calls"], json!(false));
     assert_eq!(body["temperature"], json!(0.25));
     assert_eq!(body["top_p"], json!(0.5));
-    assert_eq!(body["seed"], json!(7));
+    assert!(body.get("seed").is_none());
+    assert_eq!(
+        body["stream"],
+        json!(true),
+        "Responses API only streams SSE when asked"
+    );
     assert_eq!(
         body["reasoning"],
         json!({"effort": "high", "summary": "auto"})
@@ -397,6 +402,66 @@ async fn interleaved_items_are_normalized_by_output_index() {
         }
         last_sequence = Some(sequence);
     }
+}
+
+#[tokio::test]
+async fn parallel_function_call_argument_deltas_carry_their_item_output_index() {
+    let args_delta = |sequence: u64, index: u32, id: &str, delta: &str| {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": sequence,
+            "item_id": id,
+            "output_index": index,
+            "delta": delta
+        })
+    };
+    let first = function_call_item("fc_a", "call_a", "search", r#"{"q":"a"}"#);
+    let second = function_call_item("fc_b", "call_b", "search", r#"{"q":"b"}"#);
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, function_call_item("fc_a", "call_a", "search", "")),
+        added(2, 1, function_call_item("fc_b", "call_b", "search", "")),
+        args_delta(3, 1, "fc_b", r#"{"q":"#),
+        args_delta(4, 0, "fc_a", r#"{"q":"#),
+        args_delta(5, 0, "fc_a", r#""a"}"#),
+        args_delta(6, 1, "fc_b", r#""b"}"#),
+        done(7, 0, first.clone()),
+        done(8, 1, second.clone()),
+        completed(9, vec![first, second], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let mut fragments: std::collections::BTreeMap<u32, String> = Default::default();
+    let mut order = Vec::new();
+    for event in &events {
+        if let Ok(StreamEvent::PartDelta {
+            output_index,
+            part_index: 0,
+            delta: PartDelta::JsonArgs { fragment },
+            ..
+        }) = event
+        {
+            order.push(*output_index);
+            fragments
+                .entry(*output_index)
+                .or_default()
+                .push_str(fragment);
+        }
+    }
+    assert_eq!(order, [1, 0, 0, 1]);
+    let calls: std::collections::BTreeMap<u32, (String, String)> = completed_items(&events)
+        .into_iter()
+        .map(|(index, item)| match item {
+            Item::ToolCall {
+                call_id, raw_args, ..
+            } => (index, (call_id, raw_args.as_str().to_owned())),
+            other => panic!("expected a tool call, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(calls[&0], ("call_a".to_owned(), fragments[&0].clone()));
+    assert_eq!(calls[&1], ("call_b".to_owned(), fragments[&1].clone()));
+    assert_eq!(fragments[&0], r#"{"q":"a"}"#);
 }
 
 #[tokio::test]
@@ -885,6 +950,11 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
         top_k: Some(5),
         ..Default::default()
     });
+    let mut seed = request(vec![user_text("go")]);
+    seed.sampling = Some(asterpath_protocol::SamplingParams {
+        seed: Some(7),
+        ..Default::default()
+    });
     let mut budget = request(vec![user_text("go")]);
     budget.reasoning = Some(asterpath_protocol::ReasoningParams {
         budget_tokens: Some(1024),
@@ -900,7 +970,7 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
         }],
     }]);
 
-    for request in [top_k, budget, image] {
+    for request in [top_k, seed, budget, image] {
         let events = collect(&provider, request).await;
         let errors: Vec<_> = events
             .iter()
@@ -932,9 +1002,12 @@ async fn identical_requests_render_identical_bytes() {
 #[tokio::test]
 async fn http_errors_are_classified() {
     let server = MockServer::start(vec![
-        MockResponse::json(429, r#"{"error":{"message":"slow down"}}"#)
-            .header("retry-after", "7")
-            .header("x-request-id", "req_1"),
+        MockResponse::json(
+            429,
+            r#"{"error":{"message":"slow down","type":"requests","code":"rate_limit_exceeded"}}"#,
+        )
+        .header("retry-after", "7")
+        .header("x-request-id", "req_1"),
         MockResponse::json(401, r#"{"error":{"message":"bad key"}}"#),
         MockResponse::json(400, r#"{"error":{"code":"context_length_exceeded"}}"#),
     ]);
@@ -957,6 +1030,112 @@ async fn http_errors_are_classified() {
     assert_eq!(context.kind, ProviderErrorKind::ContextExceeded);
     assert!(!context.retryable);
     assert!(context.context_exceeded());
+}
+
+#[tokio::test]
+async fn quota_and_spend_limit_429s_are_not_retryable() {
+    let bodies = [
+        r#"{"error":{"message":"quota","type":"insufficient_quota","code":null}}"#,
+        r#"{"error":{"message":"spend","type":"requests","code":"project_spend_limit_exceeded"}}"#,
+        r#"{"error":{"message":"spend","type":"requests","code":"organization_spend_limit_exceeded"}}"#,
+    ];
+    let server = MockServer::start(
+        bodies
+            .iter()
+            .map(|body| MockResponse::json(429, *body))
+            .collect(),
+    );
+    let provider = provider(&server);
+    for body in bodies {
+        let events = collect(&provider, request(vec![user_text("go")])).await;
+        let error = events[0].as_ref().expect_err("quota");
+        assert!(!error.retryable, "{body}");
+    }
+}
+
+fn failed_with_code(code: &str) -> String {
+    sse(&[
+        created(0),
+        json!({
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {"code": code, "message": "failed"}
+            }
+        }),
+    ])
+}
+
+fn stream_error_with_code(code: &str) -> String {
+    sse(&[
+        created(0),
+        json!({
+            "type": "error",
+            "sequence_number": 1,
+            "code": code,
+            "message": "failed",
+            "param": null
+        }),
+    ])
+}
+
+async fn single_error(body: String) -> ProviderError {
+    let server = MockServer::start(vec![MockResponse::sse(body)]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    let errors: Vec<_> = events.into_iter().filter_map(Result::err).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    errors.into_iter().next().expect("one error")
+}
+
+#[tokio::test]
+async fn failed_and_stream_error_codes_share_one_classification() {
+    let timeout = single_error(failed_with_code("vector_store_timeout")).await;
+    assert!(timeout.retryable);
+
+    let invalid = single_error(failed_with_code("invalid_prompt")).await;
+    assert_eq!(invalid.kind, ProviderErrorKind::InvalidRequest);
+    assert!(!invalid.retryable);
+
+    let rate = single_error(stream_error_with_code("rate_limit_exceeded")).await;
+    assert_eq!(rate.kind, ProviderErrorKind::RateLimited);
+    assert!(rate.retryable);
+
+    let quota = single_error(stream_error_with_code("insufficient_quota")).await;
+    assert!(!quota.retryable);
+
+    let unknown = single_error(stream_error_with_code("something_new")).await;
+    assert_eq!(unknown.kind, ProviderErrorKind::Server);
+    assert!(unknown.retryable);
+}
+
+#[tokio::test]
+async fn only_server_executed_output_items_are_server_tool_calls() {
+    let items = [
+        json!({"id": "ws_1", "type": "web_search_call", "status": "completed"}),
+        json!({"id": "ct_1", "type": "custom_tool_call", "call_id": "call_1", "name": "x", "input": "y"}),
+        json!({"id": "sh_1", "type": "shell_call", "call_id": "call_2", "status": "completed"}),
+        json!({"id": "cu_1", "type": "computer_call", "call_id": "call_3", "status": "completed"}),
+    ];
+    let mut events = vec![created(0)];
+    let mut sequence = 1;
+    for (index, item) in (0u32..).zip(&items) {
+        events.push(added(sequence, index, item.clone()));
+        events.push(done(sequence + 1, index, item.clone()));
+        sequence += 2;
+    }
+    events.push(completed(sequence, items.to_vec(), usage_json(1, 0, 1)));
+    let server = MockServer::start(vec![MockResponse::sse(sse(&events))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    let completed = completed_items(&events);
+    assert_eq!(completed.len(), 4, "{events:?}");
+    assert!(
+        matches!(&completed[0].1, Item::ServerToolCall { name, .. } if name == "web_search_call")
+    );
+    for (_, item) in &completed[1..] {
+        assert!(matches!(item, Item::ProviderOpaque { .. }), "{item:?}");
+    }
 }
 
 struct OpenAiWire;

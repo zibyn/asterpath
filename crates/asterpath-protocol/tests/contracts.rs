@@ -1,6 +1,7 @@
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
-    RetirementError, SessionId, SessionStore, SignalId, SignalName, StorageError, SystemClock,
+    ApprovalGate, AwaitSignal, CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
+    RetirementError, SessionId, SessionQuery, SessionStore, SignalId, SignalName, StorageError,
+    SystemClock,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -22,7 +23,10 @@ impl SessionStore for DummyStore {
         Box::pin(async { Ok(None) })
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
+    fn sessions(
+        &self,
+        _query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -31,10 +35,6 @@ impl SessionStore for DummyStore {
         _session: SessionId,
     ) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         Box::pin(async { Ok(None) })
-    }
-
-    fn children(&self, _session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        stream::empty().boxed()
     }
 }
 

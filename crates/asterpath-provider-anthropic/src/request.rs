@@ -6,8 +6,10 @@
 
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningBinding, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, Role, ToolChoice,
 };
+
+use crate::models::{Thinking, rules_for};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -78,12 +80,17 @@ pub(crate) fn check(
         return Err(unsupported("sampling.seed"));
     }
     if let Some(reasoning) = &request.reasoning {
-        // Anthropic has no `effort`; `summary` is ignored by design.
-        if reasoning.effort.is_some() {
+        let rules = rules_for(request.spec.model.as_str());
+        if reasoning.effort.is_some() && !rules.effort {
             return Err(unsupported("reasoning.effort"));
         }
-        if reasoning.budget_tokens.is_some() && !capabilities.reasoning_roundtrip {
-            return Err(unsupported("thinking"));
+        if reasoning.budget_tokens.is_some() {
+            if rules.thinking == Thinking::Adaptive {
+                return Err(unsupported("reasoning.budget_tokens"));
+            }
+            if !capabilities.reasoning_roundtrip {
+                return Err(unsupported("thinking"));
+            }
         }
     }
     Ok(())
@@ -166,11 +173,28 @@ pub(crate) fn render(
             fields.push(("top_k", Frag::Json(json!(top_k))));
         }
     }
-    if let Some(budget) = request.reasoning.as_ref().and_then(|r| r.budget_tokens) {
-        fields.push((
-            "thinking",
-            Frag::Json(json!({"type": "enabled", "budget_tokens": budget})),
-        ));
+    if let Some(reasoning) = &request.reasoning {
+        // check() has rejected combinations the model does not accept.
+        let rules = rules_for(request.spec.model.as_str());
+        let thinking = match (reasoning.budget_tokens, rules.thinking) {
+            (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
+            (None, Thinking::Extended) => None,
+            (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
+        };
+        if let Some(mut thinking) = thinking {
+            if reasoning.summary && rules.thinking_display() {
+                thinking["display"] = json!("summarized");
+            }
+            fields.push(("thinking", Frag::Json(thinking)));
+        }
+        if let Some(effort) = reasoning.effort {
+            let effort = match effort {
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+            };
+            fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+        }
     }
     fields.push(("stream", Frag::Json(json!(true))));
     Ok(object(fields))

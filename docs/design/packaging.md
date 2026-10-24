@@ -193,12 +193,14 @@ impl SessionHandle {
 pub struct RunRequest { pub session: SessionId, pub trigger: RunTrigger }
 pub enum RunTrigger { Input(InputId), Resume }
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
     Idle { session: SessionId },
     TurnStarted { turn: TurnId },
-    ModelDelta { turn: TurnId, step: StepId, delta: PartDelta },
-    ToolStarted { turn: TurnId, step: StepId, call: ToolCallId, tool: ToolName },
+    ModelDelta { turn: TurnId, step: StepId, output_index: u32, part_index: u32, delta: PartDelta },
+    ToolStarted { turn: TurnId, step: StepId, output_index: u32, call: ToolCallId, tool: ToolName },
     ToolFinished { turn: TurnId, step: StepId, call: ToolCallId, status: ToolResultStatus },
     ApprovalRequested(ApprovalRequest),
     TurnCommitted { turn: TurnId, reason: TurnEndReason },
@@ -217,6 +219,8 @@ pub enum AgentError {
 
 - agent 循环是引擎内部的 `Agent`，不是 trait、不可替换（ADR-0026）；`SessionHandle::drive()` / `compact_now()` 是它的公开入口。
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
+- `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
+- `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。

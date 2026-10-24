@@ -42,12 +42,14 @@ use crate::views::usage::UsageService;
 use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProviderCatalog,
-    RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span,
-    SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
+    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProjectedEntry,
+    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState,
+    Span, SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
     UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
 };
-use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SignalDelivery, unique_bytes};
+use asterpath_protocol::{
+    ApprovalGate, Clock, SessionQuery, SessionStore, SignalDelivery, unique_bytes,
+};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -161,7 +163,9 @@ impl Asterpath {
             Arc::clone(&cancellations),
         ));
         let tools = Arc::new(ToolTable::new());
-        tools.register(Arc::new(SpawnTool::new()));
+        if config.spawn_tool {
+            tools.register(Arc::new(SpawnTool::new()));
+        }
         for tool in config.tools {
             tools.register(tool);
         }
@@ -304,7 +308,11 @@ impl Asterpath {
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
         // shortcut: folds every session on each call; index inside the sqlite module once session counts grow
         let mut wakeable = Vec::new();
-        for session in self.store.sessions().await? {
+        let catalog = self.store.sessions(SessionQuery::default()).await?;
+        // Id order, as before the catalog listed newest first.
+        let mut sessions: Vec<SessionId> = catalog.iter().map(|entry| entry.session).collect();
+        sessions.sort();
+        for session in sessions {
             let entries = scan_all(&*self.store, session).await?;
             let facts = SessionFacts::fold(&entries).map_err(|error| {
                 AsterError::Agent(AgentError::Corrupt {
@@ -434,6 +442,18 @@ impl SessionHandle {
         let entries = scan_all(&*self.store, self.session).await?;
         SessionFacts::fold(&entries).map_err(|error| {
             AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
+                session: self.session,
+                detail: error.to_string(),
+            })
+        })
+    }
+
+    /// The model-visible projection folded from the log, not driver memory.
+    /// Each entry keeps its origin so hosts can map items back to log ids.
+    pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
+        let entries = scan_all(&*self.store, self.session).await?;
+        asterpath_protocol::project(&entries).map_err(|error| {
+            AsterError::Agent(AgentError::Corrupt {
                 session: self.session,
                 detail: error.to_string(),
             })

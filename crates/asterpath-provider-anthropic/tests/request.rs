@@ -11,6 +11,26 @@ use common::{
     MockServer, Reply, base_request, descriptor, drain, empty_sse, model, provider, text,
 };
 
+fn request_for(model: &str) -> ModelRequest {
+    let mut request = base_request();
+    request.spec.model = ModelId::new(model);
+    request
+}
+
+fn effort(effort: ReasoningEffort) -> Option<ReasoningParams> {
+    Some(ReasoningParams {
+        effort: Some(effort),
+        ..ReasoningParams::default()
+    })
+}
+
+fn budget(tokens: u32) -> Option<ReasoningParams> {
+    Some(ReasoningParams {
+        budget_tokens: Some(tokens),
+        ..ReasoningParams::default()
+    })
+}
+
 fn user_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::User,
@@ -40,7 +60,7 @@ async fn one_request(
 #[tokio::test]
 async fn renders_system_tools_sampling_tool_choice_and_thinking() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
-    let mut request = base_request();
+    let mut request = request_for("claude-sonnet-4-5");
     request.system = vec![text("be helpful"), text("be terse")];
     request.items = vec![user_message(vec![text("hi")])];
     request.tools = vec![descriptor("search")];
@@ -77,7 +97,7 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
     );
 
     let body = recorded[0].json_body();
-    assert_eq!(body["model"], "claude-test");
+    assert_eq!(body["model"], "claude-sonnet-4-5");
     assert_eq!(body["max_tokens"], 512);
     assert_eq!(body["stream"], true);
     assert_eq!(
@@ -106,6 +126,7 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
         serde_json::json!({"type": "enabled", "budget_tokens": 2048})
     );
     assert!(body.get("seed").is_none(), "seed has no Anthropic mapping");
+    assert!(body.get("output_config").is_none());
     assert_eq!(
         body["messages"],
         serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
@@ -133,7 +154,7 @@ async fn renders_every_tool_choice_variant() {
         ToolChoice::None,
         ToolChoice::Tool(ToolName::new("search")),
     ] {
-        let mut request = base_request();
+        let mut request = request_for("claude-opus-5");
         request.tools = vec![descriptor("search")];
         request.tool_choice = choice;
         drain(&provider, request).await;
@@ -304,7 +325,8 @@ async fn unsupported_request_fields_fail_before_any_http() {
     assert_eq!(error.kind, ProviderErrorKind::Unsupported);
     assert!(!error.retryable);
 
-    let mut effort = base_request();
+    // Effort is documented only for Opus 4.5 among extended-thinking-only models.
+    let mut effort = request_for("claude-sonnet-4-5");
     effort.reasoning = Some(ReasoningParams {
         effort: Some(ReasoningEffort::High),
         ..ReasoningParams::default()
@@ -493,4 +515,190 @@ async fn reasoning_raw_json_is_replayed_byte_for_byte() {
     wrong_provider.items = vec![other_provider];
     drain(&provider, wrong_provider).await;
     assert!(!server.requests()[6].body.contains(raw));
+}
+
+#[tokio::test]
+async fn current_models_render_adaptive_thinking_with_effort() {
+    let server = MockServer::start(vec![
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ]);
+    let provider = provider(&server);
+    for (level, model) in [
+        (ReasoningEffort::Low, "claude-opus-5-5"),
+        (ReasoningEffort::Medium, "claude-haiku-5-5"),
+        (ReasoningEffort::High, "claude-opus-4-7"),
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = effort(level);
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), 3);
+    for (recorded, expected) in recorded.iter().zip(["low", "medium", "high"]) {
+        let body = recorded.json_body();
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(
+            body["output_config"],
+            serde_json::json!({"effort": expected})
+        );
+    }
+}
+
+#[tokio::test]
+async fn summary_requests_summarized_thinking_display_where_supported() {
+    let server = MockServer::start(vec![
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ]);
+    let provider = provider(&server);
+    for (model, budget_tokens) in [
+        ("claude-opus-5-5", None),
+        ("claude-opus-4-6", Some(2048)),
+        ("claude-sonnet-4-5", Some(2048)),
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            budget_tokens,
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(
+        recorded[0].json_body()["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert_eq!(
+        recorded[1].json_body()["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048, "display": "summarized"})
+    );
+    // Pre-4.6 models predate `display` and always summarize.
+    assert_eq!(
+        recorded[2].json_body()["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+    );
+}
+
+#[test]
+fn builtin_tools_are_not_advertised() {
+    use asterpath_protocol::Provider;
+    let provider = asterpath_provider_anthropic::AnthropicProvider::new("key");
+    assert!(!provider.capabilities(&model()).builtin_tools);
+}
+
+#[tokio::test]
+async fn transitional_and_opus_4_5_models_keep_their_documented_shapes() {
+    let server = MockServer::start(vec![
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ]);
+    let provider = provider(&server);
+
+    // 4.6 accepts both; adaptive is used unless a budget is asked for.
+    let mut adaptive = request_for("claude-sonnet-4-6");
+    adaptive.reasoning = effort(ReasoningEffort::Medium);
+    drain(&provider, adaptive).await;
+    let mut extended = request_for("claude-opus-4-6");
+    extended.reasoning = budget(2048);
+    drain(&provider, extended).await;
+    // Opus 4.5 is extended-thinking-only but documents effort alongside the budget.
+    let mut opus_4_5 = request_for("claude-opus-4-5-20251101");
+    opus_4_5.reasoning = Some(ReasoningParams {
+        effort: Some(ReasoningEffort::Low),
+        budget_tokens: Some(2048),
+        ..ReasoningParams::default()
+    });
+    drain(&provider, opus_4_5).await;
+
+    let recorded = server.requests();
+    let body = recorded[0].json_body();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(
+        body["output_config"],
+        serde_json::json!({"effort": "medium"})
+    );
+    let body = recorded[1].json_body();
+    assert_eq!(
+        body["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert!(body.get("output_config").is_none());
+    let body = recorded[2].json_body();
+    assert_eq!(
+        body["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert_eq!(body["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+#[tokio::test]
+async fn current_models_reject_budget_forced_tool_choice_and_sampling_before_http() {
+    let server = MockServer::start(Vec::new());
+
+    let mut with_budget = request_for("claude-opus-5-5");
+    with_budget.reasoning = budget(2048);
+    let mut forced = request_for("claude-sonnet-5-5");
+    forced.tools = vec![descriptor("search")];
+    forced.tool_choice = ToolChoice::Required;
+    let mut named = request_for("claude-fable-5-1");
+    named.tools = vec![descriptor("search")];
+    named.tool_choice = ToolChoice::Tool(ToolName::new("search"));
+    let mut sampled = request_for("claude-opus-4-7");
+    sampled.sampling = Some(SamplingParams {
+        temperature: Some(0.2),
+        ..SamplingParams::default()
+    });
+
+    for request in [with_budget, forced, named, sampled] {
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported, "{error:?}");
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+#[tokio::test]
+async fn unrecognized_model_ids_are_treated_as_the_latest_generation() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let provider = provider(&server);
+    let capabilities = asterpath_protocol::Provider::capabilities(&provider, &model());
+    assert!(!capabilities.forced_tool_choice);
+    assert!(!capabilities.sampling);
+
+    let mut with_budget = base_request();
+    with_budget.reasoning = budget(2048);
+    let error = one_request(&server, with_budget).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+
+    let mut request = base_request();
+    request.reasoning = effort(ReasoningEffort::High);
+    drain(&provider, request).await;
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), 1);
+    let body = recorded[0].json_body();
+    assert_eq!(body["model"], "claude-test");
+    assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+}
+
+#[tokio::test]
+async fn older_models_keep_forced_tool_choice_and_sampling() {
+    let provider = provider(&MockServer::start(Vec::new()));
+    for model in ["claude-sonnet-4-5", "claude-opus-4-6"] {
+        let mut spec = common::model();
+        spec.model = ModelId::new(model);
+        let capabilities = asterpath_protocol::Provider::capabilities(&provider, &spec);
+        assert!(capabilities.forced_tool_choice, "{model}");
+        assert!(capabilities.sampling, "{model}");
+    }
+    // Opus 5 still accepts forced tool use but has no sampling parameters.
+    let mut spec = common::model();
+    spec.model = ModelId::new("claude-opus-5");
+    let capabilities = asterpath_protocol::Provider::capabilities(&provider, &spec);
+    assert!(capabilities.forced_tool_choice);
+    assert!(!capabilities.sampling);
 }

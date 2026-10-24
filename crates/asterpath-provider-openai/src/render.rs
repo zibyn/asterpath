@@ -92,10 +92,9 @@ pub(crate) fn render(
         #[serde(skip_serializing_if = "Option::is_none")]
         top_p: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        seed: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<Value>,
         store: bool,
+        stream: bool,
         include: &'static [&'static str],
     }
 
@@ -110,9 +109,9 @@ pub(crate) fn render(
         max_output_tokens: request.max_output_tokens,
         temperature: sampling.and_then(|params| params.temperature),
         top_p: sampling.and_then(|params| params.top_p),
-        seed: sampling.and_then(|params| params.seed),
         reasoning: request.reasoning.as_ref().map(reasoning),
         store: false,
+        stream: true,
         include: &["reasoning.encrypted_content"],
     };
 
@@ -149,6 +148,11 @@ fn validate(
         && sampling.top_k.is_some()
     {
         return Err(unsupported("top_k sampling"));
+    }
+    if let Some(sampling) = &request.sampling
+        && sampling.seed.is_some()
+    {
+        return Err(unsupported("seed"));
     }
     if let Some(reasoning) = &request.reasoning
         && reasoning.budget_tokens.is_some()

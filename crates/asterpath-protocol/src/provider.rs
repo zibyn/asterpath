@@ -88,7 +88,8 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartDelta {
     Text { text: String },
     JsonArgs { fragment: String },

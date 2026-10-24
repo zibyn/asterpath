@@ -198,6 +198,11 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         }
     };
     assert_eq!(request.tool.as_str(), "echo");
+    assert_eq!(
+        asterpath.approval_gate().pending(),
+        vec![request.clone()],
+        "the waiting request is pending in process"
+    );
 
     // Still suspended: no result recorded while waiting.
     let before = scan(asterpath.store(), handle.id()).await;
@@ -212,6 +217,10 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
     while let Some(event) = stream.next().await {
         event.expect("drive");
     }
+    assert!(
+        asterpath.approval_gate().pending().is_empty(),
+        "a decided request is no longer pending"
+    );
 
     let entries = scan(asterpath.store(), handle.id()).await;
     let results = tool_results(&entries);
@@ -230,6 +239,50 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .expect("duplicate approve");
     let entries = scan(asterpath.store(), handle.id()).await;
     assert_eq!(kind_count(&entries, "SignalReceived"), 1);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
+async fn dropping_the_drive_stream_removes_the_pending_request() {
+    let db = temp_db("drop-pending");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![tool_call("echo")],
+        StopReason::ToolUse,
+        Usage::default(),
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![echo_tool(Arc::clone(&calls))])
+        .approval(Arc::new(AlwaysAsk))
+        .build()
+        .await
+        .expect("build");
+    let _endpoint = asterpath.approval_gate().register();
+    let handle = asterpath.create_session(spec()).await.unwrap();
+    handle.submit_input(text_input(1)).await.unwrap();
+
+    let mut stream = handle.drive();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("approval is requested")
+            .expect("event")
+            .expect("no error");
+        if matches!(event, AgentEvent::ApprovalRequested(_)) {
+            break;
+        }
+    }
+    assert_eq!(asterpath.approval_gate().pending().len(), 1);
+
+    drop(stream);
+    assert!(
+        asterpath.approval_gate().pending().is_empty(),
+        "the host dropped the wait"
+    );
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);

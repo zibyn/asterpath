@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_protocol::{
-    Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore,
-    StorageError, SystemClock,
+    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter,
+    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
@@ -347,20 +347,56 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn sessions_sync(&self) -> Result<Vec<SessionId>, StorageError> {
+    /// `last_activity` reads the last row through the `(session_id, seq)`
+    /// unique index; no derived column (ADR-0028).
+    fn sessions_sync(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, StorageError> {
+        let (mode, of) = match query.parent {
+            ParentFilter::Any => (0, None),
+            ParentFilter::Roots => (1, None),
+            ParentFilter::ChildrenOf(of) => (2, Some(of.as_bytes().to_vec())),
+        };
+        let after_created = query.after.map(|after| after.created_at);
+        let after_session = query.after.map(|after| after.session.as_bytes().to_vec());
+        let limit = query
+            .limit
+            .map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
         let conn = self.conn();
         let mut statement = conn
             .prepare(
-                "SELECT session_id FROM sessions \
-                 WHERE session_id NOT IN (SELECT session_id FROM retired_sessions) \
-                 ORDER BY session_id",
+                "SELECT s.session_id, s.parent_id, s.created_at, \
+                 COALESCE((SELECT l.recorded_at FROM log l WHERE l.session_id = s.session_id \
+                           ORDER BY l.seq DESC LIMIT 1), s.created_at) \
+                 FROM sessions s \
+                 WHERE s.session_id NOT IN (SELECT session_id FROM retired_sessions) \
+                 AND (?1 = 0 OR (?1 = 1 AND s.parent_id IS NULL) OR (?1 = 2 AND s.parent_id = ?2)) \
+                 AND (?3 IS NULL OR s.created_at < ?3 OR (s.created_at = ?3 AND s.session_id < ?4)) \
+                 ORDER BY s.created_at DESC, s.session_id DESC \
+                 LIMIT ?5",
             )
             .map_err(backend)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .query_map(
+                params![mode, of, after_created, after_session, limit],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
             .map_err(backend)?;
-        rows.map(|row| row.map_err(backend).and_then(session_from_blob))
-            .collect()
+        rows.map(|row| {
+            let (session, parent, created_at, last_activity) = row.map_err(backend)?;
+            Ok(CatalogEntry {
+                session: session_from_blob(session)?,
+                parent: parent.map(session_from_blob).transpose()?,
+                created_at,
+                last_activity,
+            })
+        })
+        .collect()
     }
 
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
@@ -379,24 +415,6 @@ impl SqliteStorage {
             Some(Some(bytes)) => session_from_blob(bytes).map(Some),
         }
     }
-
-    fn children_sync(&self, session: SessionId) -> Vec<Result<SessionId, StorageError>> {
-        let conn = self.conn();
-        let mut statement = match conn.prepare(
-            "SELECT session_id FROM sessions WHERE parent_id = ?1 \
-             AND session_id NOT IN (SELECT session_id FROM retired_sessions) \
-             ORDER BY session_id",
-        ) {
-            Ok(statement) => statement,
-            Err(error) => return vec![Err(backend(error))],
-        };
-        let rows = match statement.query_map([session.as_bytes()], |row| row.get::<_, Vec<u8>>(0)) {
-            Ok(rows) => rows,
-            Err(error) => return vec![Err(backend(error))],
-        };
-        rows.map(|row| row.map_err(backend).and_then(session_from_blob))
-            .collect()
-    }
 }
 
 impl SessionStore for SqliteStorage {
@@ -412,16 +430,15 @@ impl SessionStore for SqliteStorage {
         Box::pin(async move { self.frontier_sync(session) })
     }
 
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>> {
-        Box::pin(async move { self.sessions_sync() })
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
+        Box::pin(async move { self.sessions_sync(query) })
     }
 
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         Box::pin(async move { self.parent_sync(session) })
-    }
-
-    fn children(&self, session: SessionId) -> BoxStream<'_, Result<SessionId, StorageError>> {
-        stream::iter(self.children_sync(session)).boxed()
     }
 
     fn retire(

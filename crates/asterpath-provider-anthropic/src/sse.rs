@@ -408,6 +408,19 @@ impl Decoder {
             self.stop_reason = Some(map_stop_reason(label));
         }
         if let Some(usage) = value.get("usage") {
+            // Cumulative: server tool loops grow the input past message_start's count.
+            for (field, slot) in [
+                ("input_tokens", &mut self.usage_input.uncached),
+                ("cache_read_input_tokens", &mut self.usage_input.cache_read),
+                (
+                    "cache_creation_input_tokens",
+                    &mut self.usage_input.cache_write,
+                ),
+            ] {
+                if let Some(tokens) = usage.get(field).and_then(Value::as_u64) {
+                    *slot = tokens;
+                }
+            }
             if let Some(total) = usage.get("output_tokens").and_then(Value::as_u64) {
                 self.output_total = total;
             }

@@ -153,9 +153,10 @@ impl Harness {
             events: &events,
             spawn: None,
         };
+        let output_indices: Vec<u32> = (0..items.len() as u32).collect();
         let outcome = self
             .pipeline()
-            .run(&step, items, cancel)
+            .run(&step, items, &output_indices, cancel)
             .await
             .expect("pipeline");
         let mut live = Vec::new();

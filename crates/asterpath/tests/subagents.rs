@@ -517,7 +517,7 @@ async fn child_approval_is_scoped_to_the_child_session() {
     let db = temp_db("approval");
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register();
-    let asterpath = approval_fixture(&db, Arc::new(approval_script()), gate).await;
+    let asterpath = approval_fixture(&db, Arc::new(approval_script()), Arc::clone(&gate)).await;
     let handle = asterpath.create_session(spec(None)).await.unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
@@ -548,6 +548,10 @@ async fn child_approval_is_scoped_to_the_child_session() {
         "the parent approval does not close the child's wait"
     );
     assert!(!driver.is_finished(), "the child is still waiting");
+    let pending = gate.pending();
+    assert_eq!(pending.len(), 1, "the child's wait is listed: {pending:?}");
+    assert_eq!(pending[0].session, child, "listed under the child session");
+    assert_eq!(pending[0].tool_call_id, call);
 
     // The child's own session accepts the decision.
     asterpath

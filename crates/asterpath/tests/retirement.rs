@@ -163,11 +163,12 @@ impl SessionStore for NoRetirement {
 
     fn sessions(
         &self,
+        query: asterpath::protocol::SessionQuery,
     ) -> futures_core::future::BoxFuture<
         '_,
-        Result<Vec<SessionId>, asterpath::protocol::StorageError>,
+        Result<Vec<asterpath::protocol::CatalogEntry>, asterpath::protocol::StorageError>,
     > {
-        self.0.sessions()
+        self.0.sessions(query)
     }
 
     fn parent(
@@ -178,14 +179,6 @@ impl SessionStore for NoRetirement {
         Result<Option<SessionId>, asterpath::protocol::StorageError>,
     > {
         self.0.parent(session)
-    }
-
-    fn children(
-        &self,
-        session: SessionId,
-    ) -> futures_core::stream::BoxStream<'_, Result<SessionId, asterpath::protocol::StorageError>>
-    {
-        self.0.children(session)
     }
 }
 

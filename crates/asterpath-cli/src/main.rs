@@ -338,13 +338,18 @@ async fn inspect(args: SessionArgs) -> CliResult<()> {
 
     let handle = asterpath.open_session(session).await.map_err(aster_error)?;
     let facts = handle.facts().await.map_err(aster_error)?;
+    let items: Vec<Item> = handle
+        .projection()
+        .await
+        .map_err(aster_error)?
+        .into_iter()
+        .flat_map(|projected| projected.items)
+        .collect();
     if args.common.json {
-        let items = history(&entries).map_err(|error| CliError::run(error.to_string()))?;
         let json = serde_json::to_string_pretty(&items)
             .map_err(|error| CliError::run(error.to_string()))?;
         println!("{json}");
     } else {
-        let items = history(&entries).map_err(|error| CliError::run(error.to_string()))?;
         println!("session: {}", session.to_hex());
         println!("state: {}", state_label(facts.state()));
         println!("entries: {}", entries.len());

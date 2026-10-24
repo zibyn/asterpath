@@ -284,6 +284,79 @@ async fn normalizes_the_full_stream_into_s1_to_s10() {
 }
 
 #[tokio::test]
+async fn parallel_tool_use_json_deltas_carry_their_block_output_index() {
+    let tool_use = |index: u32, id: &str| {
+        format!(
+            r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{id}","name":"search","input":{{}}}}}}"#
+        )
+    };
+    let json_delta = |index: u32, partial: &str| {
+        format!(
+            r#"{{"type":"content_block_delta","index":{index},"delta":{{"type":"input_json_delta","partial_json":{}}}}}"#,
+            serde_json::to_string(partial).unwrap()
+        )
+    };
+    let stop = |index: u32| format!(r#"{{"type":"content_block_stop","index":{index}}}"#);
+    let frames = [
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_par","usage":{"input_tokens":1,"output_tokens":1}}}"#.to_owned(),
+        ),
+        ("content_block_start", tool_use(0, "toolu_a")),
+        ("content_block_delta", json_delta(0, r#"{"q":"#)),
+        ("content_block_delta", json_delta(0, r#""a"}"#)),
+        ("content_block_stop", stop(0)),
+        ("content_block_start", tool_use(1, "toolu_b")),
+        ("content_block_delta", json_delta(1, r#"{"q":"#)),
+        ("content_block_delta", json_delta(1, r#""b"}"#)),
+        ("content_block_stop", stop(1)),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}"#.to_owned(),
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#.to_owned()),
+    ];
+    let frames: Vec<(&str, &str)> = frames
+        .iter()
+        .map(|(event, data)| (*event, data.as_str()))
+        .collect();
+    let server = MockServer::start(vec![Reply::sse(sse_body(&frames))]);
+    let events = ok(drain(&provider(&server), base_request()).await);
+
+    let mut fragments: std::collections::BTreeMap<u32, String> = Default::default();
+    let mut calls = std::collections::BTreeMap::new();
+    for event in &events {
+        match event {
+            StreamEvent::PartDelta {
+                output_index,
+                part_index: 0,
+                delta: PartDelta::JsonArgs { fragment },
+                ..
+            } => fragments
+                .entry(*output_index)
+                .or_default()
+                .push_str(fragment),
+            StreamEvent::ItemCompleted {
+                output_index,
+                item: Item::ToolCall {
+                    call_id, raw_args, ..
+                },
+                ..
+            } => {
+                calls.insert(*output_index, (call_id.clone(), raw_args.clone()));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(fragments.len(), 2);
+    for (index, call_id) in [(0, "toolu_a"), (1, "toolu_b")] {
+        assert_eq!(calls[&index].0, call_id);
+        assert_eq!(calls[&index].1.as_str(), fragments[&index]);
+    }
+    assert_eq!(fragments[&1], r#"{"q":"b"}"#);
+}
+
+#[tokio::test]
 async fn maps_server_tools_and_unknown_blocks_to_raw_items() {
     let body = sse_body(&[
         (
@@ -735,6 +808,84 @@ async fn context_window_messages_map_to_context_exceeded() {
     assert_eq!(error.kind, ProviderErrorKind::ContextExceeded);
     assert!(!error.retryable);
     assert!(error.context_exceeded());
+}
+
+#[tokio::test]
+async fn a_spend_limit_429_is_not_retryable() {
+    let server = MockServer::start(vec![Reply::json(
+        429,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}"#,
+    )]);
+    let error = first_error(drain(&provider(&server), base_request()).await);
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert!(!error.retryable);
+}
+
+#[tokio::test]
+async fn non_transient_error_types_are_not_retryable_on_both_paths() {
+    let cases = [
+        (402, "billing_error", false),
+        (404, "not_found_error", false),
+        (413, "request_too_large", false),
+        (529, "overloaded_error", true),
+        (500, "api_error", true),
+        (504, "timeout_error", true),
+    ];
+    let mut replies = Vec::new();
+    for (status, label, _) in cases {
+        let body =
+            format!(r#"{{"type":"error","error":{{"type":"{label}","message":"{label}"}}}}"#);
+        replies.push(Reply::json(status, body.clone()));
+        replies.push(Reply::sse(sse_body(&[
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m","usage":{}}}"#,
+            ),
+            ("error", &body),
+        ])));
+    }
+    let server = MockServer::start(replies);
+    let provider = provider(&server);
+    for (status, label, retryable) in cases {
+        for path in ["http", "sse"] {
+            let error = first_error(drain(&provider, base_request()).await);
+            assert_eq!(error.retryable, retryable, "{path} {status} {label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn message_delta_cumulative_input_usage_overrides_message_start() {
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2,"output_tokens":1}}}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":30,"cache_read_input_tokens":12,"cache_creation_input_tokens":6,"output_tokens":9}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![Reply::sse(body)]);
+    let events = ok(drain(&provider(&server), base_request()).await);
+    match events.last() {
+        Some(StreamEvent::ResponseEnded { usage, .. }) => assert_eq!(
+            *usage,
+            Usage {
+                input: asterpath_protocol::InputTokens {
+                    uncached: 30,
+                    cache_read: 12,
+                    cache_write: 6,
+                },
+                output: asterpath_protocol::OutputTokens {
+                    total: 9,
+                    reasoning: 0,
+                },
+            }
+        ),
+        other => panic!("expected ResponseEnded, got {other:?}"),
+    }
 }
 
 #[tokio::test]
