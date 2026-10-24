@@ -25,6 +25,7 @@
 
 ## Consequences
 
+- **2026-10-24 #97 修订**：「一条记录一个事务」改为「一条记录一个 savepoint，同时排队的记录 group commit 进一个事务」（不设等待窗口，单批上限 64，`COMMIT` 成功后才回复，append 返回即已 fsync 不变）。#86 基准推翻了「`Mutex<Connection>` 足够」的前提（Full、N=8 时 append p99 438ms、worker 心跳 lag p99 111ms），已采用 writer 线程 + 独立只读连接；下文 Considered alternatives 中对应一条作废。
 - **2026-10-22 #32 修订**：v1 是单进程显式驱动，没有并发消费者，删除 `Storage::claim` / `ack`、租约字段与 `writer_lease` 表；唤醒改为只读 `Storage::wakeable`，待处理输入由 `pending_inputs` 派生。存储不再有调度队列。
 - **2026-10-23 #73 修订**：`EventLog` / `Storage` 双 trait 作废，后端实现单一 `SessionStore`（日志 + 会话目录 + 可选退役），见 [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md) 修订行。
 - **2026-10-23 ADR-0024 修订**：通用 timer 删除，“timer 触发与派生行同事务”一句作废，见 [ADR-0024](0024-durable-waits-only-approval-and-child.md)。

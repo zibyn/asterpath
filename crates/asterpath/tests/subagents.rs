@@ -1093,6 +1093,15 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
                 == 2
     })
     .await;
+    // Appends yield (#97), so wait until the child is materialized and its
+    // turn is open; cancelling earlier drops the spawn before the child runs.
+    let child = wait_for_child(&asterpath, parent).await;
+    wait_for(&asterpath, child, "the child's open turn", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnStarted { .. }))
+    })
+    .await;
     handle.cancel().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), driver)
         .await
@@ -1135,7 +1144,7 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
     ));
 
     // The child got the cancellation and closed its own turn.
-    let child = spawned_children(&entries)[0];
+    assert_eq!(spawned_children(&entries), [child]);
     let child_events = decoded(&scan(asterpath.store(), child).await);
     assert!(matches!(
         child_events.last(),

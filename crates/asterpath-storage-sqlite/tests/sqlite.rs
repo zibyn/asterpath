@@ -534,3 +534,104 @@ fn a_new_database_is_created_at_v2() {
         vec!["log", "retired_sessions", "sessions", "sqlite_sequence"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Writer thread: group commit with a savepoint per record (#97).
+// ---------------------------------------------------------------------------
+
+/// Run `appends` as one writer batch: the writer is parked until every
+/// append has been sent, so they are all queued when it drains.
+fn append_batch(
+    storage: &asterpath_storage_sqlite::SqliteStorage,
+    appends: Vec<NewEntry>,
+) -> Vec<Result<LogId, StorageError>> {
+    let (release, held) = mpsc::channel::<()>();
+    storage
+        .run_on_writer(move |_| {
+            let _ = held.recv();
+        })
+        .expect("park writer");
+    let appends =
+        futures_util::future::join_all(appends.into_iter().map(|entry| storage.append(entry)));
+    // `join` polls `appends` first, so every command is queued before release.
+    let (results, ()) = block_on(futures_util::future::join(
+        appends,
+        async move { drop(release) },
+    ));
+    results
+}
+
+#[test]
+fn a_bad_append_in_a_batch_fails_alone() {
+    let dir = TempDir::new("batch-bad");
+    let storage = open(dir.db()).expect("open");
+    let bad = NewEntry {
+        session: session(3),
+        schema_version: LOG_SCHEMA_VERSION,
+        dedup_key: None,
+        payload: serde_json::json!({"NoSuchEvent": {}}),
+    };
+    let results = append_batch(
+        &storage,
+        vec![
+            entry(session(3), &input_recorded(), None),
+            bad,
+            entry(session(3), &input_recorded(), None),
+        ],
+    );
+    assert!(matches!(results[1], Err(StorageError::InvalidEntry(_))));
+    let first = *results[0].as_ref().expect("first append");
+    let third = *results[2].as_ref().expect("third append");
+
+    let entries: Vec<_> = scan(storage.as_ref(), session(3))
+        .into_iter()
+        .map(|entry| entry.expect("scan"))
+        .collect();
+    let seqs: Vec<_> = entries.iter().map(|entry| entry.seq).collect();
+    assert_eq!(seqs, [1, 2], "seq has no hole for the rejected append");
+    let ids: Vec<_> = entries.iter().map(|entry| entry.log_id).collect();
+    assert_eq!(ids, [first, third]);
+}
+
+#[test]
+fn duplicate_appends_in_a_batch_share_one_row() {
+    let dir = TempDir::new("batch-dedup");
+    let storage = open(dir.db()).expect("open");
+    let results = append_batch(
+        &storage,
+        vec![
+            entry(session(4), &input_recorded(), Some(DedupKey::new("k"))),
+            entry(session(4), &input_recorded(), Some(DedupKey::new("k"))),
+        ],
+    );
+    let first = results[0].as_ref().expect("first append");
+    let second = results[1].as_ref().expect("second append");
+    assert_eq!(first, second);
+    assert_eq!(scan(storage.as_ref(), session(4)).len(), 1);
+}
+
+#[test]
+fn reopening_right_after_drop_keeps_committed_records() {
+    let dir = TempDir::new("drop-reopen");
+    let storage = open(dir.db()).expect("open");
+    for _ in 0..3 {
+        append(storage.as_ref(), entry(session(5), &input_recorded(), None)).expect("append");
+    }
+    drop(storage);
+    let storage = open(dir.db()).expect("reopen in the same process");
+    assert_eq!(scan(storage.as_ref(), session(5)).len(), 3);
+}
+
+#[test]
+fn a_stopped_writer_fails_appends_instead_of_hanging() {
+    let dir = TempDir::new("writer-stopped");
+    let storage = open(dir.db()).expect("open");
+    storage
+        .run_on_writer(|_| panic!("simulated writer crash"))
+        .expect("send to writer");
+    for _ in 0..2 {
+        let error = append(storage.as_ref(), entry(session(6), &input_recorded(), None))
+            .expect_err("writer is gone");
+        assert!(matches!(error, StorageError::Backend(_)), "{error:?}");
+    }
+}

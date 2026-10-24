@@ -233,6 +233,7 @@ version = "0.1.0"
 dependencies = [
  "asterpath-protocol",
  "asterpath-testing",
+ "futures-channel",
  "futures-core",
  "futures-executor",
  "futures-util",
