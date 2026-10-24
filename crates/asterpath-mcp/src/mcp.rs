@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use asterpath_protocol::{ImageSource, JsonString, Part, ToolError, ToolOutput};
+use asterpath_protocol::{FileSource, ImageSource, JsonString, Part, ToolError, ToolOutput};
 use serde_json::Value;
 
 use crate::adapter::{AdapterError, AdapterHandshake, AdapterTool, BoxFuture};
@@ -429,6 +429,15 @@ fn map_resource(resource: Option<&Value>) -> Part {
                 },
             };
         }
+        if media_type == "application/pdf" {
+            return Part::File {
+                media_type: media_type.to_owned(),
+                filename: None,
+                source: FileSource::Base64 {
+                    data: blob.to_owned(),
+                },
+            };
+        }
         return Part::Text {
             text: format!("[resource blob: {media_type}]"),
         };
@@ -442,9 +451,35 @@ fn map_resource(resource: Option<&Value>) -> Part {
 mod tests {
     use serde_json::json;
 
-    use asterpath_protocol::{ToolConfig, ToolError};
+    use asterpath_protocol::{FileSource, Part, ToolConfig, ToolError};
 
     use super::map_result;
+
+    #[test]
+    fn pdf_resource_blobs_become_files_and_other_blobs_stay_placeholders() {
+        let output = map_result(json!({
+            "content": [
+                {"type": "resource", "resource": {"uri": "file:///r.pdf", "mimeType": "application/pdf", "blob": "JVBE"}},
+                {"type": "resource", "resource": {"uri": "file:///r.zip", "mimeType": "application/zip", "blob": "UEsD"}},
+            ],
+        }))
+        .expect("success");
+        assert_eq!(
+            output.content,
+            vec![
+                Part::File {
+                    media_type: "application/pdf".to_owned(),
+                    filename: None,
+                    source: FileSource::Base64 {
+                        data: "JVBE".to_owned(),
+                    },
+                },
+                Part::Text {
+                    text: "[resource blob: application/zip]".to_owned(),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn is_error_messages_are_bounded_and_split_on_utf8_boundaries() {

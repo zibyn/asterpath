@@ -36,6 +36,9 @@ pub struct OpenAiModelProfile {
     pub sampling: bool,
     /// Accepts built-in (server-executed) tools in `tools`.
     pub server_tools: bool,
+    /// `Part::File` media types sent as `input_file`; empty means no file
+    /// input.
+    pub file_media_types: Cow<'static, [&'static str]>,
 }
 
 impl OpenAiModelProfile {
@@ -68,6 +71,12 @@ impl OpenAiModelProfile {
         self.server_tools = server_tools;
         self
     }
+
+    #[must_use]
+    pub fn with_file_media_types(mut self, types: impl Into<Cow<'static, [&'static str]>>) -> Self {
+        self.file_media_types = types.into();
+        self
+    }
 }
 
 const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
@@ -76,6 +85,7 @@ const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
         forced_tool_choice: true,
         sampling: true,
         server_tools: true,
+        file_media_types: Cow::Borrowed(PDF),
     }
 }
 
@@ -83,6 +93,10 @@ const fn unlisted(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
     profile.server_tools = false;
     profile
 }
+
+/// PDF input (api/docs/guides/pdf-files) on every vision-capable model; hosts
+/// widen the list for other document types.
+const PDF: &[&str] = &["application/pdf"];
 
 /// GPT-6.1 Sol and unrecognized ids.
 const LATEST: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];

@@ -11,7 +11,7 @@ use crate::config::{
     ModelSpec, ReasoningParams, RequestConfig, SamplingParams, ToolChoice, ToolDescriptor,
 };
 use crate::ids::{JsonString, ProviderId};
-use crate::item::{Item, Part, RawProviderData};
+use crate::item::{FileSource, ImageSource, Item, Part, RawProviderData, Role};
 use crate::usage::Usage;
 
 /// One complete model request for one attempt. The loop builds it from the
@@ -124,6 +124,9 @@ pub struct ProviderCapabilities {
     pub server_tools: bool,
     pub cache_control: bool,
     pub image_input: bool,
+    /// Accepts `Part::File`; the accepted media types are in the adapter's
+    /// model rules.
+    pub file_input: bool,
     pub parallel_tool_calls: bool,
 }
 
@@ -160,7 +163,48 @@ impl ProviderCapabilities {
         if !self.server_tools && has_server_tools {
             return Some("server tools");
         }
-        None
+        request.content_parts().find_map(|(role, part)| {
+            let file_id = match part {
+                Part::File { .. } if !self.file_input => return Some("file input"),
+                Part::File { .. } if role == Some(Role::Assistant) => {
+                    return Some("file in an assistant message");
+                }
+                Part::File {
+                    source: FileSource::ProviderFile(id),
+                    ..
+                }
+                | Part::Image {
+                    source: ImageSource::ProviderFile(id),
+                    ..
+                } => id,
+                _ => return None,
+            };
+            (file_id.provider != request.spec.provider)
+                .then_some("a file reference from another provider")
+        })
+    }
+}
+
+impl ModelRequest {
+    /// Media types of every `Part::File` the request renders, for the
+    /// adapter's per-model accepted-type check (protocol.md R14).
+    pub fn file_media_types(&self) -> impl Iterator<Item = &str> {
+        self.content_parts().filter_map(|(_, part)| match part {
+            Part::File { media_type, .. } => Some(media_type.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Parts of user/assistant messages (with their role) and tool results.
+    fn content_parts(&self) -> impl Iterator<Item = (Option<Role>, &Part)> {
+        self.items.iter().flat_map(|item| {
+            let (role, parts) = match item {
+                Item::Message { role, parts, .. } => (Some(*role), parts.as_slice()),
+                Item::ToolResult { parts, .. } => (None, parts.as_slice()),
+                _ => (None, &[][..]),
+            };
+            parts.iter().map(move |part| (role, part))
+        })
     }
 }
 

@@ -131,18 +131,18 @@ impl Provider for OpenAiProvider {
             server_tools: profile.server_tools,
             cache_control: false,
             image_input: true,
+            file_input: !profile.file_media_types.is_empty(),
             parallel_tool_calls: true,
         }
     }
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let capabilities = self.capabilities(&request.spec);
-        let efforts = &self.profile(&request.spec).efforts;
         let rendered = render::render(
             &request,
             &self.id,
             capabilities,
-            efforts,
+            self.profile(&request.spec),
             self.trace.as_deref(),
         );
         let (body, tools_hash) = match rendered {
