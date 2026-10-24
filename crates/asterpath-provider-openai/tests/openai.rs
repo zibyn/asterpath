@@ -1147,6 +1147,16 @@ async fn failed_and_stream_error_codes_share_one_classification() {
     let unknown = single_error(stream_error_with_code("something_new")).await;
     assert_eq!(unknown.kind, ProviderErrorKind::Server);
     assert!(unknown.retryable);
+
+    for code in [
+        "bio_policy",
+        "misalignment_policy_violation",
+        "data_residency_mismatch",
+    ] {
+        let policy = single_error(stream_error_with_code(code)).await;
+        assert_eq!(policy.kind, ProviderErrorKind::InvalidRequest, "{code}");
+        assert!(!policy.retryable, "{code}");
+    }
 }
 
 #[tokio::test]
@@ -1156,6 +1166,8 @@ async fn only_server_executed_output_items_are_server_tool_calls() {
         json!({"id": "ct_1", "type": "custom_tool_call", "call_id": "call_1", "name": "x", "input": "y"}),
         json!({"id": "sh_1", "type": "shell_call", "call_id": "call_2", "status": "completed"}),
         json!({"id": "cu_1", "type": "computer_call", "call_id": "call_3", "status": "completed"}),
+        json!({"id": "ts_1", "type": "tool_search_output", "call_id": "call_4"}),
+        json!({"id": "x_1", "type": "future_tool_result", "call_id": "call_5"}),
     ];
     let mut events = vec![created(0)];
     let mut sequence = 1;
@@ -1168,7 +1180,7 @@ async fn only_server_executed_output_items_are_server_tool_calls() {
     let server = MockServer::start(vec![MockResponse::sse(sse(&events))]);
     let events = collect(&provider(&server), request(vec![user_text("go")])).await;
     let completed = completed_items(&events);
-    assert_eq!(completed.len(), 4, "{events:?}");
+    assert_eq!(completed.len(), 6, "{events:?}");
     assert!(
         matches!(&completed[0].1, Item::ServerToolCall { name, .. } if name == "web_search_call")
     );

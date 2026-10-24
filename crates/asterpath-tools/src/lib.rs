@@ -59,7 +59,7 @@ pub fn coding(
 pub fn read_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Read,
+        Op::Fs(FsOp::Read),
         "read_file",
         "Read a UTF-8 text file. `path` is relative to the project root.",
         serde_json::json!({
@@ -74,7 +74,7 @@ pub fn read_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 pub fn list_dir(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::List,
+        Op::Fs(FsOp::List),
         "list_dir",
         "List a directory relative to the project root (default: the root). Directories end with `/`.",
         serde_json::json!({
@@ -88,7 +88,7 @@ pub fn list_dir(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 pub fn grep(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Grep,
+        Op::Fs(FsOp::Grep),
         "grep",
         "Find lines containing a literal string in files under `path` (default: the root). Prints `path:line: text`.",
         serde_json::json!({
@@ -106,7 +106,7 @@ pub fn grep(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 pub fn write_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Write,
+        Op::Fs(FsOp::Write),
         "write_file",
         "Create or overwrite a file relative to the project root; parent directories are created.",
         serde_json::json!({
@@ -124,7 +124,7 @@ pub fn write_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 pub fn edit_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
     RootTool::build(
         root,
-        Op::Edit,
+        Op::Fs(FsOp::Edit),
         "edit_file",
         "Replace `old_string` with `new_string` in a file; `old_string` must occur exactly once.",
         serde_json::json!({
@@ -161,12 +161,21 @@ pub fn bash(
     )
 }
 
-enum Op {
+/// Upper bound on what any tool reads into memory or returns; the pipeline
+/// truncates further to `ToolConfig::max_output_bytes`.
+const MAX_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Copy)]
+enum FsOp {
     Read,
     List,
     Grep,
     Write,
     Edit,
+}
+
+enum Op {
+    Fs(FsOp),
     Bash {
         sandbox: Option<Arc<dyn SandboxProvider>>,
         policy: SandboxPolicy,
@@ -190,7 +199,7 @@ impl RootTool {
         if !root.is_absolute() {
             return Err(RelativeRoot(root));
         }
-        let read_only = matches!(op, Op::Read | Op::List | Op::Grep);
+        let read_only = matches!(op, Op::Fs(FsOp::Read | FsOp::List | FsOp::Grep));
         let descriptor = ToolDescriptor {
             name: ToolName::new(name),
             description: description.to_owned(),
@@ -221,108 +230,122 @@ impl RootTool {
         }))
     }
 
-    /// Resolve `relative` inside the root. The deepest existing ancestor is
-    /// canonicalized, so `..`, absolute paths and symlinks that leave the root
-    /// are all caught; the not-yet-existing tail is plain names only.
-    // shortcut: check-then-use, so a symlink swapped in between can escape; open with O_NOFOLLOW per component if hosts run untrusted concurrent writers.
-    fn resolve(&self, relative: &str) -> Result<PathBuf, ToolError> {
-        let denied = || ToolError::Denied {
-            message: format!("path is outside the project root: {relative}"),
-        };
-        let relative = Path::new(relative);
-        if relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(denied());
-        }
-        let root = self
-            .root
-            .canonicalize()
-            .map_err(|error| ToolError::Internal {
-                message: format!("cannot open project root {}: {error}", self.root.display()),
-            })?;
-        let path = root.join(relative);
-        let mut existing = path.as_path();
-        while existing.symlink_metadata().is_err() {
-            existing = existing.parent().ok_or_else(denied)?;
-        }
-        // A dangling symlink fails to canonicalize: deny rather than follow it.
-        let real = existing.canonicalize().map_err(|_| denied())?;
-        if !real.starts_with(&root) {
-            return Err(denied());
-        }
-        let tail = path.strip_prefix(existing).expect("ancestor of path");
-        // `join("")` would append a trailing slash and make a file look like a directory.
-        Ok(if tail.as_os_str().is_empty() {
-            real
-        } else {
-            real.join(tail)
-        })
-    }
-
     async fn run(&self, args: ToolArgs, ctx: ToolContext) -> Result<String, ToolError> {
         match &self.op {
-            Op::Read => {
-                let args: PathArgs = parse(&args)?;
-                read_text(&self.resolve(&args.path)?, &args.path)
-            }
-            Op::List => {
-                let args: ListArgs = parse(&args)?;
-                let relative = args.path.as_deref().unwrap_or(".");
-                list(&self.resolve(relative)?, relative)
-            }
-            Op::Grep => {
-                let args: GrepArgs = parse(&args)?;
-                if args.pattern.is_empty() {
-                    return Err(invalid("pattern must not be empty"));
-                }
-                let relative = args.path.as_deref().unwrap_or(".");
-                let start = self.resolve(relative)?;
-                let root = self.resolve(".")?;
-                let mut out = String::new();
-                search(&root, &start, &args.pattern, &ctx, &mut out)?;
-                Ok(out)
-            }
-            Op::Write => {
-                let args: WriteArgs = parse(&args)?;
-                let path = self.resolve(&args.path)?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| io(&args.path, error))?;
-                }
-                std::fs::write(&path, &args.content).map_err(|error| io(&args.path, error))?;
-                Ok(format!(
-                    "wrote {} bytes to {}",
-                    args.content.len(),
-                    args.path
-                ))
-            }
-            Op::Edit => {
-                let args: EditArgs = parse(&args)?;
-                if args.old_string.is_empty() {
-                    return Err(invalid("old_string must not be empty"));
-                }
-                let path = self.resolve(&args.path)?;
-                let content = read_text(&path, &args.path)?;
-                match content.matches(&args.old_string).count() {
-                    1 => {}
-                    0 => return Err(invalid(format!("old_string not found in {}", args.path))),
-                    count => {
-                        return Err(invalid(format!(
-                            "old_string occurs {count} times in {}; it must be unique",
-                            args.path
-                        )));
-                    }
-                }
-                let updated = content.replacen(&args.old_string, &args.new_string, 1);
-                std::fs::write(&path, updated).map_err(|error| io(&args.path, error))?;
-                Ok(format!("edited {}", args.path))
+            &Op::Fs(op) => {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || run_fs(&root, op, &args, &ctx))
+                    .await
+                    .map_err(|error| ToolError::Internal {
+                        message: format!("tool task failed: {error}"),
+                    })?
             }
             Op::Bash { sandbox, policy } => {
+                // shortcut: no default timeout, so a command that never exits runs until the host cancels; set descriptor.timeout once a policy for unattended hosts is decided.
                 let args: BashArgs = parse(&args)?;
-                let root = self.resolve(".")?;
+                let root = resolve(&self.root, ".")?;
                 run_bash(&root, &args.command, sandbox.as_deref(), policy, &ctx).await
             }
+        }
+    }
+}
+
+/// Resolve `relative` inside the root. The deepest existing ancestor is
+/// canonicalized, so `..`, absolute paths and symlinks that leave the root
+/// are all caught; the not-yet-existing tail is plain names only.
+// shortcut: check-then-use, so a symlink swapped in between can escape; open with O_NOFOLLOW per component if hosts run untrusted concurrent writers.
+fn resolve(root: &Path, relative: &str) -> Result<PathBuf, ToolError> {
+    let denied = || ToolError::Denied {
+        message: format!("path is outside the project root: {relative}"),
+    };
+    let relative = Path::new(relative);
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(denied());
+    }
+    let root = root.canonicalize().map_err(|error| ToolError::Internal {
+        message: format!("cannot open project root {}: {error}", root.display()),
+    })?;
+    let path = root.join(relative);
+    let mut existing = path.as_path();
+    while existing.symlink_metadata().is_err() {
+        existing = existing.parent().ok_or_else(denied)?;
+    }
+    // A dangling symlink fails to canonicalize: deny rather than follow it.
+    let real = existing.canonicalize().map_err(|_| denied())?;
+    if !real.starts_with(&root) {
+        return Err(denied());
+    }
+    let tail = path.strip_prefix(existing).expect("ancestor of path");
+    // `join("")` would append a trailing slash and make a file look like a directory.
+    Ok(if tail.as_os_str().is_empty() {
+        real
+    } else {
+        real.join(tail)
+    })
+}
+
+fn run_fs(root: &Path, op: FsOp, args: &ToolArgs, ctx: &ToolContext) -> Result<String, ToolError> {
+    match op {
+        FsOp::Read => {
+            let args: PathArgs = parse(args)?;
+            read_capped(&resolve(root, &args.path)?, &args.path)
+        }
+        FsOp::List => {
+            let args: ListArgs = parse(args)?;
+            let relative = args.path.as_deref().unwrap_or(".");
+            list(&resolve(root, relative)?, relative)
+        }
+        FsOp::Grep => {
+            let args: GrepArgs = parse(args)?;
+            if args.pattern.is_empty() {
+                return Err(invalid("pattern must not be empty"));
+            }
+            let relative = args.path.as_deref().unwrap_or(".");
+            let start = resolve(root, relative)?;
+            let root = resolve(root, ".")?;
+            let mut out = String::new();
+            search(&root, &start, &args.pattern, ctx, &mut out)?;
+            if out.len() >= MAX_BYTES {
+                out.push_str("[output truncated]\n");
+            }
+            Ok(out)
+        }
+        FsOp::Write => {
+            let args: WriteArgs = parse(args)?;
+            let path = resolve(root, &args.path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| io(&args.path, error))?;
+            }
+            replace_file(&path, args.content.as_bytes()).map_err(|error| io(&args.path, error))?;
+            Ok(format!(
+                "wrote {} bytes to {}",
+                args.content.len(),
+                args.path
+            ))
+        }
+        FsOp::Edit => {
+            let args: EditArgs = parse(args)?;
+            if args.old_string.is_empty() {
+                return Err(invalid("old_string must not be empty"));
+            }
+            let path = resolve(root, &args.path)?;
+            let content = read_text(&path, &args.path)?;
+            match content.matches(&args.old_string).count() {
+                1 => {}
+                0 => return Err(invalid(format!("old_string not found in {}", args.path))),
+                count => {
+                    return Err(invalid(format!(
+                        "old_string occurs {count} times in {}; it must be unique",
+                        args.path
+                    )));
+                }
+            }
+            let updated = content.replacen(&args.old_string, &args.new_string, 1);
+            replace_file(&path, updated.as_bytes()).map_err(|error| io(&args.path, error))?;
+            Ok(format!("edited {}", args.path))
         }
     }
 }
@@ -410,6 +433,67 @@ fn read_text(path: &Path, relative: &str) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| invalid(format!("{relative} is not valid UTF-8")))
 }
 
+/// The first [`MAX_BYTES`] of a UTF-8 file, with a marker when it is longer.
+fn read_capped(path: &Path, relative: &str) -> Result<String, ToolError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| io(relative, error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io(relative, error))?;
+    let truncated = bytes.len() > MAX_BYTES;
+    bytes.truncate(MAX_BYTES);
+    let mut text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // Only a character cut by the cap may be incomplete; anything else is not UTF-8.
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).expect("valid prefix")
+        }
+        Err(_) => return Err(invalid(format!("{relative} is not valid UTF-8"))),
+    };
+    if truncated {
+        text.push_str(&format!(
+            "\n[truncated: {relative} is larger than {MAX_BYTES} bytes]"
+        ));
+    }
+    Ok(text)
+}
+
+/// Write `contents` to a temp file beside `path`, then rename it over `path`,
+/// so a crash leaves either the old or the new file. Keeps an existing mode.
+fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = path.with_file_name(name);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(contents)?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 fn list(path: &Path, relative: &str) -> Result<String, ToolError> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(path).map_err(|error| io(relative, error))? {
@@ -425,7 +509,8 @@ fn list(path: &Path, relative: &str) -> Result<String, ToolError> {
 }
 
 /// Depth-first literal search. Symlinks are not followed, so the walk never
-/// leaves the root; files that are not UTF-8 are skipped.
+/// leaves the root; `.git` and files that are not UTF-8 are skipped. Stops
+/// once `out` reaches [`MAX_BYTES`].
 fn search(
     root: &Path,
     path: &Path,
@@ -437,6 +522,9 @@ fn search(
         return Err(ToolError::Cancelled {
             message: "grep cancelled".to_owned(),
         });
+    }
+    if out.len() >= MAX_BYTES || path.file_name() == Some(OsStr::new(".git")) {
+        return Ok(());
     }
     let display = path
         .strip_prefix(root)
@@ -461,6 +549,9 @@ fn search(
         && let Ok(text) = std::fs::read_to_string(path)
     {
         for (number, line) in text.lines().enumerate() {
+            if out.len() >= MAX_BYTES {
+                break;
+            }
             if line.contains(pattern) {
                 out.push_str(&format!("{display}:{}: {line}\n", number + 1));
             }
@@ -498,24 +589,56 @@ async fn run_bash(
         .env_clear()
         .envs(&confined.env)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if let Some(cwd) = &confined.cwd {
         process.current_dir(cwd);
     }
     // shortcut: kill_on_drop signals only the direct child; put it in its own process group and killpg if backgrounded grandchildren must die too.
-    let output = tokio::select! {
-        output = process.output() => output.map_err(|error| ToolError::Internal {
-            message: format!("cannot start bash: {error}"),
+    let mut child = process.spawn().map_err(|error| ToolError::Internal {
+        message: format!("cannot start bash: {error}"),
+    })?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let output = async { tokio::try_join!(drain(stdout), drain(stderr), child.wait()) };
+    let ((stdout, stdout_cut), (stderr, stderr_cut), status) = tokio::select! {
+        output = output => output.map_err(|error| ToolError::Internal {
+            message: format!("bash failed: {error}"),
         })?,
         () = ctx.cancel.cancelled() => {
             return Err(ToolError::Cancelled { message: "bash cancelled".to_owned() });
         }
     };
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
-        text.push_str("\n[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    if stdout_cut {
+        text.push_str("\n[stdout truncated]");
     }
-    text.push_str(&format!("\n[exit status: {}]", output.status));
+    if !stderr.is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&String::from_utf8_lossy(&stderr));
+        if stderr_cut {
+            text.push_str("\n[stderr truncated]");
+        }
+    }
+    text.push_str(&format!("\n[exit status: {status}]"));
     Ok(text)
+}
+
+/// Read `pipe` to the end, keeping the first [`MAX_BYTES`] / 2 bytes; draining
+/// the rest keeps the child from blocking on a full pipe.
+async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut cut = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = pipe.read(&mut buf).await?;
+        if read == 0 {
+            return Ok((kept, cut));
+        }
+        let room = (MAX_BYTES / 2).saturating_sub(kept.len());
+        kept.extend_from_slice(&buf[..read.min(room)]);
+        cut |= read > room;
+    }
 }

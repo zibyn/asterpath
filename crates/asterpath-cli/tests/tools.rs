@@ -17,7 +17,7 @@ const ALL: [&str; 6] = [
     "bash",
 ];
 
-/// Built-in tool names the model saw in the first request, sorted.
+/// Workspace tool names the model saw in the first request, sorted.
 fn run(file: &str, flags: &[&str]) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);

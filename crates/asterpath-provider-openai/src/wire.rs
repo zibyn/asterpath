@@ -496,6 +496,9 @@ impl Normalizer {
                 raw: self.raw_data("openai.compaction", raw.get()),
             }),
             // Only types the server executes; client-executed `*_call` items stay opaque.
+            // Each carries its own result, so no separate item is a ServerToolResult:
+            // `*_output` / `*_result` types (including `tool_search_output`, whose
+            // `tool_search_call` may run on either side) take the opaque path below.
             "web_search_call"
             | "file_search_call"
             | "code_interpreter_call"
@@ -506,14 +509,6 @@ impl Normalizer {
                 call_id: item.call_id.or(item.id),
                 raw: self.raw_data("openai.server_tool_call", raw.get()),
             }),
-            other if other.ends_with("_result") || other.ends_with("_output") => {
-                Ok(Item::ServerToolResult {
-                    provider,
-                    call_id: item.call_id.or(item.id),
-                    parts: Vec::new(),
-                    raw: self.raw_data("openai.server_tool_result", raw.get()),
-                })
-            }
             other => Ok(Item::ProviderOpaque {
                 provider,
                 kind: other.to_owned(),
@@ -633,7 +628,10 @@ pub(crate) fn classify_code(
             | "unsupported_image_media_type"
             | "empty_image_file"
             | "failed_to_download_image"
-            | "image_file_not_found" => ProviderErrorKind::InvalidRequest,
+            | "image_file_not_found"
+            | "bio_policy"
+            | "misalignment_policy_violation"
+            | "data_residency_mismatch" => ProviderErrorKind::InvalidRequest,
             _ => return None,
         };
         Some((kind, kind.retryable_by_default()))

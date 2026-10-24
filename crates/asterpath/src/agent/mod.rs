@@ -712,8 +712,8 @@ impl Agent {
             }
 
             if let Some((stop_reason, usage)) = terminal {
-                let output_indices: Vec<u32> = completed.keys().copied().collect();
-                let items: Vec<Item> = completed.into_values().collect();
+                let indexed: Vec<(u32, Item)> = completed.into_iter().collect();
+                let items: Vec<Item> = indexed.iter().map(|(_, item)| item.clone()).collect();
                 self.append(
                     session,
                     SessionEvent::AssistantMessage {
@@ -732,17 +732,7 @@ impl Agent {
                 let had_calls = has_tool_calls(&items);
                 if had_calls {
                     let outcome = self
-                        .run_tools(
-                            session,
-                            config,
-                            turn,
-                            step,
-                            &items,
-                            &output_indices,
-                            false,
-                            cancel,
-                            events,
-                        )
+                        .run_tools(session, config, turn, step, &indexed, false, cancel, events)
                         .await?;
                     if outcome == ToolOutcome::Cancelled {
                         self.commit_step(session, turn, step).await?;
@@ -917,21 +907,13 @@ impl Agent {
 
         // shortcut: the log keeps no output_index, so a resumed step reports
         // item positions; this step's live deltas went to an earlier process.
-        let output_indices: Vec<u32> = (0..items.len() as u32).collect();
+        // Upgrade by recording output_index on AssistantMessage items if hosts
+        // need to correlate resumed ToolStarted with pre-crash deltas.
+        let indexed: Vec<(u32, Item)> = (0..).zip(items.iter().cloned()).collect();
         let had_calls = has_tool_calls(&items);
         if had_calls {
             let outcome = self
-                .run_tools(
-                    session,
-                    config,
-                    turn,
-                    step,
-                    &items,
-                    &output_indices,
-                    true,
-                    cancel,
-                    events,
-                )
+                .run_tools(session, config, turn, step, &indexed, true, cancel, events)
                 .await?;
             if outcome == ToolOutcome::Cancelled {
                 self.commit_step(session, turn, step).await?;
@@ -956,8 +938,7 @@ impl Agent {
         config: &ConfigSnapshot,
         turn: TurnId,
         step: StepId,
-        items: &[Item],
-        output_indices: &[u32],
+        items: &[(u32, Item)],
         recovering: bool,
         cancel: &CancelToken,
         events: &EventSink,
@@ -979,9 +960,7 @@ impl Agent {
             events,
             spawn,
         };
-        self.pipeline
-            .run(&step, items, output_indices, cancel)
-            .await
+        self.pipeline.run(&step, items, cancel).await
     }
 
     async fn commit_step(

@@ -342,3 +342,116 @@ async fn cancelling_bash_kills_the_process() {
     }
     panic!("process {pid} still running after cancel");
 }
+
+/// Larger than the 1 MiB cap every tool reads or returns.
+const BIG: usize = 3 << 20;
+const CAP_SLACK: usize = (1 << 20) + 4096;
+
+fn tail(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(80);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    &text[start..]
+}
+
+#[tokio::test]
+async fn grep_skips_git_and_stops_at_the_output_cap() {
+    let (_dir, root) = root();
+    let tools = read_only(root.clone()).expect("absolute root");
+    let grep = tool(&tools, "grep");
+    std::fs::create_dir(root.join(".git")).expect("git dir");
+    std::fs::write(root.join(".git/HEAD"), "needle\n").expect("git file");
+    std::fs::write(root.join("a.txt"), "needle\n").expect("file");
+    let out = call(&grep, serde_json::json!({ "pattern": "needle" }))
+        .await
+        .expect("grep");
+    assert_eq!(out, "a.txt:1: needle\n");
+
+    std::fs::write(root.join("big.txt"), "needle\n".repeat(BIG / 7)).expect("big file");
+    let out = call(&grep, serde_json::json!({ "pattern": "needle" }))
+        .await
+        .expect("grep");
+    assert!(out.len() < CAP_SLACK, "grep returned {} bytes", out.len());
+    assert!(out.ends_with("[output truncated]\n"), "{}", tail(&out));
+}
+
+#[tokio::test]
+async fn read_file_returns_at_most_the_cap() {
+    let (_dir, root) = root();
+    let tools = read_only(root.clone()).expect("absolute root");
+    std::fs::write(root.join("big.txt"), "é".repeat(BIG / 2)).expect("big file");
+    let out = call(
+        &tool(&tools, "read_file"),
+        serde_json::json!({ "path": "big.txt" }),
+    )
+    .await
+    .expect("read");
+    assert!(out.len() < CAP_SLACK, "read returned {} bytes", out.len());
+    assert!(
+        out.contains("[truncated: big.txt is larger than"),
+        "{}",
+        tail(&out)
+    );
+}
+
+#[tokio::test]
+async fn bash_keeps_at_most_the_cap_of_stdout() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let out = call(
+        &bash,
+        serde_json::json!({ "command": format!("head -c {BIG} /dev/zero | tr '\\0' a") }),
+    )
+    .await
+    .expect("bash");
+    assert!(out.len() < CAP_SLACK, "bash returned {} bytes", out.len());
+    assert!(out.contains("[stdout truncated]"), "{}", tail(&out));
+    assert!(
+        out.ends_with("[exit status: exit status: 0]"),
+        "{}",
+        tail(&out)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_and_edit_replace_the_file_atomically_and_keep_its_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (_dir, root) = root();
+    let tools = full_access(&root);
+    let path = root.join("run.sh");
+    std::fs::write(&path, "echo old\n").expect("file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let before = std::fs::metadata(&path).expect("meta").ino();
+
+    call(
+        &tool(&tools, "edit_file"),
+        serde_json::json!({ "path": "run.sh", "old_string": "old", "new_string": "new" }),
+    )
+    .await
+    .expect("edit");
+    let edited = std::fs::metadata(&path).expect("meta");
+    // A rename installs a new inode; an in-place truncate would keep the old one.
+    assert_ne!(before, edited.ino());
+    assert_eq!(edited.permissions().mode() & 0o777, 0o755);
+
+    call(
+        &tool(&tools, "write_file"),
+        serde_json::json!({ "path": "run.sh", "content": "echo newer\n" }),
+    )
+    .await
+    .expect("write");
+    let written = std::fs::metadata(&path).expect("meta");
+    assert_ne!(edited.ino(), written.ino());
+    assert_eq!(written.permissions().mode() & 0o777, 0o755);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "echo newer\n"
+    );
+    let names: Vec<_> = std::fs::read_dir(&root)
+        .expect("dir")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["run.sh"], "temp files left behind");
+}

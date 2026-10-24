@@ -87,6 +87,16 @@ pub fn open_with(
     path: impl AsRef<Path>,
     options: OpenOptions,
 ) -> Result<Arc<SqliteStorage>, StorageError> {
+    open_with_clock(path, options, Arc::new(SystemClock))
+}
+
+/// Contract-test seam: a fixed clock makes `created_at` ties deterministic.
+#[doc(hidden)]
+pub fn open_with_clock(
+    path: impl AsRef<Path>,
+    options: OpenOptions,
+    clock: Arc<dyn Clock>,
+) -> Result<Arc<SqliteStorage>, StorageError> {
     let path = path.as_ref();
     create_private_file(path)?;
     let conn = Connection::open(path).map_err(backend)?;
@@ -96,14 +106,14 @@ pub fn open_with(
     Ok(Arc::new(SqliteStorage {
         conn: Mutex::new(conn),
         _lock: lock,
-        clock: SystemClock,
+        clock,
     }))
 }
 
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
     _lock: WriterLock,
-    clock: SystemClock,
+    clock: Arc<dyn Clock>,
 }
 
 impl SqliteStorage {

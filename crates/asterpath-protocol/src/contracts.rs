@@ -242,6 +242,8 @@ impl ApprovalGate {
 
     /// Lists `request` as pending until the returned guard drops, however the
     /// wait ends: a decision, a cancel or a dropped drive stream.
+    // Hidden: only the engine's tool pipeline (another crate) lists requests.
+    #[doc(hidden)]
     pub fn wait_for(&self, request: ApprovalRequest) -> PendingApproval {
         let mut pending = self.lock();
         let key = pending.next;
@@ -259,6 +261,8 @@ impl ApprovalGate {
 }
 
 /// RAII listing of one waiting request; see `ApprovalGate::wait_for`.
+// Hidden: engine-internal, public only for cross-crate use by the pipeline.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct PendingApproval {
     pending: Arc<Mutex<PendingRequests>>,

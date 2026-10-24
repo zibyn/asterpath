@@ -245,7 +245,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 ## 5. 生命周期规则
 
 1. facade（组装根）显式构造引擎；只有它知道具体类型。替换能力只经适配器字段（provider、tools、compactor、存储后端、审批策略、clock）与 `Hooks`。
-2. 构造顺序固定：存储 → trace / usage 视图（读后端）→ append 入口（含钩子）→ waits → scheduler → 工具表（先注册 `spawn_agent` 描述符）→ agent（持有 scheduler）。agent 执行 `spawn_agent` 时把自己传给 `Scheduler::run_spawn_tool` 作为子会话驱动者，scheduler 不持有 agent，没有循环引用。
+2. 构造顺序固定：存储 → trace / usage 视图（读后端）→ append 入口（含钩子）→ waits → scheduler → 工具表（`AsterpathConfig.spawn_tool` 开启时先注册 `spawn_agent` 描述符，默认开启）→ agent（持有 scheduler）。agent 执行 `spawn_agent` 时把自己传给 `Scheduler::run_spawn_tool` 作为子会话驱动者，scheduler 不持有 agent，没有循环引用。
 3. 引擎没有后台任务；`shutdown()` 只释放引擎。
 4. 工具表可在运行期增加工具（只在组装时用）；session 的模型可见工具集在创建时快照。
 5. v1 不做动态发现、热替换、运行期卸载；换组件 = 重启进程。

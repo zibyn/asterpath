@@ -123,7 +123,7 @@ impl State {
 /// per-session monotonic `seq` and exclusive-cursor scans.
 pub struct InMemoryEventLog {
     state: Mutex<State>,
-    clock: SystemClock,
+    clock: Arc<dyn Clock>,
 }
 
 impl Default for InMemoryEventLog {
@@ -134,9 +134,14 @@ impl Default for InMemoryEventLog {
 
 impl InMemoryEventLog {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    /// A log that stamps `recorded_at` from `clock`.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             state: Mutex::new(State::default()),
-            clock: SystemClock,
+            clock,
         }
     }
 
@@ -263,5 +268,9 @@ impl MemoryBackend {
 impl StoreFactory for MemoryBackend {
     fn open(&self) -> Arc<dyn SessionStore> {
         self.store.clone()
+    }
+
+    fn open_with_clock(&self, clock: Arc<dyn Clock>) -> Arc<dyn SessionStore> {
+        Arc::new(InMemoryEventLog::with_clock(clock))
     }
 }

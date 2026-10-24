@@ -765,6 +765,32 @@ async fn sets_cache_breakpoints_on_last_tool_system_block_and_message_block() {
 }
 
 #[tokio::test]
+async fn empty_text_blocks_never_carry_a_breakpoint() {
+    // The API rejects cache_control on an empty text block.
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.system = vec![text("be terse"), text("")];
+    request.items = vec![user_message(vec![text("first"), text("")])];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+
+    assert_eq!(
+        body["system"],
+        serde_json::json!([
+            {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": ""}
+        ])
+    );
+    assert_eq!(
+        body["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": ""}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn breakpoints_are_omitted_without_tools_or_system() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
