@@ -155,6 +155,84 @@ async fn drive_events(handle: &SessionHandle) -> Vec<AgentEvent> {
 }
 
 #[tokio::test]
+async fn dropped_stream_redrive_requests_the_same_approval_again() {
+    let db = temp_db("redrive");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(
+                vec![tool_call("echo")],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(
+                vec![Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![text("done")],
+                }],
+                StopReason::EndTurn,
+                Usage::default(),
+            ),
+    );
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![echo_tool(Arc::clone(&calls))])
+        .approval(Arc::new(AlwaysAsk))
+        .build()
+        .await
+        .expect("build");
+    let _endpoint = asterpath.approval_gate().register();
+    let handle = asterpath.create_session(spec()).await.unwrap();
+    handle.submit_input(text_input(1)).await.unwrap();
+
+    let mut stream = handle.drive();
+    let first = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("approval is requested")
+            .expect("event")
+            .expect("no error");
+        if let AgentEvent::ApprovalRequested(request) = event {
+            break request.tool_call_id;
+        }
+    };
+    // A client disconnect: the stream is dropped while the call waits.
+    drop(stream);
+
+    let mut stream = handle.drive();
+    let second = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("approval is requested again")
+            .expect("event")
+            .expect("no error");
+        if let AgentEvent::ApprovalRequested(request) = event {
+            break request.tool_call_id;
+        }
+    };
+    assert_eq!(second, first, "re-drive re-emits the same request");
+
+    handle
+        .approve(second, ApprovalDecision::Allow)
+        .await
+        .expect("approve");
+    while let Some(event) = stream.next().await {
+        event.expect("drive");
+    }
+
+    let entries = scan(asterpath.store(), handle.id()).await;
+    assert_eq!(
+        tool_results(&entries),
+        vec![(asterpath::protocol::ToolResultStatus::Completed, None)]
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+#[tokio::test]
 async fn ask_with_open_gate_suspends_then_allow_executes() {
     let db = temp_db("allow");
     let calls = Arc::new(Mutex::new(Vec::new()));
