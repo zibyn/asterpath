@@ -108,6 +108,7 @@ AssistantMessage(tool_calls)
 
 - **每个模型发起的调用都会写 `ToolCallRequested`**，即使随后被拒绝；意图与终态一一对应（I2）。
 - 工具不在注册表时：pre-execute 照常运行；若未被拒绝，写意图（`replay = Unsafe`、`provenance = Unknown`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。模型幻觉、插件升级后移除工具都走这条路径。
+- 工具不在本 step 的生效工具集中时同样按「不在注册表」处理，即使注册表里有它：宿主经 `update_config` 移除的工具、或创建时没选中的工具（ADR-0030，[packaging.md](packaging.md) §2.1）。生效集合按 `StepStarted` 水位折叠，step 内的移除等下一个 step 才生效；已记录意图的调用照常收尾，不受之后移除的影响。
 - pre-execute 在写意图前运行。它可以改写参数，日志记录改写后的 **effective args**；模型原始参数仍在 `AssistantMessage` 中。
 - `ToolCallRequested` 同时记录框架生成的 `tool_call_id` 与模型响应中的 `provider_call_id`（`ToolCall.call_id` 原值）；投影与恢复按 `provider_call_id` 配对，两个同名同参的并行调用不会串位。
 - pre-execute 崩溃或报错不产生副作用；恢复时重跑该调用的 pre-execute。
@@ -316,6 +317,7 @@ pub struct ToolConfig {
 | T12 | 未装审批端且策略为 Ask | 按 `Deny` 处理（fail closed） |
 | T13 | 结果进入下一次模型请求 | 投影顺序 = 调用顺序；不产生独立 token 记录 |
 | T14 | 模型请求注册表中不存在的工具 | 仍写 `ToolCallRequested`；`ToolResult{Failed, NotFound}`；不审批、不执行；恢复按 [plugins.md](plugins.md) §8 |
+| T15 | 模型调用已经 `remove_tools` 移除的工具 | 下一个 step 起同 T14：`ToolResult{Failed, NotFound}`，不执行；历史中此前对它的调用与结果原样保留 |
 | T15 | 两个同名同参并行调用 | 两个 `ToolCallId` 不同；`provider_call_id` 各自对回 `ToolCall`；每条 `ToolResult` 绑定自己的调用 |
 | T16 | 崩溃于 `ToolCallRequested` 之后 | 恢复不重跑 pre-execute；按已记录 effective args 执行；尚无意图的兄弟调用才重跑 |
 | T17 | 超时与回合取消同时发生 | 只有一个 `ToolResult`；真实结果先到则记真实状态，否则记 `Interrupted`；不出现 `Failed{Timeout}`；子进程只被杀一次 |

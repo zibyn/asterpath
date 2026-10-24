@@ -15,8 +15,8 @@
 - v1 **只做摘要**，不单独折叠旧工具输出。
 - 压缩**不是 step**：`plan` 判定要调用摘要模型后，agent 写 `CompactionStarted` 意图；成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合；append 是唯一提交点，崩溃在 append 前重做，无副作用。
 - 强制压缩在**当前 step 内**完成：不新开 `StepStarted`、不写 `StepCommitted`，压缩后按新投影重试同一 step；每 step 至多一次。
-- 摘要输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
-- 压缩**重新定基线**（ADR-0030）：被替换区间内追加的 system 指令并入基线 system，不进摘要；保留区间里的指令仍按位置投影（§5 投影）。
+- 摘要输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、`ToolsChanged`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
+- 压缩**重新定基线**（ADR-0030）：被替换区间内追加的 system 指令并入基线 system、工具变更并入基线工具集，不进摘要；保留区间里的条目仍按位置投影（§5 投影）。压缩后基线工具集等于压缩时的生效工具集。
 - 窗口只有 `ModelSpec.context_window` 一个来源；`CompactionConfig` 不重复定义。
 - 进程重启上限归宿主：内核每次恢复写 `StreamResumed`，宿主据此计数并决定停车；内核不持有恢复计数器。
 - 保留最近一个完整 step，目标为 `0.5 × usable window`；每回合最多 1 次自动压缩。
@@ -141,7 +141,7 @@ project(entries):
   history = []                                   # (origin, items)
   for e in entries by seq:
     if e is CompactionApplied { first_kept, summary, replaces }:
-        baseline += 范围内条目（含尚未落位的）里的 Instruction parts
+        baseline += 范围内条目（含尚未落位的）里的 Instruction parts 与 ToolsChanged
         history.retain(|(origin, _)| !overlaps(origin, replaces))
         insert (Summary(replaces), summary) 紧邻 first_kept 之前
     else if model_visible(e):

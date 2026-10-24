@@ -86,6 +86,10 @@ pub enum Item {
     Instruction {               // 会话中途追加的 system 指令（§3.3）；只含 Text
         parts: Vec<Part>,
     },
+    ToolsChanged {              // 会话中途的工具集变更（§3.3）；先删后加
+        added: Vec<ToolDescriptor>,
+        removed: Vec<ToolName>,
+    },
     ProviderOpaque {
         provider: ProviderId,
         kind: String,
@@ -162,13 +166,15 @@ pub struct RawProviderData {
 | P9 | `Compaction` 是模型可见摘要；同一时刻投影只保留最新一条。 |
 | P10 | `Part::Refusal` 是模型可见内容；`StopReason::Refusal` 与它并存，不互相替代。 |
 
-### 3.3 指令条目与基线（ADR-0030）
+### 3.3 指令条目、工具变更条目与基线（ADR-0030）
 
-`ConfigChanged.patch.append_system` 非空时，投影生成一条 `Item::Instruction`：
+`ConfigChanged.patch.append_system` 非空时，投影生成一条 `Item::Instruction`；`add_tools` 或 `remove_tools` 非空时生成一条 `Item::ToolsChanged { added, removed }`（同一补丁两者都有时，指令在前）：
 
 - **位置**：记录之后的第一个 `StepStarted` 处（先输出此前缓冲的工具结果）；扫描在水位处结束时放在末尾。所以它总在所在 step 的 `tool_result` 之后，不会落在 `tool_use` 与 `tool_result` 之间；之后的请求里位置不变。
-- **基线**：`request_history(entries)` 同时返回基线 system 与 items。基线是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）。压缩不把指令交给摘要，而是并入基线（[compaction.md](compaction.md) §5）。
-- `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。
+- **基线**：`request_history(entries)` 同时返回基线 system、基线工具集与 items。基线 system 是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）；基线工具集是 `SessionCreated.config.tools`，依次应用被替换区间内的工具变更（先删后加，同名替换）。压缩不把它们交给摘要，而是并入基线（[compaction.md](compaction.md) §5），所以压缩后基线工具集等于压缩时的生效工具集。
+- `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。它的 `tools` 是生效工具集，即 `ModelRequest.tools`。
+- 被移除工具在历史中的 `ToolCall` / `ToolResult` 原样保留。
+- **fork**：子会话的 `SessionCreated.config.tools` 已是父在 spawn 水位的生效集合（再经 allowlist 收窄），所以 fork 复制的历史去掉 `ToolsChanged`，否则会把收窄掉的工具重新加回（[subagents.md](subagents.md)）。
 
 ## 4. 请求模型
 
@@ -194,8 +200,9 @@ pub struct ModelRequest {
     pub spec: ModelSpec,
     pub prefix_epoch: u32,              // 当前压缩代次
     pub system: Vec<Part>,              // 基线 system（§3.3），只允许 Text
-    pub items: Vec<Item>,               // 完整历史，含 Instruction 条目
-    pub tools: Vec<ToolDescriptor>,
+    pub items: Vec<Item>,               // 完整历史，含 Instruction / ToolsChanged 条目
+    pub tools: Vec<ToolDescriptor>,     // 生效工具集：本 step 模型可调用的工具
+    pub baseline_tools: Vec<ToolDescriptor>, // 基线工具集（§3.3）；items 中的 ToolsChanged 从它通向 tools
     pub tool_choice: ToolChoice,
     pub disable_parallel_tool_use: bool,
     pub sampling: Option<SamplingParams>,
@@ -604,16 +611,17 @@ pub enum ProviderErrorKind {
 
 回放规则：
 
-1. **同 provider + 同 model + `binding.prefix_epoch == request.prefix_epoch`**（Anthropic 另要求 `binding.tools_hash == tools_hash(request.tools)`，见规则 5）、且 item 未被改写：adapter 直接 splice `raw.json`，不 parse、不重新序列化。
+1. **同 provider + 同 model + `binding.prefix_epoch == request.prefix_epoch`**（Anthropic 另要求 `binding.tools_hash` 等于渲染出的顶层 `tools` 的指纹，见规则 5）、且 item 未被改写：adapter 直接 splice `raw.json`，不 parse、不重新序列化。
 2. **跨 provider**：`Reasoning`、`ServerToolCall/Result`、`ProviderOpaque` 不进入请求；规范可见的 `Message` / `ToolCall` / `ToolResult` / `Compaction` 正常渲染。`Reasoning.summary` 不转成文本。
 3. **epoch 不匹配**（压缩改变了前缀）：`Reasoning` 不进入请求；其他 item 不受影响。
 4. **model 变化但 provider 相同**：视为不匹配，`Reasoning` 不进入请求。
-5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。追加指令不改顶层 `system`（§3.3），因此不使旧 thinking 失效；只有退回路径（规则 8）改写顶层 `system`。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
+5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。追加指令不改顶层 `system`（§3.3），因此不使旧 thinking 失效；只有退回路径（规则 8）改写顶层 `system`。工具变更同理：inline 路径下顶层 `tools` 保持基线，指纹不变；退回路径（规则 9）改写顶层 `tools`，指纹不匹配。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
 8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_system = false`）**：指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
+9. **工具变更的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_tools = false`）**：顶层 `tools` 渲染生效集合，`ToolsChanged` 条目不渲染，不发 beta header；产出于变更之前的 `Reasoning` 指纹不匹配（规则 5），不进入请求。
 
-`tools_hash` 的定义：把 `ModelRequest.tools` 的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
+`tools_hash` 的定义：把渲染出的顶层工具集（OpenAI 与 Anthropic 退回路径是 `ModelRequest.tools`，Anthropic inline 路径是 `ModelRequest.baseline_tools`）的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
 
 `prefix_epoch` 的定义：会话中截至请求水位已发生的 `CompactionApplied` 数量。`Reasoning.binding.prefix_epoch` 在产出时写入（取自 `request.prefix_epoch`）；压缩后旧 reasoning 自然失效，压缩后新产出的 reasoning 使用新代次。
 
@@ -626,7 +634,8 @@ pub enum ProviderErrorKind {
 | `system: Vec<Part>` | 顶层 `system`（text blocks） | `instructions`（文本拼接） |
 | `items: Vec<Item>` | `messages[]`（按 §10.2 分组） | `input[]`（扁平 item 列表） |
 | `Item::Instruction` | `messages` 中的 `role: "system"` 消息（text blocks），推迟到下一条 assistant 之前或末尾；连续指令合并为一条。模型不支持（`inline_system = false`）时并入顶层 `system`（§9 规则 8） | `role: "developer"` 的 input 消息（`input_text`），原位 |
-| `tools: Vec<ToolDescriptor>` | `tools[{name, description, input_schema}]` | `tools[{type:"function", name, description, parameters}]` |
+| `Item::ToolsChanged` | 与指令同一条 `role: "system"` 消息中的 `tool_addition`（`tool: {type: "tool_definition", definition: {name, description, input_schema}}`）与 `tool_removal`（`tool: {type: "tool_reference", name}`）块，请求带 `anthropic-beta: inline-tools-2026-09-15`。模型不支持（`inline_tools = false`）时不渲染（§9 规则 9） | 不渲染：顶层 `tools` 已是生效集合 |
+| `tools` / `baseline_tools` | 顶层 `tools[{name, description, input_schema}]`：inline 路径渲染 `baseline_tools`，退回路径渲染 `tools` | 顶层 `tools[{type:"function", name, description, parameters}]`，渲染 `tools` |
 | `tool_choice` | `auto` / `any` / `tool` / `none` | `auto` / `required` / `function` / `none` |
 | `disable_parallel_tool_use` | `tool_choice.disable_parallel_tool_use` | `parallel_tool_calls: false` |
 | `sampling` | `temperature` / `top_p` / `top_k` | `temperature` / `top_p` / `seed` |
@@ -785,8 +794,8 @@ pub enum ProviderErrorKind {
 | A2 | OpenAI encrypted reasoning（`store:false`） | 请求含 `include:["reasoning.encrypted_content"]`；无 `previous_response_id`；回放成功 |
 | A3 | 跨 provider 切换 | `Reasoning` / `ServerTool*` / `ProviderOpaque` 不进入请求；规范历史仍可投影；trace 有 `dropped_items`；不报错 |
 | A4 | 压缩后旧 reasoning | `binding.prefix_epoch` 不匹配 → 丢弃；压缩后新 reasoning 使用新代次并可回放 |
-| A17 | 工具集变化（fork 收窄） | Anthropic：`binding.tools_hash` 不匹配 → `Reasoning` 丢弃并记 `dropped_items`；OpenAI：照常回放。规范历史与工具调用仍完整 |
-| A18 | 重启后同名工具 schema 变化 | 请求 `tools` 仍由 `ConfigSnapshot.tools` 渲染，与崩溃前一致；注册表新 schema 只影响新 session |
+| A17 | 工具集变化（fork 收窄、会话中途增删） | Anthropic inline 路径：顶层 `tools` 保持基线，变更渲染为 `tool_addition` / `tool_removal`，旧 thinking 照常回放；退回路径与 fork 收窄：`binding.tools_hash` 不匹配 → `Reasoning` 丢弃（OpenAI adapter 记 `dropped_items`；Anthropic adapter 尚无 trace sink）。OpenAI：顶层 `tools` 是生效集合，照常回放。规范历史与对已移除工具的调用仍完整 |
+| A18 | 重启后同名工具 schema 变化 | 请求 `tools` 仍由日志里记录的描述符（`SessionCreated.config.tools` 加 `ConfigChanged.add_tools`）渲染，与崩溃前一致；注册表新 schema 只影响新 session |
 | A5 | 工具调用/结果双向映射 | Anthropic 合并 user 消息且 `tool_result` 在文本前；OpenAI `function_call` / `function_call_output` 成对 |
 | A6 | OpenAI 事件交错 | 按 `output_index` 归一；item 不丢不重；`ItemCompleted` 顺序不影响最终历史 |
 | A7 | usage 归一化 | Anthropic 三项相加；OpenAI inclusive 减缓存；`total` 由派生方法得到 |

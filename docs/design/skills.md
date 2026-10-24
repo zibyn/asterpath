@@ -33,7 +33,7 @@
 - **不是工具**。工具是可执行副作用入口；技能只影响模型看到什么文本。
 - **不是 command**。M6 没有命令 seam；用户只能在 prompt 里点名，由模型决定是否加载。
 - **不是 system prompt 的替代**。宿主自己的 system 仍然先写；技能索引追加在后。
-- **不是子智能体的配置单位**。技能随会话的 system 与工具快照继承，不为子会话单独解析。
+- **不是子智能体的配置单位**。技能随会话的 system 与工具集继承，不为子会话单独解析。
 
 ## 3. 技能包格式
 
@@ -115,7 +115,7 @@ Call `load_skill` with a skill name when the task matches its description.
 ### 5.2 恢复与子会话
 
 - **恢复**：`resume` 不重新扫描索引，使用日志里的 `ConfigSnapshot.system`；`load_skill` 仍按当前根解析。技能文件消失 → 工具返回 `NotFound`；文件变化 → 返回新内容并作为新的工具结果入日志。已加载过的正文以日志为准。
-- **子会话**：fresh 子继承父的 system 与工具快照，因此索引与 `load_skill` 一起继承。模型通过 spawn 参数收窄工具集时可能留下索引却没有 `load_skill`；这是宿主选择收窄的后果，M6 不做特殊处理。
+- **子会话**：fresh 子继承父的 system 与工具集，因此索引与 `load_skill` 一起继承。模型通过 spawn 参数收窄工具集时可能留下索引却没有 `load_skill`；这是宿主选择收窄的后果，M6 不做特殊处理。
 - **compaction**：索引在 system，不参与压缩；技能正文是普通工具结果，可能被摘要替换，模型需要时可以再次 `load_skill`。
 
 ## 6. `load_skill` 工具
@@ -247,10 +247,10 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 | 技能格式、发现、索引、`load_skill`、诊断 | **本文件（#63）** |
 | 插件清单、外部能力、MCP 传输 | [plugins.md](./plugins.md) / [mcp.md](./mcp.md)；M6 不给插件增加 `Skills` 能力 |
 | 工具契约、审批、并行调度 | [tools.md](./tools.md)；技能不新增工具语义，`load_skill` 是普通 `Tool` |
-| system、`ConfigSnapshot`、工具快照 | [packaging.md](./packaging.md) / [protocol.md](./protocol.md)；只使用既有字段 |
+| system、`ConfigSnapshot`、工具集 | [packaging.md](./packaging.md) / [protocol.md](./protocol.md)；只使用既有字段 |
 | 事件日志、恢复、投影 | [event-log-recovery.md](./event-log-recovery.md)；不新增事件 |
 | 压缩 | [compaction.md](./compaction.md)；索引不进历史，正文是普通工具结果 |
-| 子智能体 | [subagents.md](./subagents.md)；继承 system 与工具快照 |
+| 子智能体 | [subagents.md](./subagents.md)；继承 system 与工具集 |
 | 追踪、用量 | [tracing.md](./tracing.md) / [usage.md](./usage.md)；普通 tool span，无用量 |
 | crate 打包、稳定层 | [packaging.md](./packaging.md)；M6、Tier 2 |
 
@@ -265,7 +265,7 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 | S5 | 崩溃恢复 | 已加载正文来自日志；未闭合调用按 `Safe` 重跑 |
 | S6 | 文件在 resume 前被删除 | `load_skill` 返回 `NotFound`；session 不失败 |
 | S7 | `run --no-skills` / `enabled = false` | 新 session 无索引、无工具；resume 的已有 session 仍可加载 |
-| S8 | fresh 子智能体 | 继承 system 与工具快照，可 `load_skill`；父收窄工具集后子不可用 |
+| S8 | fresh 子智能体 | 继承 system 与工具集，可 `load_skill`；父收窄工具集后子不可用 |
 | S9 | 索引超过 8,000 字符 | 按优先级省略低优先级条目并诊断；高优先级条目完整 |
 | S10 | 省略 `name` / `name` 与目录不符 | 省略时用目录名正常加载；不符时跳过并诊断 |
 

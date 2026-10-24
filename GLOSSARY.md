@@ -59,7 +59,7 @@ MCP 的无会话协商：用 `server/discover` 取得协议版本与能力，不
 _Avoid_: 握手、initialize
 
 **工具快照（Tool Snapshot）**：
-MCP 服务加载时发现并一次性交出的工具集合；进程内不随服务端变化。
+MCP 服务加载时发现并一次性交出的工具集合；进程内不随服务端变化。只指 MCP 服务的这份集合；会话的模型可见工具不是快照，而是生效工具集，可经配置变更增删（ADR-0030）。
 _Avoid_: 工具缓存、动态注册表
 
 ## 技能
@@ -116,12 +116,24 @@ _Avoid_: 模型配置、模型引用
 _Avoid_: 特性开关、能力矩阵
 
 **条目（Item）**：
-模型历史中的一个有序顶层单元：消息、推理、工具调用/结果、服务端工具调用/结果、压缩摘要、指令条目或供应商不透明条目。
+模型历史中的一个有序顶层单元：消息、推理、工具调用/结果、服务端工具调用/结果、压缩摘要、指令条目、工具变更条目或供应商不透明条目。
 _Avoid_: 消息（作为同义词）、记录
 
 **指令条目（Instruction）**：
 会话中途追加的 system 指令在历史中的位置（`Item::Instruction`），由投影从带 `append_system` 的配置变更生成，落在其后第一个 `StepStarted` 处。Anthropic 渲染为 `role: "system"` 消息，OpenAI 渲染为 `developer` 消息；压缩替换它时并入基线 system。
 _Avoid_: system 消息（作为规范名）、developer 消息、注入提示
+
+**工具变更条目（Tools Changed）**：
+会话中途工具增删在历史中的位置（`Item::ToolsChanged { added, removed }`），由投影从带 `add_tools` / `remove_tools` 的配置变更生成，落位规则同指令条目。Anthropic 渲染为 `role: "system"` 消息中的 `tool_addition` / `tool_removal` 块，OpenAI 不渲染（顶层 `tools` 已是生效集合）；压缩替换它时并入基线工具集。
+_Avoid_: 工具更新事件、tools diff
+
+**生效工具集（Effective Tools）**：
+某个水位上模型可调用的工具：创建时解析的工具依次应用此前的工具增删（`ModelRequest.tools`）。不在其中的名字调用时走 `NotFound`，即使注册表里有。
+_Avoid_: 当前工具、可用工具（作为规范名）
+
+**基线工具集（Baseline Tools）**：
+会话创建时的工具集，加上被压缩替换的全部工具变更条目（`request_history` 返回，即 `ModelRequest.baseline_tools`）；Anthropic inline 路径把它渲染为顶层 `tools`。
+_Avoid_: 初始工具、顶层工具（作为规范名）
 
 **基线 system（Baseline System）**：
 模型请求的顶层 system：会话创建时的 system，加上被压缩替换的全部指令条目（`request_history` 返回，即 `ModelRequest.system`）。与生效配置的 `system` 不同：后者还包含仍在历史中按位置投影的指令。
@@ -164,7 +176,7 @@ _Avoid_: 原始响应、provider payload
 _Avoid_: 签名、reasoning key
 
 **工具集指纹（Tools Hash）**：
-一次请求中模型可见工具定义（名称、说明、参数 schema）的确定性摘要；Anthropic adapter 据此判断推理条目能否回放（服务端 prefix 校验的本地近似）；OpenAI 不比较它。
+一次请求渲染出的顶层工具定义（名称、说明、参数 schema）的确定性摘要；Anthropic adapter 据此判断推理条目能否回放（服务端 prefix 校验的本地近似）；OpenAI 不比较它。Anthropic inline 路径下顶层工具是基线工具集，会话中途增删不改变指纹。
 _Avoid_: 工具版本、schema hash
 
 **前缀代次（Prefix Epoch）**：
@@ -457,7 +469,7 @@ session 创建时解析并写进 `SessionCreated` 的初始配置；宿主注册
 _Avoid_: session 配置、运行时配置
 
 **配置变更（Config Change）**：
-宿主经 `SessionHandle::update_config` 写入的一条 `ConfigChanged`，只携带变化的字段（`ConfigPatch`）；校验失败不落日志。它是历史中的一个位置，在下一个 `StepStarted` 生效。追加 system 的变更必须带宿主选的 `UpdateId` 作 dedup key，重试只记一次。
+宿主经 `SessionHandle::update_config` 写入的一条 `ConfigChanged`，只携带变化的字段（`ConfigPatch`）；校验失败不落日志。它是历史中的一个位置，在下一个 `StepStarted` 生效。追加 system 或增删工具的变更必须带宿主选的 `UpdateId` 作 dedup key，重试只记一次。
 _Avoid_: 配置覆盖、热更新
 
 **生效配置（Effective Config）**：

@@ -59,12 +59,12 @@ pub struct ConfigSnapshot {
 }
 ```
 
-- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolDescriptor>`；之后注册表增删不影响该 session 的模型可见工具集。
-- 所有 `ModelRequest.tools` 只从快照渲染，恢复后重建出与崩溃前相同的工具定义。`timeout` / `parallelism` 等执行声明同样在 session 内固定；注册表升级只影响新 session。
-- 执行仍调用活注册表：工具已消失走 `NotFound`（[plugins.md](plugins.md) §8）；恢复按 `ToolCallRequested` 上已记录的 `replay` / `provenance` 决定是否重跑，不重新解析描述符。
-- `ReasoningBinding.tools_hash` 按快照 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9），因此同一 session 内稳定，fork 收窄工具集时自然不匹配。
+- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolDescriptor>`；之后注册表增删不影响该 session 的模型可见工具集。工具集不再在会话内固定：宿主可经 `update_config` 的 `add_tools` / `remove_tools` 增删（ADR-0030）；新增的描述符同样按注册表解析后记进日志。
+- 所有 `ModelRequest.tools` 只从日志里记录的描述符渲染（快照加 `ConfigChanged.add_tools`），恢复后重建出与崩溃前相同的工具定义，不重新解析。`timeout` / `parallelism` 等执行声明随描述符记录；注册表升级只影响新 session 与之后新增的工具。
+- 每个 step 只有生效集合内的工具可调用：模型调用集合外的名字（包括已移除的工具，即使它仍在注册表里）走 `NotFound`。执行仍调用活注册表：工具已消失同样走 `NotFound`（[plugins.md](plugins.md) §8）；已记录意图的调用照常收尾，恢复按 `ToolCallRequested` 上已记录的 `replay` / `provenance` 决定是否重跑，不受之后移除的影响。
+- `ReasoningBinding.tools_hash` 按渲染出的顶层 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9）。Anthropic inline 路径下顶层 `tools` 是基线工具集，会话中途增删不改变它；fork 收窄或退回路径改写顶层 `tools` 时自然不匹配。
 - 审批策略不进快照：它是宿主代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
-- MCP 服务配置不进快照：它是宿主装配；进快照的是 MCP 工具解析后的描述符。会话中途增减工具见 [#108](https://github.com/zibyn/asterpath/issues/108)。
+- MCP 服务配置不进快照：它是宿主装配；进快照的是 MCP 工具解析后的描述符。会话中途增减工具见下文 `ConfigPatch`；MCP `list_changed` 接入另开票。
 - 快照是**初始配置**。会话中途的改动记成 `ConfigChanged { patch: ConfigPatch }`（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)），生效配置是折叠：
 
   ```rust
@@ -74,6 +74,8 @@ pub struct ConfigSnapshot {
       pub model: Option<ModelSpec>,
       pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
       pub append_system: Vec<Part>,       // 追加到 system，只含 Text；不替换已有 system
+      pub add_tools: Vec<ToolDescriptor>, // 新增工具：注册表中的描述符，记录后恢复只读不解析
+      pub remove_tools: Vec<ToolName>,    // 移除生效集合中的工具；折叠时先删后加
   }
 
   /// SessionCreated.config 依次应用 seq < watermark 的 ConfigChanged
@@ -83,7 +85,7 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  目前可变的是 `model`、`request` 与追加 system 指令；工具集的变更另开票（#111）。追加的指令在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
+  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -206,7 +208,7 @@ impl SessionHandle {
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒该调用的等待。
-- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` 非空时必须带 `id`，且只含 `Part::Text`；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。宿主直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型。`id: Option<UpdateId>` 是宿主选的 dedup key，随补丁落日志：追加不幂等，宿主重试同一次更新时用同一个 `id`，只记一条；只覆盖字段的更新可以不带 `id`。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
+- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。宿主直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是宿主选的 dedup key，随补丁落日志：追加与增删工具不幂等，宿主重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。

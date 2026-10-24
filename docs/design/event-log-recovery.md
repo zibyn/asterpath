@@ -82,7 +82,7 @@ pub enum SessionEvent {
                           deadline: Option<Timestamp> },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
     ApprovalDecided { tool_call_id: ToolCallId, decision: ApprovalDecision },
-    ConfigChanged { patch: ConfigPatch },                         // 下一个 StepStarted 生效；append_system 投影为 Instruction 条目
+    ConfigChanged { patch: ConfigPatch },                         // 下一个 StepStarted 生效；append_system / 工具增删投影为 Instruction / ToolsChanged 条目
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
@@ -163,9 +163,9 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | `CompactionStarted` / `CompactionApplied` / `CompactionAborted` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `ApprovalDecided` | `tool_call_id` |
-| `ConfigChanged` | `ConfigPatch.id`（宿主提供；可缺省，`append_system` 非空时必填） |
+| `ConfigChanged` | `ConfigPatch.id`（宿主提供；可缺省，`append_system` / `add_tools` / `remove_tools` 非空时必填） |
 
-表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 只由宿主调用写入，恢复从不补写；只覆盖字段的补丁重复写入时折叠结果不变，可以不带键；追加 system 不幂等，所以带 `append_system` 的更新必须带 `id`，宿主重试用同一个 `id`。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
+表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 只由宿主调用写入，恢复从不补写；只覆盖字段的补丁重复写入时折叠结果不变，可以不带键；追加 system 与增删工具不幂等，所以带 `append_system` / `add_tools` / `remove_tools` 的更新必须带 `id`，宿主重试用同一个 `id`。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
