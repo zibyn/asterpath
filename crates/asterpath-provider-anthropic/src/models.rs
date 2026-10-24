@@ -7,8 +7,13 @@
 //! Effort levels per model: the `xhigh` / `max` rows of the effort levels table
 //! (build-with-claude/effort, as of 2026-10-24). `Off` sends no effort; where
 //! the thinking table (as of 2026-10-24) defaults to Off it sends no `thinking`
-//! either, where it defaults to On it sends `thinking: {type: "disabled"}`, and
-//! models that are Always on or reject `"disabled"` (Sonnet 5.5) do not accept it.
+//! either, where it defaults to On it sends `thinking: {type: "disabled"}`.
+//! `Off` is `Unsupported` only where that table (build-with-claude/
+//! thinking-troubleshooting, checked 2026-10-24) rejects `"disabled"` with a 400:
+//! Opus 5.5, Fable 5.1, Mythos 5.1, Fable 5, Mythos 5 and Mythos Preview (thinking
+//! "Always on"; the effort page repeats this for Opus 5.5), and Sonnet 5.5 (On by
+//! default, but it takes `between_tools` instead of `"disabled"`). Unrecognized
+//! ids get [`LATEST`] and so reject `Off` too.
 //!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
