@@ -420,10 +420,7 @@ impl SessionHandle {
                 message: format!("unknown provider {}", model.provider),
             });
         }
-        let positional = !patch.append_system.is_empty()
-            || !patch.add_tools.is_empty()
-            || !patch.remove_tools.is_empty();
-        if positional && patch.id.is_none() {
+        if patch.is_positional() && patch.id.is_none() {
             return Err(AsterError::Config {
                 message: "append_system, add_tools and remove_tools need an update id: \
                           they are not idempotent"
@@ -440,7 +437,7 @@ impl SessionHandle {
             });
         }
         let key = patch.id.map(dedup::config_changed);
-        if !patch.add_tools.is_empty() || !patch.remove_tools.is_empty() {
+        if patch.changes_tools() {
             let records = scan::scan_decoded(&*self.store, self.session)
                 .await
                 .map_err(AgentError::from)?;

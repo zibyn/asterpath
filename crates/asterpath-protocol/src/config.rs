@@ -190,6 +190,19 @@ pub struct ConfigPatch {
     pub remove_tools: Vec<ToolName>,
 }
 
+impl ConfigPatch {
+    /// Whether the patch adds or removes tools.
+    pub fn changes_tools(&self) -> bool {
+        !self.add_tools.is_empty() || !self.remove_tools.is_empty()
+    }
+
+    /// Whether the patch has a place in history (appended instructions or a
+    /// tool change); applying such a patch twice is not idempotent.
+    pub fn is_positional(&self) -> bool {
+        !self.append_system.is_empty() || self.changes_tools()
+    }
+}
+
 /// The effective configuration at `watermark`: `SessionCreated.config` with
 /// every `ConfigChanged` whose `seq < watermark` applied in log order. `None`
 /// when the records hold no `SessionCreated`. The engine's only config fold:

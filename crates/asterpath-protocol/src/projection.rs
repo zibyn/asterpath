@@ -112,13 +112,14 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
                 });
             }
             SessionEvent::ConfigChanged { patch } => {
+                let changes_tools = patch.changes_tools();
                 let mut items = Vec::new();
                 if !patch.append_system.is_empty() {
                     items.push(Item::Instruction {
                         parts: patch.append_system,
                     });
                 }
-                if !patch.add_tools.is_empty() || !patch.remove_tools.is_empty() {
+                if changes_tools {
                     items.push(Item::ToolsChanged {
                         added: patch.add_tools,
                         removed: patch.remove_tools,

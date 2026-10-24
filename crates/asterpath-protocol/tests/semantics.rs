@@ -771,5 +771,5 @@ fn compaction_moves_replaced_tool_changes_into_the_baseline_tools() {
 #[test]
 fn a_patch_recorded_before_tool_changes_still_decodes() {
     let patch: ConfigPatch = serde_json::from_value(json!({"model": null})).expect("decode");
-    assert!(patch.add_tools.is_empty() && patch.remove_tools.is_empty());
+    assert!(!patch.changes_tools());
 }
