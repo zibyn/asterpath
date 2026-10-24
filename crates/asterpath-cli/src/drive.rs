@@ -23,6 +23,7 @@ pub struct DriveOutcome {
 
 /// Drive to `TurnCommitted` or `Idle`. With no prompt every approval request
 /// is denied; when no endpoint is registered the framework denies first.
+/// With a prompt, live events are also rendered to its writer.
 /// Injected prompt IO keeps the endpoint unit-testable; there is no exit code
 /// for "stopped at a wait".
 pub async fn drive<R: BufRead, W: Write>(
@@ -48,7 +49,11 @@ pub async fn drive<R: BufRead, W: Write>(
                 outcome.usage = Some(usage);
             }
             Ok(AgentEvent::Idle { .. }) => outcome.idle = true,
-            Ok(_) => {}
+            Ok(event) => {
+                if let Some(io) = prompt.as_deref_mut() {
+                    crate::interactive::render(&mut io.writer, &event);
+                }
+            }
             Err(error) => return Err(CliError::run(format!("drive failed: {error}"))),
         }
     }
@@ -463,7 +468,7 @@ mod tests {
             "the recorded Allow ran the tool"
         );
         assert!(
-            io.writer.is_empty(),
+            !String::from_utf8(io.writer).unwrap().contains("allow?"),
             "a recorded decision must not re-prompt"
         );
         assert_eq!(signal_count(&asterpath, handle.id()).await, 1);

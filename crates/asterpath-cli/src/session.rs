@@ -10,7 +10,7 @@ use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor, 
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
     CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, Part, ProviderCatalog,
-    SandboxPolicy, SandboxProvider, SessionQuery, Tool, decode_entry,
+    SandboxPolicy, SandboxProvider, SessionId, SessionQuery, Tool, decode_entry,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
@@ -295,7 +295,7 @@ async fn find(
             }
             Some(value) => by_id_or_name(&sessions, value)?,
         };
-        let snapshot = snapshot(&asterpath, &target).await?;
+        let snapshot = snapshot(&asterpath, target.session).await?;
         Ok((target, snapshot))
     }
     .await;
@@ -384,8 +384,8 @@ fn pick<R: BufRead, W: Write>(
 }
 
 /// The effective config at the end of the log: what the next step runs with.
-async fn snapshot(asterpath: &Asterpath, target: &CatalogEntry) -> CliResult<ConfigSnapshot> {
-    let entries = scan(asterpath.store(), target.session)
+pub async fn snapshot(asterpath: &Asterpath, session: SessionId) -> CliResult<ConfigSnapshot> {
+    let entries = scan(asterpath.store(), session)
         .await
         .map_err(CliError::run)?;
     let decoded: Vec<_> = entries
@@ -395,8 +395,7 @@ async fn snapshot(asterpath: &Asterpath, target: &CatalogEntry) -> CliResult<Con
             Some((entry, event))
         })
         .collect();
-    asterpath_protocol::effective_config(&decoded, u64::MAX)
-        .ok_or_else(|| not_found(target.session))
+    asterpath_protocol::effective_config(&decoded, u64::MAX).ok_or_else(|| not_found(session))
 }
 
 struct SkillSetup {

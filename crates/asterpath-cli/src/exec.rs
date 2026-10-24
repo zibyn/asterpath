@@ -147,7 +147,7 @@ fn read_schema(path: &Path) -> CliResult<SchemaFormat> {
 }
 
 /// An image or a PDF as an inline base64 part (ADR-0031).
-fn attachment(path: &Path) -> CliResult<Part> {
+pub fn attachment(path: &Path) -> CliResult<Part> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
