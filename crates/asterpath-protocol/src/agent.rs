@@ -44,10 +44,10 @@ pub struct ConfigUpdate {
 impl ConfigUpdate {
     /// The patch recorded for this update.
     pub fn patch(&self) -> ConfigPatch {
-        let mut patch = ConfigPatch::default();
-        patch.model = self.model.clone();
-        patch.request = self.request.clone();
-        patch
+        ConfigPatch {
+            model: self.model.clone(),
+            request: self.request.clone(),
+        }
     }
 }
 
