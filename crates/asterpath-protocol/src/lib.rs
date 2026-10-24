@@ -64,14 +64,17 @@ pub use hooks::{
 };
 pub use ids::{
     InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
-    SessionId, StepId, ToolArgs, ToolCallId, ToolName, TurnId,
+    SessionId, StepId, ToolArgs, ToolCallId, ToolName, TurnId, UpdateId,
 };
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
 pub use names::{
     ToolNameError, external_tool_name, sanitize_tool_name, validate_external_tool_name,
     validate_server_id, validate_tool_name,
 };
-pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, project};
+pub use projection::{
+    ProjectedEntry, ProjectedOrigin, ProjectionError, RequestHistory, history, project,
+    request_history,
+};
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
     ProviderError, ProviderErrorKind, StreamEvent,

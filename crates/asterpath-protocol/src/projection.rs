@@ -3,6 +3,11 @@
 //! `CompactionApplied` is a rewrite operator: it drops the replaced range
 //! (including any previous summary) and inserts the new summary immediately
 //! before `first_kept`. The raw log is never modified.
+//!
+//! An instruction appended by `ConfigChanged` takes its place at the next
+//! `StepStarted` (or the end of the scanned entries), so it always follows the
+//! tool results of the step it was appended in. A compaction that replaces it
+//! moves it into the baseline system instead of the summary (ADR-0030).
 
 use std::collections::HashMap;
 
@@ -33,20 +38,62 @@ pub enum ProjectionError {
     UnknownToolCall { tool_call: ToolCallId },
 }
 
+/// What a model request renders from the log (ADR-0030).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestHistory {
+    /// The baseline system: `SessionCreated.config.system` plus every
+    /// instruction a compaction has replaced, in log order.
+    pub system: Vec<Part>,
+    pub items: Vec<Item>,
+}
+
 /// Fold a set of scanned entries into model-visible history, ordered by seq.
 ///
 /// Tool results are emitted in `ToolCallRequested` order, not log-completion
 /// order, so parallel calls reconstruct identically whatever order they finish.
 pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionError> {
+    Ok(fold(entries)?.0)
+}
+
+/// The baseline system and the flattened history a model request carries.
+pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, ProjectionError> {
+    let (history, system) = fold(entries)?;
+    Ok(RequestHistory {
+        system,
+        items: history
+            .into_iter()
+            .flat_map(|projected| projected.items)
+            .collect(),
+    })
+}
+
+fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Vec<Part>), ProjectionError> {
     let mut ordered: Vec<&LogEntry> = entries.iter().collect();
     ordered.sort_by_key(|entry| entry.seq);
 
     let mut history: Vec<ProjectedEntry> = Vec::new();
     let mut intents: HashMap<ToolCallId, (String, u64)> = HashMap::new();
     let mut pending_results: Vec<(u64, ProjectedEntry)> = Vec::new();
+    let mut pending_instructions: Vec<ProjectedEntry> = Vec::new();
+    let mut baseline: Option<Vec<Part>> = None;
 
     for entry in ordered {
         match decode_entry(entry)? {
+            SessionEvent::SessionCreated { config, .. } if baseline.is_none() => {
+                baseline = Some(config.system);
+            }
+            SessionEvent::ConfigChanged { patch } if !patch.append_system.is_empty() => {
+                pending_instructions.push(ProjectedEntry {
+                    origin: ProjectedOrigin::Log(entry.log_id),
+                    items: vec![Item::Instruction {
+                        parts: patch.append_system,
+                    }],
+                });
+            }
+            SessionEvent::StepStarted { .. } if !pending_instructions.is_empty() => {
+                flush_results(&mut pending_results, &mut history);
+                history.append(&mut pending_instructions);
+            }
             SessionEvent::ContextForked { items, .. } => {
                 flush_results(&mut pending_results, &mut history);
                 push(&mut history, entry.log_id, items);
@@ -123,7 +170,15 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
                 ..
             } => {
                 flush_results(&mut pending_results, &mut history);
+                // Replaced instructions join the baseline, never the summary.
+                let baseline = baseline.get_or_insert_with(Vec::new);
+                for projected in history.iter().chain(&pending_instructions) {
+                    if overlaps(&projected.origin, &replaces) {
+                        baseline.extend(instruction_parts(&projected.items));
+                    }
+                }
                 history.retain(|projected| !overlaps(&projected.origin, &replaces));
+                pending_instructions.retain(|projected| !overlaps(&projected.origin, &replaces));
                 let index = history
                     .iter()
                     .position(|projected| match projected.origin {
@@ -143,8 +198,16 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
         }
     }
     flush_results(&mut pending_results, &mut history);
+    history.append(&mut pending_instructions);
 
-    Ok(history)
+    Ok((history, baseline.unwrap_or_default()))
+}
+
+fn instruction_parts(items: &[Item]) -> impl Iterator<Item = Part> + '_ {
+    items.iter().flat_map(|item| match item {
+        Item::Instruction { parts } => parts.clone(),
+        _ => Vec::new(),
+    })
 }
 
 fn flush_results(pending: &mut Vec<(u64, ProjectedEntry)>, history: &mut Vec<ProjectedEntry>) {

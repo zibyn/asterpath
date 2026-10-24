@@ -493,3 +493,171 @@ fn config_changed_round_trips_through_the_log_encoding() {
     let stored = entry(1, new.schema_version, new.payload);
     assert_eq!(decode_entry(&stored).expect("decode"), event);
 }
+
+fn appended(value: &str) -> SessionEvent {
+    let mut patch = ConfigPatch::default();
+    patch.append_system = vec![text(value)];
+    SessionEvent::ConfigChanged { patch }
+}
+
+fn log(events: &[SessionEvent]) -> Vec<LogEntry> {
+    events
+        .iter()
+        .zip(1u64..)
+        .map(|(event, seq)| entry(seq, 1, serde_json::to_value(event).unwrap()))
+        .collect()
+}
+
+fn created_with_system(value: &str) -> SessionEvent {
+    SessionEvent::SessionCreated {
+        config: ConfigSnapshot {
+            system: vec![text(value)],
+            ..config()
+        },
+        parent: None,
+    }
+}
+
+fn tool_step(call_byte: u8) -> [SessionEvent; 2] {
+    [
+        SessionEvent::AssistantMessage {
+            turn_id: turn(1),
+            step_id: step(call_byte),
+            items: vec![Item::ToolCall {
+                call_id: format!("call-{call_byte}"),
+                provider_item_id: None,
+                name: ToolName::new("echo"),
+                raw_args: JsonString::new("{}"),
+                raw: None,
+            }],
+            raw: None,
+            model: model(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        },
+        SessionEvent::ToolCallRequested {
+            turn_id: turn(1),
+            step_id: step(call_byte),
+            tool_call_id: call(call_byte),
+            provider_call_id: format!("call-{call_byte}"),
+            name: ToolName::new("echo"),
+            raw_args: JsonString::new("{}"),
+            replay: ReplaySafety::Safe,
+            provenance: Provenance::InProcess,
+        },
+    ]
+}
+
+fn result(call_byte: u8) -> SessionEvent {
+    SessionEvent::ToolResult {
+        tool_call_id: call(call_byte),
+        status: ToolResultStatus::Completed,
+        output: Some(vec![text("done")]),
+        error: None,
+        truncated: false,
+    }
+}
+
+fn step_started(byte: u8) -> SessionEvent {
+    SessionEvent::StepStarted {
+        turn_id: turn(1),
+        step_id: step(byte),
+    }
+}
+
+fn instruction(value: &str) -> Item {
+    Item::Instruction {
+        parts: vec![text(value)],
+    }
+}
+
+#[test]
+fn effective_config_appends_system_instructions() {
+    let records = records(vec![created_with_system("base"), appended("more")]);
+    let config = effective_config(
+        records.iter().map(|(entry, event)| (entry, event)),
+        u64::MAX,
+    )
+    .expect("config");
+    assert_eq!(config.system, vec![text("base"), text("more")]);
+}
+
+#[test]
+fn an_appended_instruction_lands_after_the_tool_results_at_the_next_step() {
+    let [call_message, requested] = tool_step(1);
+    let entries = log(&[
+        created_with_system("base"),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        step_started(1),
+        call_message,
+        requested,
+        // Appended while the tool runs: between tool_use and tool_result.
+        appended("be brief"),
+        result(1),
+        step_started(2),
+        assistant("ok"),
+    ]);
+
+    // The request of step 2 sees everything below its StepStarted (seq 8).
+    let at_step = request_history(&entries[..7]).expect("project");
+    assert_eq!(
+        at_step.system,
+        vec![text("base")],
+        "top-level system is unchanged"
+    );
+    assert!(matches!(at_step.items[1], Item::ToolCall { .. }));
+    assert!(matches!(at_step.items[2], Item::ToolResult { .. }));
+    assert_eq!(at_step.items[3], instruction("be brief"));
+    assert_eq!(at_step.items.len(), 4);
+
+    // Later requests keep it at the same place, before the step's reply.
+    let later = request_history(&entries).expect("project");
+    assert_eq!(later.items[..4], at_step.items[..]);
+    assert!(matches!(later.items[4], Item::Message { .. }));
+}
+
+#[test]
+fn compaction_moves_replaced_instructions_into_the_baseline_system() {
+    let [call_message, requested] = tool_step(1);
+    let entries = log(&[
+        created_with_system("base"),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        step_started(1),
+        call_message,
+        requested,
+        appended("first"),
+        result(1),
+        step_started(2),
+        assistant("ok"),
+        appended("second"),
+        SessionEvent::CompactionApplied {
+            first_kept: LogId::from_i64(12),
+            summary: vec![text("summary")],
+            replaces: LogIdRange {
+                first: LogId::from_i64(2),
+                last: LogId::from_i64(9),
+            },
+            model: model(),
+            usage: Usage::default(),
+            raw: None,
+        },
+        step_started(3),
+    ]);
+
+    let projected = request_history(&entries).expect("project");
+    assert_eq!(projected.system, vec![text("base"), text("first")]);
+    assert_eq!(
+        projected.items,
+        vec![
+            Item::Compaction {
+                parts: vec![text("summary")]
+            },
+            instruction("second"),
+        ],
+        "an instruction after the replaced range keeps its place"
+    );
+}

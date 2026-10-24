@@ -161,8 +161,9 @@ pub enum ContextPolicy {
     Fork { at: LogId },
 }
 
-/// The fields one `ConfigChanged` overrides (ADR-0030). Each present field
+/// The fields one `ConfigChanged` changes (ADR-0030). Each present field
 /// replaces the effective value whole; absent fields keep theirs.
+/// `append_system` is appended, never replaced.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigPatch {
@@ -170,6 +171,9 @@ pub struct ConfigPatch {
     pub model: Option<ModelSpec>,
     #[serde(default)]
     pub request: Option<RequestConfig>,
+    /// Instructions appended to the system. Only `Part::Text` is valid.
+    #[serde(default)]
+    pub append_system: Vec<Part>,
 }
 
 /// The effective configuration at `watermark`: `SessionCreated.config` with
@@ -206,7 +210,8 @@ pub fn effective_config<'a>(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub model: ModelSpec,
-    /// Only `Part::Text` is valid.
+    /// Only `Part::Text` is valid. In `SessionCreated` the initial system;
+    /// folded, it also holds every appended instruction in log order.
     pub system: Vec<Part>,
     /// Resolved at session creation and then fixed for the session's lifetime.
     pub tools: Vec<ToolDescriptor>,
@@ -225,6 +230,7 @@ impl ConfigSnapshot {
         if let Some(request) = &patch.request {
             self.request = request.clone();
         }
+        self.system.extend(patch.append_system.iter().cloned());
     }
 }
 

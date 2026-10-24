@@ -4,7 +4,7 @@
 //! `(session, event_kind, dedup_key)`, so two event kinds may deliberately
 //! share one key (for example `ToolCallRequested` and `ToolResult`).
 
-use crate::{DedupKey, InputId, LogId, SessionId, StepId, ToolCallId, TurnId};
+use crate::{DedupKey, InputId, LogId, SessionId, StepId, ToolCallId, TurnId, UpdateId};
 
 pub fn session_created(session: SessionId) -> DedupKey {
     DedupKey::new(session.to_hex())
@@ -28,6 +28,10 @@ pub fn tool_call(tool_call: ToolCallId) -> DedupKey {
 
 pub fn tool_result(tool_call: ToolCallId) -> DedupKey {
     DedupKey::new(tool_call.to_hex())
+}
+
+pub fn config_changed(update: UpdateId) -> DedupKey {
+    DedupKey::new(update.to_hex())
 }
 
 pub fn step_committed(step: StepId) -> DedupKey {

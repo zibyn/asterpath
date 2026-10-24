@@ -55,6 +55,11 @@ pub enum Item {
     Compaction {
         parts: Vec<Part>,
     },
+    /// A system instruction appended mid-session (ADR-0030), at the first
+    /// `StepStarted` after its `ConfigChanged`. Only `Part::Text`.
+    Instruction {
+        parts: Vec<Part>,
+    },
     ProviderOpaque {
         provider: ProviderId,
         kind: String,
