@@ -65,11 +65,19 @@ pub struct ReasoningParams {
     pub summary: bool,
 }
 
+/// A level the adapter maps to the provider's effort value. A model that does
+/// not accept the level gets `Unsupported`; adapters never pick a nearby one.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningEffort {
+    /// No reasoning: OpenAI `none`; Anthropic sends neither thinking nor effort.
+    Off,
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +233,25 @@ impl Default for ToolConfig {
             max_output_bytes_per_step: 256 * 1024,
             external_timeout: Some(Duration::from_secs(120)),
             kill_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn efforts_persisted_before_the_new_levels_still_decode() {
+        for (json, effort) in [
+            ("\"Low\"", ReasoningEffort::Low),
+            ("\"Medium\"", ReasoningEffort::Medium),
+            ("\"High\"", ReasoningEffort::High),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ReasoningEffort>(json).unwrap(),
+                effort
+            );
         }
     }
 }
