@@ -1339,7 +1339,7 @@ async fn an_instruction_renders_as_a_system_message_and_keeps_old_thinking() {
 async fn an_instruction_followed_by_user_input_moves_after_it() {
     // The API accepts a system message only before an assistant turn or at the end.
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
-    let mut request = base_request();
+    let mut request = request_for("claude-opus-5-5");
     request.items = vec![
         user_message(vec![text("first")]),
         Item::Instruction {
