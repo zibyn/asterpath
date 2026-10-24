@@ -345,7 +345,7 @@ pub enum AsterError {
 - `--output-format text`（默认）：stdout 只有最终助手文本；stderr 输出 session id 与诊断。
 - `--output-format json`：stdout 一个对象 `{ "session": <hex>, "result": <最终助手文本>, "reason": <TurnEndReason>, "usage": <本回合用量> }`；字段只增不改。
 - `--output-format stream-json`：stdout 每行一个 `AgentEvent` 的 serde 序列化（`tag = "type"`），最后一行是上面的结果对象。
-- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出。
+- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；无法解析的命令是用法错误（退出 2）。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
 
 ### 4.4 审批

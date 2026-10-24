@@ -17,6 +17,7 @@ mod drive;
 mod exec;
 mod interactive;
 mod session;
+mod stream;
 
 use std::path::PathBuf;
 

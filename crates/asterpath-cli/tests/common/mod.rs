@@ -9,7 +9,12 @@ pub use asterpath_testing::http_mock::{MockServer, Reply};
 /// The CLI binary with host environment removed and a dummy key in place.
 /// The default config path points nowhere, so the host's file is never read.
 pub fn bin() -> Command {
-    let mut command = Command::cargo_bin("asterpath").expect("asterpath binary");
+    Command::from(process_bin())
+}
+
+/// [`bin`] as a plain process, for tests that talk to it while it runs.
+pub fn process_bin() -> std::process::Command {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("asterpath"));
     command.env("XDG_CONFIG_HOME", "/nonexistent/asterpath-test-config");
     for name in [
         "ASTERPATH_CONFIG",
