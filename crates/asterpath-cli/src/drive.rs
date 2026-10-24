@@ -1,7 +1,7 @@
 //! Driving a session to the end of its turn, with or without an operator
 //! approval prompt, and reading the result back from the log.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 use asterpath::SessionHandle;
@@ -15,76 +15,109 @@ use crate::{CliError, CliResult, aster_error};
 
 #[derive(Default)]
 pub struct DriveOutcome {
+    /// Whether anything was driven.
+    pub ran: bool,
     pub idle: bool,
     pub reason: Option<TurnEndReason>,
     /// The usage of the last committed turn.
     pub usage: Option<Usage>,
+    /// A host protocol error that stopped serving early; reported after the
+    /// result line.
+    pub error: Option<CliError>,
 }
 
-/// Drive to `TurnCommitted` or `Idle`. With no prompt every approval request
-/// is denied; when no endpoint is registered the framework denies first.
-/// With a prompt, live events are also rendered to its writer.
-/// Injected prompt IO keeps the endpoint unit-testable; there is no exit code
-/// for "stopped at a wait".
-pub async fn drive<R: BufRead, W: Write>(
-    handle: &SessionHandle,
-    mut prompt: Option<&mut PromptIo<R, W>>,
-) -> CliResult<DriveOutcome> {
-    let mut outcome = DriveOutcome::default();
-    let mut stream = handle.drive();
-    while let Some(event) = stream.next().await {
+impl DriveOutcome {
+    /// Fold one live event into the outcome.
+    pub fn observe(&mut self, event: &AgentEvent) {
         match event {
-            Ok(AgentEvent::ApprovalRequested(request)) => {
-                let decision = match prompt.as_deref_mut() {
-                    Some(io) => prompt_decision(io, &request),
-                    None => ApprovalDecision::Deny { reason: None },
-                };
-                handle
+            AgentEvent::TurnCommitted { reason, usage, .. } => {
+                self.reason = Some(reason.clone());
+                self.usage = Some(*usage);
+            }
+            AgentEvent::Idle { .. } => self.idle = true,
+            _ => {}
+        }
+    }
+}
+
+/// Who watches a drive and answers its approvals.
+pub trait Operator {
+    /// A live event to show.
+    fn show(&mut self, _event: &AgentEvent) {}
+
+    /// The answer to an approval request; `None` cancels the turn.
+    fn decide(
+        &mut self,
+        _request: &ApprovalRequest,
+    ) -> impl Future<Output = Option<ApprovalDecision>> {
+        std::future::ready(Some(ApprovalDecision::Deny { reason: None }))
+    }
+
+    /// Resolves when the operator interrupts the turn; never by default.
+    fn interrupted(&mut self) -> impl Future<Output = ()> {
+        std::future::pending()
+    }
+}
+
+/// No operator: nothing is shown and every approval is denied (with no
+/// endpoint registered, the framework denies first).
+pub struct Headless;
+
+impl Operator for Headless {}
+
+/// Drive to `TurnCommitted` or `Idle`; an interrupt cancels the turn and
+/// the drive runs on to its end. There is no exit code for "stopped at a wait".
+pub async fn drive(
+    handle: &SessionHandle,
+    operator: &mut impl Operator,
+) -> CliResult<DriveOutcome> {
+    let mut outcome = DriveOutcome {
+        ran: true,
+        ..DriveOutcome::default()
+    };
+    let mut stream = handle.drive();
+    loop {
+        let event = tokio::select! {
+            event = stream.next() => event,
+            () = operator.interrupted() => {
+                handle.cancel().await.map_err(aster_error)?;
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
+        let event = event.map_err(|error| CliError::run(format!("drive failed: {error}")))?;
+        outcome.observe(&event);
+        if let AgentEvent::ApprovalRequested(request) = &event {
+            match operator.decide(request).await {
+                Some(decision) => handle
                     .approve(request.tool_call_id, decision)
                     .await
-                    .map_err(aster_error)?;
+                    .map_err(aster_error)?,
+                None => handle.cancel().await.map_err(aster_error)?,
             }
-            Ok(AgentEvent::TurnCommitted { reason, usage, .. }) => {
-                outcome.reason = Some(reason);
-                outcome.usage = Some(usage);
-            }
-            Ok(AgentEvent::Idle { .. }) => outcome.idle = true,
-            Ok(event) => {
-                if let Some(io) = prompt.as_deref_mut() {
-                    crate::interactive::render(&mut io.writer, &event);
-                }
-            }
-            Err(error) => return Err(CliError::run(format!("drive failed: {error}"))),
+        } else {
+            operator.show(&event);
         }
     }
     Ok(outcome)
 }
 
-pub struct PromptIo<R, W> {
-    pub reader: R,
-    pub writer: W,
+/// Print an approval request's fields and the question.
+pub fn ask<W: Write>(out: &mut W, request: &ApprovalRequest) {
+    let _ = writeln!(out, "tool: {}", request.tool.as_str());
+    let _ = writeln!(out, "args: {}", request.args.as_str());
+    let _ = writeln!(out, "replay: {:?}", request.replay);
+    let _ = writeln!(out, "side_effect: {:?}", request.side_effect);
+    let _ = writeln!(out, "provenance: {:?}", request.provenance);
+    let _ = write!(out, "allow? [y/N] ");
+    let _ = out.flush();
 }
 
-/// Ask the operator; anything other than yes (including EOF) denies.
-pub fn prompt_decision<R: BufRead, W: Write>(
-    io: &mut PromptIo<R, W>,
-    request: &ApprovalRequest,
-) -> ApprovalDecision {
-    let _ = writeln!(io.writer, "tool: {}", request.tool.as_str());
-    let _ = writeln!(io.writer, "args: {}", request.args.as_str());
-    let _ = writeln!(io.writer, "replay: {:?}", request.replay);
-    let _ = writeln!(io.writer, "side_effect: {:?}", request.side_effect);
-    let _ = writeln!(io.writer, "provenance: {:?}", request.provenance);
-    let _ = write!(io.writer, "allow? [y/N] ");
-    let _ = io.writer.flush();
-
-    let mut answer = String::new();
-    let allowed = io.reader.read_line(&mut answer).is_ok()
-        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    if allowed {
-        ApprovalDecision::Allow
-    } else {
-        ApprovalDecision::Deny { reason: None }
+/// Anything other than yes (including EOF, `None`) denies.
+pub fn answer(line: Option<&str>) -> ApprovalDecision {
+    match line.map(|line| line.trim().to_ascii_lowercase()).as_deref() {
+        Some("y" | "yes") => ApprovalDecision::Allow,
+        _ => ApprovalDecision::Deny { reason: None },
     }
 }
 
@@ -194,27 +227,43 @@ mod tests {
 
     #[test]
     fn prompt_prints_every_approval_field_and_maps_the_answer() {
-        for (answer, expected) in [
-            ("y\n", ApprovalDecision::Allow),
-            ("yes\n", ApprovalDecision::Allow),
-            ("n\n", ApprovalDecision::Deny { reason: None }),
-            ("\n", ApprovalDecision::Deny { reason: None }),
+        let mut rendered = Vec::new();
+        ask(&mut rendered, &request());
+        let rendered = String::from_utf8(rendered).unwrap();
+        for field in [
+            "tool: echo",
+            r#"args: {"q":"hi"}"#,
+            "replay: Safe",
+            "side_effect: ReadOnly",
+            "provenance: InProcess",
+            "allow? [y/N]",
         ] {
-            let mut io = PromptIo {
-                reader: Cursor::new(answer.as_bytes()),
-                writer: Vec::new(),
-            };
-            assert_eq!(prompt_decision(&mut io, &request()), expected);
-            let rendered = String::from_utf8(io.writer).unwrap();
-            for field in [
-                "tool: echo",
-                r#"args: {"q":"hi"}"#,
-                "replay: Safe",
-                "side_effect: ReadOnly",
-                "provenance: InProcess",
-            ] {
-                assert!(rendered.contains(field), "missing {field}: {rendered}");
-            }
+            assert!(rendered.contains(field), "missing {field}: {rendered}");
+        }
+        for (line, expected) in [
+            (Some("y"), ApprovalDecision::Allow),
+            (Some(" YES "), ApprovalDecision::Allow),
+            (Some("n"), ApprovalDecision::Deny { reason: None }),
+            (Some(""), ApprovalDecision::Deny { reason: None }),
+            (None, ApprovalDecision::Deny { reason: None }),
+        ] {
+            assert_eq!(answer(line), expected);
+        }
+    }
+
+    /// Answers approvals from scripted lines and records the questions.
+    struct PromptIo {
+        reader: Cursor<&'static [u8]>,
+        writer: Vec<u8>,
+    }
+
+    impl Operator for PromptIo {
+        async fn decide(&mut self, request: &ApprovalRequest) -> Option<ApprovalDecision> {
+            use std::io::BufRead;
+            ask(&mut self.writer, request);
+            let mut line = String::new();
+            let read = self.reader.read_line(&mut line).is_ok_and(|n| n > 0);
+            Some(answer(read.then_some(line.as_str())))
         }
     }
 
@@ -360,7 +409,7 @@ mod tests {
             reader: Cursor::new(b"y\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, Some(&mut io)).await.expect("drive");
+        let outcome = drive(&handle, &mut io).await.expect("drive");
 
         assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
         assert!(!outcome.idle);
@@ -396,7 +445,7 @@ mod tests {
             reader: Cursor::new(b"n\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, Some(&mut io)).await.expect("drive");
+        let outcome = drive(&handle, &mut io).await.expect("drive");
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let values = tool_result_values(&asterpath, handle.id()).await;
@@ -459,7 +508,7 @@ mod tests {
             reader: Cursor::new(b"n\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, Some(&mut io)).await.expect("resume");
+        let outcome = drive(&handle, &mut io).await.expect("resume");
 
         assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
         assert_eq!(
@@ -530,7 +579,7 @@ mod tests {
                 reader: Cursor::new(b"n\n"),
                 writer: Vec::new(),
             };
-            drive(&handle, Some(&mut io)).await.expect("drive");
+            drive(&handle, &mut io).await.expect("drive");
 
             let asked = String::from_utf8(io.writer).unwrap().contains("tool: bash");
             assert_eq!(asked, open, "ApprovalRequested only while the gate is open");

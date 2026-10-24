@@ -271,7 +271,7 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 
 ## 12. M6 出界
 
-- 用户调用（`/skill`、`exec --skill`）与命令 seam。
+- 用户调用（交互模式的 `/skill` 斜杠命令或命令行选项）与命令 seam。
 - 读取 `references/` / `assets/`，执行 `scripts/`。
 - 热加载、运行期增删技能。
 - 插件打包技能、远程 registry、安装/更新。

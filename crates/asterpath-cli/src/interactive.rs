@@ -2,19 +2,19 @@
 //!
 //! Input lines and Ctrl-C arrive on channels, so [`repl`] runs without a TTY:
 //! a thread feeds stdin lines, a task feeds interrupts. Approval prompts read
-//! their answer from the same line channel.
+//! their answer from the same line channel and are interrupted by Ctrl-C.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, Write};
 
 use asterpath::{Asterpath, SessionHandle};
 use asterpath_protocol::{
-    AgentEvent, ConfigPatch, InputId, ModelId, Part, PartDelta, SystemClock, UsageScope, UserInput,
-    unique_bytes,
+    AgentEvent, ApprovalDecision, ApprovalRequest, InputId, Part, PartDelta, SystemClock,
+    UsageScope, UserInput, unique_bytes,
 };
 use asterpath_protocol::{Clock, CompactResult};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::drive::{self, PromptIo, scan, turn_result};
+use crate::drive::{self, scan, turn_result};
 use crate::exec::attachment;
 use crate::session::{self, SessionArgs};
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
@@ -63,18 +63,30 @@ pub async fn interactive(
         )
         .await;
         drop(endpoint);
+        // `/new` keeps the model in use, including one chosen with `/model`.
+        // shortcut: carries the model id only, so a resumed session on another provider than the config's hands over a foreign id; carry the provider when `-m` can name one
+        let model = match &next {
+            Ok(Next::New) => session::snapshot(&opened.asterpath, opened.handle.id())
+                .await
+                .ok()
+                .map(|snapshot| snapshot.model.model.as_str().to_owned()),
+            _ => None,
+        };
         opened.shutdown().await?;
         match next? {
             Next::Exit => return Ok(()),
-            Next::New => opened = session::open(global, &new_session(&args), None).await?,
+            Next::New => {
+                let args = new_session(&args, model);
+                opened = session::open(global, &args, None).await?;
+            }
         }
     }
 }
 
 /// The flags of a fresh session in the current work root.
-fn new_session(args: &SessionArgs) -> SessionArgs {
+fn new_session(args: &SessionArgs, model: Option<String>) -> SessionArgs {
     SessionArgs {
-        model: args.model.clone(),
+        model: model.or_else(|| args.model.clone()),
         approval: args.approval,
         sandbox: args.sandbox,
         cd: None,
@@ -174,24 +186,15 @@ async fn turn<W: Write>(
             .await
             .map_err(aster_error)?;
     }
-    let mut io = PromptIo {
-        reader: BufReader::new(LineReader {
+    let outcome = drive::drive(
+        handle,
+        &mut Terminal {
             lines,
-            pending: Vec::new(),
-        }),
-        writer: &mut *out,
-    };
-    let outcome = {
-        let drive = drive::drive(handle, Some(&mut io));
-        tokio::pin!(drive);
-        loop {
-            tokio::select! {
-                outcome = &mut drive => break outcome?,
-                Some(()) = interrupts.recv() => handle.cancel().await.map_err(aster_error)?,
-            }
-        }
-    };
-    drop(io);
+            interrupts,
+            out: &mut *out,
+        },
+    )
+    .await?;
     let _ = writeln!(out);
     let entries = scan(asterpath.store(), handle.id())
         .await
@@ -241,11 +244,11 @@ async fn switch_model(
     handle: &SessionHandle,
     model: &str,
 ) -> CliResult<String> {
-    let mut spec = session::snapshot(asterpath, handle.id()).await?.model;
-    spec.model = ModelId::new(model.to_owned());
-    let mut patch = ConfigPatch::default();
-    patch.model = Some(spec);
-    handle.update_config(patch).await.map_err(aster_error)?;
+    let snapshot = session::snapshot(asterpath, handle.id()).await?;
+    handle
+        .update_config(session::model_patch(&snapshot, model))
+        .await
+        .map_err(aster_error)?;
     Ok(format!("model: {model}"))
 }
 
@@ -311,26 +314,31 @@ fn truncate(text: &str) -> String {
     }
 }
 
-/// Blocking `Read` over the line channel for the synchronous approval prompt.
-/// A closed channel reads as EOF, which denies.
-struct LineReader<'a> {
+/// The TTY operator: live events on `out`, approvals answered from the line
+/// channel, Ctrl-C cancels the turn (also while an approval is asked).
+struct Terminal<'a, W> {
     lines: &'a mut UnboundedReceiver<String>,
-    pending: Vec<u8>,
+    interrupts: &'a mut UnboundedReceiver<()>,
+    out: W,
 }
 
-impl Read for LineReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pending.is_empty() {
-            // shortcut: needs the multi-thread runtime; an async approval channel would lift that
-            match tokio::task::block_in_place(|| self.lines.blocking_recv()) {
-                Some(line) => self.pending = format!("{line}\n").into_bytes(),
-                None => return Ok(0),
-            }
+impl<W: Write> drive::Operator for Terminal<'_, W> {
+    fn show(&mut self, event: &AgentEvent) {
+        render(&mut self.out, event);
+    }
+
+    async fn decide(&mut self, request: &ApprovalRequest) -> Option<ApprovalDecision> {
+        drive::ask(&mut self.out, request);
+        tokio::select! {
+            line = self.lines.recv() => Some(drive::answer(line.as_deref())),
+            Some(()) = self.interrupts.recv() => None,
         }
-        let n = buf.len().min(self.pending.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        Ok(n)
+    }
+
+    async fn interrupted(&mut self) {
+        if self.interrupts.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -341,8 +349,8 @@ mod tests {
     use std::time::Duration;
 
     use asterpath_protocol::{
-        Item, JsonString, ModelSpec, Provider, ProviderId, Role, SessionSpec, StopReason, Tool,
-        ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, Usage,
+        Item, JsonString, ModelId, ModelSpec, Provider, ProviderId, Role, SessionSpec, StopReason,
+        Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, Usage,
     };
     use asterpath_testing::ScriptedProvider;
     use futures_util::future::BoxFuture;
@@ -386,7 +394,15 @@ mod tests {
         spec
     }
 
-    async fn setup(dir: &std::path::Path) -> Asterpath {
+    struct AlwaysAsk;
+
+    impl asterpath_protocol::ApprovalPolicy for AlwaysAsk {
+        fn classify(&self, _request: &ApprovalRequest) -> asterpath_protocol::ApprovalVerdict {
+            asterpath_protocol::ApprovalVerdict::Ask
+        }
+    }
+
+    async fn setup(dir: &std::path::Path, ask: bool) -> Asterpath {
         let provider = ScriptedProvider::new("p")
             .respond(
                 vec![Item::ToolCall {
@@ -415,19 +431,20 @@ mod tests {
             String::new(),
             serde_json::json!({"type": "object"}),
         ));
-        Asterpath::builder()
+        let mut builder = Asterpath::builder()
             .database(dir.join("repl.db"))
             .providers(vec![Arc::new(provider) as Arc<dyn Provider>])
-            .tools(vec![Arc::new(hang) as Arc<dyn Tool>])
-            .build()
-            .await
-            .expect("build")
+            .tools(vec![Arc::new(hang) as Arc<dyn Tool>]);
+        if ask {
+            builder = builder.approval(Arc::new(AlwaysAsk));
+        }
+        builder.build().await.expect("build")
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ctrl_c_cancels_the_turn_then_exits_while_idle() {
         let dir = tempfile::tempdir().unwrap();
-        let asterpath = setup(dir.path()).await;
+        let asterpath = setup(dir.path(), false).await;
         let handle = asterpath.create_session(spec()).await.unwrap();
         let (line_tx, mut lines) = unbounded_channel::<String>();
         let (interrupt_tx, mut interrupts) = unbounded_channel();
@@ -460,6 +477,51 @@ mod tests {
         assert_eq!(next, Next::Exit);
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("[tool] hang {}"), "{out}");
+        assert!(out.contains("turn ended with Cancelled"), "{out}");
+        assert!(!out.contains("after"), "{out}");
+        drop((line_tx, interrupter.await));
+        drop(handle);
+        asterpath.shutdown().await.unwrap();
+    }
+
+    /// Single-threaded: the approval prompt must not block the runtime.
+    #[tokio::test]
+    async fn ctrl_c_during_an_approval_prompt_cancels_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let asterpath = setup(dir.path(), true).await;
+        let _endpoint = asterpath.approval_gate().register();
+        let handle = asterpath.create_session(spec()).await.unwrap();
+        let (line_tx, mut lines) = unbounded_channel::<String>();
+        let (interrupt_tx, mut interrupts) = unbounded_channel();
+        line_tx.send("go".into()).unwrap();
+        let interrupter = tokio::spawn(async move {
+            // One Ctrl-C at the approval prompt, one at the next prompt.
+            for _ in 0..2 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                interrupt_tx.send(()).unwrap();
+            }
+            interrupt_tx
+        });
+
+        let mut out = Vec::new();
+        let next = tokio::time::timeout(
+            Duration::from_secs(10),
+            repl(
+                &asterpath,
+                &handle,
+                Vec::new(),
+                &mut lines,
+                &mut interrupts,
+                &mut out,
+            ),
+        )
+        .await
+        .expect("the REPL returns")
+        .expect("no error");
+
+        assert_eq!(next, Next::Exit);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("allow? [y/N]"), "{out}");
         assert!(out.contains("turn ended with Cancelled"), "{out}");
         assert!(!out.contains("after"), "{out}");
         drop((line_tx, interrupter.await));

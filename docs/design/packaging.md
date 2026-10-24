@@ -330,7 +330,7 @@ pub enum AsterError {
 | `-i, --image <file>` | 交互、`exec` | 给首条输入附图（文件输入，ADR-0031） |
 | `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
 | `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
-| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031） |
+| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031）；写进新会话或分叉会话的配置，因此只用于新会话与 `--fork-session`，续原会话时是用法错误（没有单回合的请求选项，写进去会留在会话里） |
 
 - Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
 - 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。
@@ -338,14 +338,14 @@ pub enum AsterError {
 
 **续会话的驱动语义**：`--continue` / `-r` 打开会话后，先检查会话事实；有未闭合回合或待处理输入则先 `drive()` 到结束（崩溃恢复），再处理新输入。`exec -r <id>` 不带 `PROMPT` 只做恢复，没有可恢复的内容时输出 `idle`、退出 0；交互模式恢复后进入提示符。
 
-**续会话的工作根目录**：取会话元数据里的 `cwd`，显式 `-C` 时取 `-C`；目录不存在是配置错误（退出 2）。`--continue` 与选择器按当前工作根目录（或 `-C`）匹配元数据 `cwd`。名字重复时 `-r <name>` 取最后活动的一个。
+**续会话的工作根目录**：取会话元数据里的 `cwd`，显式 `-C` 时取 `-C`；目录不存在是配置错误（退出 2）。`--continue`、选择器与 `-r <name>` 按当前工作根目录（或 `-C`）匹配元数据 `cwd`；`-r <id>` 不限目录。名字重复时 `-r <name>` 取最后活动的一个。
 
 ### 4.3 无头输出与输入
 
 - `--output-format text`（默认）：stdout 只有最终助手文本；stderr 输出 session id 与诊断。
 - `--output-format json`：stdout 一个对象 `{ "session": <hex>, "result": <最终助手文本>, "reason": <TurnEndReason>, "usage": <本回合用量> }`；字段只增不改。
 - `--output-format stream-json`：stdout 每行一个 `AgentEvent` 的 serde 序列化（`tag = "type"`），最后一行是上面的结果对象。
-- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；无法解析的命令是用法错误（退出 2）。
+- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出，stdin 关闭时仍有审批在等则取消该回合（没有人能回答了）。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；无法解析的命令（或读不了 stdin）停止读入并取消进行中的回合，照常输出结果行后以用法错误退出（退出 2）。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
 
 ### 4.4 审批
@@ -357,7 +357,7 @@ pub enum AsterError {
 
 ### 4.5 交互模式
 
-- 斜杠命令：`/help`、`/new`（新建会话）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
+- 斜杠命令：`/help`、`/new`（新建会话，沿用当前模型）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
 - 回合进行中第一次 Ctrl-C 调用 `cancel()`；空闲时 Ctrl-C 或 Ctrl-D 退出。
 - 显示：`ModelDelta` 文本增量直接输出；`ToolStarted` 显示工具名与参数，`ToolFinished` 显示状态与截断后的结果。显示前的脱敏是 CLI 的策略。
 
@@ -471,7 +471,7 @@ default = "untrusted"         # untrusted | never
 | M1 恢复 | 场景 (a)；引入 `asterpath-acceptance` | `acceptance` 的 A1–A3 通过 |
 | M2 双协议 | 两个 provider crate + adapter 测试 | 场景 (b) 通过 |
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；默认 compactor 可选接入 | 场景 (c) 通过 |
-| M4 CLI | `asterpath-cli` 六命令、配置、审批端 | CLI 场景测试通过 |
+| M4 CLI | `asterpath-cli` 交互模式与 `exec` / `doctor` / `debug`（§4.1）、配置、审批端 | CLI 场景测试通过 |
 | M5 扩展（已交付） | `asterpath-mcp`（MCP 服务配置、子进程、MCP adapter；#80 前为 `asterpath-plugin-host`）、沙箱合约（#80 起在 protocol）与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
 | M6 技能（已交付） | `asterpath-skills`、CLI `[skills]`（`enabled` 开关）、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
 

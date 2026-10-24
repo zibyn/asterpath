@@ -296,3 +296,53 @@ async fn an_input_waiting_for_the_next_turn_is_not_copied() {
 
     assert_eq!(history(&fork).await, [user("one")]);
 }
+
+#[tokio::test]
+async fn a_compaction_inside_the_turn_in_progress_is_not_copied() {
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![assistant("a")],
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let asterpath = build(&provider).await;
+    let source = asterpath.create_session(spec()).await.expect("create");
+    turn(&source, 1, "one").await;
+
+    // A second turn starts and compacts everything so far, then is still
+    // running when the host forks.
+    let turn_id = TurnId::from_bytes([2; 16]);
+    source.submit_input(input(2, "two")).await.expect("input");
+    for event in [
+        SessionEvent::TurnStarted { turn_id },
+        SessionEvent::StepStarted {
+            turn_id,
+            step_id: StepId::from_bytes([2; 16]),
+        },
+    ] {
+        let entry = encode_entry(source.id(), None, &event).expect("encode");
+        asterpath.store().append(entry).await.expect("append");
+    }
+    let log = scan_all(&*asterpath.store(), source.id())
+        .await
+        .expect("scan");
+    let compaction = SessionEvent::CompactionApplied {
+        first_kept: log.last().expect("entry").log_id,
+        summary: vec![text("in-progress summary")],
+        replaces: asterpath::protocol::LogIdRange {
+            first: log[1].log_id,
+            last: log[log.len() - 2].log_id,
+        },
+        model: spec().model,
+        usage: Usage::default(),
+        raw: None,
+    };
+    let entry = encode_entry(source.id(), None, &compaction).expect("encode");
+    asterpath.store().append(entry).await.expect("append");
+
+    let fork = asterpath
+        .fork_session(source.id(), BTreeMap::new())
+        .await
+        .expect("fork");
+
+    assert_eq!(history(&fork).await, [user("one"), assistant("a")]);
+}

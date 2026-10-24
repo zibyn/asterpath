@@ -596,18 +596,16 @@ impl SqliteStorage {
         rows.map(|row| {
             let (session, parent, created_at, last_activity, metadata) = row.map_err(backend)?;
             let session = session_from_blob(session)?;
-            Ok(CatalogEntry {
+            Ok(CatalogEntry::new(
                 session,
-                parent: parent.map(session_from_blob).transpose()?,
+                parent.map(session_from_blob).transpose()?,
                 created_at,
                 last_activity,
-                metadata: serde_json::from_str(&metadata).map_err(|error| {
-                    StorageError::Corrupt {
-                        session: Some(session),
-                        detail: format!("catalog metadata: {error}"),
-                    }
+                serde_json::from_str(&metadata).map_err(|error| StorageError::Corrupt {
+                    session: Some(session),
+                    detail: format!("catalog metadata: {error}"),
                 })?,
-            })
+            ))
         })
         .collect()
     }

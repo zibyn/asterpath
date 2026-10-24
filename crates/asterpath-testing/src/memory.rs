@@ -105,15 +105,16 @@ impl State {
                 ParentFilter::Roots => parent.is_none(),
                 ParentFilter::ChildrenOf(of) => *parent == Some(of),
             })
-            .map(|(session, (parent, created_at, metadata))| CatalogEntry {
-                session: *session,
-                parent: *parent,
-                created_at: *created_at,
-                last_activity: self
-                    .log_of(*session)
-                    .last()
-                    .map_or(*created_at, |entry| entry.recorded_at),
-                metadata: metadata.clone(),
+            .map(|(session, (parent, created_at, metadata))| {
+                CatalogEntry::new(
+                    *session,
+                    *parent,
+                    *created_at,
+                    self.log_of(*session)
+                        .last()
+                        .map_or(*created_at, |entry| entry.recorded_at),
+                    metadata.clone(),
+                )
             })
             .filter(|entry| query.after.is_none_or(|after| entry.cursor() < after))
             .collect();

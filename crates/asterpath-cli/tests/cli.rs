@@ -272,61 +272,167 @@ fn stream_json_output_prints_each_event_then_the_result_object() {
     assert_eq!(result["usage"]["input"]["uncached"], 5, "{result}");
 }
 
+/// `exec` in stream-json mode with a host on stdin. Every read times out, so
+/// a hang fails the test; the child is killed on drop.
+struct Host {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Host {
+    fn start(dir: &TestDir) -> Self {
+        use std::io::BufRead;
+        use std::process::Stdio;
+
+        let mut child = common::process_bin()
+            .current_dir(&dir.path)
+            .args(["exec", "--config", dir.config_path().to_str().unwrap()])
+            .args(["-s", "full-access", "--output-format", "stream-json"])
+            .args(["--input-format", "stream-json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn asterpath");
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            lines,
+        }
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write;
+        writeln!(self.stdin.as_mut().expect("stdin open"), "{line}").unwrap();
+    }
+
+    fn close(&mut self) {
+        self.stdin = None;
+    }
+
+    fn next(&self) -> serde_json::Value {
+        let line = self
+            .lines
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a stdout line in time");
+        serde_json::from_str(&line).expect("json line")
+    }
+
+    /// Skip to the next event of `kind`.
+    fn until(&self, kind: &str) -> serde_json::Value {
+        loop {
+            let event = self.next();
+            if event["type"] == kind {
+                return event;
+            }
+        }
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(std::time::Instant::now() < deadline, "asterpath exits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const GO: &str = r#"{"type":"user_input","parts":[{"Text":{"text":"go"}}]}"#;
+
 /// A host on stdin answers the `bash` approval; closing stdin while idle ends
 /// the run with the result object.
 #[test]
 fn stream_json_input_round_trips_an_approval_through_the_host() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::Stdio;
-
     let server = MockServer::start(vec![
         Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
         Reply::sse(common::text_sse("done")),
     ]);
     let dir = TestDir::new("stream-input");
     dir.config(&config_body(&server, &dir.db()));
-    let mut child = common::process_bin()
-        .current_dir(&dir.path)
-        .args(["exec", "--config", dir.config_path().to_str().unwrap()])
-        .args(["-s", "full-access", "--output-format", "stream-json"])
-        .args(["--input-format", "stream-json"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn asterpath");
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut next = || -> serde_json::Value {
-        serde_json::from_str(&stdout.next().expect("a line").unwrap()).expect("json line")
-    };
+    let mut host = Host::start(&dir);
 
-    writeln!(
-        stdin,
-        r#"{{"type":"user_input","parts":[{{"Text":{{"text":"go"}}}}]}}"#
-    )
-    .unwrap();
-    let request = loop {
-        let event = next();
-        if event["type"] == "approval_requested" {
-            break event;
-        }
-    };
+    host.send(GO);
+    let request = host.until("approval_requested");
     assert_eq!(request["tool"], "bash");
     assert!(!dir.path.join("ran").exists(), "asked before running");
-    writeln!(
-        stdin,
+    host.send(&format!(
         r#"{{"type":"approval","call":{},"decision":"Allow"}}"#,
         request["tool_call_id"]
-    )
-    .unwrap();
-    while next()["type"] != "turn_committed" {}
-    drop(stdin);
+    ));
+    host.until("turn_committed");
+    host.close();
 
-    let result = next();
+    let result = host.next();
     assert_eq!(result["result"], "done");
     assert_eq!(result["reason"], "Completed");
-    assert!(child.wait().unwrap().success());
+    assert_eq!(host.exit_code(), Some(0));
     assert!(dir.path.join("ran").exists(), "the allowed bash ran");
+}
+
+/// Closing stdin while an approval waits cancels the turn instead of hanging.
+#[test]
+fn stream_json_stdin_closed_during_an_approval_cancels_the_turn() {
+    let server = MockServer::start(vec![Reply::sse(common::tool_use_sse(
+        "bash",
+        r#"{"command":"touch ran"}"#,
+    ))]);
+    let dir = TestDir::new("stream-eof");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    host.until("approval_requested");
+    host.close();
+
+    assert_eq!(host.until("turn_committed")["reason"], "Cancelled");
+    assert_eq!(host.next()["reason"], "Cancelled", "the result line");
+    assert_eq!(host.exit_code(), Some(1));
+    assert!(!dir.path.join("ran").exists());
+}
+
+/// A bad command cancels the open turn, still prints the result line, then
+/// exits with a usage error.
+#[test]
+fn stream_json_bad_command_cancels_and_exits_two_after_the_result() {
+    let server = MockServer::start(vec![Reply::sse(common::tool_use_sse(
+        "bash",
+        r#"{"command":"touch ran"}"#,
+    ))]);
+    let dir = TestDir::new("stream-bad");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    host.until("approval_requested");
+    host.send(r#"{"type":"quit"}"#);
+
+    assert_eq!(host.until("turn_committed")["reason"], "Cancelled");
+    let result = host.next();
+    assert_eq!(result["reason"], "Cancelled", "{result}");
+    assert!(result.get("session").is_some(), "{result}");
+    assert_eq!(host.exit_code(), Some(2));
+    assert!(!dir.path.join("ran").exists());
 }
 
 #[test]
@@ -363,6 +469,41 @@ fn output_schema_constrains_the_request() {
         "{}",
         seen(&server, 0)
     );
+}
+
+/// A schema would stay in a continued session's config after this exec, so
+/// it is refused there; a fork is a new session and takes it.
+#[test]
+fn output_schema_on_a_continued_session_is_a_usage_error() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("first")),
+        Reply::sse(common::text_sse("{}")),
+    ]);
+    let dir = TestDir::new("schema-resume");
+    dir.config(&config_body(&server, &dir.db()));
+    let schema = dir.path.join("schema.json");
+    fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+
+    let schema = schema.to_str().unwrap();
+    assert_eq!(
+        code(
+            dir.exec(&dir.path)
+                .args(["-r", &session, "--output-schema", schema, "again"])
+        ),
+        Some(2)
+    );
+    assert_eq!(server.requests().len(), 1, "nothing was sent");
+    ok(dir.exec(&dir.path).args([
+        "-r",
+        &session,
+        "--fork-session",
+        "-m",
+        "claude-fable-5-1",
+        "--output-schema",
+        schema,
+        "again",
+    ]));
 }
 
 #[test]
@@ -449,13 +590,14 @@ fn resume_finds_a_session_by_id_or_by_name() {
     dir.config(&config_body(&server, &dir.db()));
     let (_, named) = ok(dir.exec(&dir.path).args(["-n", "bugfix", "remember 42"]));
 
-    // From another directory: `-r` is not limited to the work root.
-    let other = dir.sub("other");
-    let (stdout, session) = ok(dir.exec(&other).args(["-r", "bugfix", "and?"]));
+    let (stdout, session) = ok(dir.exec(&dir.path).args(["-r", "bugfix", "and?"]));
     assert_eq!(
         (stdout.as_str(), session.as_str()),
         ("by name", named.as_str())
     );
+    // From another directory: a name matches only the work root, an id anywhere.
+    let other = dir.sub("other");
+    assert_eq!(code(dir.exec(&other).args(["-r", "bugfix", "x"])), Some(1));
     let (_, session) = ok(dir.exec(&other).args(["-r", &named, "again"]));
     assert_eq!(session, named);
     assert!(seen(&server, 2).contains("remember 42"));
