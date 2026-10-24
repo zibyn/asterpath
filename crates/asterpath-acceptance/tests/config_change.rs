@@ -1,7 +1,9 @@
 //! Mid-session config changes through real adapters. A model switch (#109):
 //! reasoning bound to the old model is not replayed, and is replayed again
 //! after switching back; the gating is the adapter's binding check. An
-//! appended instruction (#110) renders in place and keeps old thinking.
+//! appended instruction (#110) renders in place and keeps old thinking. A
+//! tool change (#111) renders inline on Anthropic and as the effective
+//! top-level `tools` on OpenAI.
 #![cfg(unix)]
 
 mod common;
@@ -19,6 +21,7 @@ use asterpath_protocol::{
     Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection,
     TurnConfig, UpdateId, UserInput,
 };
+use asterpath_protocol::{SessionEvent, ToolErrorKind, ToolResultStatus, decode_entry, scan_all};
 use asterpath_testing::http_mock::MockServer;
 use asterpath_testing::{Fixture, InMemoryEventLog};
 use futures_util::StreamExt;
@@ -393,4 +396,283 @@ async fn openai_appends_a_developer_message_after_the_tool_output() {
             "content": [{"type": "input_text", "text": "answer in French"}]
         })
     );
+}
+
+fn plain_tool(name: &str) -> ToolDescriptor {
+    ToolDescriptor {
+        name: ToolName::new(name),
+        description: format!("{name} tool"),
+        schema: json!({"type": "object"}),
+        parallelism: Parallelism::Exclusive,
+        replay: ReplaySafety::Safe,
+        side_effect: SideEffect::ReadOnly,
+        provenance: Provenance::InProcess,
+        timeout: None,
+        max_output_bytes: None,
+    }
+}
+
+/// Adds `lookup` and removes itself.
+struct Equip {
+    descriptor: ToolDescriptor,
+    handle: OnceLock<SessionHandle>,
+}
+
+impl Tool for Equip {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke(
+        &self,
+        _args: ToolArgs,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        Box::pin(async move {
+            let mut update = ConfigPatch::default();
+            update.id = Some(UpdateId::from_bytes([8; 16]));
+            update.add_tools = vec![plain_tool("lookup")];
+            update.remove_tools = vec![ToolName::new("equip")];
+            self.handle
+                .get()
+                .expect("handle set")
+                .update_config(update)
+                .await
+                .expect("update accepted");
+            Ok(ToolOutput::new(vec![Part::Text {
+                text: "equipped".to_owned(),
+            }]))
+        })
+    }
+}
+
+struct Lookup(ToolDescriptor);
+
+impl Tool for Lookup {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.0
+    }
+
+    fn invoke(
+        &self,
+        _args: ToolArgs,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        Box::pin(async {
+            Ok(ToolOutput::new(vec![Part::Text {
+                text: "found".to_owned(),
+            }]))
+        })
+    }
+}
+
+/// One turn: step 1 thinks and calls `equip`, step 2 calls `lookup`, step 3
+/// calls the removed `equip`, step 4 answers. Returns the tool result
+/// statuses with their error kinds.
+async fn run_equip_turn(
+    provider: Arc<dyn Provider>,
+    model: ModelSpec,
+) -> Vec<(ToolResultStatus, Option<ToolErrorKind>)> {
+    let equip = Arc::new(Equip {
+        descriptor: plain_tool("equip"),
+        handle: OnceLock::new(),
+    });
+    let asterpath = Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
+        .providers(vec![provider])
+        .tools(vec![equip.clone(), Arc::new(Lookup(plain_tool("lookup")))])
+        .build()
+        .await
+        .expect("build");
+    let handle = asterpath
+        .create_session(SessionSpec {
+            model,
+            system: vec![Part::Text {
+                text: "be helpful".to_owned(),
+            }],
+            tools: ToolSelection::Names(vec![ToolName::new("equip")]),
+            request: RequestConfig::default(),
+            turn: TurnConfig {
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                ..TurnConfig::default()
+            },
+            compaction: CompactionConfig::default(),
+            subagents: SubagentConfig::default(),
+        })
+        .await
+        .expect("create");
+    equip.handle.set(handle.clone()).expect("set once");
+    handle
+        .submit_input(UserInput {
+            id: InputId::from_bytes([1; 16]),
+            parts: vec![Part::Text {
+                text: "go".to_owned(),
+            }],
+        })
+        .await
+        .expect("input");
+    let mut stream = handle.drive();
+    while let Some(event) = stream.next().await {
+        event.expect("drive");
+    }
+    scan_all(&*asterpath.store(), handle.id())
+        .await
+        .expect("scan")
+        .iter()
+        .filter_map(|entry| match decode_entry(entry).expect("decode") {
+            SessionEvent::ToolResult { status, error, .. } => {
+                Some((status, error.map(|error| error.kind)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn equip_fixture(provider: &str, model: &str) -> Fixture {
+    let reasoning = json!({"Reasoning": {
+        "summary": [{"Text": {"text": "think"}}],
+        "binding": {"provider": provider, "model": model, "prefix_epoch": 0, "tools_hash": ""},
+        "raw": {"provider": provider, "model": model, "kind": "fixture", "json": "{}"},
+    }});
+    let call = |id: &str, name: &str| {
+        json!({"ToolCall": {
+            "call_id": id,
+            "provider_item_id": null,
+            "name": name,
+            "raw_args": "{}",
+            "raw": null,
+        }})
+    };
+    let done = json!({"Message": {"role": "Assistant", "parts": [{"Text": {"text": "fini"}}]}});
+    serde_json::from_value(json!({
+        "steps": [
+            step(vec![reasoning, call("call-1", "equip")], "ToolUse"),
+            step(vec![call("call-2", "lookup")], "ToolUse"),
+            step(vec![call("call-3", "equip")], "ToolUse"),
+            step(vec![done], "EndTurn"),
+        ],
+    }))
+    .expect("fixture")
+}
+
+fn expected_results() -> Vec<(ToolResultStatus, Option<ToolErrorKind>)> {
+    vec![
+        (ToolResultStatus::Completed, None),
+        (ToolResultStatus::Completed, None),
+        (ToolResultStatus::Failed, Some(ToolErrorKind::NotFound)),
+    ]
+}
+
+fn top_level_tools(body: &Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn anthropic_renders_tool_changes_inline_and_replays_the_old_thinking() {
+    let server = MockServer::start(common::mock::anthropic_replies(&equip_fixture(
+        "anthropic",
+        "claude-opus-5-5",
+    )));
+    let provider = Arc::new(AnthropicProvider::new("test-key").with_base_url(server.base_url()));
+    let results = run_equip_turn(provider, anthropic_model()).await;
+    assert_eq!(results, expected_results());
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    let after = &requests[1];
+    assert!(
+        after
+            .head
+            .to_ascii_lowercase()
+            .contains("anthropic-beta: inline-tools-2026-09-15"),
+        "{}",
+        after.head
+    );
+    let body = after.json_body();
+    assert_eq!(
+        top_level_tools(&body),
+        ["equip"],
+        "top-level tools unchanged"
+    );
+    assert_eq!(
+        body["messages"][1]["content"][0],
+        json!({"type": "thinking", "thinking": "think", "signature": "sig-anthropic"}),
+        "the thinking from before the change is replayed"
+    );
+    let system = &body["messages"][3];
+    assert_eq!(system["role"], "system");
+    assert_eq!(system["content"][0]["type"], "tool_addition");
+    assert_eq!(system["content"][0]["tool"]["definition"]["name"], "lookup");
+    assert_eq!(system["content"][1]["type"], "tool_removal");
+    assert_eq!(
+        system["content"][1]["tool"],
+        json!({"type": "tool_reference", "name": "equip"})
+    );
+    let last = requests[3].json_body();
+    assert_eq!(top_level_tools(&last), ["equip"]);
+    assert!(
+        requests[3].body.contains("is not registered"),
+        "the removed tool's call and result stay in history"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_without_inline_tools_rewrites_the_tools_and_drops_the_old_thinking() {
+    let server = MockServer::start(common::mock::anthropic_replies(&equip_fixture(
+        "anthropic",
+        "claude-opus-5-5",
+    )));
+    let provider = Arc::new(
+        AnthropicProvider::new("test-key")
+            .with_base_url(server.base_url())
+            .with_model_profile(
+                "claude-opus-5-5",
+                AnthropicModelProfile::latest().with_inline_tools(false),
+            ),
+    );
+    let results = run_equip_turn(provider, anthropic_model()).await;
+    assert_eq!(results, expected_results());
+
+    let after = &server.requests()[1];
+    assert!(!after.head.to_ascii_lowercase().contains("anthropic-beta"));
+    assert!(!after.body.contains("sig-anthropic"), "{}", after.body);
+    let body = after.json_body();
+    assert_eq!(top_level_tools(&body), ["lookup"]);
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|message| message["role"] != "system")
+    );
+}
+
+#[tokio::test]
+async fn openai_sends_the_effective_tools_and_replays_reasoning() {
+    let server = MockServer::start(common::mock::openai_replies(&equip_fixture(
+        "openai", "model-1",
+    )));
+    let provider = Arc::new(
+        OpenAiProvider::new("test-key").with_base_url(format!("{}/v1", server.base_url())),
+    );
+    let results = run_equip_turn(provider, model("model-1")).await;
+    assert_eq!(results, expected_results());
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    let body = requests[1].json_body();
+    assert_eq!(top_level_tools(&body), ["lookup"]);
+    assert_eq!(reasoning_inputs(&body).len(), 1, "reasoning is replayed");
+    let last = requests[3].json_body();
+    assert!(
+        requests[3].body.contains("is not registered"),
+        "the removed tool's call and result stay in history"
+    );
+    assert_eq!(top_level_tools(&last), ["lookup"]);
 }
