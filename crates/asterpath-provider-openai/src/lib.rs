@@ -95,7 +95,8 @@ impl Provider for OpenAiProvider {
             sampling: true,
             reasoning_roundtrip: true,
             citations: false,
-            builtin_tools: true,
+            // Only `function` tools are rendered today.
+            builtin_tools: false,
             cache_control: false,
             image_input: false,
             parallel_tool_calls: true,
@@ -159,23 +160,24 @@ async fn http_error(response: reqwest::Response) -> ProviderError {
     let request_id = asterpath_http::request_id(response.headers());
     let retry_after = asterpath_http::retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
-    let lower = body.to_lowercase();
-    let context_exceeded = lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("context window")
-        || lower.contains("too many tokens");
-    let kind = if context_exceeded {
-        ProviderErrorKind::ContextExceeded
-    } else {
-        asterpath_http::classify_status(status.as_u16())
-    };
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let field = |name: &str| parsed.pointer(name).and_then(serde_json::Value::as_str);
+    let (kind, retryable) = wire::classify_code(field("/error/code"), field("/error/type"))
+        .unwrap_or_else(|| {
+            let kind = if wire::context_exceeded_message(&body) {
+                ProviderErrorKind::ContextExceeded
+            } else {
+                asterpath_http::classify_status(status.as_u16())
+            };
+            (kind, kind.retryable_by_default())
+        });
     let message = if body.is_empty() {
         format!("openai returned HTTP {status}")
     } else {
         body.clone()
     };
     let mut error = ProviderError::new(kind, message);
-    error.retryable = kind.retryable_by_default();
+    error.retryable = retryable;
     error.retry_after = retry_after;
     error.request_id = request_id;
     if !body.is_empty() {
