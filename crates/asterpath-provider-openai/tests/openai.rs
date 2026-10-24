@@ -313,7 +313,7 @@ async fn provider_declares_openai_capabilities() {
             sampling: true,
             reasoning_roundtrip: true,
             citations: false,
-            builtin_tools: true,
+            builtin_tools: false,
             cache_control: false,
             image_input: false,
             parallel_tool_calls: true,
@@ -1002,9 +1002,12 @@ async fn identical_requests_render_identical_bytes() {
 #[tokio::test]
 async fn http_errors_are_classified() {
     let server = MockServer::start(vec![
-        MockResponse::json(429, r#"{"error":{"message":"slow down"}}"#)
-            .header("retry-after", "7")
-            .header("x-request-id", "req_1"),
+        MockResponse::json(
+            429,
+            r#"{"error":{"message":"slow down","type":"requests","code":"rate_limit_exceeded"}}"#,
+        )
+        .header("retry-after", "7")
+        .header("x-request-id", "req_1"),
         MockResponse::json(401, r#"{"error":{"message":"bad key"}}"#),
         MockResponse::json(400, r#"{"error":{"code":"context_length_exceeded"}}"#),
     ]);
@@ -1027,6 +1030,112 @@ async fn http_errors_are_classified() {
     assert_eq!(context.kind, ProviderErrorKind::ContextExceeded);
     assert!(!context.retryable);
     assert!(context.context_exceeded());
+}
+
+#[tokio::test]
+async fn quota_and_spend_limit_429s_are_not_retryable() {
+    let bodies = [
+        r#"{"error":{"message":"quota","type":"insufficient_quota","code":null}}"#,
+        r#"{"error":{"message":"spend","type":"requests","code":"project_spend_limit_exceeded"}}"#,
+        r#"{"error":{"message":"spend","type":"requests","code":"organization_spend_limit_exceeded"}}"#,
+    ];
+    let server = MockServer::start(
+        bodies
+            .iter()
+            .map(|body| MockResponse::json(429, *body))
+            .collect(),
+    );
+    let provider = provider(&server);
+    for body in bodies {
+        let events = collect(&provider, request(vec![user_text("go")])).await;
+        let error = events[0].as_ref().expect_err("quota");
+        assert!(!error.retryable, "{body}");
+    }
+}
+
+fn failed_with_code(code: &str) -> String {
+    sse(&[
+        created(0),
+        json!({
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {"code": code, "message": "failed"}
+            }
+        }),
+    ])
+}
+
+fn stream_error_with_code(code: &str) -> String {
+    sse(&[
+        created(0),
+        json!({
+            "type": "error",
+            "sequence_number": 1,
+            "code": code,
+            "message": "failed",
+            "param": null
+        }),
+    ])
+}
+
+async fn single_error(body: String) -> ProviderError {
+    let server = MockServer::start(vec![MockResponse::sse(body)]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    let errors: Vec<_> = events.into_iter().filter_map(Result::err).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    errors.into_iter().next().expect("one error")
+}
+
+#[tokio::test]
+async fn failed_and_stream_error_codes_share_one_classification() {
+    let timeout = single_error(failed_with_code("vector_store_timeout")).await;
+    assert!(timeout.retryable);
+
+    let invalid = single_error(failed_with_code("invalid_prompt")).await;
+    assert_eq!(invalid.kind, ProviderErrorKind::InvalidRequest);
+    assert!(!invalid.retryable);
+
+    let rate = single_error(stream_error_with_code("rate_limit_exceeded")).await;
+    assert_eq!(rate.kind, ProviderErrorKind::RateLimited);
+    assert!(rate.retryable);
+
+    let quota = single_error(stream_error_with_code("insufficient_quota")).await;
+    assert!(!quota.retryable);
+
+    let unknown = single_error(stream_error_with_code("something_new")).await;
+    assert_eq!(unknown.kind, ProviderErrorKind::Server);
+    assert!(unknown.retryable);
+}
+
+#[tokio::test]
+async fn only_server_executed_output_items_are_server_tool_calls() {
+    let items = [
+        json!({"id": "ws_1", "type": "web_search_call", "status": "completed"}),
+        json!({"id": "ct_1", "type": "custom_tool_call", "call_id": "call_1", "name": "x", "input": "y"}),
+        json!({"id": "sh_1", "type": "shell_call", "call_id": "call_2", "status": "completed"}),
+        json!({"id": "cu_1", "type": "computer_call", "call_id": "call_3", "status": "completed"}),
+    ];
+    let mut events = vec![created(0)];
+    let mut sequence = 1;
+    for (index, item) in (0u32..).zip(&items) {
+        events.push(added(sequence, index, item.clone()));
+        events.push(done(sequence + 1, index, item.clone()));
+        sequence += 2;
+    }
+    events.push(completed(sequence, items.to_vec(), usage_json(1, 0, 1)));
+    let server = MockServer::start(vec![MockResponse::sse(sse(&events))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    let completed = completed_items(&events);
+    assert_eq!(completed.len(), 4, "{events:?}");
+    assert!(
+        matches!(&completed[0].1, Item::ServerToolCall { name, .. } if name == "web_search_call")
+    );
+    for (_, item) in &completed[1..] {
+        assert!(matches!(item, Item::ProviderOpaque { .. }), "{item:?}");
+    }
 }
 
 struct OpenAiWire;

@@ -368,16 +368,17 @@ impl Normalizer {
                 out.push(Err(error));
             }
             "error" => {
-                let message = serde_json::from_str::<Value>(data)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "provider error".to_owned());
-                let error = ProviderError::new(ProviderErrorKind::Server, message);
+                let value = serde_json::from_str::<Value>(data).unwrap_or(Value::Null);
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider error")
+                    .to_owned();
+                let (kind, retryable) =
+                    classify_code(value.get("code").and_then(Value::as_str), None)
+                        .unwrap_or((ProviderErrorKind::Server, true));
+                let mut error = ProviderError::new(kind, message);
+                error.retryable = retryable;
                 return self.poison(error);
             }
             _ => {}
@@ -396,21 +397,15 @@ impl Normalizer {
             .and_then(Value::as_str)
             .unwrap_or("openai response failed")
             .to_owned();
-        let combined = format!("{code} {message}").to_lowercase();
-        let kind = if combined.contains("context_length")
-            || combined.contains("maximum context length")
-            || combined.contains("context window")
-            || combined.contains("too many tokens")
-        {
-            ProviderErrorKind::ContextExceeded
-        } else if combined.contains("rate_limit") {
-            ProviderErrorKind::RateLimited
-        } else if combined.contains("server_error") || combined.contains("internal") {
-            ProviderErrorKind::Server
-        } else {
-            ProviderErrorKind::InvalidRequest
-        };
+        let (kind, retryable) = classify_code(Some(code), None).unwrap_or_else(|| {
+            if context_exceeded_message(&message) {
+                (ProviderErrorKind::ContextExceeded, false)
+            } else {
+                (ProviderErrorKind::InvalidRequest, false)
+            }
+        });
         let mut error = ProviderError::new(kind, message);
+        error.retryable = retryable;
         error.request_id = response_id(raw)
             .map(str::to_owned)
             .or_else(|| self.request_id.clone())
@@ -500,9 +495,14 @@ impl Normalizer {
                 kind: kind.to_owned(),
                 raw: self.raw_data("openai.compaction", raw.get()),
             }),
-            other if other.ends_with("_call") => Ok(Item::ServerToolCall {
+            // Only types the server executes; client-executed `*_call` items stay opaque.
+            "web_search_call"
+            | "file_search_call"
+            | "code_interpreter_call"
+            | "image_generation_call"
+            | "mcp_call" => Ok(Item::ServerToolCall {
                 provider,
-                name: other.to_owned(),
+                name: kind.to_owned(),
                 call_id: item.call_id.or(item.id),
                 raw: self.raw_data("openai.server_tool_call", raw.get()),
             }),
@@ -598,6 +598,55 @@ fn usage(value: Option<&Value>) -> Usage {
                 .unwrap_or_default(),
         },
     }
+}
+
+/// Kind and retryability for a documented OpenAI error `code` / `type`; `None` when unknown.
+pub(crate) fn classify_code(
+    code: Option<&str>,
+    error_type: Option<&str>,
+) -> Option<(ProviderErrorKind, bool)> {
+    [code, error_type].into_iter().flatten().find_map(|code| {
+        let kind = match code {
+            // Billing / spend caps: a 429 that waiting will not fix.
+            "insufficient_quota"
+            | "credit_balance_exhausted"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "organization_usage_limit_exceeded" => {
+                return Some((ProviderErrorKind::RateLimited, false));
+            }
+            "rate_limit_exceeded" => ProviderErrorKind::RateLimited,
+            "server_error" => ProviderErrorKind::Server,
+            "vector_store_timeout" => ProviderErrorKind::Timeout,
+            "context_length_exceeded" => ProviderErrorKind::ContextExceeded,
+            "invalid_prompt"
+            | "invalid_image"
+            | "invalid_image_format"
+            | "invalid_base64_image"
+            | "invalid_image_url"
+            | "image_too_large"
+            | "image_too_small"
+            | "image_parse_error"
+            | "image_content_policy_violation"
+            | "invalid_image_mode"
+            | "image_file_too_large"
+            | "unsupported_image_media_type"
+            | "empty_image_file"
+            | "failed_to_download_image"
+            | "image_file_not_found" => ProviderErrorKind::InvalidRequest,
+            _ => return None,
+        };
+        Some((kind, kind.retryable_by_default()))
+    })
+}
+
+/// Message-text fallback for gateways that omit the `context_length_exceeded` code.
+pub(crate) fn context_exceeded_message(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("context window")
+        || lower.contains("too many tokens")
 }
 
 fn protocol(message: impl Into<String>) -> ProviderError {
