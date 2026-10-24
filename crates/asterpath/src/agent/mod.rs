@@ -1459,11 +1459,7 @@ fn config_at(
     decoded: &[(LogEntry, SessionEvent)],
     watermark: u64,
 ) -> Result<ConfigSnapshot, AgentError> {
-    effective_config(
-        decoded.iter().map(|(entry, event)| (entry, event)),
-        watermark,
-    )
-    .ok_or_else(|| AgentError::Corrupt {
+    effective_config(decoded, watermark).ok_or_else(|| AgentError::Corrupt {
         session,
         detail: "session log has no SessionCreated".to_owned(),
     })

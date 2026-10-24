@@ -442,13 +442,10 @@ fn effective_config_applies_changes_below_the_watermark_only() {
         changed("third"),
     ]);
     let at = |watermark| {
-        effective_config(
-            records.iter().map(|(entry, event)| (entry, event)),
-            watermark,
-        )
-        .expect("has SessionCreated")
-        .model
-        .model
+        effective_config(&records, watermark)
+            .expect("has SessionCreated")
+            .model
+            .model
     };
     assert_eq!(at(1), ModelId::new("model"), "SessionCreated alone");
     assert_eq!(
@@ -476,13 +473,7 @@ fn a_patch_overrides_only_the_fields_it_carries() {
 #[test]
 fn effective_config_needs_session_created() {
     let records = records(vec![changed("second")]);
-    assert!(
-        effective_config(
-            records.iter().map(|(entry, event)| (entry, event)),
-            u64::MAX
-        )
-        .is_none()
-    );
+    assert!(effective_config(&records, u64::MAX).is_none());
 }
 
 #[test]
@@ -574,11 +565,7 @@ fn instruction(value: &str) -> Item {
 #[test]
 fn effective_config_appends_system_instructions() {
     let records = records(vec![created_with_system("base"), appended("more")]);
-    let config = effective_config(
-        records.iter().map(|(entry, event)| (entry, event)),
-        u64::MAX,
-    )
-    .expect("config");
+    let config = effective_config(&records, u64::MAX).expect("config");
     assert_eq!(config.system, vec![text("base"), text("more")]);
 }
 
@@ -710,11 +697,7 @@ fn effective_config_adds_and_removes_tools() {
         created_with_tools(&["echo", "read"]),
         tools_changed(&["write"], &["echo"]),
     ]);
-    let config = effective_config(
-        records.iter().map(|(entry, event)| (entry, event)),
-        u64::MAX,
-    )
-    .expect("config");
+    let config = effective_config(&records, u64::MAX).expect("config");
     assert_eq!(names(&config.tools), ["read", "write"]);
 }
 

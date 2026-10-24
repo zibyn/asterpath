@@ -99,10 +99,8 @@ async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<
         if matches!(
             event,
             SessionEvent::StepStarted { .. } | SessionEvent::CompactionStarted { .. }
-        ) && let Some(effective) = effective_config(
-            decoded.iter().map(|(entry, event)| (entry, event)),
-            entry.seq,
-        ) {
+        ) && let Some(effective) = effective_config(&decoded, entry.seq)
+        {
             folder.config = effective;
         }
         folder.apply(entry, event);

@@ -605,14 +605,14 @@ async fn session_snapshot(
         .await
         .map_err(CliError::run)?;
     let decoded: Vec<_> = entries
-        .iter()
-        .filter_map(|entry| Some((entry, decode_entry(entry).ok()?)))
+        .into_iter()
+        .filter_map(|entry| {
+            let event = decode_entry(&entry).ok()?;
+            Some((entry, event))
+        })
         .collect();
     // The effective config: `resume` registers the provider the next step uses.
-    let snapshot = asterpath_protocol::effective_config(
-        decoded.iter().map(|(entry, event)| (*entry, event)),
-        u64::MAX,
-    );
+    let snapshot = asterpath_protocol::effective_config(&decoded, u64::MAX);
     asterpath.shutdown().await.map_err(aster_error)?;
     snapshot.ok_or_else(|| CliError::run(format!("session {session:?} has no SessionCreated")))
 }

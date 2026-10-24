@@ -450,13 +450,11 @@ impl SessionHandle {
             {
                 return Ok(());
             }
-            let effective = asterpath_protocol::effective_config(
-                records.iter().map(|(entry, event)| (entry, event)),
-                u64::MAX,
-            )
-            .ok_or(AsterError::Agent(AgentError::NotFound {
-                session: self.session,
-            }))?;
+            let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
+                AsterError::Agent(AgentError::NotFound {
+                    session: self.session,
+                }),
+            )?;
             self.check_tool_change(&patch, &effective.tools)?;
         }
         // Without an id a retry may land twice; whole-field overrides fold the same.

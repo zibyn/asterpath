@@ -207,11 +207,11 @@ impl ConfigPatch {
 /// every `ConfigChanged` whose `seq < watermark` applied in log order. `None`
 /// when the records hold no `SessionCreated`. The engine's only config fold:
 /// the agent, scheduler, trace, facade and CLI all read config through it.
-pub fn effective_config<'a>(
-    records: impl IntoIterator<Item = (&'a crate::LogEntry, &'a crate::SessionEvent)>,
+pub fn effective_config(
+    records: &[(crate::LogEntry, crate::SessionEvent)],
     watermark: u64,
 ) -> Option<ConfigSnapshot> {
-    let mut ordered: Vec<_> = records.into_iter().collect();
+    let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|(entry, _)| entry.seq);
     let mut config: Option<ConfigSnapshot> = None;
     for (entry, event) in ordered {

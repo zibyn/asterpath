@@ -159,13 +159,11 @@ impl Scheduler {
             // later parent changes never reach the child (ADR-0030).
             let watermark =
                 spawn_step_start(&parent_events, req.caused_by).map_or(u64::MAX, |entry| entry.seq);
-            let parent_config = effective_config(
-                parent_events.iter().map(|(entry, event)| (entry, event)),
-                watermark,
-            )
-            .ok_or(SpawnError::Execution(ExecutionError::NotFound {
-                session: req.parent.session,
-            }))?;
+            let parent_config = effective_config(&parent_events, watermark).ok_or(
+                SpawnError::Execution(ExecutionError::NotFound {
+                    session: req.parent.session,
+                }),
+            )?;
             let subagents = parent_config.subagents.clone();
             // Per-call wins; otherwise the inherited default (None by default).
             let timeout = req.timeout.or(subagents.spawn_timeout);
