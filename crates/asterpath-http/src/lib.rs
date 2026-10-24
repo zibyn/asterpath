@@ -1,12 +1,15 @@
-//! Shared HTTP helpers for provider and MCP adapters.
+//! Shared HTTP and request-rendering helpers for provider and MCP adapters.
 //!
 //! Not part of the stable surface (ADR-0026, re-audit candidate 5 revision).
 #![allow(clippy::result_large_err)]
 
 use std::time::Duration;
 
-use asterpath_protocol::{ProviderError, ProviderErrorKind};
+use asterpath_protocol::{
+    ModelRequest, ProviderError, ProviderErrorKind, ProviderId, RawProviderData,
+};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+use serde_json::{Map, Value};
 
 /// One dispatched server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,4 +133,77 @@ pub fn request_id(headers: &HeaderMap) -> Option<String> {
 
 fn protocol(message: String) -> ProviderError {
     ProviderError::new(ProviderErrorKind::StreamProtocol, message)
+}
+
+/// The `provider_options` entry for `request.spec.provider` as top-level body fields,
+/// rejecting any key in `reserved` (keys the adapter never lets a host set,
+/// written or not) as `Unsupported` and a non-object value as `InvalidRequest`.
+/// Merge the result with [`merge_provider_option`].
+pub fn provider_options_for(
+    request: &ModelRequest,
+    reserved: &[&str],
+) -> Result<Map<String, Value>, ProviderError> {
+    let provider = &request.spec.provider;
+    let Some(options) = request.provider_options.get(provider) else {
+        return Ok(Map::new());
+    };
+    let options = match serde_json::from_str(options.as_str()) {
+        Ok(Value::Object(map)) => map,
+        _ => {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("provider_options for {provider} must be a JSON object"),
+            ));
+        }
+    };
+    if let Some(key) = options.keys().find(|key| reserved.contains(&key.as_str())) {
+        return Err(provider_option_conflict(key));
+    }
+    Ok(options)
+}
+
+/// Deep-merge one `provider_options` value into the value the adapter wrote at
+/// `path`: objects merge key by key, new keys are added, and any other overlap
+/// would replace the adapter's value, so it is `Unsupported`.
+pub fn merge_provider_option(
+    target: &mut Value,
+    source: Value,
+    path: &str,
+) -> Result<(), ProviderError> {
+    match (target, source) {
+        (Value::Object(target), Value::Object(source)) => {
+            for (key, value) in source {
+                let nested = format!("{path}.{key}");
+                match target.get_mut(&key) {
+                    Some(existing) => merge_provider_option(existing, value, &nested)?,
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(provider_option_conflict(path)),
+    }
+}
+
+/// `provider_options` tried to set `path`, which the adapter writes or reserves.
+pub fn provider_option_conflict(path: &str) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Unsupported,
+        format!("provider_options may not set {path:?}: the adapter writes or reserves it"),
+    )
+}
+
+/// One top-level field of a message's raw JSON, only when the raw came from
+/// `provider` (ADR 0010); a missing or `null` field is `None`.
+pub fn same_provider_raw_field(
+    raw: Option<&RawProviderData>,
+    provider: &ProviderId,
+    field: &str,
+) -> Option<Value> {
+    raw.filter(|raw| &raw.provider == provider)
+        .and_then(|raw| serde_json::from_str::<Value>(raw.json.as_str()).ok())
+        .and_then(|mut value| value.get_mut(field).map(Value::take))
+        .filter(|value| !value.is_null())
 }

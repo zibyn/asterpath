@@ -61,69 +61,6 @@ impl ModelRequest {
             provider_options: request.provider_options.clone(),
         }
     }
-
-    /// The `provider_options` entry for `spec.provider` as top-level body fields,
-    /// rejecting any key in `reserved` (keys the adapter never lets a host set,
-    /// written or not) as `Unsupported` and a non-object value as `InvalidRequest`.
-    /// Merge the result with [`merge_provider_option`].
-    // The provider error shape is fixed by the protocol contract.
-    #[allow(clippy::result_large_err)]
-    pub fn provider_options_for(
-        &self,
-        reserved: &[&str],
-    ) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
-        let provider = &self.spec.provider;
-        let Some(options) = self.provider_options.get(provider) else {
-            return Ok(serde_json::Map::new());
-        };
-        let options = match serde_json::from_str(options.as_str()) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    format!("provider_options for {provider} must be a JSON object"),
-                ));
-            }
-        };
-        if let Some(key) = options.keys().find(|key| reserved.contains(&key.as_str())) {
-            return Err(provider_option_conflict(key));
-        }
-        Ok(options)
-    }
-}
-
-/// Deep-merge one `provider_options` value into the value the adapter wrote at
-/// `path`: objects merge key by key, new keys are added, and any other overlap
-/// would replace the adapter's value, so it is `Unsupported`.
-#[allow(clippy::result_large_err)]
-pub fn merge_provider_option(
-    target: &mut serde_json::Value,
-    source: serde_json::Value,
-    path: &str,
-) -> Result<(), ProviderError> {
-    match (target, source) {
-        (serde_json::Value::Object(target), serde_json::Value::Object(source)) => {
-            for (key, value) in source {
-                let nested = format!("{path}.{key}");
-                match target.get_mut(&key) {
-                    Some(existing) => merge_provider_option(existing, value, &nested)?,
-                    None => {
-                        target.insert(key, value);
-                    }
-                }
-            }
-            Ok(())
-        }
-        _ => Err(provider_option_conflict(path)),
-    }
-}
-
-/// `provider_options` tried to set `path`, which the adapter writes or reserves.
-pub fn provider_option_conflict(path: &str) -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::Unsupported,
-        format!("provider_options may not set {path:?}: the adapter writes or reserves it"),
-    )
 }
 
 /// Normalized streaming response events. Only `ItemCompleted` is persisted.

@@ -4,10 +4,13 @@
 //! bytes. Persisted provider raw JSON is spliced into the content arrays
 //! verbatim and is never parsed or re-serialized.
 
+use asterpath_http::{
+    merge_provider_option, provider_option_conflict, provider_options_for, same_provider_raw_field,
+};
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
     ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
-    ToolChoice, merge_provider_option, provider_option_conflict,
+    ToolChoice,
 };
 
 use crate::models::{ModelRules, Thinking, rules_for};
@@ -154,7 +157,7 @@ pub(crate) fn render(
     provider: &ProviderId,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
-    let options = request.provider_options_for(&[])?;
+    let options = provider_options_for(request, &[])?;
     let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let messages = render_messages(provider, request, &tools_hash)?;
 
@@ -296,12 +299,10 @@ fn render_messages(
                     .filter_map(|part| render_part(provider, part))
                     .collect();
                 // Only the text block's `citations` are merged from same-provider raw (ADR 0010).
-                if let Some(citations) = raw
-                    .as_ref()
-                    .filter(|raw| &raw.provider == provider)
-                    .and_then(|raw| serde_json::from_str::<Value>(raw.json.as_str()).ok())
-                    .and_then(|mut value| value.get_mut("citations").map(Value::take))
-                    .filter(|citations| citations.as_array().is_some_and(|list| !list.is_empty()))
+                if let Some(citations) =
+                    same_provider_raw_field(raw.as_ref(), provider, "citations").filter(
+                        |citations| citations.as_array().is_some_and(|list| !list.is_empty()),
+                    )
                     && let Some(Frag::Json(block)) = blocks
                         .iter_mut()
                         .find(|block| matches!(block, Frag::Json(value) if value["type"] == "text"))
