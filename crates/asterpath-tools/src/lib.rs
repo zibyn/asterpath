@@ -57,7 +57,7 @@ pub fn coding(
 }
 
 pub fn read_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::Read,
         "read_file",
@@ -72,7 +72,7 @@ pub fn read_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 }
 
 pub fn list_dir(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::List,
         "list_dir",
@@ -86,7 +86,7 @@ pub fn list_dir(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 }
 
 pub fn grep(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::Grep,
         "grep",
@@ -104,7 +104,7 @@ pub fn grep(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 }
 
 pub fn write_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::Write,
         "write_file",
@@ -122,7 +122,7 @@ pub fn write_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 }
 
 pub fn edit_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::Edit,
         "edit_file",
@@ -147,7 +147,7 @@ pub fn bash(
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: SandboxPolicy,
 ) -> Result<Arc<dyn Tool>, RelativeRoot> {
-    RootTool::new(
+    RootTool::build(
         root,
         Op::Bash { sandbox, policy },
         "bash",
@@ -180,7 +180,7 @@ struct RootTool {
 }
 
 impl RootTool {
-    fn new(
+    fn build(
         root: PathBuf,
         op: Op,
         name: &str,

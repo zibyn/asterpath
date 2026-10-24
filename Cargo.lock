@@ -124,6 +124,7 @@ dependencies = [
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "clap",
  "futures-util",
  "serde",
