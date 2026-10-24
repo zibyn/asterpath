@@ -98,7 +98,7 @@ impl Provider for OpenAiProvider {
             // Only `function` tools are rendered today.
             builtin_tools: false,
             cache_control: false,
-            image_input: false,
+            image_input: true,
             parallel_tool_calls: true,
         }
     }

@@ -315,9 +315,47 @@ async fn provider_declares_openai_capabilities() {
             citations: false,
             builtin_tools: false,
             cache_control: false,
-            image_input: false,
+            image_input: true,
             parallel_tool_calls: true,
         }
+    );
+}
+
+#[tokio::test]
+async fn user_images_render_as_input_image() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server);
+    let image = request(vec![Item::Message {
+        role: Role::User,
+        parts: vec![
+            Part::Text {
+                text: "look".to_owned(),
+            },
+            Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::Base64 {
+                    data: "AAAA".to_owned(),
+                },
+            },
+            Part::Image {
+                media_type: "image/jpeg".to_owned(),
+                source: ImageSource::Url {
+                    url: "https://example.invalid/x.jpg".to_owned(),
+                },
+            },
+        ],
+    }]);
+    let events = collect(&provider, image).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "input_image", "image_url": "https://example.invalid/x.jpg"}
+        ])
     );
 }
 
@@ -960,8 +998,9 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
         budget_tokens: Some(1024),
         ..Default::default()
     });
+    // Responses assistant output content does not accept images.
     let image = request(vec![Item::Message {
-        role: Role::User,
+        role: Role::Assistant,
         parts: vec![Part::Image {
             media_type: "image/png".to_owned(),
             source: ImageSource::Base64 {

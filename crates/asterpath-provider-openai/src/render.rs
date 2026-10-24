@@ -1,8 +1,8 @@
 //! Canonical request rendering for the OpenAI Responses API.
 
 use asterpath_protocol::{
-    Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderId,
-    RawProviderData, Role, ToolChoice,
+    ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
+    ProviderId, RawProviderData, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
@@ -300,6 +300,14 @@ fn message_item(
         match part {
             Part::Text { text } => content.push(json!({"type": text_type, "text": text})),
             Part::Refusal { text } => content.push(json!({"type": "refusal", "refusal": text})),
+            Part::Image { media_type, source } if role == Role::User => {
+                let image_url = match source {
+                    ImageSource::Url { url } => url.clone(),
+                    ImageSource::Base64 { data } => format!("data:{media_type};base64,{data}"),
+                };
+                content.push(json!({"type": "input_image", "image_url": image_url}));
+            }
+            // Responses assistant output content does not accept images.
             Part::Image { .. } => return Err(unsupported("image input")),
             Part::ProviderOpaque {
                 provider: source,
