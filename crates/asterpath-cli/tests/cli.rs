@@ -245,6 +245,102 @@ fn json_output_is_one_result_object() {
 }
 
 #[test]
+fn stream_json_output_prints_each_event_then_the_result_object() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("stream-json");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, session) = ok(dir
+        .exec(&dir.path)
+        .args(["--output-format", "stream-json", "hi"]));
+
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one json value per line"))
+        .collect();
+    let types: Vec<&str> = lines[..lines.len() - 1]
+        .iter()
+        .map(|event| event["type"].as_str().expect("tagged event"))
+        .collect();
+    assert_eq!(types.first(), Some(&"turn_started"), "{types:?}");
+    assert!(types.contains(&"model_delta"), "{types:?}");
+    assert_eq!(types.last(), Some(&"turn_committed"), "{types:?}");
+    let result = lines.last().unwrap();
+    assert_eq!(result["session"], session);
+    assert_eq!(result["result"], "Hello");
+    assert_eq!(result["reason"], "Completed");
+    assert_eq!(result["usage"]["input"]["uncached"], 5, "{result}");
+}
+
+/// A host on stdin answers the `bash` approval; closing stdin while idle ends
+/// the run with the result object.
+#[test]
+fn stream_json_input_round_trips_an_approval_through_the_host() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-input");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut child = common::process_bin()
+        .current_dir(&dir.path)
+        .args(["exec", "--config", dir.config_path().to_str().unwrap()])
+        .args(["-s", "full-access", "--output-format", "stream-json"])
+        .args(["--input-format", "stream-json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn asterpath");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut next = || -> serde_json::Value {
+        serde_json::from_str(&stdout.next().expect("a line").unwrap()).expect("json line")
+    };
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user_input","parts":[{{"Text":{{"text":"go"}}}}]}}"#
+    )
+    .unwrap();
+    let request = loop {
+        let event = next();
+        if event["type"] == "approval_requested" {
+            break event;
+        }
+    };
+    assert_eq!(request["tool"], "bash");
+    assert!(!dir.path.join("ran").exists(), "asked before running");
+    writeln!(
+        stdin,
+        r#"{{"type":"approval","call":{},"decision":"Allow"}}"#,
+        request["tool_call_id"]
+    )
+    .unwrap();
+    while next()["type"] != "turn_committed" {}
+    drop(stdin);
+
+    let result = next();
+    assert_eq!(result["result"], "done");
+    assert_eq!(result["reason"], "Completed");
+    assert!(child.wait().unwrap().success());
+    assert!(dir.path.join("ran").exists(), "the allowed bash ran");
+}
+
+#[test]
+fn stream_json_input_needs_stream_json_output() {
+    let dir = TestDir::new("stream-input-usage");
+    let server = MockServer::start(Vec::new());
+    dir.config(&config_body(&server, &dir.db()));
+    assert_eq!(
+        code(dir.exec(&dir.path).args(["--input-format", "stream-json"])),
+        Some(2)
+    );
+}
+
+#[test]
 fn output_schema_constrains_the_request() {
     let server = MockServer::start(vec![Reply::sse(common::text_sse("{}"))]);
     let dir = TestDir::new("schema");
