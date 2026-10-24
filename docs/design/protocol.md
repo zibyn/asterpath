@@ -227,11 +227,17 @@ pub struct ReasoningParams {
     pub summary: bool,                   // OpenAI reasoning.summary；Anthropic 忽略
 }
 
+#[non_exhaustive]
 pub enum ReasoningEffort {
+    Off,      // OpenAI none；Anthropic 不发 thinking 与 effort
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
+// 模型不接受该档位 → Unsupported，不就近映射（各 adapter 的 models.rs 规则表）
 ```
 
 请求规则：

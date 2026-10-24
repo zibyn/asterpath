@@ -2,12 +2,13 @@
 
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use crate::TraceSink;
+use crate::models::efforts_for;
 
 /// A protocol-level trace mark emitted while rendering.
 ///
@@ -159,6 +160,14 @@ fn validate(
     {
         return Err(unsupported("reasoning budget_tokens"));
     }
+    if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
+        && !efforts_for(request.spec.model.as_str()).contains(&effort)
+    {
+        return Err(unsupported(&format!(
+            "reasoning effort {effort:?} on {}",
+            request.spec.model
+        )));
+    }
     Ok(())
 }
 
@@ -188,9 +197,14 @@ fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
         object.insert(
             "effort".to_owned(),
             json!(match effort {
-                asterpath_protocol::ReasoningEffort::Low => "low",
-                asterpath_protocol::ReasoningEffort::Medium => "medium",
-                asterpath_protocol::ReasoningEffort::High => "high",
+                ReasoningEffort::Off => "none",
+                ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+                ReasoningEffort::XHigh => "xhigh",
+                ReasoningEffort::Max => "max",
+                _ => unreachable!("validate rejects efforts missing from the model table"),
             }),
         );
     }

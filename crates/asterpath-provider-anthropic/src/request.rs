@@ -110,8 +110,18 @@ pub(crate) fn check(
     }
     if let Some(reasoning) = &request.reasoning {
         let rules = rules_for(request.spec.model.as_str());
-        if reasoning.effort.is_some() && !rules.effort {
-            return Err(unsupported("reasoning.effort"));
+        if let Some(effort) = reasoning.effort
+            && !rules.efforts.contains(&effort)
+        {
+            return Err(unsupported(&format!(
+                "reasoning.effort {effort:?} on {}",
+                request.spec.model
+            )));
+        }
+        if reasoning.effort == Some(ReasoningEffort::Off) && reasoning.budget_tokens.is_some() {
+            return Err(invalid_request(
+                "reasoning.effort Off contradicts reasoning.budget_tokens",
+            ));
         }
         if reasoning.budget_tokens.is_some() {
             if rules.thinking == Thinking::Adaptive {
@@ -208,7 +218,11 @@ pub(crate) fn render(
             fields.push(("top_k", Frag::Json(json!(top_k))));
         }
     }
-    if let Some(reasoning) = &request.reasoning {
+    if let Some(reasoning) = request
+        .reasoning
+        .as_ref()
+        .filter(|reasoning| reasoning.effort != Some(ReasoningEffort::Off))
+    {
         // check() has rejected combinations the model does not accept.
         let rules = rules_for(request.spec.model.as_str());
         let thinking = match (reasoning.budget_tokens, rules.thinking) {
@@ -227,6 +241,9 @@ pub(crate) fn render(
                 ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
+                ReasoningEffort::XHigh => "xhigh",
+                ReasoningEffort::Max => "max",
+                _ => unreachable!("check rejects efforts missing from the model table"),
             };
             fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
         }

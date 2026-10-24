@@ -1300,3 +1300,82 @@ async fn message_raw_from_another_provider_is_ignored() {
         rendered_input(assistant_with_raw("hello", None)).await
     );
 }
+
+fn with_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> ModelRequest {
+    let mut request = request(vec![user_text("hello")]);
+    request.spec = spec(model);
+    request.reasoning = Some(asterpath_protocol::ReasoningParams {
+        effort: Some(effort),
+        ..asterpath_protocol::ReasoningParams::default()
+    });
+    request
+}
+
+#[tokio::test]
+async fn every_effort_renders_its_wire_value_on_a_model_that_accepts_it() {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Max, Medium, Minimal, Off, XHigh};
+    let cases = [
+        ("gpt-6-luna", Off, "none"),
+        ("gpt-5", Minimal, "minimal"),
+        ("gpt-6.1-sol", Low, "low"),
+        ("gpt-6.1-sol", Medium, "medium"),
+        ("gpt-5", High, "high"),
+        ("gpt-5.5", XHigh, "xhigh"),
+        ("gpt-6-astra", Max, "max"),
+    ];
+    let server = MockServer::start(
+        cases
+            .iter()
+            .map(|_| MockResponse::sse(completed_text_body("Hi")))
+            .collect(),
+    );
+    let provider = provider(&server);
+    for (model, effort, _) in cases {
+        let events = collect(&provider, with_effort(model, effort)).await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "{model} {effort:?}: {events:?}"
+        );
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), cases.len());
+    for (recorded, (model, _, wire)) in recorded.iter().zip(cases) {
+        let body: Value = serde_json::from_str(&recorded.body).expect("request json");
+        assert_eq!(body["reasoning"], json!({"effort": wire}), "{model}");
+    }
+}
+
+#[tokio::test]
+async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Max, Minimal, Off, XHigh};
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+    for (model, effort) in [
+        ("gpt-6.1-sol", Off),
+        ("gpt-6.1-sol", Minimal),
+        ("gpt-6-astra", Off),
+        ("gpt-5", Off),
+        ("gpt-5", XHigh),
+        ("gpt-5.5", Max),
+        ("gpt-5.1", Minimal),
+        ("gpt-5-pro", Low),
+        ("gpt-5.5-pro", Low),
+        ("gpt-5.4-pro", Off),
+        // Unknown ids get the newest rules (GPT-6.1 Sol): no `none`.
+        ("gpt-next", Off),
+    ] {
+        let events = collect(&provider, with_effort(model, effort)).await;
+        let error = events[0].as_ref().expect_err("unsupported");
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::Unsupported,
+            "{model} {effort:?}"
+        );
+        assert!(error.message.contains(&format!("{effort:?}")), "{error:?}");
+    }
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let events = collect(&self::provider(&server), with_effort("gpt-next", High)).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+}

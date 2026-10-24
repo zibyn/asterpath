@@ -341,9 +341,13 @@ fn parse_tool_choice(value: &str) -> Result<ToolChoice, String> {
 
 fn parse_effort(value: &str) -> Result<ReasoningEffort, String> {
     match value {
+        "off" => Ok(ReasoningEffort::Off),
+        "minimal" => Ok(ReasoningEffort::Minimal),
         "low" => Ok(ReasoningEffort::Low),
         "medium" => Ok(ReasoningEffort::Medium),
         "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::XHigh),
+        "max" => Ok(ReasoningEffort::Max),
         other => Err(format!("unknown reasoning effort {other}")),
     }
 }
@@ -694,6 +698,22 @@ mod tests {
             ToolChoice::Tool(ToolName::new("search"))
         );
         assert!(parse_tool_choice("").is_err());
+    }
+
+    #[test]
+    fn effort_accepts_every_level() {
+        for (text, effort) in [
+            ("off", ReasoningEffort::Off),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+        ] {
+            assert_eq!(parse_effort(text).unwrap(), effort);
+        }
+        assert!(parse_effort("none").is_err());
     }
 
     #[test]
