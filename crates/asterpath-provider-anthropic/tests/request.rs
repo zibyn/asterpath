@@ -1259,3 +1259,139 @@ async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
     spec.model = ModelId::new("deepseek-flash");
     assert!(!asterpath_protocol::Provider::capabilities(&plain, &spec).sampling);
 }
+
+const THINKING: &str = r#"{"type":"thinking","thinking":"plan","signature":"sig-1"}"#;
+const LATER_THINKING: &str = r#"{"type":"thinking","thinking":"again","signature":"sig-2"}"#;
+
+fn thinking(model_id: &str, raw: &str) -> Item {
+    Item::Reasoning {
+        summary: Vec::new(),
+        binding: ReasoningBinding {
+            provider: model().provider,
+            model: ModelId::new(model_id),
+            prefix_epoch: 0,
+            tools_hash: asterpath_protocol::tools_hash(&[]),
+        },
+        raw: RawProviderData {
+            provider: model().provider,
+            model: Some(ModelId::new(model_id)),
+            kind: "anthropic.thinking".to_owned(),
+            json: JsonString::new(raw),
+        },
+    }
+}
+
+/// A tool loop with an instruction appended after the tool result.
+fn instructed_request(model_id: &str) -> ModelRequest {
+    let mut request = request_for(model_id);
+    request.items = vec![
+        user_message(vec![text("hi")]),
+        thinking(model_id, THINKING),
+        Item::ToolCall {
+            call_id: "toolu_1".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("echo"),
+            raw_args: JsonString::new("{}"),
+            raw: None,
+        },
+        Item::ToolResult {
+            call_id: "toolu_1".to_owned(),
+            provider_item_id: None,
+            parts: vec![text("done")],
+            is_error: false,
+            raw: None,
+        },
+        Item::Instruction {
+            parts: vec![text("answer in French")],
+        },
+    ];
+    request
+}
+
+#[tokio::test]
+async fn an_instruction_renders_as_a_system_message_and_keeps_old_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    drain(&provider(&server), instructed_request("claude-opus-5-5")).await;
+    let request = &server.requests()[0];
+    assert!(request.body.contains(THINKING), "old thinking is replayed");
+    let body = request.json_body();
+    assert_eq!(body["system"][0]["text"], "be helpful");
+    assert_eq!(
+        body["system"].as_array().unwrap().len(),
+        1,
+        "top-level system is unchanged"
+    );
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{body}");
+    assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    assert_eq!(messages[3]["role"], "system");
+    assert_eq!(messages[3]["content"][0]["text"], "answer in French");
+}
+
+#[tokio::test]
+async fn an_instruction_followed_by_user_input_moves_after_it() {
+    // The API accepts a system message only before an assistant turn or at the end.
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.items = vec![
+        user_message(vec![text("first")]),
+        Item::Instruction {
+            parts: vec![text("rule")],
+        },
+        user_message(vec![text("second")]),
+        assistant_message(vec![text("ok")]),
+    ];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    let roles: Vec<&str> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "system", "assistant"], "{body}");
+    assert_eq!(body["messages"][0]["content"][1]["text"], "second");
+}
+
+#[tokio::test]
+async fn without_inline_system_an_instruction_joins_the_top_level_system_and_drops_old_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let provider = provider(&server).with_model_profile(
+        "claude-opus-5-5",
+        AnthropicModelProfile::latest().with_inline_system(false),
+    );
+    let mut request = instructed_request("claude-opus-5-5");
+    request
+        .items
+        .push(thinking("claude-opus-5-5", LATER_THINKING));
+    request
+        .items
+        .push(assistant_message(vec![text("d'accord")]));
+    request.items.push(user_message(vec![text("merci")]));
+    drain(&provider, request).await;
+    let sent = &server.requests()[0];
+    assert!(
+        !sent.body.contains(THINKING),
+        "thinking before the change is dropped"
+    );
+    assert!(
+        sent.body.contains(LATER_THINKING),
+        "thinking after it is kept"
+    );
+    let body = sent.json_body();
+    let system: Vec<&str> = body["system"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(system, ["be helpful", "answer in French"]);
+    assert!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["role"] != "system"),
+        "{body}"
+    );
+}

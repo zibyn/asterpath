@@ -15,6 +15,10 @@
 //! default, but it takes `between_tools` instead of `"disabled"`). Unrecognized
 //! ids get [`LATEST`] and so reject `Off` too.
 //!
+//! `inline_system`: the supported-models list of build-with-claude/
+//! mid-conversation-system-messages (checked 2026-10-24; no beta header). Sonnet 5
+//! is listed as unsupported; models the page does not list fall back.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
 //! (`claude-opus-5`). Ids no row matches get [`LATEST`], so a new model works
@@ -55,6 +59,10 @@ pub struct AnthropicModelProfile {
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p` / `top_k`.
     pub sampling: bool,
+    /// Accepts `role: "system"` messages inside `messages`. Without it an
+    /// appended instruction joins the top-level `system`, and thinking from
+    /// before it is dropped.
+    pub inline_system: bool,
 }
 
 impl AnthropicModelProfile {
@@ -93,6 +101,12 @@ impl AnthropicModelProfile {
         self
     }
 
+    #[must_use]
+    pub fn with_inline_system(mut self, inline: bool) -> Self {
+        self.inline_system = inline;
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
     pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
@@ -111,7 +125,13 @@ const fn rules(
         thinking_default_on: false,
         forced_tool_choice: forced,
         sampling,
+        inline_system: false,
     }
+}
+
+const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+    profile.inline_system = true;
+    profile
 }
 
 const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
@@ -119,19 +139,27 @@ const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1 and unrecognized ids.
-const LATEST: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
-/// Opus 5, Sonnet 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
+const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
+/// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
     efforts: Cow::Borrowed(OFF_TO_MAX),
     thinking_default_on: true,
     forced_tool_choice: true,
     sampling: false,
+    inline_system: true,
+};
+/// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
+const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
+    inline_system: false,
+    ..ADAPTIVE
 };
 /// Fable 5 and Mythos 5: thinking is always on.
-const ALWAYS_ON: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, true, false);
-/// Opus 4.7 / 4.8: thinking is off by default.
+const ALWAYS_ON: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, true, false));
+/// Opus 4.7: thinking is off by default.
 const ADAPTIVE_OFF: AnthropicModelProfile = rules(Thinking::Adaptive, OFF_TO_MAX, true, false);
+/// Opus 4.8: as [`ADAPTIVE_OFF`], with mid-conversation system messages.
+const OPUS_4_8: AnthropicModelProfile = inline(ADAPTIVE_OFF);
 const MYTHOS_PREVIEW: AnthropicModelProfile = rules(Thinking::Both, NO_XHIGH, true, true);
 const BOTH: AnthropicModelProfile =
     rules(Thinking::Both, &[Off, Low, Medium, High, Max], true, true);
@@ -146,11 +174,11 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-mythos-5-1", LATEST),
     ("claude-haiku-5-5", ADAPTIVE),
     ("claude-opus-5", ADAPTIVE),
-    ("claude-sonnet-5", ADAPTIVE),
+    ("claude-sonnet-5", SONNET_5),
     ("claude-fable-5", ALWAYS_ON),
     ("claude-mythos-5", ALWAYS_ON),
     ("claude-mythos-preview", MYTHOS_PREVIEW),
-    ("claude-opus-4-8", ADAPTIVE_OFF),
+    ("claude-opus-4-8", OPUS_4_8),
     ("claude-opus-4-7", ADAPTIVE_OFF),
     ("claude-opus-4-6", BOTH),
     ("claude-sonnet-4-6", BOTH),
@@ -199,6 +227,29 @@ mod tests {
         assert_eq!(*builtin("claude-opus-4-1-20250805"), EXTENDED);
         assert_eq!(*builtin("claude-sonnet-4-20250514"), EXTENDED);
         assert_eq!(*builtin("claude-next"), LATEST);
+    }
+
+    #[test]
+    fn inline_system_follows_the_supported_model_list() {
+        for (model, inline) in [
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-haiku-5-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-mythos-5-1", true),
+            ("claude-fable-5", true),
+            ("claude-mythos-5", true),
+            ("claude-opus-5", true),
+            ("claude-opus-4-8", true),
+            ("claude-next", true),
+            ("claude-sonnet-5", false),
+            ("claude-opus-4-7", false),
+            ("claude-mythos-preview", false),
+            ("claude-sonnet-4-6", false),
+            ("claude-3-haiku", false),
+        ] {
+            assert_eq!(builtin(model).inline_system, inline, "{model}");
+        }
     }
 
     #[test]

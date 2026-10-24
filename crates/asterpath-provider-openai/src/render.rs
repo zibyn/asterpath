@@ -335,6 +335,13 @@ fn render_input(
                     "content": text_content(parts, provider, trace),
                 }))?);
             }
+            Item::Instruction { parts } => {
+                input.push(raw(json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": text_content(parts, provider, trace),
+                }))?);
+            }
         }
     }
     Ok(input)

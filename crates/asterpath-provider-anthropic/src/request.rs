@@ -100,9 +100,14 @@ pub(crate) fn check(
     if let Some(feature) = capabilities.unsupported_feature(request) {
         return Err(unsupported(feature));
     }
+    let instructions = request.items.iter().flat_map(|item| match item {
+        Item::Instruction { parts } => parts.as_slice(),
+        _ => &[],
+    });
     if !request
         .system
         .iter()
+        .chain(instructions)
         .all(|part| matches!(part, Part::Text { .. }))
     {
         return Err(invalid_request("system may only contain text parts"));
@@ -160,16 +165,23 @@ pub(crate) fn render(
 ) -> Result<String, ProviderError> {
     let options = provider_options_for(request, &[])?;
     let tools_hash = asterpath_protocol::tools_hash(&request.tools);
-    let messages = render_messages(provider, request, &tools_hash)?;
+    let messages = render_messages(provider, request, &tools_hash, rules.inline_system)?;
+    let mut system: Vec<&Part> = request.system.iter().collect();
+    if !rules.inline_system {
+        // Fallback: appended instructions join the top-level system.
+        system.extend(request.items.iter().flat_map(|item| match item {
+            Item::Instruction { parts } => parts.as_slice(),
+            _ => &[],
+        }));
+    }
 
     let mut fields: Vec<(&str, Frag)> = vec![
         ("model", Frag::Json(json!(request.spec.model.as_str()))),
         ("max_tokens", Frag::Json(json!(request.max_output_tokens))),
     ];
-    if !request.system.is_empty() {
-        let mut blocks: Vec<Value> = request
-            .system
-            .iter()
+    if !system.is_empty() {
+        let mut blocks: Vec<Value> = system
+            .into_iter()
             .map(|part| match part {
                 Part::Text { text } => json!({"type": "text", "text": text}),
                 _ => unreachable!("check rejects non-text system parts"),
@@ -285,13 +297,50 @@ struct PendingMessage {
     other: Vec<Frag>,
 }
 
+/// Messages being rendered. Instruction blocks wait for the next assistant
+/// turn (or the end): the API accepts a content-carrying system message only
+/// after a user turn and before an assistant turn or the end of `messages`.
+#[derive(Default)]
+struct Messages {
+    list: Vec<PendingMessage>,
+    system: Vec<Frag>,
+}
+
+impl Messages {
+    fn push(&mut self, role: &'static str, tool_results: Vec<Frag>, other: Vec<Frag>) {
+        if role == "assistant" {
+            self.flush_system();
+        }
+        push_blocks(&mut self.list, role, tool_results, other);
+    }
+
+    fn flush_system(&mut self) {
+        if !self.system.is_empty() {
+            let system = std::mem::take(&mut self.system);
+            push_blocks(&mut self.list, "system", Vec::new(), system);
+        }
+    }
+}
+
 fn render_messages(
     provider: &ProviderId,
     request: &ModelRequest,
     tools_hash: &str,
+    inline_system: bool,
 ) -> Result<String, ProviderError> {
-    let mut messages: Vec<PendingMessage> = Vec::new();
-    for item in &request.items {
+    // On the fallback path the top-level system holds every instruction, so
+    // thinking produced before the last one was bound to a different system.
+    let replay_from = if inline_system {
+        0
+    } else {
+        request
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction { .. }))
+            .map_or(0, |index| index + 1)
+    };
+    let mut messages = Messages::default();
+    for (index, item) in request.items.iter().enumerate() {
         match item {
             Item::Message { role, parts, raw } => {
                 let mut blocks: Vec<Frag> = parts
@@ -310,13 +359,12 @@ fn render_messages(
                     block["citations"] = citations;
                 }
                 if !blocks.is_empty() {
-                    push_blocks(&mut messages, role_name(*role), Vec::new(), blocks);
+                    messages.push(role_name(*role), Vec::new(), blocks);
                 }
             }
             Item::Reasoning { binding, raw, .. } => {
-                if replayable(binding, raw, request, tools_hash) {
-                    push_blocks(
-                        &mut messages,
+                if index >= replay_from && replayable(binding, raw, request, tools_hash) {
+                    messages.push(
                         "assistant",
                         Vec::new(),
                         vec![Frag::Raw(raw.json.as_str().to_owned())],
@@ -337,8 +385,7 @@ fn render_messages(
                         "tool call {call_id} raw_args must be a JSON object"
                     )));
                 }
-                push_blocks(
-                    &mut messages,
+                messages.push(
                     "assistant",
                     Vec::new(),
                     vec![Frag::Json(json!({
@@ -365,7 +412,7 @@ fn render_messages(
                     ("content", Frag::Raw(array(content))),
                     ("is_error", Frag::Json(json!(is_error))),
                 ]);
-                push_blocks(&mut messages, "user", vec![block], Vec::new());
+                messages.push("user", vec![block], Vec::new());
             }
             Item::ServerToolCall {
                 provider: item_provider,
@@ -383,8 +430,7 @@ fn render_messages(
                 ..
             } => {
                 if item_provider == provider {
-                    push_blocks(
-                        &mut messages,
+                    messages.push(
                         "assistant",
                         Vec::new(),
                         vec![Frag::Raw(raw.json.as_str().to_owned())],
@@ -397,14 +443,23 @@ fn render_messages(
                     .filter_map(|part| render_part(provider, part))
                     .collect();
                 if !blocks.is_empty() {
-                    push_blocks(&mut messages, "user", Vec::new(), blocks);
+                    messages.push("user", Vec::new(), blocks);
                 }
             }
+            Item::Instruction { parts } if inline_system => {
+                messages
+                    .system
+                    .extend(parts.iter().filter_map(|part| render_part(provider, part)));
+            }
+            // Rendered into the top-level system by `render`.
+            Item::Instruction { .. } => {}
         }
     }
+    messages.flush_system();
 
-    let count = messages.len();
+    let count = messages.list.len();
     let rendered = messages
+        .list
         .into_iter()
         .enumerate()
         .map(|(position, message)| {

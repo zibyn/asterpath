@@ -973,6 +973,33 @@ async fn compaction_renders_as_a_user_text_message() {
 }
 
 #[tokio::test]
+async fn an_instruction_renders_as_a_developer_message_in_place() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
+    let mut request = request(vec![
+        user_text("hi"),
+        Item::Instruction {
+            parts: texts("answer in French"),
+        },
+    ]);
+    request.system = texts("be helpful");
+    let events = collect(&provider(&server), request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["instructions"], "be helpful",
+        "the baseline is unchanged"
+    );
+    assert_eq!(
+        body["input"][1],
+        json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "answer in French"}]
+        })
+    );
+}
+
+#[tokio::test]
 async fn provider_opaque_and_server_tools_replay_only_for_the_same_provider() {
     let raw = r#"{"type":"web_search_call","id":"ws_1","status":"completed"}"#;
     let server = MockServer::start(vec![
