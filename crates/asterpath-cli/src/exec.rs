@@ -1,8 +1,5 @@
-//! `asterpath exec`: one headless turn (packaging.md §4.3).
-//!
-//! `--output-format stream-json` and `--input-format` plug in here: a new
-//! [`OutputFormat`] variant that prints each `AgentEvent` from the drive and
-//! the same result object last.
+//! `asterpath exec`: one headless turn (packaging.md §4.3). `stream-json`
+//! output and input are served by [`crate::stream`].
 
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -13,6 +10,7 @@ use clap::{Args, ValueEnum};
 
 use crate::drive::{self, PromptIo, final_assistant_text, scan, turn_result};
 use crate::session::{self, SessionArgs};
+use crate::stream;
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
 
 #[derive(Args)]
@@ -22,6 +20,9 @@ pub struct ExecArgs {
     /// What stdout carries.
     #[arg(long, value_enum, default_value_t)]
     output_format: OutputFormat,
+    /// What stdin carries; `stream-json` needs `--output-format stream-json`.
+    #[arg(long, value_enum, default_value_t)]
+    input_format: InputFormat,
     /// JSON Schema the final reply must follow (structured output).
     #[arg(long, value_name = "FILE")]
     output_schema: Option<PathBuf>,
@@ -36,20 +37,42 @@ enum OutputFormat {
     Text,
     /// One result object.
     Json,
+    /// One `AgentEvent` per line, then the result object.
+    StreamJson,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
+enum InputFormat {
+    /// The prompt as text.
+    #[default]
+    Text,
+    /// One command per line; approvals are asked over the stream.
+    StreamJson,
 }
 
 pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     let continuing = args.session.continuing();
+    let commands = args.input_format == InputFormat::StreamJson;
+    if commands && !matches!(args.output_format, OutputFormat::StreamJson) {
+        return Err(CliError::config(
+            "--input-format stream-json needs --output-format stream-json",
+        ));
+    }
     // Files are read before the work root changes the process directory.
     let schema = args.output_schema.as_deref().map(read_schema).transpose()?;
     let mut parts = Vec::new();
-    if let Some(text) = input_text(args.prompt.as_deref(), continuing)? {
+    let text = if commands {
+        args.prompt.clone().filter(|prompt| prompt != "-")
+    } else {
+        input_text(args.prompt.as_deref(), continuing)?
+    };
+    if let Some(text) = text {
         parts.push(Part::Text { text });
     }
     for path in &args.session.images {
         parts.push(attachment(path)?);
     }
-    if parts.is_empty() && !continuing {
+    if parts.is_empty() && !continuing && !commands {
         return Err(CliError::config(
             "no prompt: give PROMPT or pipe it on stdin",
         ));
@@ -57,24 +80,29 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
 
     let opened = session::open(global, &args.session, schema).await?;
     let handle = &opened.handle;
-    let mut outcome = drive::DriveOutcome::default();
-    let mut ran = false;
     // A continued session first finishes what it had open (crash recovery).
-    if opened.continued && handle.facts().await.map_err(aster_error)?.is_wakeable() {
-        outcome = drive::drive(handle, no_prompt()).await?;
-        ran = true;
-    }
-    if !parts.is_empty() {
-        handle
-            .submit_input(UserInput {
-                id: InputId::from_bytes(unique_bytes(SystemClock.now())),
-                parts,
-            })
-            .await
-            .map_err(aster_error)?;
-        outcome = drive::drive(handle, no_prompt()).await?;
-        ran = true;
-    }
+    let recover = opened.continued && handle.facts().await.map_err(aster_error)?.is_wakeable();
+    let (outcome, ran) = if let OutputFormat::StreamJson = args.output_format {
+        let start = recover || !parts.is_empty();
+        if !parts.is_empty() {
+            submit(handle, parts).await?;
+        }
+        // Only a host on stdin can answer; otherwise the framework denies every `Ask`.
+        let _endpoint = commands.then(|| opened.asterpath.approval_gate().register());
+        let stdin = commands.then(|| tokio::io::BufReader::new(tokio::io::stdin()));
+        stream::run(handle, start, stdin, &mut io::stdout()).await?
+    } else {
+        let input = !parts.is_empty();
+        let mut outcome = drive::DriveOutcome::default();
+        if recover {
+            outcome = drive::drive(handle, no_prompt()).await?;
+        }
+        if input {
+            submit(handle, parts).await?;
+            outcome = drive::drive(handle, no_prompt()).await?;
+        }
+        (outcome, recover || input)
+    };
 
     let entries = scan(opened.asterpath.store(), handle.id())
         .await
@@ -87,7 +115,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
                 println!("{text}");
             }
         }
-        OutputFormat::Json => println!(
+        OutputFormat::Json | OutputFormat::StreamJson => println!(
             "{}",
             serde_json::json!({
                 "session": handle.id().to_hex(),
@@ -99,6 +127,17 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     }
     opened.shutdown().await?;
     turn_result(outcome.reason.as_ref(), &entries)
+}
+
+pub async fn submit(handle: &asterpath::SessionHandle, parts: Vec<Part>) -> CliResult<()> {
+    handle
+        .submit_input(UserInput {
+            id: InputId::from_bytes(unique_bytes(SystemClock.now())),
+            parts,
+        })
+        .await
+        .map(drop)
+        .map_err(aster_error)
 }
 
 /// `exec` has no approval channel without `--input-format stream-json`, so no
