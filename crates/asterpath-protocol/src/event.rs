@@ -3,7 +3,9 @@
 use crate::{LogId, LogIdRange, SessionId, StepId, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ConfigSnapshot, ContextPolicy, ModelSpec, Provenance, ReplaySafety};
+use crate::config::{
+    ConfigPatch, ConfigSnapshot, ContextPolicy, ModelSpec, Provenance, ReplaySafety,
+};
 use crate::ids::JsonString;
 use crate::ids::ToolName;
 use crate::item::{Item, Part, RawProviderData};
@@ -124,6 +126,11 @@ pub enum SessionEvent {
         tool_call_id: ToolCallId,
         decision: ApprovalDecision,
     },
+    /// A host change to the effective configuration; it takes effect at the
+    /// next `StepStarted` (ADR-0030).
+    ConfigChanged {
+        patch: ConfigPatch,
+    },
 }
 
 impl SessionEvent {
@@ -149,6 +156,7 @@ impl SessionEvent {
             Self::ChildSessionSpawned { .. } => "ChildSessionSpawned",
             Self::ChildSessionCompleted { .. } => "ChildSessionCompleted",
             Self::ApprovalDecided { .. } => "ApprovalDecided",
+            Self::ConfigChanged { .. } => "ConfigChanged",
         }
     }
 }

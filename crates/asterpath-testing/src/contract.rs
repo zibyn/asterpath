@@ -37,6 +37,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     idempotent_append(store).await;
     shared_dedup_key_pairs(store).await;
     monotonic_seq(store).await;
+    config_changes(store).await;
     cursor_scan(store).await;
     independent_streams(store).await;
     hard_errors(store).await;
@@ -377,6 +378,29 @@ async fn monotonic_seq(log: &dyn SessionStore) {
         1,
         "G3: seq is per session, not global"
     );
+}
+
+/// `ConfigChanged` has no dedup key: every change is its own record and
+/// decodes back to the same patch.
+async fn config_changes(log: &dyn SessionStore) {
+    let sid = session(35);
+    let mut patch = asterpath_protocol::ConfigPatch::default();
+    patch.model = Some(ModelSpec {
+        model: ModelId::new("model-2"),
+        ..model()
+    });
+    let event = SessionEvent::ConfigChanged { patch };
+    let first = append(log, sid, &event, None).await;
+    let second = append(log, sid, &event, None).await;
+    assert_ne!(first, second, "a keyless ConfigChanged is never deduplicated");
+    let entries = scan(log, sid).await;
+    assert_eq!(entries.len(), 2);
+    for entry in &entries {
+        assert_eq!(
+            asterpath_protocol::decode_entry(entry).expect("decode"),
+            event
+        );
+    }
 }
 
 async fn cursor_scan(log: &dyn SessionStore) {

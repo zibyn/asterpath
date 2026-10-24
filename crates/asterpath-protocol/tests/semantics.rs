@@ -409,3 +409,87 @@ fn usage_totals_use_the_exclusive_rule() {
     assert_eq!(usage.input_total(), 15);
     assert_eq!(usage.total(), 22);
 }
+
+fn changed(model_name: &str) -> SessionEvent {
+    let mut patch = ConfigPatch::default();
+    patch.model = Some(ModelSpec {
+        model: ModelId::new(model_name),
+        ..model()
+    });
+    SessionEvent::ConfigChanged { patch }
+}
+
+fn records(events: Vec<SessionEvent>) -> Vec<(LogEntry, SessionEvent)> {
+    events
+        .into_iter()
+        .zip(1u64..)
+        .map(|(event, seq)| (entry(seq, LOG_SCHEMA_VERSION, json!(null)), event))
+        .collect()
+}
+
+#[test]
+fn effective_config_applies_changes_below_the_watermark_only() {
+    let records = records(vec![
+        SessionEvent::SessionCreated {
+            config: config(),
+            parent: None,
+        },
+        changed("second"),
+        SessionEvent::StepStarted {
+            turn_id: turn(1),
+            step_id: step(1),
+        },
+        changed("third"),
+    ]);
+    let at = |watermark| {
+        effective_config(
+            records.iter().map(|(entry, event)| (entry, event)),
+            watermark,
+        )
+        .expect("has SessionCreated")
+        .model
+        .model
+    };
+    assert_eq!(at(1), ModelId::new("model"), "SessionCreated alone");
+    assert_eq!(
+        at(3),
+        ModelId::new("second"),
+        "the step at seq 3 sees seq 2"
+    );
+    assert_eq!(at(u64::MAX), ModelId::new("third"));
+}
+
+#[test]
+fn a_patch_overrides_only_the_fields_it_carries() {
+    let request = RequestConfig {
+        stop_sequences: vec!["END".to_owned()],
+        ..RequestConfig::default()
+    };
+    let mut patch = ConfigPatch::default();
+    patch.request = Some(request.clone());
+    let mut snapshot = config();
+    snapshot.apply(&patch);
+    assert_eq!(snapshot.request, request);
+    assert_eq!(snapshot.model, model(), "an absent field keeps its value");
+}
+
+#[test]
+fn effective_config_needs_session_created() {
+    let records = records(vec![changed("second")]);
+    assert!(
+        effective_config(
+            records.iter().map(|(entry, event)| (entry, event)),
+            u64::MAX
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn config_changed_round_trips_through_the_log_encoding() {
+    let event = changed("second");
+    assert_eq!(event.kind(), "ConfigChanged");
+    let new = encode_entry(session(1), None, &event).expect("encode");
+    let stored = entry(1, new.schema_version, new.payload);
+    assert_eq!(decode_entry(&stored).expect("decode"), event);
+}

@@ -161,7 +161,48 @@ pub enum ContextPolicy {
     Fork { at: LogId },
 }
 
-/// The persistent projection of a session's construction-time configuration.
+/// The fields one `ConfigChanged` overrides (ADR-0030). Each present field
+/// replaces the effective value whole; absent fields keep theirs.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigPatch {
+    #[serde(default)]
+    pub model: Option<ModelSpec>,
+    #[serde(default)]
+    pub request: Option<RequestConfig>,
+}
+
+/// The effective configuration at `watermark`: `SessionCreated.config` with
+/// every `ConfigChanged` whose `seq < watermark` applied in log order. `None`
+/// when the records hold no `SessionCreated`. The engine's only config fold.
+pub fn effective_config<'a>(
+    records: impl IntoIterator<Item = (&'a crate::LogEntry, &'a crate::SessionEvent)>,
+    watermark: u64,
+) -> Option<ConfigSnapshot> {
+    let mut ordered: Vec<_> = records.into_iter().collect();
+    ordered.sort_by_key(|(entry, _)| entry.seq);
+    let mut config: Option<ConfigSnapshot> = None;
+    for (entry, event) in ordered {
+        match event {
+            crate::SessionEvent::SessionCreated {
+                config: created, ..
+            } if config.is_none() => {
+                config = Some(created.clone());
+            }
+            crate::SessionEvent::ConfigChanged { patch } if entry.seq < watermark => {
+                if let Some(config) = &mut config {
+                    config.apply(patch);
+                }
+            }
+            _ => {}
+        }
+    }
+    config
+}
+
+/// The persistent projection of a session's configuration. In
+/// `SessionCreated` it is the initial value; `effective_config` folds later
+/// changes onto it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub model: ModelSpec,
@@ -173,6 +214,18 @@ pub struct ConfigSnapshot {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+}
+
+impl ConfigSnapshot {
+    /// Apply one `ConfigChanged` patch in place.
+    pub fn apply(&mut self, patch: &ConfigPatch) {
+        if let Some(model) = &patch.model {
+            self.model = model.clone();
+        }
+        if let Some(request) = &patch.request {
+            self.request = request.clone();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
