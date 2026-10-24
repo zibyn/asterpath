@@ -1282,6 +1282,17 @@ async fn message_raw_without_phase_renders_like_no_raw() {
 }
 
 #[tokio::test]
+async fn message_raw_with_a_null_phase_renders_like_no_raw() {
+    let mut item = message_item("msg_1", "old");
+    item["phase"] = Value::Null;
+    let raw = raw_data("openai", "openai.message", &item.to_string());
+    assert_eq!(
+        rendered_input(assistant_with_raw("hello", Some(raw))).await,
+        rendered_input(assistant_with_raw("hello", None)).await
+    );
+}
+
+#[tokio::test]
 async fn rewritten_message_text_wins_over_raw() {
     let mut item = message_item("msg_1", "old text");
     item["phase"] = json!("final_answer");

@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use asterpath_http::{merge_provider_option, provider_options_for, same_provider_raw_field};
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice, merge_provider_option,
+    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
@@ -63,7 +64,7 @@ pub(crate) fn render(
 ) -> Result<Vec<u8>, ProviderError> {
     validate(request, provider, capabilities)?;
     // R1: no server state, written or not.
-    let options = request.provider_options_for(&["previous_response_id", "conversation"])?;
+    let options = provider_options_for(request, &["previous_response_id", "conversation"])?;
 
     let instructions = system_text(&request.system);
     let input = render_input(request, provider, trace)?;
@@ -261,12 +262,7 @@ fn render_input(
             } => {
                 let mut message = message_item(*role, parts, provider, trace)?;
                 // Only `phase` is merged from same-provider raw; the id is never replayed (ADR 0010).
-                if let Some(phase) = data
-                    .as_ref()
-                    .filter(|data| &data.provider == provider)
-                    .and_then(|data| serde_json::from_str::<Value>(data.json.as_str()).ok())
-                    .and_then(|mut value| value.get_mut("phase").map(Value::take))
-                {
+                if let Some(phase) = same_provider_raw_field(data.as_ref(), provider, "phase") {
                     message["phase"] = phase;
                 }
                 input.push(raw(message)?);

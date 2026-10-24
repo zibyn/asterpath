@@ -646,6 +646,43 @@ async fn a_tool_that_reports_cancelled_under_turn_cancel_stays_cancelled() {
 }
 
 #[tokio::test]
+async fn a_turn_cancel_during_the_kill_grace_keeps_cancelled() {
+    let cancel = CancelToken::new();
+    let turn = cancel.clone();
+    let quitter = TestTool::new(
+        ToolDescriptor {
+            timeout: Some(Duration::from_millis(10)),
+            ..descriptor("quitter")
+        },
+        Arc::default(),
+        move |_args, ctx| {
+            let turn = turn.clone();
+            Box::pin(async move {
+                // Deadline fires first; the turn is cancelled inside the grace.
+                ctx.cancel.cancelled().await;
+                turn.cancel();
+                tokio::task::yield_now().await;
+                Err(asterpath_protocol::ToolError::Cancelled {
+                    message: "stopped".to_owned(),
+                })
+            })
+        },
+    );
+    let mut harness = Harness::new(vec![quitter]).await;
+    harness.config.kill_grace = Duration::from_secs(5);
+    harness.cancel_grace = Duration::from_secs(5);
+
+    harness
+        .run_with(&[tool_call("call-1", "quitter", "{}")], false, &cancel)
+        .await;
+
+    assert_eq!(
+        harness.result("call-1").await.error_kind(),
+        Some(ToolErrorKind::Cancelled)
+    );
+}
+
+#[tokio::test]
 async fn a_panicking_tool_fails_alone() {
     let boom = tool_with(descriptor("boom"), || Box::pin(async { panic!("boom") }));
     let harness = Harness::new(vec![boom, echo("ok")]).await;

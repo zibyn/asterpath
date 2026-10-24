@@ -117,6 +117,8 @@ pub fn open_with_clock(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(backend)?;
+    // shortcut: unbounded queue, no backpressure when appends outrun fsync; switch to a
+    // bounded channel with an async send when a host can outrun the disk.
     let (commands, queue) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("asterpath-sqlite-writer".to_owned())
@@ -143,10 +145,12 @@ pub struct SqliteStorage {
 /// Most writes group-committed in one transaction.
 const MAX_BATCH: usize = 64;
 
+#[cfg(test)]
 type WriterJob = Box<dyn FnOnce(&Connection) + Send>;
 
 enum Command {
     Write(Write),
+    #[cfg(test)]
     Run(WriterJob),
 }
 
@@ -217,6 +221,7 @@ fn writer_stopped() -> StorageError {
 fn run_writer(mut conn: Connection, queue: mpsc::Receiver<Command>, clock: Arc<dyn Clock>) {
     while let Ok(first) = queue.recv() {
         let mut batch = match first {
+            #[cfg(test)]
             Command::Run(job) => {
                 job(&conn);
                 continue;
@@ -224,10 +229,12 @@ fn run_writer(mut conn: Connection, queue: mpsc::Receiver<Command>, clock: Arc<d
             Command::Write(write) => vec![write],
         };
         // Take only what is already queued: no timer, no added latency.
+        #[cfg(test)]
         let mut after = None;
         while batch.len() < MAX_BATCH {
             match queue.try_recv() {
                 Ok(Command::Write(write)) => batch.push(write),
+                #[cfg(test)]
                 Ok(Command::Run(job)) => {
                     after = Some(job);
                     break;
@@ -236,6 +243,7 @@ fn run_writer(mut conn: Connection, queue: mpsc::Receiver<Command>, clock: Arc<d
             }
         }
         commit_batch(&mut conn, batch, clock.as_ref());
+        #[cfg(test)]
         if let Some(job) = after {
             job(&conn);
         }
@@ -471,28 +479,23 @@ impl SqliteStorage {
         self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn send(&self, write: Write) -> Result<(), StorageError> {
+    fn send(&self, command: Command) -> Result<(), StorageError> {
         self.writer
             .commands
             .as_ref()
             .ok_or_else(writer_stopped)?
-            .send(Command::Write(write))
+            .send(command)
             .map_err(|_| writer_stopped())
     }
 
     /// Test seam: run `job` on the writer thread between batches (inspect
     /// the write connection, park the writer, or crash it).
-    #[doc(hidden)]
-    pub fn run_on_writer(
+    #[cfg(test)]
+    fn run_on_writer(
         &self,
         job: impl FnOnce(&Connection) + Send + 'static,
     ) -> Result<(), StorageError> {
-        self.writer
-            .commands
-            .as_ref()
-            .ok_or_else(writer_stopped)?
-            .send(Command::Run(Box::new(job)))
-            .map_err(|_| writer_stopped())
+        self.send(Command::Run(Box::new(job)))
     }
 
     fn scan_sync(&self, query: LogQuery) -> Vec<Result<LogEntry, StorageError>> {
@@ -628,11 +631,11 @@ impl SessionStore for SqliteStorage {
         Box::pin(async move {
             let payload = serde_json::to_string(&entry.payload).map_err(backend)?;
             let (reply, response) = oneshot::channel();
-            self.send(Write::Append {
+            self.send(Command::Write(Write::Append {
                 entry,
                 payload,
                 reply,
-            })?;
+            }))?;
             response.await.unwrap_or_else(|_| Err(writer_stopped()))
         })
     }
@@ -663,11 +666,11 @@ impl SessionStore for SqliteStorage {
     ) -> BoxFuture<'_, Result<(), RetirementError>> {
         Box::pin(async move {
             let (reply, response) = oneshot::channel();
-            self.send(Write::Retire {
+            self.send(Command::Write(Write::Retire {
                 session,
                 expected_frontier,
                 reply,
-            })?;
+            }))?;
             response
                 .await
                 .unwrap_or_else(|_| Err(writer_stopped().into()))
@@ -921,6 +924,158 @@ mod tests {
             );
             drop(storage);
             std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    // --- writer seam: group commit with a savepoint per record (#97) -------
+
+    use asterpath_protocol::LOG_SCHEMA_VERSION;
+    use std::sync::mpsc;
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        futures_executor::block_on(future)
+    }
+
+    fn session(byte: u8) -> SessionId {
+        SessionId::from_bytes([byte; 16])
+    }
+
+    fn input_recorded() -> SessionEvent {
+        SessionEvent::InputRecorded { input: vec![] }
+    }
+
+    fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) -> NewEntry {
+        NewEntry {
+            session,
+            schema_version: LOG_SCHEMA_VERSION,
+            dedup_key,
+            payload: serde_json::to_value(event).expect("serialize event"),
+        }
+    }
+
+    fn append(storage: &dyn SessionStore, entry: NewEntry) -> Result<LogId, StorageError> {
+        block_on(storage.append(entry))
+    }
+
+    fn scan(storage: &dyn SessionStore, session: SessionId) -> Vec<Result<LogEntry, StorageError>> {
+        block_on(
+            storage
+                .scan(LogQuery {
+                    session,
+                    after: None,
+                    limit: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// A fresh database under the temp dir; the directory is removed on drop.
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "asterpath-sqlite-unit-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("test.sqlite")
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run `appends` as one writer batch: the writer is parked until every
+    /// append has been sent, so they are all queued when it drains.
+    fn append_batch(
+        storage: &SqliteStorage,
+        appends: Vec<NewEntry>,
+    ) -> Vec<Result<LogId, StorageError>> {
+        let (release, held) = mpsc::channel::<()>();
+        storage
+            .run_on_writer(move |_| {
+                let _ = held.recv();
+            })
+            .expect("park writer");
+        let appends =
+            futures_util::future::join_all(appends.into_iter().map(|entry| storage.append(entry)));
+        // `join` polls `appends` first, so every command is queued before release.
+        let (results, ()) = block_on(futures_util::future::join(
+            appends,
+            async move { drop(release) },
+        ));
+        results
+    }
+
+    #[test]
+    fn a_bad_append_in_a_batch_fails_alone() {
+        let dir = TempDb::new("batch-bad");
+        let storage = open(dir.db()).expect("open");
+        let bad = NewEntry {
+            session: session(3),
+            schema_version: LOG_SCHEMA_VERSION,
+            dedup_key: None,
+            payload: serde_json::json!({"NoSuchEvent": {}}),
+        };
+        let results = append_batch(
+            &storage,
+            vec![
+                entry(session(3), &input_recorded(), None),
+                bad,
+                entry(session(3), &input_recorded(), None),
+            ],
+        );
+        assert!(matches!(results[1], Err(StorageError::InvalidEntry(_))));
+        let first = *results[0].as_ref().expect("first append");
+        let third = *results[2].as_ref().expect("third append");
+
+        let entries: Vec<_> = scan(storage.as_ref(), session(3))
+            .into_iter()
+            .map(|entry| entry.expect("scan"))
+            .collect();
+        let seqs: Vec<_> = entries.iter().map(|entry| entry.seq).collect();
+        assert_eq!(seqs, [1, 2], "seq has no hole for the rejected append");
+        let ids: Vec<_> = entries.iter().map(|entry| entry.log_id).collect();
+        assert_eq!(ids, [first, third]);
+    }
+
+    #[test]
+    fn duplicate_appends_in_a_batch_share_one_row() {
+        let dir = TempDb::new("batch-dedup");
+        let storage = open(dir.db()).expect("open");
+        let results = append_batch(
+            &storage,
+            vec![
+                entry(session(4), &input_recorded(), Some(DedupKey::new("k"))),
+                entry(session(4), &input_recorded(), Some(DedupKey::new("k"))),
+            ],
+        );
+        let first = results[0].as_ref().expect("first append");
+        let second = results[1].as_ref().expect("second append");
+        assert_eq!(first, second);
+        assert_eq!(scan(storage.as_ref(), session(4)).len(), 1);
+    }
+
+    #[test]
+    fn a_stopped_writer_fails_appends_instead_of_hanging() {
+        let dir = TempDb::new("writer-stopped");
+        let storage = open(dir.db()).expect("open");
+        storage
+            .run_on_writer(|_| panic!("simulated writer crash"))
+            .expect("send to writer");
+        for _ in 0..2 {
+            let error = append(storage.as_ref(), entry(session(6), &input_recorded(), None))
+                .expect_err("writer is gone");
+            assert!(matches!(error, StorageError::Backend(_)), "{error:?}");
         }
     }
 }

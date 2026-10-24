@@ -964,8 +964,11 @@ async fn invoke_tool(
             let already_cancelled = cancel.is_cancelled() || turn_cancel.is_cancelled();
             cancel.cancel();
             match tokio::time::timeout(kill_grace, future.as_mut()).await {
-                // The tool only saw a cancel; the engine knows it was the deadline.
-                Ok(Ok(Err(ToolError::Cancelled { message }))) if !already_cancelled => {
+                // The tool only saw a cancel; the engine knows it was the deadline
+                // unless the turn was cancelled during the grace too.
+                Ok(Ok(Err(ToolError::Cancelled { message })))
+                    if !already_cancelled && !turn_cancel.is_cancelled() =>
+                {
                     Invocation::Returned(Err(ToolError::Timeout { message }))
                 }
                 Ok(Ok(result)) => Invocation::Returned(result),
