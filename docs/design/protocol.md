@@ -269,7 +269,7 @@ pub struct ProviderCapabilities {
     pub reasoning_roundtrip: bool,   // 返回可回放的不透明 reasoning
     pub citations: bool,             // informational；v1 不暴露 typed citations
     pub builtin_tools: bool,         // 可能产出 ServerToolCall/Result
-    pub cache_control: bool,         // informational；v1 无规范断点
+    pub cache_control: bool,         // informational；adapter 自动设置缓存断点
     pub image_input: bool,
     pub parallel_tool_calls: bool,   // 可控制是否并行
 }
@@ -279,7 +279,8 @@ pub struct ProviderCapabilities {
 - 默认值保守：未知即 `false`。能力标志是 adapter 的声明，不是运行时探测。
 - loop 只按标志分支，不按 provider 身份分支；需要的能力为 `false` 时，adapter 在发 HTTP 前返回 `Unsupported`。
 - `server_state` 在 v1 恒为 `false`；即使供应商支持，也不使用。
-- `citations` / `cache_control` 在 v1 仅用于告知宿主；typed citations 与宿主指定断点出界，供应商数据仍保留在 `raw`。
+- `citations` 在 v1 仅用于告知宿主；typed citations 出界，供应商数据仍保留在 `raw`。
+- `cache_control = true` 表示 adapter 在每个请求上自动设置缓存断点（Anthropic：最后一个 tool、system 最后一个 block、最后一条消息的最后一个可携带断点的 block，均为 `ephemeral`；原样回放的 raw block 不改动，断点前移或省略）。仅用于告知宿主；宿主指定断点出界。
 - `builtin_tools` 为 `true` 时，`ServerToolCall` / `ServerToolResult` 是普通历史 item；loop 不执行它们。
 - `image_input = false` 时，请求中的 user/assistant `Part::Image` 返回 `Unsupported`；工具结果图像按 §10.4 渲染为占位。
 - 能力匹配不在 `create_session` 预检；adapter 是唯一权威（#26）。

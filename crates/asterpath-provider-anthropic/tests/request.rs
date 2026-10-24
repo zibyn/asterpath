@@ -104,7 +104,7 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
         body["system"],
         serde_json::json!([
             {"type": "text", "text": "be helpful"},
-            {"type": "text", "text": "be terse"}
+            {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
         ])
     );
     assert_eq!(body["tools"][0]["name"], "search");
@@ -129,7 +129,9 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
     assert!(body.get("output_config").is_none());
     assert_eq!(
         body["messages"],
-        serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+        serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+        ]}])
     );
     assert!(
         body["messages"]
@@ -233,7 +235,7 @@ async fn renders_tool_calls_and_merges_consecutive_results_before_text() {
         serde_json::json!([
             {"type": "tool_result", "tool_use_id": "toolu_a", "content": [{"type": "text", "text": "first"}], "is_error": false},
             {"type": "tool_result", "tool_use_id": "toolu_b", "content": [{"type": "text", "text": "second"}], "is_error": true},
-            {"type": "text", "text": "follow up"}
+            {"type": "text", "text": "follow up", "cache_control": {"type": "ephemeral"}}
         ]),
         "tool_result blocks come before text in the merged user message"
     );
@@ -273,7 +275,7 @@ async fn renders_images_and_refusals() {
     );
     assert_eq!(
         body["messages"][1]["content"],
-        serde_json::json!([{"type": "text", "text": "I will not"}])
+        serde_json::json!([{"type": "text", "text": "I will not", "cache_control": {"type": "ephemeral"}}])
     );
 }
 
@@ -307,7 +309,8 @@ async fn tool_result_images_render_natively() {
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
                 {"type": "text", "text": "caption"}
             ],
-            "is_error": false
+            "is_error": false,
+            "cache_control": {"type": "ephemeral"}
         })
     );
 }
@@ -701,4 +704,143 @@ async fn older_models_keep_forced_tool_choice_and_sampling() {
     let capabilities = asterpath_protocol::Provider::capabilities(&provider, &spec);
     assert!(capabilities.forced_tool_choice);
     assert!(!capabilities.sampling);
+}
+
+fn breakpoints(body: &serde_json::Value) -> usize {
+    match body {
+        serde_json::Value::Object(map) => {
+            usize::from(map.contains_key("cache_control"))
+                + map.values().map(breakpoints).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(breakpoints).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn cache_control_is_advertised() {
+    use asterpath_protocol::Provider;
+    let provider = asterpath_provider_anthropic::AnthropicProvider::new("key");
+    assert!(provider.capabilities(&model()).cache_control);
+}
+
+#[tokio::test]
+async fn sets_cache_breakpoints_on_last_tool_system_block_and_message_block() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.system = vec![text("be helpful"), text("be terse")];
+    request.tools = vec![descriptor("a"), descriptor("b")];
+    request.items = vec![
+        user_message(vec![text("hi")]),
+        assistant_message(vec![text("hello")]),
+        user_message(vec![text("first"), text("second")]),
+    ];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(
+        body["tools"][1]["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        body["system"],
+        serde_json::json!([
+            {"type": "text", "text": "be helpful"},
+            {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+        ])
+    );
+    assert_eq!(
+        body["messages"][2]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}}
+        ])
+    );
+    assert_eq!(
+        breakpoints(&body),
+        3,
+        "at most 3 of the API's 4 breakpoints"
+    );
+}
+
+#[tokio::test]
+async fn breakpoints_are_omitted_without_tools_or_system() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.system = Vec::new();
+    request.items = vec![user_message(vec![text("hi")])];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert!(body.get("tools").is_none());
+    assert!(body.get("system").is_none());
+    assert_eq!(
+        body["messages"][0]["content"],
+        serde_json::json!([{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}])
+    );
+    assert_eq!(breakpoints(&body), 1);
+}
+
+#[tokio::test]
+async fn tool_result_blocks_carry_the_message_breakpoint() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    request.system = Vec::new();
+    request.items = vec![Item::ToolResult {
+        call_id: "toolu_a".to_owned(),
+        provider_item_id: None,
+        parts: vec![text("done")],
+        is_error: false,
+        raw: None,
+    }];
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(breakpoints(&body), 1);
+}
+
+#[tokio::test]
+async fn breakpoint_skips_replayed_raw_blocks_and_leaves_them_byte_identical() {
+    let raw = "{\"type\":\"redacted_thinking\",\n  \"data\":\"opaque\"}";
+    let opaque = || Part::ProviderOpaque {
+        provider: ProviderId::new("anthropic"),
+        kind: "anthropic.redacted_thinking".to_owned(),
+        raw: RawProviderData {
+            provider: ProviderId::new("anthropic"),
+            model: Some(ModelId::new("claude-test")),
+            kind: "anthropic.redacted_thinking".to_owned(),
+            json: JsonString::new(raw),
+        },
+    };
+    let server = MockServer::start(vec![Reply::sse(empty_sse()), Reply::sse(empty_sse())]);
+    let provider = provider(&server);
+
+    // A raw last block moves the breakpoint to the previous carrier.
+    let mut moved = base_request();
+    moved.system = Vec::new();
+    moved.items = vec![assistant_message(vec![text("before"), opaque()])];
+    drain(&provider, moved).await;
+    // Only raw blocks in the last message: the breakpoint is omitted.
+    let mut omitted = base_request();
+    omitted.system = Vec::new();
+    omitted.items = vec![
+        user_message(vec![text("hi")]),
+        assistant_message(vec![opaque()]),
+    ];
+    drain(&provider, omitted).await;
+
+    let recorded = server.requests();
+    assert!(recorded[0].body.contains(raw), "{}", recorded[0].body);
+    let body = recorded[0].json_body();
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        serde_json::json!({"type": "text", "text": "before", "cache_control": {"type": "ephemeral"}})
+    );
+    assert_eq!(breakpoints(&body), 1);
+
+    assert!(recorded[1].body.contains(raw), "{}", recorded[1].body);
+    assert_eq!(breakpoints(&recorded[1].json_body()), 0);
 }
