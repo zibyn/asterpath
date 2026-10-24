@@ -12,6 +12,7 @@ mod commit;
 mod compaction;
 pub mod config;
 pub mod error;
+mod fork;
 mod scan;
 mod scheduler;
 mod tools;
@@ -42,7 +43,7 @@ use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ForkSource, Item, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
+    ForkSource, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
     SessionFacts, SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError,
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
@@ -294,41 +295,12 @@ impl Asterpath {
                 detail,
             })
         };
-        // The last committed turn's end, or creation when none has committed.
-        let waterline = records
-            .iter()
-            .rev()
-            .find(|(_, event)| matches!(event, SessionEvent::TurnCommitted { .. }))
-            .or_else(|| records.first())
-            .map(|(entry, _)| entry.clone())
-            .ok_or_else(not_found)?;
-        // Inputs after the last step started belong to the next turn.
-        let last_step = records
-            .iter()
-            .filter(|(entry, event)| {
-                entry.seq <= waterline.seq && matches!(event, SessionEvent::StepStarted { .. })
-            })
-            .map(|(entry, _)| entry.seq)
-            .max()
-            .unwrap_or(0);
-        // Compactions fold regardless of the waterline, as for a spawn fork.
-        let prefix: Vec<_> = records
-            .iter()
-            .filter(|(entry, event)| match event {
-                SessionEvent::CompactionApplied { .. } => true,
-                SessionEvent::InputRecorded { .. } => entry.seq <= last_step,
-                _ => entry.seq <= waterline.seq,
-            })
-            .map(|(entry, _)| entry.clone())
-            .collect();
-        let history =
-            asterpath_protocol::request_history(&prefix).map_err(|e| corrupt(e.to_string()))?;
+        let (waterline, prefix) = fork::session_prefix(&records).ok_or_else(not_found)?;
+        let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
         let mut config =
             asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
-        // The copied history already holds the instructions appended so far.
-        config.system = history.system;
-        let mut items = history.items;
-        items.retain(|item| !matches!(item, Item::ToolsChanged { .. }));
+        config.system = snapshot.system;
+        let items = snapshot.items;
 
         let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
         // shortcut: two appends, so a crash between them leaves an empty fork; needs a batch append in SessionStore
