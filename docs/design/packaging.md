@@ -115,7 +115,7 @@ pub struct ConfigSnapshot {
 | Tier 2 | 适配器 crate 的公开项 | 0.x 实验面；minor 内可改，变更写入对应 design 文档 |
 | Tier 3 | `asterpath-testing`、`asterpath-acceptance`、`xtask`、未在 spec 中记录的 `pub` 项 | 无承诺 |
 
-- 公开错误枚举、事件枚举与可能增字段的结构一律 `#[non_exhaustive]`；配置结构提供 `Default` + builder，不承诺字面量构造。
+- 公开错误枚举、事件枚举与可能增字段的结构一律 `#[non_exhaustive]`；配置结构提供 `Default` + 公开字段赋值（`Type::default()` 再赋字段），必填字段多的类型可另提供 builder，不承诺字面量构造。含无默认值必填字段的规格类型（如 `SessionSpec`、`ModelSpec`）暂不受此条约束。
 - 不使用 unstable feature flag 表达稳定度。
 - v1 不发布 crates.io；`0.1.0` 是 workspace 内的语义版本，不是发布承诺。
 
