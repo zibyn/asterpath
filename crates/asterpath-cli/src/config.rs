@@ -415,7 +415,7 @@ struct ReasoningSection {
 #[serde(default, deny_unknown_fields)]
 struct ToolsSection {
     max_parallel_calls: Option<NonZeroUsize>,
-    /// Built-in tools for new sessions; absent means all of them.
+    /// Workspace tools for new sessions; absent means all of them.
     enabled: Option<Vec<String>>,
 }
 
@@ -515,7 +515,7 @@ impl Settings {
         self.file.skills.enabled.unwrap_or(true)
     }
 
-    /// `[tools] enabled`; `None` means every built-in tool.
+    /// `[tools] enabled`; `None` means every workspace tool.
     pub fn tool_names(&self) -> Option<&[String]> {
         self.file.tools.enabled.as_deref()
     }

@@ -59,10 +59,10 @@ struct RunArgs {
     /// Skip skill discovery for this new session.
     #[arg(long)]
     no_skills: bool,
-    /// Register only these built-in tools (comma-separated).
+    /// Register only these workspace tools (comma-separated).
     #[arg(long, value_delimiter = ',', conflicts_with = "no_tools")]
     tools: Option<Vec<String>>,
-    /// Register no built-in tools.
+    /// Register no workspace tools.
     #[arg(long)]
     no_tools: bool,
     /// User input for the new session.
@@ -310,7 +310,7 @@ async fn resume(args: SessionArgs) -> CliResult<()> {
     let mcp = load_mcp(&settings).await?;
     report_mcp_failures(&settings, &mcp)?;
     // The frozen snapshot decides what the model sees; register every
-    // built-in tool so any subset chosen at `run` still resolves.
+    // workspace tool so any subset chosen at `run` still resolves.
     let mut tools = workspace_tools(&settings, None)?;
     tools.push(Arc::new(LoadSkillTool::new(skill_roots(&settings))));
     tools.extend(mcp.tools());
