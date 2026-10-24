@@ -80,7 +80,6 @@ pub(crate) fn check(
         return Err(unsupported("sampling.seed"));
     }
     if let Some(reasoning) = &request.reasoning {
-        // `summary` is ignored by design.
         let rules = rules_for(request.spec.model.as_str());
         if reasoning.effort.is_some() && !rules.effort {
             return Err(unsupported("reasoning.effort"));
@@ -176,15 +175,16 @@ pub(crate) fn render(
     }
     if let Some(reasoning) = &request.reasoning {
         // check() has rejected combinations the model does not accept.
-        let thinking = match (
-            reasoning.budget_tokens,
-            rules_for(request.spec.model.as_str()).thinking,
-        ) {
+        let rules = rules_for(request.spec.model.as_str());
+        let thinking = match (reasoning.budget_tokens, rules.thinking) {
             (Some(budget), _) => Some(json!({"type": "enabled", "budget_tokens": budget})),
             (None, Thinking::Extended) => None,
             (None, Thinking::Both | Thinking::Adaptive) => Some(json!({"type": "adaptive"})),
         };
-        if let Some(thinking) = thinking {
+        if let Some(mut thinking) = thinking {
+            if reasoning.summary && rules.thinking_display() {
+                thinking["display"] = json!("summarized");
+            }
             fields.push(("thinking", Frag::Json(thinking)));
         }
         if let Some(effort) = reasoning.effort {

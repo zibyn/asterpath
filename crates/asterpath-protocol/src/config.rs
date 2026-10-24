@@ -60,7 +60,8 @@ pub struct SamplingParams {
 pub struct ReasoningParams {
     pub effort: Option<ReasoningEffort>,
     pub budget_tokens: Option<u32>,
-    /// OpenAI `reasoning.summary`; ignored by Anthropic.
+    /// Ask for reasoning summaries: OpenAI `reasoning.summary`, Anthropic
+    /// `thinking.display: "summarized"` (on models that accept it).
     pub summary: bool,
 }
 

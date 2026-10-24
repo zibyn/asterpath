@@ -66,7 +66,8 @@ impl Provider for AnthropicProvider {
             sampling: rules.sampling,
             reasoning_roundtrip: true,
             citations: false,
-            builtin_tools: true,
+            // Server tools are not expressible in the normalized protocol yet.
+            builtin_tools: false,
             cache_control: false,
             image_input: true,
             parallel_tool_calls: true,
