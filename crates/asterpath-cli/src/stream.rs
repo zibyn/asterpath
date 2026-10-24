@@ -2,6 +2,7 @@
 //! JSON line on stdout and, with `--input-format stream-json`, one command per
 //! stdin line. Approvals go to the host over the stream.
 
+use std::collections::HashSet;
 use std::io::Write;
 
 use asterpath::SessionHandle;
@@ -28,25 +29,35 @@ enum Command {
 }
 
 /// Drive (from the start when `start`), printing every event, and serve
-/// `commands` until stdin is closed and the session is idle. Returns the last
-/// turn's outcome and whether anything was driven.
+/// `commands` until stdin is closed and the session is idle. Stdin closing
+/// while an approval waits cancels the turn: nobody is left to answer. A bad
+/// command or unreadable stdin cancels the turn and stops serving; the error
+/// comes back in [`DriveOutcome::error`] so the caller still prints the result.
 pub async fn run<R: AsyncBufRead + Unpin, W: Write>(
     handle: &SessionHandle,
     start: bool,
     commands: Option<R>,
     out: &mut W,
-) -> CliResult<(DriveOutcome, bool)> {
-    let mut outcome = DriveOutcome::default();
-    let mut ran = start;
+) -> CliResult<DriveOutcome> {
+    let mut outcome = DriveOutcome {
+        ran: start,
+        ..DriveOutcome::default()
+    };
     let mut lines = commands.map(AsyncBufReadExt::lines);
     let mut stream: Option<BoxStream<'_, _>> = start.then(|| handle.drive());
+    let mut pending: HashSet<ToolCallId> = HashSet::new();
     loop {
+        // Nobody is left to answer a waiting approval.
+        if lines.is_none() && !pending.is_empty() {
+            pending.clear();
+            handle.cancel().await.map_err(aster_error)?;
+        }
         tokio::select! {
             event = async { stream.as_mut()?.next().await }, if stream.is_some() => match event {
                 Some(Ok(event)) => {
-                    if let AgentEvent::TurnCommitted { reason, usage, .. } = &event {
-                        outcome.reason = Some(reason.clone());
-                        outcome.usage = Some(*usage);
+                    outcome.observe(&event);
+                    if let AgentEvent::ApprovalRequested(request) = &event {
+                        pending.insert(request.tool_call_id);
                     }
                     emit(out, &event)?;
                 }
@@ -54,39 +65,49 @@ pub async fn run<R: AsyncBufRead + Unpin, W: Write>(
                 // Input that arrived during the drive starts the next one.
                 None => {
                     stream = None;
-                    if handle.facts().await.map_err(aster_error)?.is_wakeable() {
+                    pending.clear();
+                    if outcome.error.is_none()
+                        && handle.facts().await.map_err(aster_error)?.is_wakeable()
+                    {
                         stream = Some(handle.drive());
                     }
                 }
             },
-            line = async { lines.as_mut()?.next_line().await.transpose() }, if lines.is_some() => match line {
-                Some(line) => {
-                    let line = line.map_err(|error| CliError::run(format!("cannot read stdin: {error}")))?;
-                    if line.trim().is_empty() {
+            line = async { lines.as_mut()?.next_line().await.transpose() }, if lines.is_some() => {
+                let command = match line {
+                    Some(Ok(line)) if line.trim().is_empty() => continue,
+                    Some(Ok(line)) => serde_json::from_str(&line)
+                        .map_err(|error| CliError::config(format!("bad command {line}: {error}"))),
+                    Some(Err(error)) => Err(CliError::run(format!("cannot read stdin: {error}"))),
+                    None => {
+                        lines = None;
                         continue;
                     }
-                    let command = serde_json::from_str(&line)
-                        .map_err(|error| CliError::config(format!("bad command {line}: {error}")))?;
-                    match command {
-                        Command::UserInput { parts } => {
-                            crate::exec::submit(handle, parts).await?;
-                            if stream.is_none() {
-                                stream = Some(handle.drive());
-                                ran = true;
-                            }
+                };
+                match command {
+                    Ok(Command::UserInput { parts }) => {
+                        crate::exec::submit(handle, parts).await?;
+                        if stream.is_none() {
+                            stream = Some(handle.drive());
+                            outcome.ran = true;
                         }
-                        Command::Approval { call, decision } => {
-                            handle.approve(call, decision).await.map_err(aster_error)?;
-                        }
-                        Command::Cancel => handle.cancel().await.map_err(aster_error)?,
+                    }
+                    Ok(Command::Approval { call, decision }) => {
+                        pending.remove(&call);
+                        handle.approve(call, decision).await.map_err(aster_error)?;
+                    }
+                    Ok(Command::Cancel) => handle.cancel().await.map_err(aster_error)?,
+                    Err(error) => {
+                        outcome.error = Some(error);
+                        lines = None;
+                        handle.cancel().await.map_err(aster_error)?;
                     }
                 }
-                None => lines = None,
             },
             else => break,
         }
     }
-    Ok((outcome, ran))
+    Ok(outcome)
 }
 
 fn emit<W: Write>(out: &mut W, event: &AgentEvent) -> CliResult<()> {

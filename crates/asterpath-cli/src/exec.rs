@@ -8,7 +8,7 @@ use asterpath_protocol::{Clock, SystemClock, UserInput, unique_bytes};
 use asterpath_protocol::{FileSource, ImageSource, InputId, OutputFormat as SchemaFormat, Part};
 use clap::{Args, ValueEnum};
 
-use crate::drive::{self, PromptIo, final_assistant_text, scan, turn_result};
+use crate::drive::{self, final_assistant_text, scan, turn_result};
 use crate::session::{self, SessionArgs};
 use crate::stream;
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
@@ -82,7 +82,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     let handle = &opened.handle;
     // A continued session first finishes what it had open (crash recovery).
     let recover = opened.continued && handle.facts().await.map_err(aster_error)?.is_wakeable();
-    let (outcome, ran) = if let OutputFormat::StreamJson = args.output_format {
+    let outcome = if let OutputFormat::StreamJson = args.output_format {
         let start = recover || !parts.is_empty();
         if !parts.is_empty() {
             submit(handle, parts).await?;
@@ -92,17 +92,18 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         let stdin = commands.then(|| tokio::io::BufReader::new(tokio::io::stdin()));
         stream::run(handle, start, stdin, &mut io::stdout()).await?
     } else {
-        let input = !parts.is_empty();
+        // No approval channel: no endpoint is registered, so every `Ask` is denied.
         let mut outcome = drive::DriveOutcome::default();
         if recover {
-            outcome = drive::drive(handle, no_prompt()).await?;
+            outcome = drive::drive(handle, &mut drive::Headless).await?;
         }
-        if input {
+        if !parts.is_empty() {
             submit(handle, parts).await?;
-            outcome = drive::drive(handle, no_prompt()).await?;
+            outcome = drive::drive(handle, &mut drive::Headless).await?;
         }
-        (outcome, recover || input)
+        outcome
     };
+    let ran = outcome.ran;
 
     let entries = scan(opened.asterpath.store(), handle.id())
         .await
@@ -126,6 +127,9 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         ),
     }
     opened.shutdown().await?;
+    if let Some(error) = outcome.error {
+        return Err(error);
+    }
     turn_result(outcome.reason.as_ref(), &entries)
 }
 
@@ -138,12 +142,6 @@ pub async fn submit(handle: &asterpath::SessionHandle, parts: Vec<Part>) -> CliR
         .await
         .map(drop)
         .map_err(aster_error)
-}
-
-/// `exec` has no approval channel without `--input-format stream-json`, so no
-/// endpoint is registered and the framework denies every `Ask`.
-fn no_prompt() -> Option<&'static mut PromptIo<io::Empty, io::Sink>> {
-    None
 }
 
 /// The prompt, with piped stdin appended as a `<stdin>` block; `-` or no
