@@ -103,6 +103,7 @@ dependencies = [
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "futures-util",
  "libc",
  "serde",
