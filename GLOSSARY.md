@@ -473,7 +473,7 @@ _Avoid_: session 配置、运行时配置
 _Avoid_: 配置覆盖、热更新
 
 **生效配置（Effective Config）**：
-配置快照依次应用水位之前全部配置变更的折叠结果（`effective_config`）。模型调用按 step 的 `StepStarted.seq` 取值，恢复、调度、trace 用同一个折叠。
+配置快照依次应用水位之前全部配置变更的折叠结果（`effective_config`）。模型调用按 step 的 `StepStarted.seq` 取值，恢复、调度、trace 用同一个折叠。代码里它与配置快照同为 `ConfigSnapshot` 类型：类型名指形状，「配置快照」一词只指 `SessionCreated` 里的初始值。
 _Avoid_: 当前配置、运行时配置
 
 **验收场景（Acceptance Scenario）**：
