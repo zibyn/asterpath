@@ -9,7 +9,7 @@ asterpath-protocol = { path = "../asterpath-protocol" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "process"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt"] }
 
 [dev-dependencies]
 asterpath-testing = { path = "../asterpath-testing" }
