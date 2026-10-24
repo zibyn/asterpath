@@ -1023,19 +1023,48 @@ async fn empty_stop_sequences_are_not_sent() {
 }
 
 #[tokio::test]
+async fn provider_options_deep_merge_into_objects_the_adapter_writes() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = request_for("claude-opus-5-5");
+    request.reasoning = effort(ReasoningEffort::High);
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"output_config":{"format":{"type":"json_schema"}}}"#),
+    );
+
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(
+        body["output_config"],
+        serde_json::json!({"effort": "high", "format": {"type": "json_schema"}})
+    );
+}
+
+#[tokio::test]
+async fn provider_options_may_not_replace_a_nested_value_the_adapter_writes() {
+    let server = MockServer::start(Vec::new());
+    let mut request = request_for("claude-opus-5-5");
+    request.reasoning = effort(ReasoningEffort::High);
+    request.provider_options.insert(
+        ProviderId::new("anthropic"),
+        JsonString::new(r#"{"output_config":{"effort":"low"}}"#),
+    );
+
+    let error = one_request(&server, request).await;
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(error.message.contains("output_config.effort"), "{error:?}");
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+#[tokio::test]
 async fn provider_options_conflicting_or_non_object_fail_before_http() {
     let server = MockServer::start(Vec::new());
     for (options, kind) in [
         (r#"{"model":"other"}"#, ProviderErrorKind::Unsupported),
         (r#"{"messages":[]}"#, ProviderErrorKind::Unsupported),
-        (
-            r#"{"thinking":{"type":"adaptive"}}"#,
-            ProviderErrorKind::Unsupported,
-        ),
-        (
-            r#"{"stop_sequences":["x"]}"#,
-            ProviderErrorKind::Unsupported,
-        ),
+        (r#"{"max_tokens":1}"#, ProviderErrorKind::Unsupported),
+        (r#"{"stream":false}"#, ProviderErrorKind::Unsupported),
+        (r#"{"system":"other"}"#, ProviderErrorKind::Unsupported),
         (r#"["service_tier"]"#, ProviderErrorKind::InvalidRequest),
         ("not json", ProviderErrorKind::InvalidRequest),
     ] {
