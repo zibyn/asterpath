@@ -262,6 +262,7 @@ dependencies = [
  "asterpath-protocol",
  "asterpath-testing",
  "futures-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
