@@ -1044,6 +1044,7 @@ mod tests {
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(format!("{}-wal", db.display()));
         let _ = std::fs::remove_file(format!("{}-shm", db.display()));
+        let _ = std::fs::remove_file(format!("{}.lock", db.display()));
     }
 
     fn script() -> Arc<ScriptedProvider> {

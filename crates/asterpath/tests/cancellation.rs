@@ -41,6 +41,7 @@ fn cleanup(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(format!("{}-wal", path.display()));
     let _ = fs::remove_file(format!("{}-shm", path.display()));
+    let _ = fs::remove_file(format!("{}.lock", path.display()));
 }
 
 fn text(value: &str) -> Part {

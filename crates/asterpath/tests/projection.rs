@@ -158,7 +158,7 @@ async fn projection_matches_history_on_the_sqlite_backend() {
     let path = std::env::temp_dir().join(format!("asterpath-projection-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     projection_follows_the_log(Asterpath::builder().database(&path)).await;
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", ".lock"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }

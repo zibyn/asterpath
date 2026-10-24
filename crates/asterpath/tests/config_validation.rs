@@ -117,7 +117,9 @@ async fn p2_external_tool_names_are_validated_at_the_facade() {
         .await
         .expect("an external composed name is registrable");
     asterpath.shutdown().await.expect("shutdown");
-    let _ = std::fs::remove_file(&path);
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[tokio::test]
