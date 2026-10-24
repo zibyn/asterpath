@@ -103,6 +103,7 @@ dependencies = [
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "futures-util",
  "libc",
  "serde",
@@ -123,6 +124,7 @@ dependencies = [
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
+ "asterpath-tools",
  "clap",
  "futures-util",
  "serde",
@@ -250,6 +252,19 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-tools"
+version = "0.1.0"
+dependencies = [
+ "asterpath-protocol",
+ "asterpath-testing",
+ "futures-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

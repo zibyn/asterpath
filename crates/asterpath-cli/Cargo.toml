@@ -19,6 +19,7 @@ asterpath = { path = "../asterpath", default-features = false }
 asterpath-mcp = { path = "../asterpath-mcp" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-skills = { path = "../asterpath-skills" }
+asterpath-tools = { path = "../asterpath-tools" }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

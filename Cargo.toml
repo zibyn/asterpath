@@ -9,6 +9,7 @@ members = [
     "crates/asterpath-provider-anthropic",
     "crates/asterpath-mcp",
     "crates/asterpath-skills",
+    "crates/asterpath-tools",
     "crates/asterpath-mcp-fixture",
     "crates/asterpath-testing",
     "crates/asterpath-acceptance",
