@@ -547,6 +547,50 @@ async fn current_models_render_adaptive_thinking_with_effort() {
 }
 
 #[tokio::test]
+async fn summary_requests_summarized_thinking_display_where_supported() {
+    let server = MockServer::start(vec![
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+        Reply::sse(empty_sse()),
+    ]);
+    let provider = provider(&server);
+    for (model, budget_tokens) in [
+        ("claude-opus-5-5", None),
+        ("claude-opus-4-6", Some(2048)),
+        ("claude-sonnet-4-5", Some(2048)),
+    ] {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            budget_tokens,
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(
+        recorded[0].json_body()["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert_eq!(
+        recorded[1].json_body()["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048, "display": "summarized"})
+    );
+    // Pre-4.6 models predate `display` and always summarize.
+    assert_eq!(
+        recorded[2].json_body()["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+    );
+}
+
+#[test]
+fn builtin_tools_are_not_advertised() {
+    use asterpath_protocol::Provider;
+    let provider = asterpath_provider_anthropic::AnthropicProvider::new("key");
+    assert!(!provider.capabilities(&model()).builtin_tools);
+}
+
+#[tokio::test]
 async fn transitional_and_opus_4_5_models_keep_their_documented_shapes() {
     let server = MockServer::start(vec![
         Reply::sse(empty_sse()),

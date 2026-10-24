@@ -32,6 +32,13 @@ pub(crate) struct ModelRules {
     pub sampling: bool,
 }
 
+impl ModelRules {
+    /// Accepts `thinking.display`; earlier models always summarize.
+    pub fn thinking_display(self) -> bool {
+        self.thinking != Thinking::Extended
+    }
+}
+
 const fn rules(thinking: Thinking, effort: bool, forced: bool, sampling: bool) -> ModelRules {
     ModelRules {
         thinking,
@@ -58,6 +65,7 @@ const TABLE: &[(&str, ModelRules)] = &[
     ("claude-sonnet-5", ADAPTIVE),
     ("claude-fable-5", ADAPTIVE),
     ("claude-mythos-5", ADAPTIVE),
+    ("claude-mythos-preview", BOTH),
     ("claude-opus-4-8", ADAPTIVE),
     ("claude-opus-4-7", ADAPTIVE),
     ("claude-opus-4-6", BOTH),
@@ -90,5 +98,17 @@ mod tests {
         assert_eq!(rules_for("claude-opus-4-1-20250805"), EXTENDED);
         assert_eq!(rules_for("claude-sonnet-4-20250514"), EXTENDED);
         assert_eq!(rules_for("claude-next"), LATEST);
+    }
+
+    #[test]
+    fn mythos_preview_accepts_both_thinking_types() {
+        assert_eq!(rules_for("claude-mythos-preview").thinking, Thinking::Both);
+    }
+
+    #[test]
+    fn display_is_sent_only_from_4_6_on() {
+        assert!(rules_for("claude-opus-5-5").thinking_display());
+        assert!(rules_for("claude-sonnet-4-6").thinking_display());
+        assert!(!rules_for("claude-sonnet-4-5").thinking_display());
     }
 }
