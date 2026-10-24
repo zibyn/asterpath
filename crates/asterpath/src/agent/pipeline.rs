@@ -49,6 +49,9 @@ pub(crate) struct ToolStep<'a> {
     /// unsafe intent without a recorded approval is never rerun.
     pub(crate) recovering: bool,
     pub(crate) cancel_grace: Duration,
+    /// The step's effective tool set: a fresh call to any other name is
+    /// `NotFound`, even if the registry holds it (ADR-0030).
+    pub(crate) tools: &'a [ToolDescriptor],
     pub(crate) events: &'a EventSink,
     pub(crate) spawn: Option<&'a SpawnFn<'a>>,
 }
@@ -301,7 +304,12 @@ impl ToolPipeline {
 
         let tool_call_id = ToolCallId::from_bytes(unique_bytes(self.clock.now()));
         let mut args = call.raw_args;
-        let tool = self.tools.get(&call.name);
+        let tool = step
+            .tools
+            .iter()
+            .any(|tool| tool.name == call.name)
+            .then(|| self.tools.get(&call.name))
+            .flatten();
         let (replay, provenance) = match &tool {
             Some(tool) => (tool.descriptor().replay, tool.descriptor().provenance),
             None => (ReplaySafety::Unsafe, Provenance::Unknown),

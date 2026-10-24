@@ -661,3 +661,115 @@ fn compaction_moves_replaced_instructions_into_the_baseline_system() {
         "an instruction after the replaced range keeps its place"
     );
 }
+
+fn tool(name: &str) -> ToolDescriptor {
+    ToolDescriptor {
+        name: ToolName::new(name),
+        description: format!("{name} tool"),
+        schema: json!({"type": "object"}),
+        parallelism: Parallelism::Parallel,
+        replay: ReplaySafety::Safe,
+        side_effect: SideEffect::ReadOnly,
+        provenance: Provenance::InProcess,
+        timeout: None,
+        max_output_bytes: None,
+    }
+}
+
+fn created_with_tools(names: &[&str]) -> SessionEvent {
+    SessionEvent::SessionCreated {
+        config: ConfigSnapshot {
+            tools: names.iter().map(|name| tool(name)).collect(),
+            ..config()
+        },
+        parent: None,
+    }
+}
+
+fn tools_changed(added: &[&str], removed: &[&str]) -> SessionEvent {
+    let mut patch = ConfigPatch::default();
+    patch.add_tools = added.iter().map(|name| tool(name)).collect();
+    patch.remove_tools = removed.iter().map(|name| ToolName::new(*name)).collect();
+    SessionEvent::ConfigChanged { patch }
+}
+
+fn tools_item(added: &[&str], removed: &[&str]) -> Item {
+    Item::ToolsChanged {
+        added: added.iter().map(|name| tool(name)).collect(),
+        removed: removed.iter().map(|name| ToolName::new(*name)).collect(),
+    }
+}
+
+fn names(tools: &[ToolDescriptor]) -> Vec<&str> {
+    tools.iter().map(|tool| tool.name.as_str()).collect()
+}
+
+#[test]
+fn effective_config_adds_and_removes_tools() {
+    let records = records(vec![
+        created_with_tools(&["echo", "read"]),
+        tools_changed(&["write"], &["echo"]),
+    ]);
+    let config = effective_config(
+        records.iter().map(|(entry, event)| (entry, event)),
+        u64::MAX,
+    )
+    .expect("config");
+    assert_eq!(names(&config.tools), ["read", "write"]);
+}
+
+#[test]
+fn a_tool_change_lands_at_the_next_step_and_keeps_the_baseline_tools() {
+    let [call_message, requested] = tool_step(1);
+    let entries = log(&[
+        created_with_tools(&["echo"]),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        step_started(1),
+        call_message,
+        requested,
+        tools_changed(&["write"], &["echo"]),
+        result(1),
+        step_started(2),
+    ]);
+    let projected = request_history(&entries).expect("project");
+    assert_eq!(names(&projected.tools), ["echo"], "baseline is unchanged");
+    assert!(matches!(projected.items[2], Item::ToolResult { .. }));
+    assert_eq!(projected.items[3], tools_item(&["write"], &["echo"]));
+}
+
+#[test]
+fn compaction_moves_replaced_tool_changes_into_the_baseline_tools() {
+    let entries = log(&[
+        created_with_tools(&["echo"]),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        tools_changed(&["write"], &[]),
+        step_started(1),
+        assistant("ok"),
+        tools_changed(&[], &["echo"]),
+        SessionEvent::CompactionApplied {
+            first_kept: LogId::from_i64(7),
+            summary: vec![text("summary")],
+            replaces: LogIdRange {
+                first: LogId::from_i64(2),
+                last: LogId::from_i64(5),
+            },
+            model: model(),
+            usage: Usage::default(),
+            raw: None,
+        },
+        step_started(2),
+    ]);
+    let projected = request_history(&entries).expect("project");
+    assert_eq!(names(&projected.tools), ["echo", "write"]);
+    assert_eq!(projected.items[1], tools_item(&[], &["echo"]));
+}
+
+#[test]
+fn a_patch_recorded_before_tool_changes_still_decodes() {
+    let patch: ConfigPatch = serde_json::from_value(json!({"model": null})).expect("decode");
+    assert!(patch.add_tools.is_empty() && patch.remove_tools.is_empty());
+}

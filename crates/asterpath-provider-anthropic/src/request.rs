@@ -10,13 +10,45 @@ use asterpath_http::{
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
     ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
-    ToolChoice,
+    ToolChoice, ToolDescriptor,
 };
 
 use crate::models::{AnthropicModelProfile, Thinking};
 use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+
+/// The rendered top-level `tools`: the baseline when tool changes render
+/// inline, otherwise the effective set (ADR-0030). `tools_hash` covers these.
+pub(crate) fn top_level_tools<'a>(
+    rules: &AnthropicModelProfile,
+    request: &'a ModelRequest,
+) -> &'a [ToolDescriptor] {
+    if rules.inline_tools {
+        &request.baseline_tools
+    } else {
+        &request.tools
+    }
+}
+
+/// The `anthropic-beta` header the rendered body needs.
+pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Option<&'static str> {
+    (rules.inline_tools
+        && request
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::ToolsChanged { .. })))
+    .then_some(INLINE_TOOLS_BETA)
+}
+
+fn tool_definition(tool: &ToolDescriptor) -> Value {
+    json!({
+        "name": tool.name.as_str(),
+        "description": tool.description,
+        "input_schema": tool.schema,
+    })
+}
 
 /// One rendered JSON fragment: ordinary values are serialized compactly,
 /// replayed provider raw data is inserted exactly as persisted.
@@ -164,8 +196,9 @@ pub(crate) fn render(
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
     let options = provider_options_for(request, &[])?;
-    let tools_hash = asterpath_protocol::tools_hash(&request.tools);
-    let messages = render_messages(provider, request, &tools_hash, rules.inline_system)?;
+    let top_tools = top_level_tools(rules, request);
+    let tools_hash = asterpath_protocol::tools_hash(top_tools);
+    let messages = render_messages(provider, request, &tools_hash, rules)?;
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_system {
         // Fallback: appended instructions join the top-level system.
@@ -193,18 +226,8 @@ pub(crate) fn render(
         fields.push(("system", Frag::Json(Value::Array(blocks))));
     }
     fields.push(("messages", Frag::Raw(messages)));
-    if !request.tools.is_empty() {
-        let mut tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name.as_str(),
-                    "description": tool.description,
-                    "input_schema": tool.schema,
-                })
-            })
-            .collect();
+    if !top_tools.is_empty() {
+        let mut tools: Vec<Value> = top_tools.iter().map(tool_definition).collect();
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = ephemeral();
         }
@@ -326,8 +349,9 @@ fn render_messages(
     provider: &ProviderId,
     request: &ModelRequest,
     tools_hash: &str,
-    inline_system: bool,
+    rules: &AnthropicModelProfile,
 ) -> Result<String, ProviderError> {
+    let inline_system = rules.inline_system;
     // On the fallback path the top-level system holds every instruction, so
     // thinking produced before the last one was bound to a different system.
     let replay_from = if inline_system {
@@ -453,6 +477,22 @@ fn render_messages(
             }
             // Rendered into the top-level system by `render`.
             Item::Instruction { .. } => {}
+            Item::ToolsChanged { added, removed } if rules.inline_tools => {
+                messages.system.extend(added.iter().map(|tool| {
+                    Frag::Json(json!({
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_definition", "definition": tool_definition(tool)},
+                    }))
+                }));
+                messages.system.extend(removed.iter().map(|name| {
+                    Frag::Json(json!({
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": name.as_str()},
+                    }))
+                }));
+            }
+            // The top-level `tools` is already the effective set.
+            Item::ToolsChanged { .. } => {}
         }
     }
     messages.flush_system();

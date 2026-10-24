@@ -1,7 +1,9 @@
-//! Mid-session configuration changes (ADR-0030, #109): `update_config` writes
-//! a `ConfigChanged`, and every step folds the config at its `StepStarted`.
+//! Mid-session configuration changes (ADR-0030, #109, #110, #111):
+//! `update_config` writes a `ConfigChanged`, and every step folds the config
+//! at its `StepStarted`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -13,8 +15,13 @@ use asterpath::protocol::{
     decode_entry, scan_all,
 };
 use asterpath::protocol::{ContextPolicy, LogId, SessionStore, SpanAttributes, StorageError};
+use asterpath::protocol::{
+    Parallelism, Provenance, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor,
+    ToolError, ToolErrorKind, ToolOutput, ToolResultStatus,
+};
 use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
+use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -635,4 +642,377 @@ async fn trace_attributes_each_model_call_to_the_model_it_used() {
             ("chat model-2".to_owned(), ModelId::new("model-2")),
         ]
     );
+}
+
+fn lookup() -> ToolDescriptor {
+    ToolDescriptor {
+        name: ToolName::new("lookup"),
+        description: "look something up".to_owned(),
+        schema: serde_json::json!({"type": "object"}),
+        parallelism: Parallelism::Parallel,
+        replay: ReplaySafety::Safe,
+        side_effect: SideEffect::ReadOnly,
+        provenance: Provenance::InProcess,
+        timeout: None,
+        max_output_bytes: None,
+    }
+}
+
+struct Lookup {
+    descriptor: ToolDescriptor,
+    calls: AtomicUsize,
+}
+
+impl Tool for Lookup {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke(
+        &self,
+        _args: ToolArgs,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(ToolOutput::new(vec![text("found")])) })
+    }
+}
+
+fn lookup_tool() -> Arc<Lookup> {
+    Arc::new(Lookup {
+        descriptor: lookup(),
+        calls: AtomicUsize::new(0),
+    })
+}
+
+async fn assemble_with_lookup(
+    store: Arc<dyn SessionStore>,
+    provider: Arc<dyn Provider>,
+    tool: Arc<Lookup>,
+) -> Asterpath {
+    Asterpath::builder()
+        .store(store)
+        .providers(vec![provider])
+        .tools(vec![tool])
+        .build()
+        .await
+        .expect("build")
+}
+
+fn add_lookup(id: u8) -> ConfigPatch {
+    let mut update = ConfigPatch::default();
+    update.id = Some(UpdateId::from_bytes([id; 16]));
+    update.add_tools = vec![lookup()];
+    update
+}
+
+fn remove_lookup(id: u8) -> ConfigPatch {
+    let mut update = ConfigPatch::default();
+    update.id = Some(UpdateId::from_bytes([id; 16]));
+    update.remove_tools = vec![ToolName::new("lookup")];
+    update
+}
+
+fn call_lookup(call_id: &str) -> Vec<Item> {
+    vec![Item::ToolCall {
+        call_id: call_id.to_owned(),
+        provider_item_id: None,
+        name: ToolName::new("lookup"),
+        raw_args: JsonString::new("{}"),
+        raw: None,
+    }]
+}
+
+fn names(tools: &[ToolDescriptor]) -> Vec<&str> {
+    tools.iter().map(|tool| tool.name.as_str()).collect()
+}
+
+fn has_tools_changed(items: &[Item]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, Item::ToolsChanged { .. }))
+}
+
+#[tokio::test]
+async fn an_added_tool_is_callable_next_step_and_a_removed_one_is_not_found() {
+    // Step 1 adds `lookup`, step 2 calls it, step 3 removes it, step 4 calls it again.
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(call_lookup("call-1"), StopReason::ToolUse, Usage::default())
+            .respond(reply("third"), StopReason::PauseTurn, Usage::default())
+            .respond(call_lookup("call-2"), StopReason::ToolUse, Usage::default())
+            .respond(reply("done"), StopReason::EndTurn, Usage::default()),
+        vec![Some(add_lookup(1)), None, Some(remove_lookup(2))],
+    );
+    let tool = lookup_tool();
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        provider.clone(),
+        tool.clone(),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let requests = provider.inner.requests();
+    assert!(
+        requests[0].tools.is_empty(),
+        "the running step is unaffected"
+    );
+    assert_eq!(names(&requests[1].tools), ["lookup"]);
+    assert!(
+        requests[1].baseline_tools.is_empty(),
+        "the baseline is unchanged"
+    );
+    assert!(
+        has_tools_changed(&requests[1].items),
+        "{:?}",
+        requests[1].items
+    );
+    assert!(requests[3].tools.is_empty());
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        1,
+        "only the first call runs"
+    );
+
+    let results: Vec<(ToolResultStatus, Option<ToolErrorKind>)> = events(&asterpath, &handle)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult { status, error, .. } => {
+                Some((status, error.map(|error| error.kind)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            (ToolResultStatus::Completed, None),
+            (ToolResultStatus::Failed, Some(ToolErrorKind::NotFound)),
+        ]
+    );
+    let calls = requests[4]
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::ToolCall { .. }))
+        .count();
+    assert_eq!(calls, 2, "calls to the removed tool stay in history");
+}
+
+#[tokio::test]
+async fn invalid_tool_changes_are_rejected_and_nothing_is_logged() {
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath
+        .create_session(SessionSpec {
+            tools: ToolSelection::Names(vec![ToolName::new("lookup")]),
+            ..spec()
+        })
+        .await
+        .expect("create");
+    let before = events(&asterpath, &handle).await;
+
+    let mut unregistered = add_lookup(1);
+    unregistered.add_tools[0].name = ToolName::new("missing");
+    let duplicate = add_lookup(2);
+    let mut absent = remove_lookup(3);
+    absent.remove_tools = vec![ToolName::new("missing")];
+    let mut without_id = remove_lookup(4);
+    without_id.id = None;
+    for update in [unregistered, duplicate, absent, without_id] {
+        let error = handle.update_config(update.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, AsterError::Config { .. }),
+            "{update:?}: {error:?}"
+        );
+    }
+    assert_eq!(events(&asterpath, &handle).await, before);
+}
+
+#[tokio::test]
+async fn an_added_descriptor_must_match_the_registry() {
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    let mut changed = add_lookup(1);
+    changed.add_tools[0].description = "something else".to_owned();
+    let error = handle.update_config(changed).await.unwrap_err();
+    assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_retried_tool_change_is_recorded_once() {
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    handle.update_config(add_lookup(1)).await.expect("first");
+    handle.update_config(add_lookup(1)).await.expect("retry");
+    let changes = events(&asterpath, &handle)
+        .await
+        .into_iter()
+        .filter(|event| event.kind() == "ConfigChanged")
+        .count();
+    assert_eq!(changes, 1);
+}
+
+/// Adds `lookup` during step 1, which pauses the turn, so step 2 runs with it.
+fn pausing_adder() -> Arc<Switching> {
+    Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(reply("second"), StopReason::EndTurn, Usage::default()),
+        vec![Some(add_lookup(1))],
+    )
+}
+
+#[tokio::test]
+async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
+    let live = pausing_adder();
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        live.clone(),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    live.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+    let live_step_2 = live.inner.requests()[1].clone();
+    assert_eq!(names(&live_step_2.tools), ["lookup"]);
+
+    // Dies appending step 2's `StepStarted` (see the model-switch case).
+    let shared = Arc::new(InMemoryEventLog::new());
+    let crashing = pausing_adder();
+    let failing: Arc<dyn SessionStore> = Arc::new(FailpointEventLog::new(
+        shared.clone(),
+        Failpoint::panic(Point::AppendBeforeCommit)
+            .with_occurrence(NonZeroUsize::new(8).expect("non-zero")),
+    ));
+    let asterpath = assemble_with_lookup(failing, crashing.clone(), lookup_tool()).await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    crashing.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    let driven = handle.clone();
+    let crashed = tokio::spawn(async move { drive(&driven).await }).await;
+    assert!(crashed.is_err_and(|error| error.is_panic()));
+    let prefix = kinds(shared.as_ref(), &handle).await.expect("scan");
+    assert_eq!(prefix.last(), Some(&"StepCommitted"));
+
+    let recovered = Arc::new(ScriptedProvider::new("p").respond(
+        reply("second"),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let asterpath = assemble_with_lookup(shared.clone(), recovered.clone(), lookup_tool()).await;
+    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    drive(&handle).await;
+
+    assert_eq!(recovered.requests(), [live_step_2]);
+}
+
+#[tokio::test]
+async fn compaction_rebases_replaced_tool_changes_into_the_baseline_tools() {
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(reply("second"), StopReason::EndTurn, Usage::default())
+            .respond(reply("third"), StopReason::EndTurn, Usage::default())
+            .respond(reply("the summary"), StopReason::EndTurn, Usage::default())
+            .respond(reply("fourth"), StopReason::EndTurn, Usage::default()),
+        vec![Some(add_lookup(1))],
+    );
+    let catalog = ProviderCatalog::new(vec![provider.clone() as Arc<dyn Provider>]).expect("one");
+    let asterpath = Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
+        .providers(vec![provider.clone()])
+        .tools(vec![lookup_tool()])
+        .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
+        .build()
+        .await
+        .expect("build");
+    let mut session = spec();
+    session.model.context_window = Some(100_000);
+    let handle = asterpath.create_session(session).await.expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+    handle.submit_input(input(2)).await.expect("input");
+    drive(&handle).await;
+    handle.compact_now().await.expect("compact");
+    handle.submit_input(input(3)).await.expect("input");
+    drive(&handle).await;
+
+    let after = &provider.inner.requests()[4];
+    assert_eq!(after.prefix_epoch, 1);
+    assert_eq!(names(&after.baseline_tools), ["lookup"]);
+    assert_eq!(after.baseline_tools, after.tools);
+    assert!(!has_tools_changed(&after.items), "{:?}", after.items);
+}
+
+#[tokio::test]
+async fn a_forked_child_starts_from_the_effective_tools_without_change_items() {
+    // Calls: parent step 1 (adds lookup), parent step 2 spawns, the child, parent step 3.
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(
+                vec![Item::ToolCall {
+                    call_id: "call-spawn".to_owned(),
+                    provider_item_id: None,
+                    name: ToolName::new("spawn_agent"),
+                    raw_args: JsonString::new(r#"{"task":"look"}"#),
+                    raw: None,
+                }],
+                StopReason::ToolUse,
+                Usage::default(),
+            )
+            .respond(reply("child done"), StopReason::EndTurn, Usage::default())
+            .respond(reply("parent done"), StopReason::EndTurn, Usage::default()),
+        vec![Some(add_lookup(1))],
+    );
+    let asterpath = assemble_with_lookup(
+        Arc::new(InMemoryEventLog::new()),
+        provider.clone(),
+        lookup_tool(),
+    )
+    .await;
+    let handle = asterpath
+        .create_session(SessionSpec {
+            tools: ToolSelection::Names(vec![ToolName::new("spawn_agent")]),
+            subagents: SubagentConfig {
+                default_context: ContextPolicy::Fork {
+                    at: LogId::from_i64(0),
+                },
+                ..SubagentConfig::default()
+            },
+            ..spec()
+        })
+        .await
+        .expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let child = &provider.inner.requests()[2];
+    assert_eq!(names(&child.tools), ["spawn_agent", "lookup"]);
+    assert_eq!(child.baseline_tools, child.tools);
+    assert!(!has_tools_changed(&child.items), "{:?}", child.items);
 }

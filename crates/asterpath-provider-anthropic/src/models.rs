@@ -19,6 +19,11 @@
 //! mid-conversation-system-messages (checked 2026-10-24; no beta header). Sonnet 5
 //! is listed as unsupported; models the page does not list fall back.
 //!
+//! `inline_tools`: the same page says mid-conversation tool changes are in
+//! beta "on the same models" (checked 2026-10-24); definitions by value need
+//! `anthropic-beta: inline-tools-2026-09-15`, Claude API only. Whether Sonnet 5
+//! takes them is not stated, so it falls back like `inline_system`.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
 //! (`claude-opus-5`). Ids no row matches get [`LATEST`], so a new model works
@@ -63,6 +68,10 @@ pub struct AnthropicModelProfile {
     /// appended instruction joins the top-level `system`, and thinking from
     /// before it is dropped.
     pub inline_system: bool,
+    /// Accepts `tool_addition` / `tool_removal` blocks in a `role: "system"`
+    /// message. Without it a tool change rewrites the top-level `tools`, and
+    /// thinking bound to the old set is dropped.
+    pub inline_tools: bool,
 }
 
 impl AnthropicModelProfile {
@@ -107,6 +116,12 @@ impl AnthropicModelProfile {
         self
     }
 
+    #[must_use]
+    pub fn with_inline_tools(mut self, inline: bool) -> Self {
+        self.inline_tools = inline;
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
     pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
@@ -126,11 +141,13 @@ const fn rules(
         forced_tool_choice: forced,
         sampling,
         inline_system: false,
+        inline_tools: false,
     }
 }
 
 const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile.inline_system = true;
+    profile.inline_tools = true;
     profile
 }
 
@@ -148,10 +165,12 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     forced_tool_choice: true,
     sampling: false,
     inline_system: true,
+    inline_tools: true,
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
     inline_system: false,
+    inline_tools: false,
     ..ADAPTIVE
 };
 /// Fable 5 and Mythos 5: thinking is always on.
@@ -230,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_system_follows_the_supported_model_list() {
+    fn inline_system_and_tools_follow_the_supported_model_list() {
         for (model, inline) in [
             ("claude-opus-5-5", true),
             ("claude-sonnet-5-5", true),
@@ -249,6 +268,7 @@ mod tests {
             ("claude-3-haiku", false),
         ] {
             assert_eq!(builtin(model).inline_system, inline, "{model}");
+            assert_eq!(builtin(model).inline_tools, inline, "{model}");
         }
     }
 

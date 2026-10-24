@@ -705,7 +705,10 @@ impl Scheduler {
     ) -> Result<Vec<Item>, ExecutionError> {
         let entries = scan_decoded(&*self.log, parent.session).await?;
         let (prefix, _) = fork_prefix(&entries, at)?;
-        let items = asterpath_protocol::history(&prefix).map_err(backend)?;
+        let mut items = asterpath_protocol::history(&prefix).map_err(backend)?;
+        // The child's created tools are already the narrowed effective set, so
+        // copied changes would re-add tools the allowlist removed (ADR-0030).
+        items.retain(|item| !matches!(item, Item::ToolsChanged { .. }));
         Ok(items)
     }
 

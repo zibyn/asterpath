@@ -167,6 +167,7 @@ impl DefaultCompactor {
             system: Vec::new(),
             items,
             tools: Vec::new(),
+            baseline_tools: Vec::new(),
             tool_choice: ToolChoice::None,
             disable_parallel_tool_use: false,
             sampling: None,
@@ -330,11 +331,13 @@ fn text_view(items: &[Item]) -> Vec<Item> {
             }
             // Never forward reasoning: the summary request's system differs from
             // the session's, and Anthropic rejects thinking replayed under it (#104).
-            // Instructions are rebased into the system, never summarized (ADR-0030).
+            // Instructions and tool changes are rebased into the baseline, never
+            // summarized (ADR-0030).
             Item::Reasoning { .. }
             | Item::ProviderOpaque { .. }
             | Item::ServerToolCall { .. }
-            | Item::Instruction { .. } => {}
+            | Item::Instruction { .. }
+            | Item::ToolsChanged { .. } => {}
             Item::ToolCall { name, raw_args, .. } => view.push(text_item(format!(
                 "tool call {name}({})",
                 raw_args.as_str()

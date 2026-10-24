@@ -948,6 +948,7 @@ impl Agent {
             step,
             recovering,
             cancel_grace: config.turn.cancel_grace,
+            tools: &config.tools,
             events,
             spawn,
         };
@@ -1012,14 +1013,16 @@ impl Agent {
                 session,
                 detail: error.to_string(),
             })?;
-        Ok(ModelRequest::new(
+        let mut request = ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
             history.system,
             history.items,
             config.tools.clone(),
             &config.request,
-        ))
+        );
+        request.baseline_tools = history.tools;
+        Ok(request)
     }
 
     async fn commit_turn(

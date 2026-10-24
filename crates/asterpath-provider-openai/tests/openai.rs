@@ -55,6 +55,7 @@ fn request(items: Vec<Item>) -> ModelRequest {
         }],
         items,
         tools: vec![tool("get_weather")],
+        baseline_tools: vec![tool("get_weather")],
         tool_choice: ToolChoice::Auto,
         disable_parallel_tool_use: false,
         sampling: None,
@@ -996,6 +997,40 @@ async fn an_instruction_renders_as_a_developer_message_in_place() {
             "role": "developer",
             "content": [{"type": "input_text", "text": "answer in French"}]
         })
+    );
+}
+
+#[tokio::test]
+async fn a_tool_change_sends_the_effective_tools_and_renders_no_item() {
+    let raw_item = r#"{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA"}"#;
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
+    let mut request = request(vec![
+        user_text("hi"),
+        reasoning_item(binding("gpt-5", 0, "an-older-tool-set"), raw_item),
+        Item::ToolsChanged {
+            added: vec![tool("get_time")],
+            removed: vec![ToolName::new("get_weather")],
+        },
+    ]);
+    request.tools = vec![tool("get_time")];
+    let events = collect(&provider(&server), request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    let names: Vec<&Value> = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| &tool["name"])
+        .collect();
+    assert_eq!(
+        names,
+        [&json!("get_time")],
+        "top-level tools are the effective set"
+    );
+    assert_eq!(body["input"].as_array().expect("input").len(), 2);
+    assert!(
+        server.requests()[0].body.contains(raw_item),
+        "reasoning is replayed"
     );
 }
 

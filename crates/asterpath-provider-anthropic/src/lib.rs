@@ -136,8 +136,9 @@ impl Provider for AnthropicProvider {
             provider,
             request.spec.model.clone(),
             request.prefix_epoch,
-            asterpath_protocol::tools_hash(&request.tools),
+            asterpath_protocol::tools_hash(request::top_level_tools(profile, &request)),
             body,
+            request::beta(profile, &request),
         );
         stream::unfold(Some(decoder), |state| async move {
             let mut decoder = state?;

@@ -139,12 +139,18 @@ impl Harness {
         cancel: &CancelToken,
     ) -> (ToolOutcome, Vec<AgentEvent>) {
         let events = EventSink::default();
+        let tools: Vec<_> = self
+            .tools
+            .iter()
+            .map(|tool| tool.descriptor().clone())
+            .collect();
         let step = ToolStep {
             session: SESSION,
             turn: TURN,
             step: STEP,
             recovering,
             cancel_grace: self.cancel_grace,
+            tools: &tools,
             events: &events,
             spawn: None,
         };

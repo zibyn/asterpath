@@ -4,15 +4,17 @@
 //! (including any previous summary) and inserts the new summary immediately
 //! before `first_kept`. The raw log is never modified.
 //!
-//! An instruction appended by `ConfigChanged` takes its place at the next
-//! `StepStarted` (or the end of the scanned entries), so it always follows the
-//! tool results of the step it was appended in. A compaction that replaces it
-//! moves it into the baseline system instead of the summary (ADR-0030).
+//! An instruction or tool change recorded by `ConfigChanged` takes its place
+//! at the next `StepStarted` (or the end of the scanned entries), so it always
+//! follows the tool results of the step it was recorded in. A compaction that
+//! replaces it moves it into the baseline system or tools instead of the
+//! summary (ADR-0030).
 
 use std::collections::HashMap;
 
 use crate::{LogEntry, LogId, LogIdRange, ToolCallId};
 
+use crate::config::{ToolDescriptor, change_tools};
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::event::{SessionEvent, ToolResultStatus};
 use crate::item::{Item, Part};
@@ -44,7 +46,30 @@ pub struct RequestHistory {
     /// The baseline system: `SessionCreated.config.system` plus every
     /// instruction a compaction has replaced, in log order.
     pub system: Vec<Part>,
+    /// The baseline tools: `SessionCreated.config.tools` with every tool
+    /// change a compaction has replaced applied, in log order.
+    pub tools: Vec<ToolDescriptor>,
     pub items: Vec<Item>,
+}
+
+#[derive(Default)]
+struct Baseline {
+    system: Vec<Part>,
+    tools: Vec<ToolDescriptor>,
+}
+
+impl Baseline {
+    fn absorb(&mut self, items: &[Item]) {
+        for item in items {
+            match item {
+                Item::Instruction { parts } => self.system.extend(parts.iter().cloned()),
+                Item::ToolsChanged { added, removed } => {
+                    change_tools(&mut self.tools, added, removed);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Fold a set of scanned entries into model-visible history, ordered by seq.
@@ -57,9 +82,10 @@ pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionEr
 
 /// The baseline system and the flattened history a model request carries.
 pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, ProjectionError> {
-    let (history, system) = fold(entries)?;
+    let (history, baseline) = fold(entries)?;
     Ok(RequestHistory {
-        system,
+        system: baseline.system,
+        tools: baseline.tools,
         items: history
             .into_iter()
             .flat_map(|projected| projected.items)
@@ -67,32 +93,47 @@ pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, Projectio
     })
 }
 
-fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Vec<Part>), ProjectionError> {
+fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), ProjectionError> {
     let mut ordered: Vec<&LogEntry> = entries.iter().collect();
     ordered.sort_by_key(|entry| entry.seq);
 
     let mut history: Vec<ProjectedEntry> = Vec::new();
     let mut intents: HashMap<ToolCallId, (String, u64)> = HashMap::new();
     let mut pending_results: Vec<(u64, ProjectedEntry)> = Vec::new();
-    let mut pending_instructions: Vec<ProjectedEntry> = Vec::new();
-    let mut baseline: Option<Vec<Part>> = None;
+    let mut pending_changes: Vec<ProjectedEntry> = Vec::new();
+    let mut baseline: Option<Baseline> = None;
 
     for entry in ordered {
         match decode_entry(entry)? {
             SessionEvent::SessionCreated { config, .. } if baseline.is_none() => {
-                baseline = Some(config.system);
-            }
-            SessionEvent::ConfigChanged { patch } if !patch.append_system.is_empty() => {
-                pending_instructions.push(ProjectedEntry {
-                    origin: ProjectedOrigin::Log(entry.log_id),
-                    items: vec![Item::Instruction {
-                        parts: patch.append_system,
-                    }],
+                baseline = Some(Baseline {
+                    system: config.system,
+                    tools: config.tools,
                 });
             }
-            SessionEvent::StepStarted { .. } if !pending_instructions.is_empty() => {
+            SessionEvent::ConfigChanged { patch } => {
+                let mut items = Vec::new();
+                if !patch.append_system.is_empty() {
+                    items.push(Item::Instruction {
+                        parts: patch.append_system,
+                    });
+                }
+                if !patch.add_tools.is_empty() || !patch.remove_tools.is_empty() {
+                    items.push(Item::ToolsChanged {
+                        added: patch.add_tools,
+                        removed: patch.remove_tools,
+                    });
+                }
+                if !items.is_empty() {
+                    pending_changes.push(ProjectedEntry {
+                        origin: ProjectedOrigin::Log(entry.log_id),
+                        items,
+                    });
+                }
+            }
+            SessionEvent::StepStarted { .. } if !pending_changes.is_empty() => {
                 flush_results(&mut pending_results, &mut history);
-                history.append(&mut pending_instructions);
+                history.append(&mut pending_changes);
             }
             SessionEvent::ContextForked { items, .. } => {
                 flush_results(&mut pending_results, &mut history);
@@ -170,15 +211,15 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Vec<Part>), Projec
                 ..
             } => {
                 flush_results(&mut pending_results, &mut history);
-                // Replaced instructions join the baseline, never the summary.
-                let baseline = baseline.get_or_insert_with(Vec::new);
-                for projected in history.iter().chain(&pending_instructions) {
+                // Replaced changes join the baseline, never the summary.
+                let baseline = baseline.get_or_insert_with(Baseline::default);
+                for projected in history.iter().chain(&pending_changes) {
                     if overlaps(&projected.origin, &replaces) {
-                        baseline.extend(instruction_parts(&projected.items));
+                        baseline.absorb(&projected.items);
                     }
                 }
                 history.retain(|projected| !overlaps(&projected.origin, &replaces));
-                pending_instructions.retain(|projected| !overlaps(&projected.origin, &replaces));
+                pending_changes.retain(|projected| !overlaps(&projected.origin, &replaces));
                 let index = history
                     .iter()
                     .position(|projected| match projected.origin {
@@ -198,16 +239,9 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Vec<Part>), Projec
         }
     }
     flush_results(&mut pending_results, &mut history);
-    history.append(&mut pending_instructions);
+    history.append(&mut pending_changes);
 
     Ok((history, baseline.unwrap_or_default()))
-}
-
-fn instruction_parts(items: &[Item]) -> impl Iterator<Item = Part> + '_ {
-    items.iter().flat_map(|item| match item {
-        Item::Instruction { parts } => parts.clone(),
-        _ => Vec::new(),
-    })
 }
 
 fn flush_results(pending: &mut Vec<(u64, ProjectedEntry)>, history: &mut Vec<ProjectedEntry>) {

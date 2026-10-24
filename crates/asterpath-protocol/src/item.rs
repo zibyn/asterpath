@@ -60,6 +60,12 @@ pub enum Item {
     Instruction {
         parts: Vec<Part>,
     },
+    /// A mid-session tool set change (ADR-0030), placed like `Instruction`.
+    /// The request's top-level tools are the baseline before it.
+    ToolsChanged {
+        added: Vec<crate::ToolDescriptor>,
+        removed: Vec<ToolName>,
+    },
     ProviderOpaque {
         provider: ProviderId,
         kind: String,

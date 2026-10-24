@@ -67,6 +67,7 @@ async fn renders_system_tools_sampling_tool_choice_and_thinking() {
     request.system = vec![text("be helpful"), text("be terse")];
     request.items = vec![user_message(vec![text("hi")])];
     request.tools = vec![descriptor("search")];
+    request.baseline_tools = request.tools.clone();
     request.tool_choice = ToolChoice::Required;
     request.disable_parallel_tool_use = true;
     request.sampling = Some(SamplingParams {
@@ -161,6 +162,7 @@ async fn renders_every_tool_choice_variant() {
     ] {
         let mut request = request_for("claude-opus-5");
         request.tools = vec![descriptor("search")];
+        request.baseline_tools = request.tools.clone();
         request.tool_choice = choice;
         drain(&provider, request).await;
     }
@@ -371,6 +373,7 @@ async fn the_same_log_renders_byte_identical_requests() {
     let mut request = base_request();
     request.items = vec![user_message(vec![text("hi")])];
     request.tools = vec![descriptor("a"), descriptor("b")];
+    request.baseline_tools = request.tools.clone();
     request.max_output_tokens = 100;
     drain(&provider, request.clone()).await;
     drain(&provider, request).await;
@@ -508,6 +511,7 @@ async fn reasoning_raw_json_is_replayed_byte_for_byte() {
     // Non-empty tools change the fingerprint, so the reasoning is dropped.
     let mut wrong_tools = base_request();
     wrong_tools.tools = vec![descriptor("search")];
+    wrong_tools.baseline_tools = wrong_tools.tools.clone();
     wrong_tools.items = vec![reasoning.clone()];
     drain(&provider, wrong_tools).await;
     assert!(!server.requests()[5].body.contains(raw));
@@ -759,9 +763,11 @@ async fn current_models_reject_budget_forced_tool_choice_and_sampling_before_htt
     with_budget.reasoning = budget(2048);
     let mut forced = request_for("claude-sonnet-5-5");
     forced.tools = vec![descriptor("search")];
+    forced.baseline_tools = forced.tools.clone();
     forced.tool_choice = ToolChoice::Required;
     let mut named = request_for("claude-fable-5-1");
     named.tools = vec![descriptor("search")];
+    named.baseline_tools = named.tools.clone();
     named.tool_choice = ToolChoice::Tool(ToolName::new("search"));
     let mut sampled = request_for("claude-opus-4-7");
     sampled.sampling = Some(SamplingParams {
@@ -842,6 +848,7 @@ async fn sets_cache_breakpoints_on_last_tool_system_block_and_message_block() {
     let mut request = base_request();
     request.system = vec![text("be helpful"), text("be terse")];
     request.tools = vec![descriptor("a"), descriptor("b")];
+    request.baseline_tools = request.tools.clone();
     request.items = vec![
         user_message(vec![text("hi")]),
         assistant_message(vec![text("hello")]),
@@ -1386,6 +1393,109 @@ async fn without_inline_system_an_instruction_joins_the_top_level_system_and_dro
         .map(|block| block["text"].as_str().unwrap())
         .collect();
     assert_eq!(system, ["be helpful", "answer in French"]);
+    assert!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["role"] != "system"),
+        "{body}"
+    );
+}
+
+/// A tool loop whose tool set changed after the tool result: `echo` was
+/// the baseline, `write` replaced it.
+fn tools_changed_request(model_id: &str) -> ModelRequest {
+    let mut request = instructed_request(model_id);
+    request.items.pop();
+    if let Item::Reasoning { binding, .. } = &mut request.items[1] {
+        binding.tools_hash = asterpath_protocol::tools_hash(&[descriptor("echo")]);
+    }
+    request.items.push(Item::ToolsChanged {
+        added: vec![descriptor("write")],
+        removed: vec![ToolName::new("echo")],
+    });
+    request.baseline_tools = vec![descriptor("echo")];
+    request.tools = vec![descriptor("write")];
+    request
+}
+
+fn tool_names(body: &serde_json::Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect()
+}
+
+const INLINE_TOOLS_BETA: &str = "anthropic-beta: inline-tools-2026-09-15";
+
+#[tokio::test]
+async fn a_tool_change_renders_inline_and_keeps_the_top_level_tools_and_old_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    drain(&provider(&server), tools_changed_request("claude-opus-5-5")).await;
+    let sent = &server.requests()[0];
+    assert!(
+        sent.head.to_ascii_lowercase().contains(INLINE_TOOLS_BETA),
+        "{}",
+        sent.head
+    );
+    assert!(sent.body.contains(THINKING), "old thinking is replayed");
+    let body = sent.json_body();
+    assert_eq!(
+        tool_names(&body),
+        ["echo"],
+        "top-level tools stay the baseline"
+    );
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last["role"], "system", "{body}");
+    assert_eq!(
+        last["content"][0],
+        serde_json::json!({
+            "type": "tool_addition",
+            "tool": {
+                "type": "tool_definition",
+                "definition": {
+                    "name": "write",
+                    "description": "write tool",
+                    "input_schema": descriptor("write").schema,
+                },
+            },
+        })
+    );
+    assert_eq!(last["content"][1]["type"], "tool_removal", "{body}");
+    assert_eq!(
+        last["content"][1]["tool"],
+        serde_json::json!({"type": "tool_reference", "name": "echo"})
+    );
+}
+
+#[tokio::test]
+async fn without_inline_tools_a_tool_change_rewrites_the_top_level_tools_and_drops_old_thinking() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let provider = provider(&server).with_model_profile(
+        "claude-opus-5-5",
+        AnthropicModelProfile::latest().with_inline_tools(false),
+    );
+    drain(&provider, tools_changed_request("claude-opus-5-5")).await;
+    let sent = &server.requests()[0];
+    assert!(
+        !sent.head.to_ascii_lowercase().contains("anthropic-beta"),
+        "{}",
+        sent.head
+    );
+    assert!(
+        !sent.body.contains(THINKING),
+        "thinking bound to the old tools is dropped"
+    );
+    let body = sent.json_body();
+    assert_eq!(
+        tool_names(&body),
+        ["write"],
+        "top-level tools are the effective set"
+    );
     assert!(
         body["messages"]
             .as_array()

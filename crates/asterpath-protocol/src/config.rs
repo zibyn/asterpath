@@ -164,13 +164,14 @@ pub enum ContextPolicy {
 /// A host change to a session's configuration (ADR-0030), validated by
 /// `SessionHandle::update_config` and recorded as one `ConfigChanged`. Each
 /// present field replaces the effective value whole; absent fields keep
-/// theirs. `append_system` is appended, never replaced.
+/// theirs. `append_system` is appended, never replaced; `remove_tools` and
+/// `add_tools` change the tool set by name.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigPatch {
     /// Dedup key: a retried patch with the same id is recorded once.
-    /// Required when `append_system` is non-empty, since appending twice is
-    /// not idempotent.
+    /// Required when `append_system`, `add_tools` or `remove_tools` is
+    /// non-empty, since applying those twice is not idempotent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<UpdateId>,
     #[serde(default)]
@@ -180,6 +181,13 @@ pub struct ConfigPatch {
     /// Instructions appended to the system. Only `Part::Text` is valid.
     #[serde(default)]
     pub append_system: Vec<Part>,
+    /// Tools the model may call from the next step on, recorded as the
+    /// registry's descriptors; recovery reads them and never re-resolves.
+    #[serde(default)]
+    pub add_tools: Vec<ToolDescriptor>,
+    /// Effective tools the model may no longer call from the next step on.
+    #[serde(default)]
+    pub remove_tools: Vec<ToolName>,
 }
 
 /// The effective configuration at `watermark`: `SessionCreated.config` with
@@ -219,7 +227,8 @@ pub struct ConfigSnapshot {
     /// Only `Part::Text` is valid. In `SessionCreated` the initial system;
     /// folded, it also holds every appended instruction in log order.
     pub system: Vec<Part>,
-    /// Resolved at session creation and then fixed for the session's lifetime.
+    /// In `SessionCreated` the tools resolved at creation; folded, the
+    /// effective set after every `add_tools` / `remove_tools`.
     pub tools: Vec<ToolDescriptor>,
     pub request: RequestConfig,
     pub turn: TurnConfig,
@@ -237,7 +246,21 @@ impl ConfigSnapshot {
             self.request = request.clone();
         }
         self.system.extend(patch.append_system.iter().cloned());
+        change_tools(&mut self.tools, &patch.add_tools, &patch.remove_tools);
     }
+}
+
+/// Remove `removed`, then add `added`. An added name replaces a tool of the
+/// same name, so the fold never holds two tools with one name.
+pub(crate) fn change_tools(
+    tools: &mut Vec<ToolDescriptor>,
+    added: &[ToolDescriptor],
+    removed: &[ToolName],
+) {
+    tools.retain(|tool| {
+        !removed.contains(&tool.name) && !added.iter().any(|new| new.name == tool.name)
+    });
+    tools.extend(added.iter().cloned());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

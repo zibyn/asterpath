@@ -36,6 +36,7 @@ pub(crate) struct Decoder {
     prefix_epoch: u32,
     tools_hash: String,
     body: String,
+    beta: Option<&'static str>,
 
     phase: Option<Phase>,
     terminal: bool,
@@ -91,6 +92,7 @@ impl Decoder {
         prefix_epoch: u32,
         tools_hash: String,
         body: String,
+        beta: Option<&'static str>,
     ) -> Self {
         Self {
             client,
@@ -101,6 +103,7 @@ impl Decoder {
             prefix_epoch,
             tools_hash,
             body,
+            beta,
             phase: Some(Phase::Connect),
             terminal: false,
             queue: VecDeque::new(),
@@ -162,16 +165,17 @@ impl Decoder {
     }
 
     async fn connect(&mut self) {
-        let response = self
+        let mut request = self
             .client
             .post(&self.url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .body(self.body.clone())
-            .send()
-            .await;
+            .header("accept", "text/event-stream");
+        if let Some(beta) = self.beta {
+            request = request.header("anthropic-beta", beta);
+        }
+        let response = request.body(self.body.clone()).send().await;
         let response = match response {
             Ok(response) => response,
             Err(failure) => {

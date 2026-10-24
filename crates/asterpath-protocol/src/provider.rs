@@ -24,7 +24,11 @@ pub struct ModelRequest {
     /// Only `Part::Text` is valid.
     pub system: Vec<Part>,
     pub items: Vec<Item>,
+    /// The effective tool set: what the model may call this step.
     pub tools: Vec<ToolDescriptor>,
+    /// The tool set at creation or the latest compaction; the
+    /// `Item::ToolsChanged` entries in `items` lead from it to `tools`.
+    pub baseline_tools: Vec<ToolDescriptor>,
     pub tool_choice: ToolChoice,
     pub disable_parallel_tool_use: bool,
     pub sampling: Option<SamplingParams>,
@@ -51,6 +55,7 @@ impl ModelRequest {
             prefix_epoch,
             system,
             items,
+            baseline_tools: tools.clone(),
             tools,
             tool_choice: request.tool_choice.clone(),
             disable_parallel_tool_use: request.disable_parallel_tool_use,

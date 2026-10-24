@@ -342,6 +342,8 @@ fn render_input(
                     "content": text_content(parts, provider, trace),
                 }))?);
             }
+            // Top-level `tools` is already the effective set (ADR-0030).
+            Item::ToolsChanged { .. } => {}
         }
     }
     Ok(input)

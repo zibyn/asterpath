@@ -271,6 +271,7 @@ impl Asterpath {
             session,
             store: Arc::clone(&self.store),
             providers: Arc::clone(&self.providers),
+            tools: Arc::clone(&self.tools),
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
@@ -366,6 +367,7 @@ pub struct SessionHandle {
     session: SessionId,
     store: Arc<dyn SessionStore>,
     providers: Arc<ProviderCatalog>,
+    tools: Arc<ToolTable>,
     agent: Arc<Agent>,
     waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
@@ -399,13 +401,17 @@ impl SessionHandle {
         Ok(input.id)
     }
 
-    /// Change the session's model or request parameters, or append system
-    /// instructions (ADR-0030). Validated first: an unregistered provider, an
-    /// `append_system` without `id` or with non-text parts is a `Config` error
-    /// and nothing is logged. An update with an `id` is recorded once however
-    /// often it is retried. Otherwise one `ConfigChanged` is appended; it may be called
-    /// mid-turn and takes effect at the next `StepStarted`, so a step already
-    /// running keeps its config.
+    /// Change the session's model or request parameters, append system
+    /// instructions, or add and remove tools (ADR-0030). Validated first: an
+    /// unregistered provider; an `append_system`, `add_tools` or
+    /// `remove_tools` without `id`; non-text system parts; an added tool that
+    /// is not registered on this `Asterpath`, differs from the registered
+    /// descriptor or is already effective; a removed tool that is not
+    /// effective. Each is a `Config` error and nothing is logged. An update
+    /// with an `id` is recorded once however often it is retried. Otherwise
+    /// one `ConfigChanged` is appended; it may be called mid-turn and takes
+    /// effect at the next `StepStarted`, so a step already running keeps its
+    /// config.
     pub async fn update_config(&self, patch: ConfigPatch) -> Result<(), AsterError> {
         if let Some(model) = &patch.model
             && self.providers.get(&model.provider).is_none()
@@ -414,9 +420,14 @@ impl SessionHandle {
                 message: format!("unknown provider {}", model.provider),
             });
         }
-        if !patch.append_system.is_empty() && patch.id.is_none() {
+        let positional = !patch.append_system.is_empty()
+            || !patch.add_tools.is_empty()
+            || !patch.remove_tools.is_empty();
+        if positional && patch.id.is_none() {
             return Err(AsterError::Config {
-                message: "append_system needs an update id: appending is not idempotent".to_owned(),
+                message: "append_system, add_tools and remove_tools need an update id: \
+                          they are not idempotent"
+                    .to_owned(),
             });
         }
         if !patch
@@ -429,6 +440,28 @@ impl SessionHandle {
             });
         }
         let key = patch.id.map(dedup::config_changed);
+        if !patch.add_tools.is_empty() || !patch.remove_tools.is_empty() {
+            let records = scan::scan_decoded(&*self.store, self.session)
+                .await
+                .map_err(AgentError::from)?;
+            // A retry of a recorded change is a no-op, not a conflict with itself.
+            // Dedup keys are scoped by record kind.
+            if key.is_some()
+                && records.iter().any(|(entry, event)| {
+                    matches!(event, SessionEvent::ConfigChanged { .. }) && entry.dedup_key == key
+                })
+            {
+                return Ok(());
+            }
+            let effective = asterpath_protocol::effective_config(
+                records.iter().map(|(entry, event)| (entry, event)),
+                u64::MAX,
+            )
+            .ok_or(AsterError::Agent(AgentError::NotFound {
+                session: self.session,
+            }))?;
+            self.check_tool_change(&patch, &effective.tools)?;
+        }
         // Without an id a retry may land twice; whole-field overrides fold the same.
         let entry = asterpath_protocol::encode_entry(
             self.session,
@@ -439,6 +472,39 @@ impl SessionHandle {
             message: error.to_string(),
         })?;
         self.store.append(entry).await?;
+        Ok(())
+    }
+
+    /// Added tools must be registered with this exact descriptor and not yet
+    /// effective; removed tools must be effective.
+    fn check_tool_change(
+        &self,
+        patch: &ConfigPatch,
+        effective: &[asterpath_protocol::ToolDescriptor],
+    ) -> Result<(), AsterError> {
+        let error = |message: String| Err(AsterError::Config { message });
+        let is_effective =
+            |name: &asterpath_protocol::ToolName| effective.iter().any(|tool| &tool.name == name);
+        for (index, added) in patch.add_tools.iter().enumerate() {
+            let name = &added.name;
+            match self.tools.get(name) {
+                None => return error(format!("unknown tool {name}")),
+                Some(tool) if tool.descriptor() != added => {
+                    return error(format!(
+                        "tool {name} differs from the registered descriptor"
+                    ));
+                }
+                Some(_) => {}
+            }
+            if is_effective(name) || patch.add_tools[..index].iter().any(|t| &t.name == name) {
+                return error(format!("tool {name} is already in the tool set"));
+            }
+        }
+        for name in &patch.remove_tools {
+            if !is_effective(name) {
+                return error(format!("tool {name} is not in the tool set"));
+            }
+        }
         Ok(())
     }
 
