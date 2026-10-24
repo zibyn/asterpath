@@ -111,11 +111,12 @@ impl ToolPipeline {
 
     /// Give every tool call in `items` a recorded result. Calls of this step
     /// that already have an intent reuse it verbatim; calls with a result are
-    /// skipped.
+    /// skipped. `output_indices[i]` is the stream `output_index` of `items[i]`.
     pub(crate) async fn run(
         &self,
         step: &ToolStep<'_>,
         items: &[Item],
+        output_indices: &[u32],
         cancel: &CancelToken,
     ) -> Result<ToolOutcome, AgentError> {
         let recorded = self.recorded(step).await?;
@@ -127,7 +128,7 @@ impl ToolPipeline {
         let mut runnable: Vec<Runnable> = Vec::new();
         let mut cancelled = cancel.is_cancelled();
 
-        for call in tool_calls(items) {
+        for call in tool_calls(items, output_indices) {
             let Some(admitted) = self.resolve(step, &recorded, call).await? else {
                 continue;
             };
@@ -172,6 +173,7 @@ impl ToolPipeline {
                     tool,
                     descriptor,
                     tool_call_id: admitted.tool_call_id,
+                    output_index: admitted.output_index,
                     provider_call_id: admitted.provider_call_id,
                     name: admitted.name,
                     args: admitted.args,
@@ -287,6 +289,7 @@ impl ToolPipeline {
             }
             return Ok(Some(Admitted {
                 tool_call_id: intent.tool_call_id,
+                output_index: call.output_index,
                 provider_call_id: call.provider_call_id,
                 tool: self.tools.get(&intent.name),
                 name: intent.name.clone(),
@@ -330,6 +333,7 @@ impl ToolPipeline {
         .await?;
         Ok(Some(Admitted {
             tool_call_id,
+            output_index: call.output_index,
             provider_call_id: call.provider_call_id,
             tool,
             name: call.name,
@@ -459,6 +463,7 @@ impl ToolPipeline {
             step.events.push(Ok(AgentEvent::ToolStarted {
                 turn: step.turn,
                 step: step.step,
+                output_index: item.output_index,
                 call: item.tool_call_id,
                 tool: item.name.clone(),
             }));
@@ -783,6 +788,7 @@ impl ToolPipeline {
 }
 
 struct CallItem {
+    output_index: u32,
     provider_call_id: String,
     name: ToolName,
     raw_args: ToolArgs,
@@ -848,6 +854,7 @@ impl Recorded {
 /// A call whose intent is recorded, before approval.
 struct Admitted {
     tool_call_id: ToolCallId,
+    output_index: u32,
     provider_call_id: String,
     tool: Option<Arc<dyn Tool>>,
     name: ToolName,
@@ -864,6 +871,7 @@ struct Runnable {
     tool: Arc<dyn Tool>,
     descriptor: ToolDescriptor,
     tool_call_id: ToolCallId,
+    output_index: u32,
     name: ToolName,
     args: ToolArgs,
 }
@@ -1035,16 +1043,18 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn tool_calls(items: &[Item]) -> Vec<CallItem> {
+fn tool_calls(items: &[Item], output_indices: &[u32]) -> Vec<CallItem> {
     items
         .iter()
-        .filter_map(|item| match item {
+        .zip(output_indices)
+        .filter_map(|(item, &output_index)| match item {
             Item::ToolCall {
                 call_id,
                 name,
                 raw_args,
                 ..
             } => Some(CallItem {
+                output_index,
                 provider_call_id: call_id.clone(),
                 name: name.clone(),
                 raw_args: raw_args.clone(),
