@@ -7,14 +7,15 @@
 //! Layout: `config` resolves the file, `-c` and flags; `session` assembles the
 //! composition root and opens a new, continued or forked session; `drive`
 //! runs it to the end of a turn; `exec`, `doctor` and `debug` are the
-//! commands. The interactive mode plugs into [`dispatch`] on `command: None`
-//! and reuses `session::open` and `drive`.
+//! commands; `interactive` is the bare command (`command: None`) and reuses
+//! `session::open` and `drive`.
 
 mod config;
 mod debug;
 mod doctor;
 mod drive;
 mod exec;
+mod interactive;
 mod session;
 mod stream;
 
@@ -116,13 +117,7 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         Some(Command::Exec(args)) => exec::exec(&cli.global, args).await,
         Some(Command::Doctor) => doctor::doctor(&cli.global).await,
         Some(Command::Debug(args)) => debug::debug(&cli.global, args).await,
-        // shortcut: the interactive REPL is #123; until then the bare command is a usage error
-        None => {
-            let _ = (cli.session, cli.prompt);
-            Err(CliError::config(
-                "interactive mode is not available yet; use `asterpath exec`",
-            ))
-        }
+        None => interactive::interactive(&cli.global, cli.session, cli.prompt).await,
     }
 }
 
