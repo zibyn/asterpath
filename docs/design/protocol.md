@@ -192,6 +192,8 @@ pub struct RequestConfig {
     pub disable_parallel_tool_use: bool,    // 默认 false
     pub sampling: Option<SamplingParams>,   // 默认 None
     pub reasoning: Option<ReasoningParams>, // 默认 None
+    pub stop_sequences: Vec<String>,        // 默认空；serde default
+    pub provider_options: BTreeMap<ProviderId, JsonString>, // 默认空；serde default；规则 R11
 }
 
 pub struct ModelRequest {
@@ -205,6 +207,8 @@ pub struct ModelRequest {
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,         // 必填；Anthropic max_tokens
     pub reasoning: Option<ReasoningParams>,
+    pub stop_sequences: Vec<String>,    // Anthropic stop_sequences；OpenAI Responses 无此参数，非空 → Unsupported
+    pub provider_options: BTreeMap<ProviderId, JsonString>,
 }
 
 pub enum ToolChoice {
@@ -254,6 +258,7 @@ pub enum ReasoningEffort {
 | R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
 | R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。 |
+| R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于宿主策略。 |
 
 - `RequestConfig` 在 `create_session` 时随 `SessionSpec` 写入 `ConfigSnapshot`；loop 每次都从快照读取，恢复后重建出同一请求。
 - `create_session` 只做结构校验（provider 已注册、`system` 全为 `Part::Text`、工具名可解析）；`sampling` / `reasoning` / `Required` / `disable_parallel_tool_use` 的能力不匹配不在创建时预检，由 adapter 按 R5–R8 返回 `Unsupported`。
@@ -264,7 +269,7 @@ pub enum ReasoningEffort {
 | --- | --- | --- |
 | `budget_tokens` | `thinking: {type:"enabled", budget_tokens}` | 不支持；非空 → `Unsupported` |
 | `effort` | `output_config.effort`（`xhigh` / `max` 按模型）；`Off` 不发 effort，thinking 默认开启的模型发 `thinking: {type:"disabled"}`，无法关闭的模型 → `Unsupported`；`Minimal` → `Unsupported` | `reasoning.effort`（`Off` → `none`）；模型不接受的档位 → `Unsupported` |
-| `summary` | 忽略（thinking 文本照常返回） | `reasoning.summary = "auto"`；false 时不请求摘要 |
+| `summary` | 忽略（thinking 文本照常返回） | `reasoning.summary = "auto"`；false 时不请求摘要（宿主可经 `provider_options` 的 `{"reasoning":{"summary":"detailed"}}` 自选档位，R11） |
 
 ## 5. 能力标志
 

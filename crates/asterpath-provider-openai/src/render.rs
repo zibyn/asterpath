@@ -1,8 +1,10 @@
 //! Canonical request rendering for the OpenAI Responses API.
 
+use std::collections::BTreeMap;
+
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice,
+    ProviderId, RawProviderData, ReasoningEffort, Role, ToolChoice, merge_provider_option,
 };
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
@@ -60,7 +62,8 @@ pub(crate) fn render(
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<u8>, ProviderError> {
     validate(request, provider, capabilities)?;
-    let options = request.provider_options_for(OWNED_KEYS)?;
+    // R1: no server state, written or not.
+    let options = request.provider_options_for(&["previous_response_id", "conversation"])?;
 
     let instructions = system_text(&request.system);
     let input = render_input(request, provider, trace)?;
@@ -98,8 +101,6 @@ pub(crate) fn render(
         store: bool,
         stream: bool,
         include: &'static [&'static str],
-        #[serde(flatten)]
-        options: Map<String, Value>,
     }
 
     let sampling = request.sampling.as_ref();
@@ -117,33 +118,37 @@ pub(crate) fn render(
         store: false,
         stream: true,
         include: &["reasoning.encrypted_content"],
-        options,
     };
 
-    serde_json::to_vec(&body).map_err(|error| {
-        ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            format!("request is not serializable: {error}"),
-        )
-    })
+    let bytes = serde_json::to_vec(&body).map_err(not_serializable)?;
+    if options.is_empty() {
+        return Ok(bytes);
+    }
+    // Top-level fields stay raw, so replayed input and f32 sampling bytes are untouched;
+    // only a field an option merges into is parsed and re-serialized.
+    let mut fields: BTreeMap<String, Box<RawValue>> =
+        serde_json::from_slice(&bytes).map_err(not_serializable)?;
+    for (key, value) in options {
+        let value = match fields.get(&key) {
+            Some(existing) => {
+                let mut target: Value =
+                    serde_json::from_str(existing.get()).map_err(not_serializable)?;
+                merge_provider_option(&mut target, value, &key)?;
+                target
+            }
+            None => value,
+        };
+        fields.insert(key, raw(value)?);
+    }
+    serde_json::to_vec(&fields).map_err(not_serializable)
 }
 
-/// Every top-level key [`render`] can write; `provider_options` may not set them.
-const OWNED_KEYS: &[&str] = &[
-    "model",
-    "instructions",
-    "input",
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
-    "max_output_tokens",
-    "temperature",
-    "top_p",
-    "reasoning",
-    "store",
-    "stream",
-    "include",
-];
+fn not_serializable(error: serde_json::Error) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        format!("request is not serializable: {error}"),
+    )
+}
 
 fn validate(
     request: &ModelRequest,

@@ -1405,6 +1405,42 @@ async fn same_provider_options_merge_into_the_top_level_body() {
 }
 
 #[tokio::test]
+async fn provider_options_can_set_reasoning_summary_alongside_the_typed_effort() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let mut request = with_effort("gpt-5", asterpath_protocol::ReasoningEffort::High);
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"reasoning":{"summary":"detailed"}}"#),
+    );
+    let events = collect(&provider(&server), request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high", "summary": "detailed"})
+    );
+}
+
+#[tokio::test]
+async fn provider_options_may_not_replace_the_typed_reasoning_summary() {
+    let server = MockServer::start(Vec::new());
+    let mut request = with_effort("gpt-5", asterpath_protocol::ReasoningEffort::High);
+    if let Some(reasoning) = request.reasoning.as_mut() {
+        reasoning.summary = true;
+    }
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"reasoning":{"summary":"detailed"}}"#),
+    );
+    let events = collect(&provider(&server), request).await;
+    let error = events[0].as_ref().expect_err("rejected");
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert!(error.message.contains("reasoning.summary"), "{error:?}");
+    assert!(server.requests().is_empty(), "rejected before any HTTP");
+}
+
+#[tokio::test]
 async fn bad_provider_options_and_stop_sequences_fail_before_http() {
     let server = MockServer::start(Vec::new());
     let provider = provider(&server);
@@ -1428,7 +1464,15 @@ async fn bad_provider_options_and_stop_sequences_fail_before_http() {
             ProviderErrorKind::Unsupported,
         ),
         (
-            with_options(r#"{"reasoning":{}}"#),
+            with_options(r#"{"previous_response_id":"resp_1"}"#),
+            ProviderErrorKind::Unsupported,
+        ),
+        (
+            with_options(r#"{"conversation":"conv_1"}"#),
+            ProviderErrorKind::Unsupported,
+        ),
+        (
+            with_options(r#"{"tool_choice":{"type":"none"}}"#),
             ProviderErrorKind::Unsupported,
         ),
         (with_options(r#""flex""#), ProviderErrorKind::InvalidRequest),

@@ -74,7 +74,7 @@ pub use names::{
 pub use projection::{ProjectedEntry, ProjectedOrigin, ProjectionError, history, project};
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
-    ProviderError, ProviderErrorKind, StreamEvent,
+    ProviderError, ProviderErrorKind, StreamEvent, merge_provider_option, provider_option_conflict,
 };
 pub use sandbox::{
     ConfinedSpawn, Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider,

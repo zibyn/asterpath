@@ -7,7 +7,7 @@
 use asterpath_protocol::{
     ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
     ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams, Role,
-    ToolChoice,
+    ToolChoice, merge_provider_option, provider_option_conflict,
 };
 
 use crate::models::{ModelRules, Thinking, rules_for};
@@ -15,22 +15,6 @@ use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Every top-level key [`render`] can write; `provider_options` may not set them.
-const OWNED_KEYS: &[&str] = &[
-    "model",
-    "max_tokens",
-    "system",
-    "messages",
-    "tools",
-    "tool_choice",
-    "temperature",
-    "top_p",
-    "top_k",
-    "thinking",
-    "output_config",
-    "stop_sequences",
-    "stream",
-];
 /// One rendered JSON fragment: ordinary values are serialized compactly,
 /// replayed provider raw data is inserted exactly as persisted.
 enum Frag {
@@ -170,7 +154,7 @@ pub(crate) fn render(
     provider: &ProviderId,
     request: &ModelRequest,
 ) -> Result<String, ProviderError> {
-    let options = request.provider_options_for(OWNED_KEYS)?;
+    let options = request.provider_options_for(&[])?;
     let tools_hash = asterpath_protocol::tools_hash(&request.tools);
     let messages = render_messages(provider, request, &tools_hash)?;
 
@@ -253,7 +237,12 @@ pub(crate) fn render(
     }
     fields.push(("stream", Frag::Json(json!(true))));
     for (key, value) in &options {
-        fields.push((key.as_str(), Frag::Json(value.clone())));
+        match fields.iter_mut().find(|(name, _)| name == key) {
+            Some((_, Frag::Json(existing))) => merge_provider_option(existing, value.clone(), key)?,
+            // Raw fragments (messages, f32 sampling values) are never merged into.
+            Some(_) => return Err(provider_option_conflict(key)),
+            None => fields.push((key.as_str(), Frag::Json(value.clone()))),
+        }
     }
     Ok(object(fields))
 }
