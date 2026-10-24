@@ -649,8 +649,7 @@ pub enum ProviderErrorKind {
 | `message` + `refusal` | `Part::Refusal` |
 | `function_call` | `Item::ToolCall`；`call_id = call_id`，`provider_item_id = id` |
 | `reasoning` | `Item::Reasoning`；`summary` 来自 summary 文本，`raw` 含 `encrypted_content` |
-| 内置工具调用 | `Item::ServerToolCall` |
-| 内置工具结果 | `Item::ServerToolResult` |
+| 服务端执行的工具调用（白名单：`web_search_call` / `file_search_call` / `code_interpreter_call` / `image_generation_call` / `mcp_call`；结果内嵌于同一 item） | `Item::ServerToolCall` |
 | 原生 compaction item | v1 不解释；保留为 `Item::ProviderOpaque` |
 | 未知 item | `Item::ProviderOpaque` |
 
