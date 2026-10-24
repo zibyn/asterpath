@@ -572,14 +572,42 @@ async fn off_sends_neither_thinking_nor_effort_where_thinking_defaults_off() {
 }
 
 #[tokio::test]
+async fn off_sends_disabled_thinking_where_thinking_defaults_on() {
+    let models = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"];
+    let server = MockServer::start(models.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for model in models {
+        let mut request = request_for(model);
+        request.reasoning = Some(ReasoningParams {
+            effort: Some(ReasoningEffort::Off),
+            summary: true,
+            ..ReasoningParams::default()
+        });
+        drain(&provider, request).await;
+    }
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), models.len());
+    for (recorded, model) in recorded.iter().zip(models) {
+        let body = recorded.json_body();
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "disabled"}),
+            "{model}"
+        );
+        assert!(body.get("output_config").is_none(), "{model}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn efforts_a_model_does_not_accept_are_unsupported_before_http() {
     let server = MockServer::start(Vec::new());
     for (level, model) in [
         // Every Anthropic model: there is no `minimal`.
         (ReasoningEffort::Minimal, "claude-opus-5-5"),
-        // Thinking is on by default or always on: omitting it does not turn it off.
+        // Thinking cannot be disabled (always on, or `disabled` rejected).
         (ReasoningEffort::Off, "claude-opus-5-5"),
-        (ReasoningEffort::Off, "claude-haiku-5-5"),
+        (ReasoningEffort::Off, "claude-sonnet-5-5"),
+        (ReasoningEffort::Off, "claude-fable-5"),
         (ReasoningEffort::Off, "claude-mythos-preview"),
         (ReasoningEffort::Off, "claude-test"),
         // `max` without `xhigh`.

@@ -961,9 +961,13 @@ async fn invoke_tool(
             Err(_) => Invocation::Panic,
         },
         _ = &mut deadline => {
-            let already_cancelled = cancel.is_cancelled();
+            let already_cancelled = cancel.is_cancelled() || turn_cancel.is_cancelled();
             cancel.cancel();
             match tokio::time::timeout(kill_grace, future.as_mut()).await {
+                // The tool only saw a cancel; the engine knows it was the deadline.
+                Ok(Ok(Err(ToolError::Cancelled { message }))) if !already_cancelled => {
+                    Invocation::Returned(Err(ToolError::Timeout { message }))
+                }
                 Ok(Ok(result)) => Invocation::Returned(result),
                 Ok(Err(_)) => Invocation::Panic,
                 Err(_) if already_cancelled || turn_cancel.is_cancelled() => {
