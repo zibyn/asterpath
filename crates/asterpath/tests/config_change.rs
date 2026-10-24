@@ -11,7 +11,7 @@ use asterpath::protocol::{
     RequestConfig, Role, SessionEvent, SessionSpec, StopReason, StreamEvent, SubagentConfig,
     ToolName, ToolSelection, TurnConfig, Usage, UserInput, decode_entry, scan_all,
 };
-use asterpath::protocol::{SessionStore, StorageError};
+use asterpath::protocol::{SessionStore, SpanAttributes, StorageError};
 use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
 use futures_core::stream::BoxStream;
@@ -356,4 +356,39 @@ async fn a_child_inherits_the_config_of_its_spawn_step() {
         })
         .expect("spawned");
     assert_eq!(spawned, model("model-2"));
+}
+
+#[tokio::test]
+async fn trace_attributes_each_model_call_to_the_model_it_used() {
+    // Step 2 never gets an `AssistantMessage`: its span can only learn the
+    // model from the fold or the abort record.
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .fail(ProviderError::new(ProviderErrorKind::InvalidRequest, "no")),
+        vec![Some(switch_to("model-2"))],
+    );
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
+    let handle = asterpath.create_session(spec()).await.expect("create");
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let calls: Vec<(String, ModelId)> = asterpath
+        .trace(handle.id())
+        .await
+        .expect("trace")
+        .into_iter()
+        .filter_map(|span| match span.attributes {
+            SpanAttributes::ModelCall(attrs) => Some((span.name, attrs.request_model.model)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("chat model-1".to_owned(), ModelId::new("model-1")),
+            ("chat model-2".to_owned(), ModelId::new("model-2")),
+        ]
+    );
 }

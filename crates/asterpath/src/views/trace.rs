@@ -278,6 +278,9 @@ impl Folder {
         };
         match event {
             SessionEvent::SessionCreated { .. } => {}
+            // Folded in log order, so each `StepStarted` sees the config in
+            // effect at its seq, as the agent does (ADR-0030).
+            SessionEvent::ConfigChanged { patch } => self.config.apply(patch),
             SessionEvent::ContextForked { source_log, .. } => {
                 if let SpanAttributes::Session(attrs) =
                     &mut self.spans[self.session_span].attributes
