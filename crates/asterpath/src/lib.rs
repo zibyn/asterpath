@@ -23,9 +23,7 @@ pub use compaction::DefaultCompactor;
 /// The contract crate: adapter traits, hooks and value types.
 pub use asterpath_protocol as protocol;
 /// Core id types, so embedders need only this crate.
-pub use asterpath_protocol::{
-    InputId, LogId, SessionId, SignalId, StepId, Timestamp, ToolCallId, TurnId,
-};
+pub use asterpath_protocol::{InputId, LogId, SessionId, StepId, Timestamp, ToolCallId, TurnId};
 
 /// Re-export of the Anthropic adapter when the `anthropic` feature is enabled.
 /// Providers stay host-injected: the facade never assembles one itself.
@@ -45,11 +43,9 @@ use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProjectedEntry,
     ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState,
     Span, SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
-    UsageScope, UserInput, approval_signal_id, approval_signal_name, dedup,
+    UsageScope, UserInput, dedup,
 };
-use asterpath_protocol::{
-    ApprovalGate, Clock, SessionQuery, SessionStore, SignalDelivery, unique_bytes,
-};
+use asterpath_protocol::{ApprovalGate, Clock, SessionQuery, SessionStore, unique_bytes};
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -500,22 +496,14 @@ impl SessionHandle {
     }
 
     /// Answer a pending `Ask` as the approval endpoint. The decision is a
-    /// recorded `SignalReceived`, so it survives a crash and is reused.
+    /// recorded `ApprovalDecided`, so it survives a crash and is reused.
     pub async fn approve(
         &self,
         call: ToolCallId,
         decision: ApprovalDecision,
     ) -> Result<(), AsterError> {
-        let payload = serde_json::to_value(decision).map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
         self.waits
-            .deliver_signal(SignalDelivery {
-                session: self.session,
-                signal: approval_signal_id(call),
-                name: approval_signal_name(call),
-                payload,
-            })
+            .record_approval(self.session, call, decision)
             .await?;
         Ok(())
     }

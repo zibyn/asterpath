@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::ManualClock;
 use asterpath_protocol::{
     CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, ParentFilter,
-    RetirementError, SessionId, SessionQuery, SessionStore, SignalId, SignalName, StepId,
-    StorageError, ToolCallId, TurnId,
+    RetirementError, SessionId, SessionQuery, SessionStore, StepId, StorageError, ToolCallId,
+    TurnId,
 };
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -59,10 +59,6 @@ fn step() -> StepId {
 
 fn call(byte: u8) -> ToolCallId {
     ToolCallId::from_bytes([byte; 16])
-}
-
-fn signal() -> SignalId {
-    SignalId::from_bytes([3; 16])
 }
 
 fn model() -> ModelSpec {
@@ -164,11 +160,10 @@ fn child_completed(child: SessionId) -> SessionEvent {
     }
 }
 
-fn signal_received() -> SessionEvent {
-    SessionEvent::SignalReceived {
-        signal_id: signal(),
-        name: SignalName::new("wait"),
-        payload: json!({}),
+fn approval_decided(call_id: ToolCallId) -> SessionEvent {
+    SessionEvent::ApprovalDecided {
+        tool_call_id: call_id,
+        decision: asterpath_protocol::ApprovalDecision::Allow,
     }
 }
 
@@ -296,7 +291,11 @@ async fn shared_dedup_key_pairs(log: &dyn SessionStore) {
         (
             session(20),
             dedup::tool_call(call_id),
-            vec![tool_call_requested(call_id), tool_result(call_id)],
+            vec![
+                tool_call_requested(call_id),
+                approval_decided(call_id),
+                tool_result(call_id),
+            ],
         ),
         (
             session(22),
@@ -311,11 +310,6 @@ async fn shared_dedup_key_pairs(log: &dyn SessionStore) {
             session(23),
             dedup::child_session(child),
             vec![child_spawned(child), child_completed(child)],
-        ),
-        (
-            session(25),
-            dedup::signal(signal()),
-            vec![signal_received()],
         ),
         (
             session(26),

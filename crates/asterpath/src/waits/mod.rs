@@ -1,8 +1,8 @@
 //! Durable waits: approval signals and child-completion wakes expressed
 //! through the event log.
 //!
-//! An approval wait is recorded by its open `ToolCallRequested`; delivery
-//! appends `SignalReceived` under the approval's dedup key, so a re-delivery
+//! An approval wait is recorded by its open `ToolCallRequested`; the answer
+//! appends `ApprovalDecided` under the call's dedup key, so a re-delivery
 //! after a crash never mints a second record. The waiter registry is process
 //! memory only; recovery rebuilds waits by scanning the log.
 
@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    AwaitSignal, ExecutionError, LogId, SessionId, SessionStore, SignalDelivery, SignalId,
-    SignalPayload, WakeCause,
+    ApprovalDecision, ExecutionError, LogId, SessionId, SessionStore, ToolCallId,
 };
 use asterpath_protocol::{SessionEvent, dedup, encode_entry};
 use futures_core::future::BoxFuture;
@@ -22,7 +21,7 @@ use tokio::sync::Notify;
 /// Process-local wait identities. Not persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WaitKey {
-    Signal(SignalId),
+    Approval(ToolCallId),
     Child(SessionId),
 }
 
@@ -77,18 +76,19 @@ impl Waits {
         self.log.append(entry).await.map_err(backend)
     }
 
-    pub(crate) async fn find_signal(
+    pub(crate) async fn find_approval(
         &self,
         session: SessionId,
-        signal: SignalId,
-    ) -> Result<Option<SignalPayload>, ExecutionError> {
+        call: ToolCallId,
+    ) -> Result<Option<ApprovalDecision>, ExecutionError> {
         Ok(scan_decoded(&*self.log, session)
             .await?
             .into_iter()
             .find_map(|(_, event)| match event {
-                SessionEvent::SignalReceived {
-                    signal_id, payload, ..
-                } if signal_id == signal => Some(payload),
+                SessionEvent::ApprovalDecided {
+                    tool_call_id,
+                    decision,
+                } if tool_call_id == call => Some(decision),
                 _ => None,
             }))
     }
@@ -135,65 +135,50 @@ impl Waits {
 }
 
 impl Waits {
-    pub(crate) fn await_signal(
+    pub(crate) fn await_approval(
         &self,
-        req: AwaitSignal,
-    ) -> BoxFuture<'_, Result<SignalPayload, ExecutionError>> {
-        Box::pin(self.wait_until(WaitKey::Signal(req.signal), move || {
-            self.find_signal(req.session, req.signal)
+        session: SessionId,
+        call: ToolCallId,
+    ) -> BoxFuture<'_, Result<ApprovalDecision, ExecutionError>> {
+        Box::pin(self.wait_until(WaitKey::Approval(call), move || {
+            self.find_approval(session, call)
         }))
     }
 
-    pub(crate) fn deliver_signal(
+    pub(crate) fn record_approval(
         &self,
-        delivery: SignalDelivery,
+        session: SessionId,
+        call: ToolCallId,
+        decision: ApprovalDecision,
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
         Box::pin(async move {
-            let signal = delivery.signal;
             self.append(
-                delivery.session,
-                &SessionEvent::SignalReceived {
-                    signal_id: signal,
-                    name: delivery.name,
-                    payload: delivery.payload,
+                session,
+                &SessionEvent::ApprovalDecided {
+                    tool_call_id: call,
+                    decision,
                 },
-                Some(dedup::signal(signal)),
+                Some(dedup::approval_decided(call)),
             )
             .await?;
-            self.waiters.wake(WaitKey::Signal(signal));
+            self.waiters.wake(WaitKey::Approval(call));
             Ok(())
         })
     }
 
-    pub(crate) fn await_wake(
+    /// Resolves once `session`'s log records `child`'s completion.
+    pub(crate) fn await_child(
         &self,
         session: SessionId,
-        cause: WakeCause,
+        child: SessionId,
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
-        Box::pin(async move {
-            match cause {
-                WakeCause::Signal(signal) => self
-                    .wait_until(WaitKey::Signal(signal), || {
-                        self.find_signal(session, signal)
-                    })
-                    .await
-                    .map(drop),
-                WakeCause::ChildCompleted(child) => {
-                    self.wait_until(WaitKey::Child(child), || {
-                        self.child_completed(session, child)
-                    })
-                    .await
-                }
-            }
-        })
+        Box::pin(self.wait_until(WaitKey::Child(child), move || {
+            self.child_completed(session, child)
+        }))
     }
 
-    pub(crate) fn wake(&self, cause: WakeCause) {
-        let key = match cause {
-            WakeCause::Signal(signal) => WaitKey::Signal(signal),
-            WakeCause::ChildCompleted(child) => WaitKey::Child(child),
-        };
-        self.waiters.wake(key);
+    pub(crate) fn wake_child(&self, child: SessionId) {
+        self.waiters.wake(WaitKey::Child(child));
     }
 }
 

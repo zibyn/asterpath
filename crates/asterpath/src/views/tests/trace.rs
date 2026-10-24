@@ -13,7 +13,7 @@ use asterpath_protocol::{
     RequestConfig, ResumeReason, Role, SessionEvent, SideEffect, Span, SpanAttributes, SpanFilter,
     SpanKind, SpanStatus, StopReason, SubagentConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind,
     ToolName, ToolResultStatus, TraceError, TurnConfig, TurnEndReason, Usage, WaitKind,
-    approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
+    decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
     DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
@@ -852,10 +852,9 @@ async fn t7_approval_wait_is_a_child_span_with_its_deadline_and_cause() {
         Some(dedup::tool_call(c)),
     )
     .await;
-    let signal_event = SessionEvent::SignalReceived {
-        signal_id: approval_signal_id(c),
-        name: approval_signal_name(c),
-        payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+    let signal_event = SessionEvent::ApprovalDecided {
+        tool_call_id: c,
+        decision: ApprovalDecision::Allow,
     };
     append(&*log, session, &signal_event, Some(dedup::tool_call(c))).await;
     append(
@@ -910,7 +909,7 @@ async fn t7_approval_wait_is_a_child_span_with_its_deadline_and_cause() {
         .find(|entry| {
             matches!(
                 decode_entry(entry).unwrap(),
-                SessionEvent::SignalReceived { .. }
+                SessionEvent::ApprovalDecided { .. }
             )
         })
         .unwrap()

@@ -41,9 +41,8 @@ pub use config::{
     SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, AwaitSignal, CatalogCursor, CatalogEntry, DedupKey, LogEntry,
-    LogQuery, NewEntry, ParentFilter, PendingApproval, SessionQuery, SessionStore, SignalDelivery,
-    SignalName, SignalPayload, WakeCause, scan_all,
+    ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, DedupKey, LogEntry, LogQuery,
+    NewEntry, ParentFilter, PendingApproval, SessionQuery, SessionStore, scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
@@ -64,7 +63,7 @@ pub use hooks::{
 };
 pub use ids::{
     InputId, JsonSchema, JsonString, JsonValue, LogId, LogIdRange, ModelAlias, ModelId, ProviderId,
-    SessionId, SignalId, StepId, ToolArgs, ToolCallId, ToolName, TurnId,
+    SessionId, StepId, ToolArgs, ToolCallId, ToolName, TurnId,
 };
 pub use item::{ImageSource, Item, Part, RawProviderData, ReasoningBinding, Role, tools_hash};
 pub use names::{
@@ -82,9 +81,8 @@ pub use sandbox::{
 };
 pub use time::{Clock, SystemClock, Timestamp, unique_bytes};
 pub use tool::{
-    APPROVAL_SIGNAL_PREFIX, ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken,
-    DefaultApprovalPolicy, NO_APPROVAL_ENDPOINT, Tool, ToolContext, ToolError, ToolOutput,
-    approval_signal_id, approval_signal_name,
+    ApprovalDecision, ApprovalPolicy, ApprovalVerdict, CancelToken, DefaultApprovalPolicy,
+    NO_APPROVAL_ENDPOINT, Tool, ToolContext, ToolError, ToolOutput,
 };
 pub use tracing::{
     AttemptEvent, CompactionAttrs, ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, Span,

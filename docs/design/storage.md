@@ -89,7 +89,7 @@ pub enum StorageError {
 
 这套信封是 protocol 的唯一形状（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
-存储不提供 `enqueue`、租约或 ack，也不回答「哪些会话要唤醒」：唤醒是 facade 的只读折叠（§7）。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。`WakeCause` 属于引擎的持久等待（module-contracts.md §3.4），存储不需要它。
+存储不提供 `enqueue`、租约或 ack，也不回答「哪些会话要唤醒」：唤醒是 facade 的只读折叠（§7）。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。子会话与审批的等待唤醒属于引擎的持久等待（module-contracts.md §3.4），存储不参与。
 
 ## 4. SQLite schema
 
@@ -156,7 +156,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 
 - 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
 - 唯一的派生动作：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`）。其余事件只写日志。
-- 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。审批的 `SignalReceived` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。
+- 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。`ApprovalDecided` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。
 - **`idle` = 没有非 compaction 的未闭合意图。** compaction 意图只供恢复重做（#24/#27），不影响退役与唤醒发现。
 
 ### 事务边界清单
@@ -229,6 +229,6 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 - **#6**：turn/step 的终止条件、取消宽限期，决定哪些意图在何时闭合；`idle` 由未闭合意图推导。
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
-- **#17**：审批 signal 投递与子会话等待；唤醒发现见 §7。
+- **#17**：审批决定与子会话等待；唤醒发现见 §7。
 - **#18**：已定。只保留 `SessionStore::retire` 可选能力（整会话退役、墓碑）；导出由宿主用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
 - **#19**：五个注入点的工具链与 CI 场景。

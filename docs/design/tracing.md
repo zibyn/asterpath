@@ -153,14 +153,14 @@ flowchart TD
 | model_call | `StepStarted` | `AssistantMessage` 或最终 `ModelCallAborted` | step | `chat {model}` |
 | tool_call | `ToolCallRequested` | `ToolResult` | step | `execute_tool {name}` |
 | subagent | `ChildSessionSpawned` | `ChildSessionCompleted` | spawn 的 tool_call | `invoke_agent {child}` |
-| wait（approval） | `ToolCallRequested`，仅当存在 `SignalReceived{name=tool.approval.<id>}` | `SignalReceived` | tool_call | `wait approval` |
+| wait（approval） | `ToolCallRequested`，仅当存在该调用的 `ApprovalDecided` | `ApprovalDecided` | tool_call | `wait approval` |
 | compaction | `CompactionStarted` | `CompactionApplied` / `CompactionAborted` | step（强制压缩）/ turn（BetweenSteps）/ session（Idle） | `compact {model}` |
 
 规则：
 
 - **attempt 不是 span**。每次 `ModelCallAborted` 是 `model_call` span 上的 `attempt` event（字段见 §5）。一个 step 的多次重试共享同一个 `model_call` span，符合 OTel“自动重试折叠进一个逻辑 span”。
 - **child 等待就是 subagent span**，不再另建 wait span，避免同一段时间两个 span。spawn 超时没有独立 span：subagent span 以 `Cancelled{Timeout}` 结束。
-- **审批等待**只在日志里存在 `SignalReceived{name=tool.approval.<id>}` 时建立；自动允许（无 signal）不产生 wait span。重建无法区分“未询问”和“瞬间允许”，接受。
+- **审批等待**只在日志里存在该调用的 `ApprovalDecided` 时建立；自动允许（无决定记录）不产生 wait span。重建无法区分“未询问”和“瞬间允许”，接受。
 - **排队中的子会话**（尚无 `ChildSessionSpawned`）是内存状态，不建 span（#8 §3.4）。
 - **compaction 的父**由 `CompactionStarted.caused_by` 定位：落在 open step 内 → step；回合 open → turn；回合已提交 → session。
 - **子会话是独立 trace**（`TraceId = child SessionId`），其根 span 带 `parent_trace` / `parent_span`（`parent_trace` 即父会话）；父 trace 中的 `subagent` span 带 `child_trace`。exporter 用 OTel span link 连接两棵树，不合并成一条超长 trace。
@@ -282,7 +282,7 @@ pub enum TraceError {
 | #9 压缩 | `CompactionStarted` → `CompactionApplied` / `CompactionAborted` 构成 compaction span；usage 单列 |
 | #11 协议 | §2 的类型进 `asterpath-protocol` |
 | #13 token | 已定。span `usage` 与 [usage.md](usage.md) 的 `model_calls` / `compaction` 必须对账（U12）；`partial` 不进总量 |
-| #17 调度 | 审批 `SignalReceived` 的写入点；spawn 超时经 subagent span 的 outcome 呈现 |
+| #17 调度 | 审批 `ApprovalDecided` 的写入点；spawn 超时经 subagent span 的 outcome 呈现 |
 | #18 保留/归档 | 已定。退役会话返回 `NotFound`；重建范围随之缩小，见 [retention.md](retention.md) |
 | #19 测试 | 确定性重建与崩溃恢复的 trace 断言 |
 
@@ -296,7 +296,7 @@ pub enum TraceError {
 | T4 | 重试耗尽 / `Rejected` | `model_call` / turn `status=Error`，`error_type` 为最后一次 attempt |
 | T5 | 工具 `Failed` | tool span `Error` + 对应 `error_type`；step 与 turn 仍为 Ok |
 | T6 | 工具 `Interrupted`（取消） | tool span `Interrupted`；step/turn `Cancelled` |
-| T7 | 审批等待跨天 | `wait approval` span 的时长等于两次 `recorded_at` 之差；`ended_at` 为 `SignalReceived` 时间 |
+| T7 | 审批等待跨天 | `wait approval` span 的时长等于两次 `recorded_at` 之差；`ended_at` 为 `ApprovalDecided` 时间 |
 | T8 | 跨恢复 | session span 上有 `resume` event；没有 timer / 通用 signal 的 wait span |
 | T9 | 父等子会话 | 父 trace 一个 `subagent` span；子 trace 根 span 的 `parent_span` 指向 spawn 的 tool span |
 | T10 | `kill -9` 于 `Safe` 工具中 | 恢复后仍只有一个 tool span（同一 `SpanId`）；`replay=true`；恰一个 `ToolResult` |

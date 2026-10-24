@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use crate::{ApprovalGate, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
+use crate::{ApprovalGate, SessionId, StepId, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -245,7 +245,7 @@ pub enum ApprovalVerdict {
     Deny { reason: Option<String> },
 }
 
-/// Host answer to an approval request; also the `SignalReceived` payload.
+/// Host answer to an approval request, recorded as `ApprovalDecided`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
@@ -255,19 +255,6 @@ pub enum ApprovalDecision {
 
 /// Fixed reason used when `Ask` has no endpoint to answer it.
 pub const NO_APPROVAL_ENDPOINT: &str = "no approval endpoint is registered";
-
-/// Signal name prefix shared by the pipeline and approval responders.
-pub const APPROVAL_SIGNAL_PREFIX: &str = "tool.approval.";
-
-/// One call's approval signal name: `tool.approval.<tool_call_id>`.
-pub fn approval_signal_name(call: ToolCallId) -> SignalName {
-    SignalName::new(format!("{APPROVAL_SIGNAL_PREFIX}{}", call.to_hex()))
-}
-
-/// The approval signal id is the framework `tool_call_id` itself.
-pub fn approval_signal_id(call: ToolCallId) -> SignalId {
-    SignalId::from_bytes(*call.as_bytes())
-}
 
 /// Framework default: in-process tools are allowed; external tools ask while an
 /// endpoint is registered and are denied otherwise. `Unknown` is never asked.

@@ -21,7 +21,7 @@
 - **子智能体 = 独立子会话**：独立日志流、独立恢复与取消单位；父流只记生命周期（#3）。
 - **spawn 是一次工具调用**，同步等待子会话完成；v1 没有后台/异步 spawn。fan-out = 同一 `AssistantMessage` 里多个 spawn 调用并行。
 - **默认全新上下文（fresh）**；`context: fork` 按次 opt-in，fork 是 spawn 时刻父投影的**物化快照**，不是活引用。
-- **父流只记 spawn 自身的管线记录与子生命周期**：spawn 的 `ToolCallRequested`、`ChildSessionSpawned`（含可选 timeout 截止时间）、审批 `SignalReceived`（仅策略非 `Allow` 时）、`ChildSessionCompleted`、spawn 的 `ToolResult`。子的 `TurnStarted` / `StepStarted` / `AssistantMessage` / `ToolCallRequested` / `ToolResult` 绝不进父流。
+- **父流只记 spawn 自身的管线记录与子生命周期**：spawn 的 `ToolCallRequested`、`ChildSessionSpawned`（含可选 timeout 截止时间）、审批 `ApprovalDecided`（仅策略为 `Ask` 时）、`ChildSessionCompleted`、spawn 的 `ToolResult`。子的 `TurnStarted` / `StepStarted` / `AssistantMessage` / `ToolCallRequested` / `ToolResult` 绝不进父流。
 - **结果 = 状态 + 任务总结**。子任务失败仍是成功的 spawn 工具结果；只有基础设施问题才是工具失败。
 - **配置在 spawn 时刻快照继承**，模型只能收窄（模型 alias 白名单、工具 allowlist），不能放宽审批或替换 system prompt。
 - **默认深度 3、每父并发 8、调度器全局 32**；并发超限 FIFO 排队，深度超限直接失败。
@@ -98,10 +98,10 @@ pub enum ContextPolicy {
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
 - **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的宿主取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
-持久等待（引擎内部的 `Waits`）与 `AwaitSignal` 见 [module-contracts.md](module-contracts.md) §3.4（[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
+持久等待（引擎内部的 `Waits`）见 [module-contracts.md](module-contracts.md) §3.4（[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
-- 持久等待只有审批与子会话完成；没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。审批 signal id 即 `tool_call_id`，等待意图由 open 的 `ToolCallRequested` 承担（#7）；`await_signal` 不写任何记录。
-- `wake` 由终态记录的写者在 append 之后调用；注册表只在内存，恢复靠扫描日志重建。
+- 持久等待只有审批与子会话完成；没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。审批决定按 `tool_call_id` 记录，等待意图由 open 的 `ToolCallRequested` 承担（#7）；等待本身不写任何记录。
+- 唤醒由终态记录的写者在 append 之后调用；注册表只在内存，恢复靠扫描日志重建。
 
 工具描述：
 
@@ -416,7 +416,7 @@ pub struct SubagentConfig {
 
 | # | 场景 | 断言 |
 | --- | --- | --- |
-| SA1 | fresh spawn 正常完成 | 父恰为 `ToolCallRequested` → `ChildSessionSpawned` → `ChildSessionCompleted` → `ToolResult`（无审批时无 signal 记录；timeout 只体现为 `deadline` 字段）；子恰为 `SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`；父投影只含 summary；子的 step / tool 记录不出现在父流 |
+| SA1 | fresh spawn 正常完成 | 父恰为 `ToolCallRequested` → `ChildSessionSpawned` → `ChildSessionCompleted` → `ToolResult`（无审批时无 `ApprovalDecided`；timeout 只体现为 `deadline` 字段）；子恰为 `SessionCreated` → `InputRecorded` → `TurnStarted` → `AssistantMessage` → `StepCommitted` → `TurnCommitted(Completed)`；父投影只含 summary；子的 step / tool 记录不出现在父流 |
 | SA2 | fork | 子首个模型请求含父在 `StepStarted.seq` 的投影快照 + task；不含 spawn 的 `AssistantMessage` 与兄弟工具结果 |
 | SA3 | fork 后父压缩/归档 | 子会话内容不变；子恢复不读父日志 |
 | SA4 | 崩溃于 `ChildSessionSpawned` 前后 | 前：恢复重放 spawn，父仍恰一条 `ToolCallRequested` → `ChildSessionSpawned` → …；后：R2 物化同一子，子流恰一条 `SessionCreated` → `InputRecorded` → `TurnStarted`；两分支都恰一个 `ChildSessionSpawned`、无第二个子会话 |

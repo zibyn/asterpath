@@ -73,7 +73,7 @@ pub struct ConfigSnapshot {
 | `agent` | `Agent`：turn / step 循环、模型调用、恢复；`spawn_agent` 调用转给 `Scheduler::run_spawn_tool`，并把自己作为子会话驱动者传入 | `asterpath-agent` |
 | `agent::pipeline` | `ToolPipeline`：一个步骤的全部工具调用到结果（准入、审批、Parallel/Exclusive 锁、并发上限、截断、取消收尾）；唯一操作 `run`，依赖构造时注入，可脱离回合直接测试（#68） | — |
 | `scheduler` | `Scheduler`：spawn / 物化 / 准入 / 等待 / 超时 / 取消；`SpawnTool` 只是工具表里的描述符 | `asterpath-scheduler` |
-| `waits` | `Waits`：审批 signal 与子会话完成的持久等待 | `asterpath-runtime` |
+| `waits` | `Waits`：审批决定与子会话完成的持久等待 | `asterpath-runtime` |
 | `tools` | `ToolTable`：按名有序、重名保留先注册者 | `asterpath-tools` |
 | `views::trace` / `views::usage` | `TracingQuery` / `UsageService`：日志上的纯折叠 | `asterpath-tracing` / `asterpath-usage` |
 | `compaction` | `DefaultCompactor`（facade 根部 `pub use`） | `asterpath-compaction` |
@@ -135,7 +135,7 @@ impl Asterpath {
 - `spawn_tool(false)`（= `AsterpathConfig.spawn_tool = false`）不注册 `spawn_agent`：`ToolSelection::All` 快照不含它，`Names` 点名它是 `AsterError::Config`；调度器与子会话恢复不受影响。
 - 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
-- 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
+- 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
 - 注入 `store` 时 `database` 被忽略；未注入时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
@@ -185,7 +185,7 @@ impl SessionHandle {
 - `projection()` 返回对日志折叠出的模型可见投影（每项带来源 log id），不读驱动者内存。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
-- `approve()` 经引擎的持久等待投递 signal（signal name = `tool.approval.<tool_call_id>`，payload = `ApprovalDecision`），落 `SignalReceived`。
+- `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒该调用的等待。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。

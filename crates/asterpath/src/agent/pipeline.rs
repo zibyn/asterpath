@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, AwaitSignal, CancelReason, CancelToken, ChildOutcome, Clock, DedupKey,
-    HookError, Hooks, Item, LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance,
-    ReplaySafety, SessionEvent, SessionFacts, SessionId, SessionStore, SignalPayload, StepId, Tool,
-    ToolArgs, ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError,
-    ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView,
-    TurnId, UsageLookup, approval_signal_id, approval_signal_name, dedup, unique_bytes,
+    ApprovalVerdict, CancelReason, CancelToken, ChildOutcome, Clock, DedupKey, HookError, Hooks,
+    Item, LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance, ReplaySafety,
+    SessionEvent, SessionFacts, SessionId, SessionStore, StepId, Tool, ToolArgs, ToolCallCtx,
+    ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind,
+    ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnId, UsageLookup, dedup,
+    unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -645,11 +645,14 @@ impl ToolPipeline {
         descriptor: &ToolDescriptor,
         cancel: &CancelToken,
     ) -> Result<ToolDecision, AgentError> {
-        let signal = approval_signal_id(call.tool_call_id);
         // Read right before deciding: a decision recorded while an earlier
         // call of this step waited for a human still wins.
-        if let Some(payload) = self.waits.find_signal(step.session, signal).await? {
-            return approval_decision(step.session, payload);
+        if let Some(decision) = self
+            .waits
+            .find_approval(step.session, call.tool_call_id)
+            .await?
+        {
+            return approval_decision(step.session, decision);
         }
 
         let request = ApprovalRequest::new(
@@ -682,23 +685,19 @@ impl ToolPipeline {
                 // Listed until this wait ends for any reason, including drop.
                 let _pending = self.gate.wait_for(request.clone());
                 step.events.push(Ok(AgentEvent::ApprovalRequested(request)));
-                // A signal recorded after this step's read is still returned here.
-                let wait = self.waits.await_signal(AwaitSignal {
-                    session: step.session,
-                    signal,
-                    name: approval_signal_name(call.tool_call_id),
-                });
+                // A decision recorded after this step's read is still returned here.
+                let wait = self.waits.await_approval(step.session, call.tool_call_id);
                 tokio::pin!(wait);
                 let token = cancel.clone();
                 let cancel_wait = token.cancelled();
                 tokio::pin!(cancel_wait);
-                let payload = tokio::select! {
+                let decision = tokio::select! {
                     biased;
                     // The interrupted ToolResult closes this call's intent.
                     _ = &mut cancel_wait => return Ok(ToolDecision::Cancelled),
-                    payload = &mut wait => payload?,
+                    decision = &mut wait => decision?,
                 };
-                approval_decision(step.session, payload)
+                approval_decision(step.session, decision)
             }
             _ => Ok(ToolDecision::Deny(DENIED_WITHOUT_REASON.to_owned())),
         }
@@ -892,20 +891,16 @@ enum ToolDecision {
 
 fn approval_decision(
     session: SessionId,
-    payload: SignalPayload,
+    decision: ApprovalDecision,
 ) -> Result<ToolDecision, AgentError> {
-    match serde_json::from_value::<ApprovalDecision>(payload) {
-        Ok(ApprovalDecision::Allow) => Ok(ToolDecision::Allow),
-        Ok(ApprovalDecision::Deny { reason }) => Ok(ToolDecision::Deny(
+    match decision {
+        ApprovalDecision::Allow => Ok(ToolDecision::Allow),
+        ApprovalDecision::Deny { reason } => Ok(ToolDecision::Deny(
             reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
         )),
-        Ok(_) => Err(AgentError::Corrupt {
+        _ => Err(AgentError::Corrupt {
             session,
             detail: "unknown approval decision".to_owned(),
-        }),
-        Err(error) => Err(AgentError::Corrupt {
-            session,
-            detail: format!("invalid approval decision: {error}"),
         }),
     }
 }

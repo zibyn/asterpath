@@ -8,7 +8,7 @@
 >
 > - `ToolResult` 增加 `error` 与 `truncated`。
 > - `ToolCallRequested.raw_args` 明确为 pre-execute 之后的 **effective args**。
-> - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。
+> - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。（2026-10-24 改为类型化的 `ApprovalDecided`，见 §4。）
 > - `ToolError` 增加 `Cancelled`（#31）。
 >
 > 2026-10-22 #28 修订：`ToolCallRequested` 增加 `provider_call_id`；已有意图的调用恢复时不重跑 pre-execute；每个调用由单一 supervisor 写终态（真实结果 > 取消 > 超时）。
@@ -21,7 +21,7 @@
 
 - **管线固定**：pre-execute → 意图记录 → 审批 → 执行 → 截断 → post-execute → 结果记录。只有 pre-execute（`before_tool`）与 post-execute（`after_tool`）可拦截；其余只能经 `on_record` 观察。
 - **审批是框架管线阶段**。框架定义策略 seam、请求/决定事件与持久等待；具体审批 UI 与策略由 host 提供。
-- **审批决定复用 `SignalReceived`**，跨崩溃；审批请求是进程内 typed event，不进日志。
+- **审批决定记录为 `ApprovalDecided { tool_call_id, decision }`**，跨崩溃；审批请求是进程内 typed event，不进日志。
 - **`External` 默认 fail closed**：没有审批端时按 Deny 处理；`ReplaySafety` 默认 `Unsafe`。
 - **并行/独占按 step 内锁调度**；结果完成即追加，模型投影按调用顺序重排。
 - **工具失败不重试**；超时、取消、panic、外部崩溃统一映射为 `ToolResult`。
@@ -104,7 +104,7 @@ AssistantMessage(tool_calls)
     append ToolCallRequested { tool_call_id, provider_call_id, effective args }
     if tool not in registry: append ToolResult{Failed, NotFound}; done
     approval policy                # Allow / Ask / Deny
-    if Ask: await signal           # 可跨天、跨崩溃
+    if Ask: await decision         # 可跨天、跨崩溃
     if Deny: append ToolResult{Failed, Denied}; done
     acquire Parallel / Exclusive lock
     invoke (timeout + cancel)
@@ -139,7 +139,7 @@ pub enum ApprovalVerdict {
     Deny { reason: Option<String> },
 }
 
-/// 宿主对一次审批请求的回答，也是 `SignalReceived.payload`。
+/// 宿主对一次审批请求的回答，记录为 `ApprovalDecided.decision`。
 #[non_exhaustive]
 pub enum ApprovalDecision {
     Allow,
@@ -160,17 +160,17 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ```
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
-- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后经引擎持久等待 `await_signal(AwaitSignal { name: "tool.approval.<tool_call_id>", .. })`。
-- 决定由 host 的审批端投递为 `SignalReceived { signal_id: tool_call_id, name: "tool.approval.<tool_call_id>", payload: ApprovalDecision }`。
+- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后经引擎持久等待该调用的 `ApprovalDecided`。
+- 决定由 host 的审批端经 `SessionHandle::approve(tool_call_id, decision)` 写为 `ApprovalDecided { tool_call_id, decision: ApprovalDecision }`，dedup key 为 `tool_call_id`。
 - `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是宿主的回答；两者不合并，`Ask` 只在策略侧存在。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
 - Deny 的 `reason` 写入 `ToolResult.error.message`；没有 reason 时用固定文本。
-- **恢复**：open `ToolCallRequested` + 无决定信号 + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有决定信号则按记录执行，**不再看当前策略**。
+- **恢复**：open `ToolCallRequested` + 无 `ApprovalDecided` + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有 `ApprovalDecided` 则按记录执行，**不再看当前策略**。
 - 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。host 不得在调用 open 期间热换策略（v1 无热替换，#2）。
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
-- 不引入独立的 `Approver` trait：host 在能够应答时用 `Asterpath::approval_gate().register()` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并投递 signal 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
-- signal name 只在会话内唯一；signal id 由 `(session, name)` 确定性派生（审批 name 为 `tool.approval.<tool_call_id>`），重复注册/投递不会产生第二个等待。持久等待按 session 作用域等待（#17）。
-- `await_signal` 不写意图记录：open 的 `ToolCallRequested` 已承担意图。审批是唯一的 signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
+- 不引入独立的 `Approver` trait：host 在能够应答时用 `Asterpath::approval_gate().register()` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并调用 `approve` 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
+- 一个调用最多一条 `ApprovalDecided`：重复回答被 dedup 吸收，先写入者生效。等待按 session 作用域。
+- 等待不写意图记录：open 的 `ToolCallRequested` 已承担意图。
 - 未注册审批端点时，`Ask` 按 `Deny` 处理（fail closed），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
 - **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序），宿主按 `ApprovalRequest::session` 过滤，供新连上的客户端找回待审批项。等待因任何原因结束（决定、取消、宿主丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
 
@@ -313,7 +313,7 @@ pub struct ToolConfig {
 | --- | --- | --- |
 | T1 | pre-execute 改写参数 | `ToolCallRequested` 记 effective args；`AssistantMessage` 保留原始 args；工具按 effective args 执行 |
 | T2 | pre-execute deny | 写 `ToolResult{Failed, Denied}`；不审批、不执行；恢复不重跑 |
-| T3 | Ask + 批准 + 崩溃于执行前 | `SignalReceived` 已记录；恢复后直接执行，不重新提示 |
+| T3 | Ask + 批准 + 崩溃于执行前 | `ApprovalDecided` 已记录；恢复后直接执行，不重新提示 |
 | T4 | Ask + 未决 + 崩溃 | 恢复重新挂起并重新发请求；没有 `ToolResult` |
 | T5 | Ask + 拒绝 | 不执行；`ToolResult{Failed, Denied}` 模型可见 |
 | T6 | 并行与独占混合 | `Exclusive` 期间无其他调用；结果按完成顺序落日志，投影按调用顺序 |
@@ -345,7 +345,7 @@ pub struct ToolConfig {
 - **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
-- **#17**：已定。持久等待的 `await_signal` 支持审批等待，不写意图记录（#65 删除通用 signal）；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#17**：已定。审批等待不写意图记录（#65 删除通用 signal，2026-10-24 审批决定类型化为 `ApprovalDecided`）；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。
 - **#20**：已定。MCP 外部工具的发现、结果/错误映射、失败矩阵与 ACP 出界见 [mcp.md](mcp.md)；`Provenance` 只带 `TransportKind::{Stdio, Http}`。
 - **#21**：已定。沙箱是 spawn 点变换；启动前拒绝映射为 `ToolError::Denied`。接缝与策略见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。

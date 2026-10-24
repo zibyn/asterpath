@@ -18,11 +18,11 @@ use asterpath_protocol::{
     DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ParentRef, Provenance, ReplaySafety,
     Role, RunRequest, RunTrigger, SessionEvent, StopReason, Tool, ToolArgs, ToolCallCtx,
     ToolConfig, ToolDescriptor, ToolGate, ToolName, ToolResultStatus, TurnEndReason, Usage,
-    approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
+    decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
     ApprovalGate, CatalogEntry, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId,
-    SessionQuery, SessionStore, SignalDelivery, StepId, StorageError, ToolCallId, TurnId,
+    SessionQuery, SessionStore, StepId, StorageError, ToolCallId, TurnId,
 };
 use asterpath_testing::TestTool;
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider, ToolCalls};
@@ -710,7 +710,7 @@ async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
         results(&entries),
         vec![(CALL, ToolResultStatus::Failed, Some("NotFound"))]
     );
-    assert_eq!(count(&entries, "SignalReceived"), 0);
+    assert_eq!(count(&entries, "ApprovalDecided"), 0);
     assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Completed]);
 }
 
@@ -936,12 +936,11 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
     .await;
     append(
         &log,
-        SessionEvent::SignalReceived {
-            signal_id: approval_signal_id(CALL),
-            name: approval_signal_name(CALL),
-            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+        SessionEvent::ApprovalDecided {
+            tool_call_id: CALL,
+            decision: ApprovalDecision::Allow,
         },
-        Some(dedup::signal(approval_signal_id(CALL))),
+        Some(dedup::approval_decided(CALL)),
     )
     .await;
 
@@ -1045,14 +1044,9 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
     );
 
     waits
-        .deliver_signal(SignalDelivery {
-            session: SESSION,
-            signal: approval_signal_id(CALL),
-            name: approval_signal_name(CALL),
-            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
-        })
+        .record_approval(SESSION, CALL, ApprovalDecision::Allow)
         .await
-        .expect("deliver");
+        .expect("record");
     while let Some(event) = stream.next().await {
         event.expect("drive");
     }

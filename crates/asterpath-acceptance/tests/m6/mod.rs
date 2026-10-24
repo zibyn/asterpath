@@ -328,7 +328,7 @@ async fn s4_load_skill_returns_the_body_and_needs_no_approval() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, SessionEvent::SignalReceived { .. })),
+            .any(|event| matches!(event, SessionEvent::ApprovalDecided { .. })),
         "no approval signal is written"
     );
 }

@@ -1,7 +1,6 @@
 use asterpath_protocol::{
-    ApprovalGate, AwaitSignal, CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
-    RetirementError, SessionId, SessionQuery, SessionStore, SignalId, SignalName, StorageError,
-    SystemClock,
+    ApprovalGate, CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
+    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -62,11 +61,6 @@ fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
         session,
         after: Some(LogId::from_i64(2)),
         limit: Some(10),
-    };
-    let _await = AwaitSignal {
-        session,
-        signal: SignalId::from_bytes([3; 16]),
-        name: SignalName::new("tool.approval.c1"),
     };
 }
 

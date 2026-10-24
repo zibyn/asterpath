@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    APPROVAL_SIGNAL_PREFIX, AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot,
-    ErrorType, ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span,
-    SpanAttributes, SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs,
-    ToolErrorKind, ToolResultStatus, TraceError, TraceId, TurnAttrs, TurnEndReason, WaitAttrs,
-    WaitKind, decode_entry,
+    AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot, ErrorType,
+    ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span, SpanAttributes,
+    SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs, ToolErrorKind,
+    ToolResultStatus, TraceError, TraceId, TurnAttrs, TurnEndReason, WaitAttrs, WaitKind,
+    decode_entry,
 };
 use asterpath_protocol::{
-    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, SignalId, StepId, Timestamp,
-    ToolCallId, TurnId,
+    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, StepId, Timestamp, ToolCallId,
+    TurnId,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -647,10 +647,8 @@ impl Folder {
                 self.close(index, entry, child_status(outcome), None);
                 self.stack.retain(|open| *open != index);
             }
-            SessionEvent::SignalReceived {
-                signal_id, name, ..
-            } if name.as_str().starts_with(APPROVAL_SIGNAL_PREFIX) => {
-                self.close_approval(*signal_id, entry);
+            SessionEvent::ApprovalDecided { tool_call_id, .. } => {
+                self.close_approval(*tool_call_id, entry);
             }
             _ => {}
         }
@@ -670,8 +668,7 @@ impl Folder {
 
     /// An approval wait is only materialized when its decision was recorded; the
     /// opening record is the tool call, shared with the tool span.
-    fn close_approval(&mut self, signal: SignalId, entry: &LogEntry) {
-        let tool_call = ToolCallId::from_bytes(*signal.as_bytes());
+    fn close_approval(&mut self, tool_call: ToolCallId, entry: &LogEntry) {
         let Some(tool_index) = self.tools.get(&tool_call).copied() else {
             return;
         };

@@ -150,7 +150,6 @@ opaque_id!(TurnId);
 opaque_id!(StepId);
 opaque_id!(InputId);
 opaque_id!(ToolCallId);
-opaque_id!(SignalId);
 
 /// Position of a committed log record within its session stream.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

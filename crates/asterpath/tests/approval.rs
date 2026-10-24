@@ -13,8 +13,7 @@ use asterpath::protocol::{
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider,
     ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
     StopReason, SubagentConfig, Tool, ToolArgs, ToolConfig, ToolDescriptor, ToolName, ToolOutput,
-    ToolSelection, TurnConfig, Usage, UserInput, approval_signal_id, approval_signal_name,
-    decode_entry, dedup, encode_entry,
+    ToolSelection, TurnConfig, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
 use asterpath::protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
 use asterpath::{Asterpath, SessionHandle};
@@ -311,7 +310,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         asterpath::protocol::ToolResultStatus::Completed
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
-    assert_eq!(kind_count(&entries, "SignalReceived"), 1);
+    assert_eq!(kind_count(&entries, "ApprovalDecided"), 1);
 
     // Duplicate delivery is absorbed by the signal dedup key.
     handle
@@ -319,7 +318,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .await
         .expect("duplicate approve");
     let entries = scan(asterpath.store(), handle.id()).await;
-    assert_eq!(kind_count(&entries, "SignalReceived"), 1);
+    assert_eq!(kind_count(&entries, "ApprovalDecided"), 1);
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
@@ -465,7 +464,7 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
             .is_some_and(|m| m.contains("no approval endpoint"))
     );
     assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(kind_count(&entries, "SignalReceived"), 0);
+    assert_eq!(kind_count(&entries, "ApprovalDecided"), 0);
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
@@ -550,12 +549,11 @@ async fn recorded_decision_is_reused_without_reprompting() {
     append(
         &log,
         session,
-        SessionEvent::SignalReceived {
-            signal_id: approval_signal_id(call),
-            name: approval_signal_name(call),
-            payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+        SessionEvent::ApprovalDecided {
+            tool_call_id: call,
+            decision: ApprovalDecision::Allow,
         },
-        Some(dedup::signal(approval_signal_id(call))),
+        Some(dedup::approval_decided(call)),
     )
     .await;
 

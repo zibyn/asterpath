@@ -166,7 +166,7 @@ pub enum SandboxError {
 ## 8. 与审批的关系
 
 - 审批与沙箱是两层，互不替代：`Allow` 只表示「可以做」，沙箱决定「能做到什么程度」；`Deny` 直接结束调用，不进入 spawn。
-- 沙箱拒绝发生在审批之后、`invoke` 之内；它不是审批决定，不写 `SignalReceived`，也不会反向触发 `Ask`。
+- 沙箱拒绝发生在审批之后、`invoke` 之内；它不是审批决定，不写 `ApprovalDecided`，也不会反向触发 `Ask`。
 - **v1 不做 escalation**：没有「被沙箱拒绝 → 提权审批 → 自动重试」。Codex 的一次升级重试不在 v1。
 - `ApprovalRequest` 不增加 sandbox 字段；`ApprovalPolicy` 是宿主代码，和沙箱解析器共享配置即可。
 - 宿主若要「先问再放宽」，只能在自己的 pre-execute 里换用更宽的已解析策略；框架不提供这条流程，也不记录它。

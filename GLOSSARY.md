@@ -259,7 +259,7 @@ _Avoid_: 返回值、output（作为同义词）
 _Avoid_: 工具批次、工具调度器、执行器
 
 **审批（Approval）**：
-宿主对一次工具调用作出的允许或拒绝决定；等待可以是持久的，决定以已记录的信号表达。
+宿主对一次工具调用作出的允许或拒绝决定；等待可以是持久的，决定记录为 `ApprovalDecided`。
 _Avoid_: 权限、确认
 
 **审批策略（Approval Policy）**：
@@ -267,7 +267,7 @@ _Avoid_: 权限、确认
 _Avoid_: 权限规则
 
 **审批者（Approver）**：
-订阅审批请求、把允许或拒绝作为已记录信号投递的宿主组件；不是框架 trait。
+订阅审批请求、把允许或拒绝经 `approve` 记录为 `ApprovalDecided` 的宿主组件；不是框架 trait。
 _Avoid_: 审批服务、权限服务
 
 **审批端点（Approval Endpoint）**：

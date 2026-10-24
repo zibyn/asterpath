@@ -8,7 +8,7 @@ use futures_core::stream::BoxStream;
 
 use crate::agent::ApprovalRequest;
 use crate::error::{RetirementError, StorageError};
-use crate::ids::{LogId, SessionId, SignalId};
+use crate::ids::{LogId, SessionId};
 use crate::time::Timestamp;
 
 /// Key used to make a log append idempotent within one session stream.
@@ -29,27 +29,6 @@ impl DedupKey {
 impl fmt::Debug for DedupKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DedupKey({:?})", self.0)
-    }
-}
-
-/// Name of a durable signal within a session.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct SignalName(String);
-
-impl SignalName {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SignalName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SignalName({:?})", self.0)
     }
 }
 
@@ -177,29 +156,6 @@ pub async fn scan_all(
         entries.push(entry?);
     }
     Ok(entries)
-}
-
-pub type SignalPayload = serde_json::Value;
-
-#[derive(Clone, Debug)]
-pub struct SignalDelivery {
-    pub session: SessionId,
-    pub signal: SignalId,
-    pub name: SignalName,
-    pub payload: SignalPayload,
-}
-
-#[derive(Clone, Debug)]
-pub struct AwaitSignal {
-    pub session: SessionId,
-    pub signal: SignalId,
-    pub name: SignalName,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WakeCause {
-    Signal(SignalId),
-    ChildCompleted(SessionId),
 }
 
 /// Liveness declaration for approval responders, plus the requests waiting

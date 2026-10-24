@@ -1,14 +1,13 @@
-//! Approval signal and wake behaviour through the engine's durable waits.
+//! Approval and child-completion behaviour through the engine's durable waits.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::waits::Waits;
 use asterpath_protocol::{
-    AwaitSignal, LogQuery, SessionId, SessionStore, SignalDelivery, SignalId, SignalName,
-    ToolCallId, WakeCause,
+    ApprovalDecision, CancelReason, ChildOutcome, LogQuery, SessionId, SessionStore, ToolCallId,
 };
-use asterpath_protocol::{SessionEvent, decode_entry};
+use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
 use asterpath_testing::InMemoryEventLog;
 use futures_util::StreamExt;
 
@@ -46,115 +45,95 @@ fn count(events: &[SessionEvent], kind: &str) -> usize {
 }
 
 #[tokio::test]
-async fn approval_signal_uses_tool_call_id_and_writes_no_intent() {
+async fn a_recorded_decision_wakes_the_waiter_and_is_keyed_by_the_call() {
     let fixture = fixture();
-    let tool_call = [3u8; 16];
-    let name = SignalName::new(format!(
-        "tool.approval.{}",
-        ToolCallId::from_bytes(tool_call).to_hex()
-    ));
+    let call = ToolCallId::from_bytes([3; 16]);
 
     let waiting = Arc::clone(&fixture.waits);
-    let awaited_name = name.clone();
-    let handle = tokio::spawn(async move {
-        waiting
-            .await_signal(AwaitSignal {
-                session: SESSION,
-                signal: SignalId::from_bytes(tool_call),
-                name: awaited_name,
-            })
-            .await
-    });
+    let handle = tokio::spawn(async move { waiting.await_approval(SESSION, call).await });
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     fixture
         .waits
-        .deliver_signal(SignalDelivery {
-            session: SESSION,
-            signal: SignalId::from_bytes(tool_call),
-            name,
-            payload: serde_json::json!("Allow"),
-        })
+        .record_approval(SESSION, call, ApprovalDecision::Allow)
         .await
-        .expect("deliver");
+        .expect("record");
 
-    let payload = handle.await.expect("join").expect("signal");
-    assert_eq!(payload, serde_json::json!("Allow"));
-    let received = events(&fixture.log)
+    let decision = handle.await.expect("join").expect("decision");
+    assert_eq!(decision, ApprovalDecision::Allow);
+    let recorded = events(&fixture.log)
         .await
         .into_iter()
         .find_map(|event| match event {
-            SessionEvent::SignalReceived { signal_id, .. } => Some(signal_id),
+            SessionEvent::ApprovalDecided { tool_call_id, .. } => Some(tool_call_id),
             _ => None,
         })
-        .expect("received");
-    assert_eq!(received, SignalId::from_bytes(tool_call));
+        .expect("recorded");
+    assert_eq!(recorded, call);
 }
 
 #[tokio::test]
-async fn duplicate_delivery_and_repeat_waits_collapse() {
+async fn duplicate_decisions_and_repeat_waits_collapse() {
     let fixture = fixture();
-    let name = SignalName::new("tool.approval.00");
-    let delivery = SignalDelivery {
-        session: SESSION,
-        signal: SignalId::from_bytes([0; 16]),
-        name: name.clone(),
-        payload: serde_json::json!({"n": 1}),
-    };
+    let call = ToolCallId::from_bytes([0; 16]);
     fixture
         .waits
-        .deliver_signal(delivery.clone())
+        .record_approval(SESSION, call, ApprovalDecision::Allow)
         .await
-        .expect("deliver");
-    // The second delivery must not write a second record.
+        .expect("record");
+    // The second answer must not write a second record.
     fixture
         .waits
-        .deliver_signal(SignalDelivery {
-            payload: serde_json::json!({"n": 2}),
-            ..delivery
-        })
+        .record_approval(SESSION, call, ApprovalDecision::Deny { reason: None })
         .await
-        .expect("duplicate deliver");
+        .expect("duplicate record");
 
-    let request = AwaitSignal {
-        session: SESSION,
-        signal: SignalId::from_bytes([0; 16]),
-        name,
-    };
     let first = fixture
         .waits
-        .await_signal(request.clone())
+        .await_approval(SESSION, call)
         .await
         .expect("first wait");
     let second = fixture
         .waits
-        .await_signal(request)
+        .await_approval(SESSION, call)
         .await
         .expect("second wait");
 
-    assert_eq!(first, serde_json::json!({"n": 1}));
+    assert_eq!(first, ApprovalDecision::Allow);
     assert_eq!(second, first);
     let state = events(&fixture.log).await;
-    assert_eq!(count(&state, "SignalReceived"), 1);
+    assert_eq!(count(&state, "ApprovalDecided"), 1);
 }
 
 #[tokio::test]
-async fn a_delivered_signal_satisfies_a_later_wake_wait() {
+async fn a_child_wait_resolves_once_the_completion_is_recorded() {
     let fixture = fixture();
-    let signal = SignalId::from_bytes([5; 16]);
+    let child = SessionId::from_bytes([5; 16]);
+
+    let waiting = Arc::clone(&fixture.waits);
+    let handle = tokio::spawn(async move { waiting.await_child(SESSION, child).await });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let completed = SessionEvent::ChildSessionCompleted {
+        child,
+        outcome: ChildOutcome::Cancelled {
+            reason: CancelReason::Host,
+        },
+    };
+    fixture
+        .log
+        .append(
+            encode_entry(SESSION, Some(dedup::child_session(child)), &completed).expect("encode"),
+        )
+        .await
+        .expect("append");
+    fixture.waits.wake_child(child);
+
+    handle.await.expect("join").expect("child wait");
+    // An already recorded completion satisfies a later wait immediately.
     fixture
         .waits
-        .deliver_signal(SignalDelivery {
-            session: SESSION,
-            signal,
-            name: SignalName::new("tool.approval.05"),
-            payload: serde_json::json!("Allow"),
-        })
+        .await_child(SESSION, child)
         .await
-        .expect("deliver");
-    fixture
-        .waits
-        .await_wake(SESSION, WakeCause::Signal(signal))
-        .await
-        .expect("the recorded signal satisfies the wait");
+        .expect("later wait");
 }

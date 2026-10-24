@@ -13,10 +13,10 @@ use asterpath_protocol::{
     CancelToken, ChildOutcome, ContextPolicy, DefaultApprovalPolicy, HookError, Hooks, Item,
     JsonString, NO_APPROVAL_ENDPOINT, Part, Provenance, ReplaySafety, SessionEvent, Tool, ToolArgs,
     ToolCallCtx, ToolConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName,
-    ToolOutput, ToolResultStatus, ToolResultView, approval_signal_id, approval_signal_name, dedup,
+    ToolOutput, ToolResultStatus, ToolResultView, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, LogId, SessionId, SessionStore, SignalDelivery, StepId, ToolCallId, TurnId,
+    ApprovalGate, LogId, SessionId, SessionStore, StepId, ToolCallId, TurnId,
 };
 use asterpath_testing::{InMemoryEventLog, ManualClock, TestTool};
 use futures_core::future::BoxFuture;
@@ -108,14 +108,9 @@ impl Harness {
 
     async fn deliver(&self, call: ToolCallId, decision: ApprovalDecision) {
         self.waits
-            .deliver_signal(SignalDelivery {
-                session: SESSION,
-                signal: approval_signal_id(call),
-                name: approval_signal_name(call),
-                payload: serde_json::to_value(decision).expect("payload"),
-            })
+            .record_approval(SESSION, call, decision)
             .await
-            .expect("deliver");
+            .expect("record");
     }
 
     fn pipeline(&self) -> ToolPipeline {

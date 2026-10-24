@@ -12,7 +12,7 @@ use asterpath_protocol::{
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
-    WakeCause, unique_bytes,
+    unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -374,9 +374,7 @@ impl Scheduler {
 
                 let drive = drive_child(agent, child.child);
                 tokio::pin!(drive);
-                let wake = self
-                    .waits
-                    .await_wake(child.parent.session, WakeCause::ChildCompleted(child.child));
+                let wake = self.waits.await_child(child.parent.session, child.child);
                 tokio::pin!(wake);
                 let deadline_wait = async {
                     match remaining {
@@ -417,10 +415,7 @@ impl Scheduler {
                     Some(Err(AgentError::Busy { .. })) => {
                         let _ = self
                             .waits
-                            .await_wake(
-                                child.parent.session,
-                                WakeCause::ChildCompleted(child.child),
-                            )
+                            .await_child(child.parent.session, child.child)
                             .await;
                     }
                     Some(Err(error)) => return self.lost(&child, error.to_string()).await,
@@ -804,7 +799,7 @@ impl Scheduler {
         .await
         .map_err(WaitError::Execution)?;
         self.release_slot(child.parent.session, child.parent.tool_call);
-        self.waits.wake(WakeCause::ChildCompleted(child.child));
+        self.waits.wake_child(child.child);
         Ok(())
     }
 

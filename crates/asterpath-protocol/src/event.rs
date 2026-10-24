@@ -1,14 +1,14 @@
 //! The complete session event enum and the value enums its payloads carry.
 
-use crate::{LogId, LogIdRange, SessionId, SignalId, SignalName, StepId, ToolCallId, TurnId};
+use crate::{LogId, LogIdRange, SessionId, StepId, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigSnapshot, ContextPolicy, ModelSpec, Provenance, ReplaySafety};
 use crate::ids::JsonString;
-use crate::ids::JsonValue;
 use crate::ids::ToolName;
 use crate::item::{Item, Part, RawProviderData};
 use crate::provider::{ProviderError, ProviderErrorKind};
+use crate::tool::ApprovalDecision;
 use crate::usage::Usage;
 
 /// One committed record in a session log. Only terminal records are logged.
@@ -119,10 +119,10 @@ pub enum SessionEvent {
         child: SessionId,
         outcome: ChildOutcome,
     },
-    SignalReceived {
-        signal_id: SignalId,
-        name: SignalName,
-        payload: JsonValue,
+    /// The host's answer to an `Ask` for one recorded tool call.
+    ApprovalDecided {
+        tool_call_id: ToolCallId,
+        decision: ApprovalDecision,
     },
 }
 
@@ -148,7 +148,7 @@ impl SessionEvent {
             Self::CompactionAborted { .. } => "CompactionAborted",
             Self::ChildSessionSpawned { .. } => "ChildSessionSpawned",
             Self::ChildSessionCompleted { .. } => "ChildSessionCompleted",
-            Self::SignalReceived { .. } => "SignalReceived",
+            Self::ApprovalDecided { .. } => "ApprovalDecided",
         }
     }
 }

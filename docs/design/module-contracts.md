@@ -90,7 +90,6 @@ agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`c
 ```rust
 pub type Timestamp = i64;        // Unix epoch 毫秒；唯一允许的时间表示
 pub struct DedupKey(String);
-pub struct SignalName(String);
 
 // 唯一的存储适配器（ADR-0023）：日志 + 会话目录 + 可选退役。
 pub trait SessionStore: Send + Sync {
@@ -98,11 +97,10 @@ pub trait SessionStore: Send + Sync {
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
     // 会话目录：用量子树汇总、spawn 深度、唤醒发现与归档使用（#13/#18/#73）。
-    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionId>, StorageError>>;
+    fn sessions(&self, query: SessionQuery)
+        -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>>;
     fn parent(&self, session: SessionId)
         -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
-    fn children(&self, session: SessionId)
-        -> BoxStream<'_, Result<SessionId, StorageError>>;
     // 默认 Err(RetirementError::Unsupported)；见 retention.md。
     fn retire(&self, session: SessionId, expected_frontier: LogId)
         -> BoxFuture<'_, Result<(), RetirementError>>;
@@ -111,26 +109,6 @@ pub trait SessionStore: Send + Sync {
 // 一个会话的全部已提交记录（按 seq）：引擎与宿主共用的整段扫描（#77）。
 pub async fn scan_all(log: &dyn SessionStore, session: SessionId)
     -> Result<Vec<LogEntry>, StorageError>;
-
-pub type SignalPayload = serde_json::Value;
-
-pub struct SignalDelivery {
-    pub session: SessionId,
-    pub signal: SignalId,
-    pub name: SignalName,
-    pub payload: SignalPayload,
-}
-
-pub struct AwaitSignal {
-    pub session: SessionId,
-    pub signal: SignalId,
-    pub name: SignalName,            // tool.approval.<tool_call_id>
-}
-
-pub enum WakeCause {
-    Signal(SignalId),
-    ChildCompleted(SessionId),
-}
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
@@ -143,6 +121,7 @@ pub struct ApprovalGate;
 impl ApprovalGate {
     pub fn register(&self) -> ApprovalEndpoint;   // RAII；drop 注销
     pub fn is_open(&self) -> bool;
+    pub fn pending(&self) -> Vec<ApprovalRequest>; // 进程内待审批列表（tools.md §4）
 }
 pub struct ApprovalEndpoint;
 ```
@@ -155,16 +134,16 @@ pub struct ApprovalEndpoint;
 - 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），宿主经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
 - 事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `SessionStore::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
-- 持久等待是引擎内部的 `waits::Waits`（`await_signal` / `deliver_signal` / `await_wake` / `wake`），不是 trait：持久等待只有审批与子会话完成，没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。`AwaitSignal` / `SignalDelivery` / `WakeCause` 是它的值类型，留在 protocol。v1 没有 activity / workflow。
-- 审批 signal id 即 `tool_call_id`；等待意图是 open `ToolCallRequested`，`await_signal` 不写记录，`deliver_signal` 以 signal id 为 dedup key 写 `SignalReceived`，重复投递不产生第二条。
-- `wake` 只在内存；终态记录的写者先 append 再 wake。等待者表不持久化，恢复靠扫描日志重建。
+- 持久等待是引擎内部的 `waits::Waits`，不是 trait，在 protocol 里没有值类型：持久等待只有审批与子会话完成。审批是 `await_approval` / `record_approval`，子会话是 `await_child` / `wake_child`。
+- 审批等待的意图是 open `ToolCallRequested`，`await_approval` 不写记录；`record_approval` 以 `tool_call_id` 为 dedup key 写 `ApprovalDecided`，重复回答不产生第二条。
+- 唤醒只在内存；终态记录的写者先 append 再唤醒。等待者表不持久化，恢复靠扫描日志重建。
 - 日志信封只有两个形状：`NewEntry`（调用方提交）与 `LogEntry`（存储返回）；payload 是信封层不解释的 `serde_json::Value`，信封不设 `kind` 字段（事件类型由存储从 payload 顶层键派生，用于幂等判别）。字段与语义见 [storage.md](storage.md) §3，决定见 [ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)。带类型的 `SessionEvent` 与 upcast 是同 crate 的 `decode_entry(&LogEntry)`。
 
 ### 3.5 错误与 ID
 
 - 每类能力一个 `#[non_exhaustive]` 枚举：`StorageError`、`ExecutionError`、`RetirementError`、`ProviderError`、`ToolError`、`LogDecodeError` 都在 protocol。`LogDecodeError` 只在 protocol 内部消费，经 `AgentError::Corrupt` / `StorageError::Corrupt` 露出。
 - `AsterError` 在门面 crate，对上述错误求和。
-- `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId` 是 protocol 里的 opaque newtype，facade 再导出。
+- `SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId` 是 protocol 里的 opaque newtype，facade 再导出。
 - `anyhow` 只允许出现在 CLI/二进制；库契约不暴露 `Box<dyn Error>`。
 
 ### 3.6 运行时与配置

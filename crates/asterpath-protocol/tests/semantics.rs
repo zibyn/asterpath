@@ -1,9 +1,7 @@
 //! Behaviour of the canonical model, log decoding and folds.
 
 use asterpath_protocol::*;
-use asterpath_protocol::{
-    LogEntry, LogId, LogIdRange, SessionId, SignalId, StepId, ToolCallId, TurnId,
-};
+use asterpath_protocol::{LogEntry, LogId, LogIdRange, SessionId, StepId, ToolCallId, TurnId};
 use serde_json::{Value, json};
 
 fn entry(seq: u64, schema_version: u16, payload: Value) -> LogEntry {
@@ -160,8 +158,8 @@ fn dedup_keys_follow_the_shared_key_table() {
         "compaction:7"
     );
     assert_eq!(
-        dedup::signal(SignalId::from_bytes([3; 16])).as_str(),
-        SignalId::from_bytes([3; 16]).to_hex()
+        dedup::approval_decided(ToolCallId::from_bytes([3; 16])),
+        dedup::tool_call(ToolCallId::from_bytes([3; 16]))
     );
 }
 

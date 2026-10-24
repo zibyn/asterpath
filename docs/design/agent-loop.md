@@ -167,7 +167,7 @@ run_turn(session):
 - `call_model` 的每次失败都写 `ModelCallAborted`；只有成功的 attempt 写 `AssistantMessage`。重试不新开 step，投影不变。
 - 未装配 Compactor 时 `compact_if_needed` 返回 `NotConfigured` 并继续；`compact_forced` 返回 `NotConfigured`，按内层 `Ok(_)` 分支收尾为 `ContextExhausted`（[compaction.md](compaction.md) §6）。
 - `has_pending_input` = 本回合最后一个 `StepStarted` 之后存在 `InputRecorded`。
-- 工具审批 `Ask` 会让 step 在 `Waiting` 中跨天保持 open；决定记录为 `SignalReceived`，恢复与调度见 [tools.md](tools.md)。
+- 工具审批 `Ask` 会让 step 在 `Waiting` 中跨天保持 open；决定记录为 `ApprovalDecided`，恢复与调度见 [tools.md](tools.md)。
 - 工具执行中取消的收尾顺序见 §6。
 
 ### 4.1 恢复入口

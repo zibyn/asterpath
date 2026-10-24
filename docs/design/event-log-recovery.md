@@ -23,13 +23,13 @@
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
 - **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
-- **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件。工具语义见 [tools.md](tools.md)。
+- **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件（2026-10-24 改为类型化的 `ApprovalDecided`）。工具语义见 [tools.md](tools.md)。
 - **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
 - **2026-10-22 #29 修订**：`caused_by` 指向 `ChildSessionSpawned` 的 timer 不在恢复预扫描里收尾，交给 spawn 重放（先 R3 查子终态，再处理 deadline）；排队按 open spawn `ToolCallRequested` 重建。
 - 日志层**没有 ack**：完成 = 写了终态记录。存储也没有租约或 ack；唤醒是只读发现（[storage.md](storage.md) §7）。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
-- **等待是事件**：持久等待只有两种——人工审批（意图是 open `ToolCallRequested`，终态是 `SignalReceived`）与子会话完成（`ChildSessionSpawned` → `ChildSessionCompleted`）；崩溃后重新挂起。spawn 超时是 spawn 记录上的截止时间，不是独立 timer（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
+- **等待是事件**：持久等待只有两种——人工审批（意图是 open `ToolCallRequested`，终态是 `ApprovalDecided`）与子会话完成（`ChildSessionSpawned` → `ChildSessionCompleted`）；崩溃后重新挂起。spawn 超时是 spawn 记录上的截止时间，不是独立 timer（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
 - **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合。
 - 幂等：`(session, 事件类型, dedup_key)` 唯一，重复 append 返回原 `LogId`。
 - 信封的 `recorded_at` 是诊断时间，只供 trace/审计读取；任何恢复、投影或分支逻辑不得读取它。`seq` 仍是唯一排序依据。
@@ -97,7 +97,7 @@ pub enum SessionEvent {
                           caused_by: LogId,
                           deadline: Option<Timestamp> },
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
-    SignalReceived { signal_id: SignalId, name: SignalName, payload: JsonValue },
+    ApprovalDecided { tool_call_id: ToolCallId, decision: ApprovalDecision },
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }
@@ -120,9 +120,9 @@ pub enum TurnEndReason {
 
 - **没有通用 `Error` 事件**。错误是它所附着事件的终态（`ModelCallAborted`、`ToolResult::Failed`、`ChildOutcome`）。
 - `ToolResult` 是工具调用的唯一终态：`Failed` 必带 `error`；`Interrupted` 的 `output` / `error` 为 `None`。
-- `ToolCallRequested` 的两个 id 分工固定：`tool_call_id` 由框架生成，用于 dedup key、审批 signal 与 open intent；`provider_call_id` 是 `AssistantMessage.items` 中 `ToolCall.call_id` 的原值。投影与恢复按 `provider_call_id` 把意图对回 `ToolCall`，`ToolResult` 只引用 `tool_call_id`，不重复存 provider id。
+- `ToolCallRequested` 的两个 id 分工固定：`tool_call_id` 由框架生成，用于 dedup key、审批决定与 open intent；`provider_call_id` 是 `AssistantMessage.items` 中 `ToolCall.call_id` 的原值。投影与恢复按 `provider_call_id` 把意图对回 `ToolCall`，`ToolResult` 只引用 `tool_call_id`，不重复存 provider id。
 - `ToolCallRequested` 的 `provenance` 可以是 `Unknown`（请求的工具不在注册表），此时 `replay` 记 `Unsafe`；恢复按 [plugins.md](plugins.md) §8 处理。`NotFound` 是模型可见的工具错误类型，不新增 status。
-- 审批没有独立事件：决定是 `SignalReceived { name: "tool.approval.<tool_call_id>", payload: {Allow | Deny} }`；等待意图由 open `ToolCallRequested` 承担。
+- 审批决定是 `ApprovalDecided { tool_call_id, decision: Allow | Deny }`；等待意图由 open `ToolCallRequested` 承担。
 - `StepCommitted` 是 step 的通用终态：成功、失败、取消都写它；回合结果由 `TurnCommitted.reason` 表达（#6）。
 - `usage` 与 `stop_reason` 记在 `AssistantMessage`；`StepCommitted` 不再携带。`model` 记在三个承载 usage 的终态记录上，是发起请求的 `ModelSpec`（#13）。
 - `usage` 的桶、聚合与重放去重规则见 [usage.md](usage.md)；日志层只负责让每条终态记录唯一。
@@ -133,7 +133,7 @@ pub enum TurnEndReason {
 - `Crash` 不是现场写下的记录；恢复时检测到未闭合意图才补记（见 §6）。
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-protocol` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
-- `SignalReceived` 只承载审批决定；等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
+- `ApprovalDecided` 的等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
 - 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0014](../adr/0014-subagent-scheduling-api.md)）；存储投递归 #5。
 
 ## 4. 信封与幂等键
@@ -176,9 +176,9 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | `StepCommitted` / `TurnCommitted` | step / turn id |
 | `CompactionStarted` / `CompactionApplied` / `CompactionAborted` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
-| `SignalReceived` | signal id（= 审批的 `tool_call_id`） |
+| `ApprovalDecided` | `tool_call_id` |
 
-表中的 key 按事件类型隔离：`ToolCallRequested` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
+表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
@@ -189,7 +189,7 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 - **I3 顺序**：`seq` 在 session 内严格单调；逻辑只按 `seq` 排序。
 - **I4 时间无关**：`recorded_at` 只影响 trace/审计的耗时呈现，不参与任何恢复、分支、比较或投影。
 - **I5 恢复只处理未闭合意图**：已闭合的历史不重做。
-- **I6 等待是已记录的**：每个等待都有意图记录与最终终态（审批：`ToolCallRequested` → `SignalReceived` / `ToolResult`；子会话：`ChildSessionSpawned` → `ChildSessionCompleted`）；恢复不依赖内存中的等待者。
+- **I6 等待是已记录的**：每个等待都有意图记录与最终终态（审批：`ToolCallRequested` → `ApprovalDecided` / `ToolResult`；子会话：`ChildSessionSpawned` → `ChildSessionCompleted`）；恢复不依赖内存中的等待者。
 - **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 丢弃 `replaces` 区间（含旧 summary）并在 `first_kept` 之前插入新 summary；原始记录保留。
 - **I8 幂等 append**：同一 `(session, 事件类型, dedup_key)` 永远只有一条记录。
 - **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。
@@ -215,7 +215,7 @@ pub enum StepState {
 「未闭合意图」的精确定义：`TurnStarted` 无 `TurnCommitted`；`StepStarted` 无 `StepCommitted`；`ToolCallRequested` 无 `ToolResult`；`ChildSessionSpawned` 无 `ChildSessionCompleted`；`CompactionStarted` 无 `CompactionApplied` / `CompactionAborted`。`ToolPending`（`AssistantMessage` 已写、仍有工具未终结）可由日志推导，不单列状态。
 
 - `SessionFacts`（protocol，会话事实）是唯一的折叠实现：`fold(&[LogEntry])` 批量解码折叠，`apply(seq, log_id, dedup_key, &event)` 逐事件折叠；`is_idle()` 排除 `compaction`。它同时回答未闭合意图的元数据（打开时 seq、所属回合/步骤、工具名、子会话的父工具调用与 `deadline`）、open step 及其起始 seq、是否有待处理输入、父会话。agent 恢复、scheduler 准入、facade `state()` / `facts()` / `wakeable()`、存储退役的空闲判定与 CLI `inspect` 都读它，不各写折叠。`is_wakeable()` = 非 idle 或有待处理输入；不存在物化的意图表（#73，ADR-0023）。
-- 关闭事件按键精确匹配。审批的 `SignalReceived` 不关闭任何意图（工具意图由 `ToolResult` 关闭）；`InputRecorded` 不是意图。
+- 关闭事件按键精确匹配。`ApprovalDecided` 不关闭任何意图（工具意图由 `ToolResult` 关闭）；`InputRecorded` 不是意图。
 - `Idle` 只看非 compaction 意图：只有 `CompactionStarted` 未闭合时仍是 `Idle`（丢弃一次摘要调用是安全的，见 [retention.md](retention.md) §5）。
 
 ### 算法
@@ -289,7 +289,7 @@ recover(session):
 | S10 | `kill -9` 于 `AssistantMessage` 之后、`StepCommitted` 之前 | 恢复不重调模型；恰一条 `AssistantMessage`，usage 保留；未完成工具按 S1/S2 收尾；step 最终 `StepCommitted` |
 | S11 | 工具执行中取消 | 宽限内完成记真实结果；到期写 `Interrupted`；`StepCommitted` + `TurnCommitted(Cancelled)`；恢复不重试 |
 | S12 | 同一 key、不同事件类型各 append 一次（共享 key 见 §4） | 两条记录都落盘，互不抑制 |
-| S13 | 在 open step 中到达 `InputRecorded`（steering）、`SignalReceived`（审批）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；重启后出现在 `Asterpath::wakeable()` |
+| S13 | 在 open step 中到达 `InputRecorded`（steering）、`ApprovalDecided`（审批）、`ChildSessionCompleted` | 会话仍非 `Idle`；退役 `NotIdle`；重启后出现在 `Asterpath::wakeable()` |
 | S14 | 摘要调用失败 / 压后仍超窗 | `CompactionAborted{SummaryFailed}` / `{Insufficient}` 写入；无 open `CompactionStarted`；恢复不再重做 |
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |

@@ -15,8 +15,8 @@ use asterpath_protocol::{
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
     Provider, ProviderId, ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SideEffect,
     StopReason, SubagentConfig, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UserInput, approval_signal_id,
-    approval_signal_name, decode_entry, dedup, encode_entry,
+    ToolOutput, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry, dedup,
+    encode_entry,
 };
 use asterpath_protocol::{
     DedupKey, InputId, LogEntry, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
@@ -530,12 +530,11 @@ async fn approval_prefix(asterpath: &Asterpath, session: SessionId, decision: bo
         append(
             asterpath,
             session,
-            SessionEvent::SignalReceived {
-                signal_id: approval_signal_id(CALL),
-                name: approval_signal_name(CALL),
-                payload: serde_json::to_value(ApprovalDecision::Allow).unwrap(),
+            SessionEvent::ApprovalDecided {
+                tool_call_id: CALL,
+                decision: ApprovalDecision::Allow,
             },
-            Some(dedup::signal(approval_signal_id(CALL))),
+            Some(dedup::approval_decided(CALL)),
         )
         .await;
     }
@@ -944,7 +943,7 @@ async fn s17_unknown_tool_intent_recovers_as_not_found_without_approval() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].1, ToolResultStatus::Failed);
     assert_eq!(results[0].2.as_deref(), Some("NotFound"));
-    assert_eq!(common::kind_count(&entries, "SignalReceived"), 0);
+    assert_eq!(common::kind_count(&entries, "ApprovalDecided"), 0);
     assert_eq!(common::kind_count(&entries, "ToolCallRequested"), 1);
     assert!(
         abort_kinds(&entries).is_empty(),

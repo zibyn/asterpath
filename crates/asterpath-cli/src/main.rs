@@ -1277,7 +1277,9 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .filter(|entry| decode_entry(entry).is_ok_and(|event| event.kind() == "SignalReceived"))
+            .filter(|entry| {
+                decode_entry(entry).is_ok_and(|event| event.kind() == "ApprovalDecided")
+            })
             .count()
     }
 
