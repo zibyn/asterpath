@@ -66,8 +66,8 @@ impl OpenAiProvider {
     /// Name this instance (one per vendor endpoint); raw and reasoning
     /// replay is gated by it.
     #[must_use]
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = ProviderId::new(id);
+    pub fn with_id(mut self, id: impl Into<ProviderId>) -> Self {
+        self.id = id.into();
         self
     }
 

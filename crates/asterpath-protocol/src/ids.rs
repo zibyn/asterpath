@@ -36,6 +36,18 @@ macro_rules! string_newtype {
 }
 
 string_newtype!(ProviderId);
+
+impl From<&str> for ProviderId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ProviderId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
 string_newtype!(ModelId);
 string_newtype!(ModelAlias);
 string_newtype!(ToolName);
