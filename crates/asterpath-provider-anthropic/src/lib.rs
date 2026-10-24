@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 mod error;
+mod models;
 mod request;
 mod sse;
 
@@ -57,11 +58,12 @@ impl Provider for AnthropicProvider {
         ProviderId::new(Self::ID)
     }
 
-    fn capabilities(&self, _spec: &ModelSpec) -> ProviderCapabilities {
+    fn capabilities(&self, spec: &ModelSpec) -> ProviderCapabilities {
+        let rules = models::rules_for(spec.model.as_str());
         ProviderCapabilities {
             server_state: false,
-            forced_tool_choice: true,
-            sampling: true,
+            forced_tool_choice: rules.forced_tool_choice,
+            sampling: rules.sampling,
             reasoning_roundtrip: true,
             citations: false,
             builtin_tools: true,

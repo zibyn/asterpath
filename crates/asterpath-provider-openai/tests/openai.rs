@@ -351,7 +351,11 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
     assert_eq!(body["temperature"], json!(0.25));
     assert_eq!(body["top_p"], json!(0.5));
     assert!(body.get("seed").is_none());
-    assert_eq!(body["stream"], json!(true), "Responses API only streams SSE when asked");
+    assert_eq!(
+        body["stream"],
+        json!(true),
+        "Responses API only streams SSE when asked"
+    );
     assert_eq!(
         body["reasoning"],
         json!({"effort": "high", "summary": "auto"})
