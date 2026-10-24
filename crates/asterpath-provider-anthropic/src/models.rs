@@ -15,16 +15,14 @@
 //! default, but it takes `between_tools` instead of `"disabled"`). Unrecognized
 //! ids get [`UNRECOGNIZED`] and so reject `Off` too.
 //!
-//! `inline_system`: the supported-models list of build-with-claude/
-//! mid-conversation-system-messages (checked 2026-10-24; no beta header). Sonnet 5
-//! is listed as unsupported; models the page does not list fall back, and so
-//! do unrecognized ids (third-party endpoints such as DeepSeek reach
+//! `inline_changes`: the supported-models list of build-with-claude/
+//! mid-conversation-system-messages (checked 2026-10-24; system messages need
+//! no beta header). The same page says mid-conversation tool changes are in
+//! beta "on the same models"; definitions by value need
+//! `anthropic-beta: inline-tools-2026-09-15`, Claude API only. Sonnet 5 is
+//! listed as unsupported; models the page does not list fall back, and so do
+//! unrecognized ids (third-party endpoints such as DeepSeek reach
 //! [`UNRECOGNIZED`]): only listed models render inline.
-//!
-//! `inline_tools`: the same page says mid-conversation tool changes are in
-//! beta "on the same models" (checked 2026-10-24); definitions by value need
-//! `anthropic-beta: inline-tools-2026-09-15`, Claude API only. Whether Sonnet 5
-//! takes them is not stated, so it falls back like `inline_system`.
 //!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
@@ -66,14 +64,11 @@ pub struct AnthropicModelProfile {
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p` / `top_k`.
     pub sampling: bool,
-    /// Accepts `role: "system"` messages inside `messages`. Without it an
-    /// appended instruction joins the top-level `system`, and thinking from
-    /// before it is dropped.
-    pub inline_system: bool,
-    /// Accepts `tool_addition` / `tool_removal` blocks in a `role: "system"`
-    /// message. Without it a tool change rewrites the top-level `tools`, and
-    /// thinking bound to the old set is dropped.
-    pub inline_tools: bool,
+    /// Accepts `role: "system"` messages inside `messages`, including
+    /// `tool_addition` / `tool_removal` blocks. Without it an appended
+    /// instruction joins the top-level `system` and a tool change rewrites the
+    /// top-level `tools`; thinking from before the change is dropped.
+    pub inline_changes: bool,
 }
 
 impl AnthropicModelProfile {
@@ -114,14 +109,8 @@ impl AnthropicModelProfile {
     }
 
     #[must_use]
-    pub fn with_inline_system(mut self, inline: bool) -> Self {
-        self.inline_system = inline;
-        self
-    }
-
-    #[must_use]
-    pub fn with_inline_tools(mut self, inline: bool) -> Self {
-        self.inline_tools = inline;
+    pub fn with_inline_changes(mut self, inline: bool) -> Self {
+        self.inline_changes = inline;
         self
     }
 
@@ -143,14 +132,12 @@ const fn rules(
         thinking_default_on: false,
         forced_tool_choice: forced,
         sampling,
-        inline_system: false,
-        inline_tools: false,
+        inline_changes: false,
     }
 }
 
 const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
-    profile.inline_system = true;
-    profile.inline_tools = true;
+    profile.inline_changes = true;
     profile
 }
 
@@ -169,13 +156,11 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking_default_on: true,
     forced_tool_choice: true,
     sampling: false,
-    inline_system: true,
-    inline_tools: true,
+    inline_changes: true,
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
-    inline_system: false,
-    inline_tools: false,
+    inline_changes: false,
     ..ADAPTIVE
 };
 /// Fable 5 and Mythos 5: thinking is always on.
@@ -254,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_system_and_tools_follow_the_supported_model_list() {
+    fn inline_changes_follow_the_supported_model_list() {
         for (model, inline) in [
             ("claude-opus-5-5", true),
             ("claude-sonnet-5-5", true),
@@ -273,8 +258,7 @@ mod tests {
             ("claude-sonnet-4-6", false),
             ("claude-3-haiku", false),
         ] {
-            assert_eq!(builtin(model).inline_system, inline, "{model}");
-            assert_eq!(builtin(model).inline_tools, inline, "{model}");
+            assert_eq!(builtin(model).inline_changes, inline, "{model}");
         }
     }
 

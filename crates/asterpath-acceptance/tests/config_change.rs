@@ -346,7 +346,7 @@ async fn anthropic_appends_a_system_message_and_replays_the_old_thinking() {
 }
 
 #[tokio::test]
-async fn anthropic_without_inline_system_rewrites_the_system_and_drops_the_old_thinking() {
+async fn anthropic_without_inline_changes_rewrites_the_system_and_drops_the_old_thinking() {
     let server = MockServer::start(common::mock::anthropic_replies(&append_fixture(
         "anthropic",
         "claude-opus-5-5",
@@ -356,7 +356,7 @@ async fn anthropic_without_inline_system_rewrites_the_system_and_drops_the_old_t
             .with_base_url(server.base_url())
             .with_model_profile(
                 "claude-opus-5-5",
-                AnthropicModelProfile::latest().with_inline_system(false),
+                AnthropicModelProfile::latest().with_inline_changes(false),
             ),
     );
     run_append_turn(provider, anthropic_model()).await;
@@ -623,7 +623,7 @@ async fn anthropic_renders_tool_changes_inline_and_replays_the_old_thinking() {
 }
 
 #[tokio::test]
-async fn anthropic_without_inline_tools_rewrites_the_tools_and_drops_the_old_thinking() {
+async fn anthropic_without_inline_changes_rewrites_the_tools_and_drops_the_old_thinking() {
     let server = MockServer::start(common::mock::anthropic_replies(&equip_fixture(
         "anthropic",
         "claude-opus-5-5",
@@ -633,7 +633,7 @@ async fn anthropic_without_inline_tools_rewrites_the_tools_and_drops_the_old_thi
             .with_base_url(server.base_url())
             .with_model_profile(
                 "claude-opus-5-5",
-                AnthropicModelProfile::latest().with_inline_tools(false),
+                AnthropicModelProfile::latest().with_inline_changes(false),
             ),
     );
     let results = run_equip_turn(provider, anthropic_model()).await;

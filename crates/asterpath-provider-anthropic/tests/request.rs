@@ -1395,13 +1395,13 @@ async fn an_instruction_followed_by_user_input_moves_after_it() {
 }
 
 #[tokio::test]
-async fn without_inline_system_an_instruction_joins_the_top_level_system_and_drops_old_thinking() {
+async fn without_inline_changes_an_instruction_joins_the_top_level_system_and_drops_old_thinking() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let sink = Arc::new(RecordingSink::default());
     let provider = provider(&server)
         .with_model_profile(
             "claude-opus-5-5",
-            AnthropicModelProfile::latest().with_inline_system(false),
+            AnthropicModelProfile::latest().with_inline_changes(false),
         )
         .with_trace_sink(sink.clone());
     let mut request = instructed_request("claude-opus-5-5");
@@ -1511,13 +1511,14 @@ async fn a_tool_change_renders_inline_and_keeps_the_top_level_tools_and_old_thin
 }
 
 #[tokio::test]
-async fn without_inline_tools_a_tool_change_rewrites_the_top_level_tools_and_drops_old_thinking() {
+async fn without_inline_changes_a_tool_change_rewrites_the_top_level_tools_and_drops_old_thinking()
+{
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let sink = Arc::new(RecordingSink::default());
     let provider = provider(&server)
         .with_model_profile(
             "claude-opus-5-5",
-            AnthropicModelProfile::latest().with_inline_tools(false),
+            AnthropicModelProfile::latest().with_inline_changes(false),
         )
         .with_trace_sink(sink.clone());
     drain(&provider, tools_changed_request("claude-opus-5-5")).await;

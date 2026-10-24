@@ -618,8 +618,8 @@ pub enum ProviderErrorKind {
 5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。追加指令不改顶层 `system`（§3.3），因此不使旧 thinking 失效；只有退回路径（规则 8）改写顶层 `system`。工具变更同理：inline 路径下顶层 `tools` 保持基线，指纹不变；退回路径（规则 9）改写顶层 `tools`，指纹不匹配。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
-8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_system = false`）**：只有官方文档列出支持的模型在内置表中为 `true`；未列出的模型与未识别的 id（`UNRECOGNIZED`，第三方兼容端点如 DeepSeek 会落到这里）为 `false`，宿主确认端点支持时用 `with_inline_system(true)` 注入。指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
-9. **工具变更的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_tools = false`）**：默认值规则同规则 8（文档称工具变更与中途 system 消息支持同一批模型）。顶层 `tools` 渲染生效集合，`ToolsChanged` 条目不渲染，不发 beta header；产出于变更之前的 `Reasoning` 指纹不匹配（规则 5），不进入请求。
+8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_changes = false`）**：只有官方文档列出支持的模型在内置表中为 `true`；未列出的模型与未识别的 id（`UNRECOGNIZED`，第三方兼容端点如 DeepSeek 会落到这里）为 `false`，宿主确认端点支持时用 `with_inline_changes(true)` 注入。指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
+9. **工具变更的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_changes = false`）**：与规则 8 共用同一个标志（文档称工具变更与中途 system 消息支持同一批模型）。顶层 `tools` 渲染生效集合，`ToolsChanged` 条目不渲染，不发 beta header；产出于变更之前的 `Reasoning` 指纹不匹配（规则 5），不进入请求。
 
 `tools_hash` 的定义：把渲染出的顶层工具集（OpenAI 与 Anthropic 退回路径是 `ModelRequest.tools`，Anthropic inline 路径是 `ModelRequest.baseline_tools`）的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
 
@@ -633,8 +633,8 @@ pub enum ProviderErrorKind {
 | --- | --- | --- |
 | `system: Vec<Part>` | 顶层 `system`（text blocks） | `instructions`（文本拼接） |
 | `items: Vec<Item>` | `messages[]`（按 §10.2 分组） | `input[]`（扁平 item 列表） |
-| `Item::Instruction` | `messages` 中的 `role: "system"` 消息（text blocks），推迟到下一条 assistant 之前或末尾；连续指令合并为一条。模型不支持（`inline_system = false`，未识别的 id 默认如此）时并入顶层 `system`（§9 规则 8） | `role: "developer"` 的 input 消息（`input_text`），原位 |
-| `Item::ToolsChanged` | 与指令同一条 `role: "system"` 消息中的 `tool_addition`（`tool: {type: "tool_definition", definition: {name, description, input_schema}}`）与 `tool_removal`（`tool: {type: "tool_reference", name}`）块，请求带 `anthropic-beta: inline-tools-2026-09-15`。模型不支持（`inline_tools = false`，未识别的 id 默认如此）时不渲染（§9 规则 9） | 不渲染：顶层 `tools` 已是生效集合 |
+| `Item::Instruction` | `messages` 中的 `role: "system"` 消息（text blocks），推迟到下一条 assistant 之前或末尾；连续指令合并为一条。模型不支持（`inline_changes = false`，未识别的 id 默认如此）时并入顶层 `system`（§9 规则 8） | `role: "developer"` 的 input 消息（`input_text`），原位 |
+| `Item::ToolsChanged` | 与指令同一条 `role: "system"` 消息中的 `tool_addition`（`tool: {type: "tool_definition", definition: {name, description, input_schema}}`）与 `tool_removal`（`tool: {type: "tool_reference", name}`）块，请求带 `anthropic-beta: inline-tools-2026-09-15`。模型不支持（`inline_changes = false`，未识别的 id 默认如此）时不渲染（§9 规则 9） | 不渲染：顶层 `tools` 已是生效集合 |
 | `tools` / `baseline_tools` | 顶层 `tools[{name, description, input_schema}]`：inline 路径渲染 `baseline_tools`，退回路径渲染 `tools` | 顶层 `tools[{type:"function", name, description, parameters}]`，渲染 `tools` |
 | `tool_choice` | `auto` / `any` / `tool` / `none` | `auto` / `required` / `function` / `none` |
 | `disable_parallel_tool_use` | `tool_choice.disable_parallel_tool_use` | `parallel_tool_calls: false` |

@@ -26,7 +26,7 @@ pub(crate) fn top_level_tools<'a>(
     rules: &AnthropicModelProfile,
     request: &'a ModelRequest,
 ) -> &'a [ToolDescriptor] {
-    if rules.inline_tools {
+    if rules.inline_changes {
         &request.baseline_tools
     } else {
         &request.tools
@@ -35,7 +35,7 @@ pub(crate) fn top_level_tools<'a>(
 
 /// The `anthropic-beta` header the rendered body needs.
 pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Option<&'static str> {
-    (rules.inline_tools
+    (rules.inline_changes
         && request
             .items
             .iter()
@@ -206,7 +206,7 @@ pub(crate) fn render(
     let tools_hash = asterpath_protocol::tools_hash(top_tools);
     let messages = render_messages(provider, request, &tools_hash, rules, trace)?;
     let mut system: Vec<&Part> = request.system.iter().collect();
-    if !rules.inline_system {
+    if !rules.inline_changes {
         // Fallback: appended instructions join the top-level system.
         system.extend(instruction_parts(request));
     }
@@ -355,10 +355,10 @@ fn render_messages(
     rules: &AnthropicModelProfile,
     trace: Option<&dyn TraceSink>,
 ) -> Result<String, ProviderError> {
-    let inline_system = rules.inline_system;
+    let inline_changes = rules.inline_changes;
     // On the fallback path the top-level system holds every instruction, so
     // thinking produced before the last one was bound to a different system.
-    let replay_from = if inline_system {
+    let replay_from = if inline_changes {
         0
     } else {
         request
@@ -480,14 +480,14 @@ fn render_messages(
                     messages.push("user", Vec::new(), blocks);
                 }
             }
-            Item::Instruction { parts } if inline_system => {
+            Item::Instruction { parts } if inline_changes => {
                 messages
                     .pending_system
                     .extend(parts.iter().filter_map(|part| render_part(provider, part)));
             }
             // Rendered into the top-level system by `render`.
             Item::Instruction { .. } => {}
-            Item::ToolsChanged { added, removed } if rules.inline_tools => {
+            Item::ToolsChanged { added, removed } if rules.inline_changes => {
                 messages.pending_system.extend(added.iter().map(|tool| {
                     Frag::Json(json!({
                         "type": "tool_addition",
