@@ -111,12 +111,11 @@ impl ToolPipeline {
 
     /// Give every tool call in `items` a recorded result. Calls of this step
     /// that already have an intent reuse it verbatim; calls with a result are
-    /// skipped. `output_indices[i]` is the stream `output_index` of `items[i]`.
+    /// skipped. Each item is paired with its stream `output_index`.
     pub(crate) async fn run(
         &self,
         step: &ToolStep<'_>,
-        items: &[Item],
-        output_indices: &[u32],
+        items: &[(u32, Item)],
         cancel: &CancelToken,
     ) -> Result<ToolOutcome, AgentError> {
         let recorded = self.recorded(step).await?;
@@ -128,7 +127,7 @@ impl ToolPipeline {
         let mut runnable: Vec<Runnable> = Vec::new();
         let mut cancelled = cancel.is_cancelled();
 
-        for call in tool_calls(items, output_indices) {
+        for call in tool_calls(items) {
             let Some(admitted) = self.resolve(step, &recorded, call).await? else {
                 continue;
             };
@@ -1045,11 +1044,10 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn tool_calls(items: &[Item], output_indices: &[u32]) -> Vec<CallItem> {
+fn tool_calls(items: &[(u32, Item)]) -> Vec<CallItem> {
     items
         .iter()
-        .zip(output_indices)
-        .filter_map(|(item, &output_index)| match item {
+        .filter_map(|&(output_index, ref item)| match item {
             Item::ToolCall {
                 call_id,
                 name,

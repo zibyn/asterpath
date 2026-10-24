@@ -21,12 +21,13 @@ use asterpath_protocol::{
     approval_signal_id, approval_signal_name, decode_entry, dedup, encode_entry,
 };
 use asterpath_protocol::{
-    ApprovalGate, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore,
-    SignalDelivery, StepId, ToolCallId, TurnId,
+    ApprovalGate, CatalogEntry, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId,
+    SessionQuery, SessionStore, SignalDelivery, StepId, StorageError, ToolCallId, TurnId,
 };
 use asterpath_testing::TestTool;
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider, ToolCalls};
 use futures_core::future::BoxFuture;
+use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 
 fn assistant(call_id: &str, name: &str) -> SessionEvent {
@@ -1617,42 +1618,29 @@ impl SessionStore for CorruptParentLog {
     fn append(
         &self,
         entry: asterpath_protocol::NewEntry,
-    ) -> BoxFuture<'_, Result<LogId, asterpath_protocol::StorageError>> {
+    ) -> BoxFuture<'_, Result<LogId, StorageError>> {
         self.inner.append(entry)
     }
 
-    fn scan(
-        &self,
-        query: LogQuery,
-    ) -> futures_core::stream::BoxStream<'_, Result<LogEntry, asterpath_protocol::StorageError>>
-    {
+    fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
         if query.session == PARENT {
             return futures_util::stream::once(async move { Ok(self.corrupt.clone()) }).boxed();
         }
         self.inner.scan(query)
     }
 
-    fn frontier(
-        &self,
-        session: SessionId,
-    ) -> BoxFuture<'_, Result<Option<LogId>, asterpath_protocol::StorageError>> {
+    fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
         self.inner.frontier(session)
     }
 
     fn sessions(
         &self,
-        query: asterpath_protocol::SessionQuery,
-    ) -> futures_core::future::BoxFuture<
-        '_,
-        Result<Vec<asterpath_protocol::CatalogEntry>, asterpath_protocol::StorageError>,
-    > {
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
         self.inner.sessions(query)
     }
 
-    fn parent(
-        &self,
-        session: SessionId,
-    ) -> BoxFuture<'_, Result<Option<SessionId>, asterpath_protocol::StorageError>> {
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
     }
 }

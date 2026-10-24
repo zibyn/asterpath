@@ -6,10 +6,11 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
 use asterpath_protocol::{
-    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore, StorageError,
+    CatalogEntry, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionQuery,
+    SessionStore, StorageError,
 };
+use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
@@ -134,11 +135,8 @@ impl SessionStore for CommitLog {
 
     fn sessions(
         &self,
-        query: asterpath_protocol::SessionQuery,
-    ) -> futures_core::future::BoxFuture<
-        '_,
-        Result<Vec<asterpath_protocol::CatalogEntry>, asterpath_protocol::StorageError>,
-    > {
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
         self.inner.sessions(query)
     }
 

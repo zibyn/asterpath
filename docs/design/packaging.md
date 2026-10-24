@@ -113,6 +113,7 @@ pub struct AsterpathConfig {
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
     pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
     pub hooks: Vec<Arc<dyn Hooks>>,             // 扩展钩子，按此顺序调用（ADR-0025）
+    pub spawn_tool: bool,                       // 是否注册模型可见的 spawn_agent，默认 true
 }
 
 impl Asterpath {
@@ -131,6 +132,7 @@ impl Asterpath {
 
 - 存储只有一个注入点 `store`：提供则直接使用（不需要 `database`），未提供时由 `sqlite` feature 按 `database` 打开；没有“部分注入”。注入的存储可以不实现退役（`retire` 返回 `Unsupported`）。
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应（`hooks(Arc<dyn Hooks>)` 可多次调用、逐个追加），`build().await` 按固定顺序直接构造内部组件。
+- `spawn_tool(false)`（= `AsterpathConfig.spawn_tool = false`）不注册 `spawn_agent`：`ToolSelection::All` 快照不含它，`Names` 点名它是 `AsterError::Config`；调度器与子会话恢复不受影响。
 - 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`SignalId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
@@ -170,6 +172,7 @@ impl SessionHandle {
     pub async fn cancel(&self) -> Result<(), AsterError>;
     pub async fn state(&self) -> Result<SessionState, AsterError>;
     pub async fn facts(&self) -> Result<SessionFacts, AsterError>;
+    pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError>;
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
@@ -179,6 +182,7 @@ impl SessionHandle {
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
 - `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。
+- `projection()` 返回对日志折叠出的模型可见投影（每项带来源 log id），不读驱动者内存。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 经引擎的持久等待投递 signal（signal name = `tool.approval.<tool_call_id>`，payload = `ApprovalDecision`），落 `SignalReceived`。

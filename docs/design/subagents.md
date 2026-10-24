@@ -49,7 +49,7 @@
 调度是引擎内部的 `scheduler` 模块（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，#79 起不是 trait、宿主不可直接调用）：
 
 1. `Scheduler`：spawn / 等待 / 取消，下列方法均为 `pub(crate)`；
-2. 模型可见的 spawn 工具（`spawn_agent`；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突）。工具表里的 `SpawnTool` 只是描述符：agent 执行 `spawn_agent` 时调用 `Scheduler::run_spawn_tool(&agent, args, ctx)`，把自己作为子会话的驱动者传入。agent 持有 scheduler，scheduler 不持有 agent，没有循环引用。
+2. 模型可见的 spawn 工具（`spawn_agent`；宿主可经 `AsterpathConfig.spawn_tool = false` 不注册它，此时模型无法派生，调度器与子会话恢复照常；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突）。工具表里的 `SpawnTool` 只是描述符：agent 执行 `spawn_agent` 时调用 `Scheduler::run_spawn_tool(&agent, args, ctx)`，把自己作为子会话的驱动者传入。agent 持有 scheduler，scheduler 不持有 agent，没有循环引用。
 
 形状（[#17](https://github.com/zibyn/asterpath/issues/17) 定形，见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；#79 改为内部方法）：
 

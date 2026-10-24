@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asterpath_protocol::{
-    LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionStore, StorageError,
+    CatalogEntry, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionQuery,
+    SessionStore, StorageError,
 };
 use asterpath_protocol::{Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use futures_core::future::BoxFuture;
@@ -168,11 +169,8 @@ impl SessionStore for FailpointEventLog {
 
     fn sessions(
         &self,
-        query: asterpath_protocol::SessionQuery,
-    ) -> futures_core::future::BoxFuture<
-        '_,
-        Result<Vec<asterpath_protocol::CatalogEntry>, asterpath_protocol::StorageError>,
-    > {
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
         self.inner.sessions(query)
     }
 
