@@ -259,7 +259,7 @@ pub(crate) fn render(
 }
 
 fn render_reasoning(
-    fields: &mut Vec<(&'static str, Frag)>,
+    fields: &mut Vec<(&str, Frag)>,
     reasoning: &ReasoningParams,
     rules: ModelRules,
 ) {
