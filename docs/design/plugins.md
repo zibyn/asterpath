@@ -1,10 +1,10 @@
 # MCP 服务配置与工具来源
 
-> 来源：[#16](https://github.com/zibyn/asterpath/issues/16)（2026-10-22 已定），[#80](https://github.com/zibyn/asterpath/issues/80) 按 [ADR-0027](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md) 改写：外部扩展不再建模为“插件”，只有 MCP 服务配置；`asterpath-plugin-host` 改名 `asterpath-mcp`，是一个工具来源。本文件定义配置形状、加载规则、工具命名空间与冲突策略、版本协商与失败隔离。文件名保留以免断链。
+> 来源：[#16](https://github.com/zibyn/asterpath/issues/16)、[#80](https://github.com/zibyn/asterpath/issues/80)。外部扩展只有 MCP 服务配置，`asterpath-mcp` 是一个工具来源。本文件定义配置形状、加载规则、工具命名空间与冲突策略、版本协商与失败隔离。文件名保留以免断链。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#7 工具契约](./tools.md)、[#20 MCP adapter](./mcp.md)、[沙箱](./sandbox.md)、[打包](./packaging.md)。
+> 对齐：[模块契约](./module-contracts.md)、[事件日志](./event-log-recovery.md)、[工具契约](./tools.md)、[MCP adapter](./mcp.md)、[沙箱](./sandbox.md)、[打包](./packaging.md)。
 >
-> 相关 ADR：[0027 MCP 是工具来源，不是插件宿主](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md)（取代 [0013](../adr/0013-plugin-boundary.md)）、[0018 MCP adapter](../adr/0018-mcp-adapter-and-acp-scope.md)、[0019 沙箱](../adr/0019-sandbox-seam-and-policy.md)。
+> 相关 ADR：[0027 MCP 是工具来源](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md)、[0019 沙箱接缝](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 

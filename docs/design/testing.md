@@ -1,16 +1,17 @@
 # 崩溃注入与确定性测试工具链
 
-> 来源：[#19 崩溃注入与确定性测试工具链](https://github.com/zibyn/asterpath/issues/19)，2026-10-22 已定。
-> 相关 ADR：[0017 故障注入与确定性测试工具链](../adr/0017-fault-injection-and-test-tooling.md)。
-> 前置：[#5 存储](storage.md)、[#3 事件日志与恢复](event-log-recovery.md)、[#15 打包与验收](../spec/acceptance.md)。
+> 来源：[#19](https://github.com/zibyn/asterpath/issues/19)。
+>
+> 前置：[存储](storage.md)、[事件日志与恢复](event-log-recovery.md)、[验收场景](../spec/acceptance.md)。
+>
 > 范围：**测试工具链与 CI 编排**。不改变持久化、恢复或事件语义；崩溃注入点只补真实 `SIGKILL` 覆盖不到的窗口。
 
 ## 1. 决策摘要
 
-- 五个注入点中，**四个是 `asterpath-testing` 里的 trait 装饰器**，一个是**手动时钟**；core / protocol 不新增注入钩子。
+- 五个注入点中，**四个是 `asterpath-testing` 里的 trait 装饰器**，一个是**手动时钟**；protocol 不新增注入钩子。
 - 装饰器命中后的动作只有两档：`Halt`（写 marker 后永久挂起，由父进程 `SIGKILL`）与 `Panic`（进程内测试）。
 - **不用 panic / `abort` / `exit` / 注入异常冒充崩溃**；进程级验收一律真 `SIGKILL`（[acceptance.md](../spec/acceptance.md) §1）。
-- core 新增最小 `Clock { now() }` + `SystemClock`；存储契约不收时间（#73）；`ManualClock` 在 `asterpath-testing`。
+- protocol 提供最小 `Clock { now() }` + `SystemClock`；存储契约不收时间（#73）；`ManualClock` 在 `asterpath-testing`。
 - 后端中立契约套件：**G2–G7 在 in-memory 与 SQLite 上都跑**；G1、G8、`Corrupt`、WAL/`flock`、迁移只测 SQLite。
 - CI 分三层：单测+契约（5 分钟）、进程级验收（Linux，整套 5 分钟，单 marker 等待 15 秒）、feature 矩阵。
 - 验收 fixture 单一来源：`asterpath-acceptance/fixtures/*.json`；#6 的 L 场景与 #17 的 R 场景复用，不另建。
@@ -87,7 +88,7 @@ impl FailpointTool {
 ## 3. 时钟接缝
 
 ```rust
-// core
+// protocol
 
 pub type Timestamp = i64; // Unix epoch 毫秒
 
@@ -115,7 +116,7 @@ impl ManualClock {
 impl Clock for ManualClock { /* 读 AtomicI64 */ }
 ```
 
-- 存储契约不收时间（#73 删除了 `Storage::wakeable(now)`）。`waits`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
+- 存储契约不收时间。`waits`、`scheduler` 等调用方从注入的 `Arc<dyn Clock>` 取时间。
 - `recorded_at` 仍由存储模块用自己的墙钟写入；它不参与恢复、投影或断言（#3 I8 / #12），因此存储不需要 `Clock`。
 - `clock:advance` 注入点 = `ManualClock::advance`，用于 spawn 截止时间过期等时间推进。它不产生 marker，也不模拟崩溃。
 
@@ -212,4 +213,4 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它实现�
 ## 8. 留给下游
 
 - **#20 / #21**：#20 已定：MCP adapter 的断连场景（stdio 进程死亡、HTTP 流中断、调用中超时）按 [mcp.md](mcp.md) §11 与本文的 `Halt` + marker 模式扩展。#21 已定：沙箱不新增注入点；`confine` 在 `Tool::invoke` 内，由 `tool:before_effect` / `tool:after_effect` 覆盖，场景见 [sandbox.md](sandbox.md) §12。
-- **实现方**：failpoint 类型只存在于 `asterpath-testing`；若某个新崩溃窗口需要注入，先扩展本文的 `Point` 与装饰器，不在 core/protocol 加 hook。
+- **实现方**：failpoint 类型只存在于 `asterpath-testing`；若某个新崩溃窗口需要注入，先扩展本文的 `Point` 与装饰器，不在 protocol 加 hook。

@@ -1,18 +1,10 @@
 # 原生用量统计
 
-> 来源：[#13](https://github.com/zibyn/asterpath/issues/13)，2026-10-22 已定。本文件定义 token 用量的采集口径、桶划分、聚合层级与父子归因、查询 API、重放去重规则，以及成本/预算扩展的接入接缝。
+> 来源：[#13](https://github.com/zibyn/asterpath/issues/13)。本文件定义 token 用量的采集口径、桶划分、聚合层级与父子归因、查询 API、重放去重规则，以及成本/预算扩展的接入接缝。
 >
-> 对齐：[#11 协议模型](protocol.md)、[#3 事件日志](event-log-recovery.md)、[#6 Agent loop](agent-loop.md)、[#8 子智能体](subagents.md)、[#9 上下文压缩](compaction.md)、[#12 追踪](tracing.md)。
+> 对齐：[协议模型](protocol.md)、[事件日志](event-log-recovery.md)、[Agent loop](agent-loop.md)、[子智能体](subagents.md)、[上下文压缩](compaction.md)、[追踪](tracing.md)。
 >
-> 相关 ADR：[0012 用量是事件日志的确定性投影](../adr/0012-usage-accounting.md)。
->
-> **2026-10-23 #78 修订**（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：`UsageRecorded` 与事件总线已删除。实时观察统一走 `Hooks::on_record` + `usage_of`；预算在 `Hooks::before_step` 用 `StepCtx::usage()`。§6 已按此改写。
->
-> 本票对已关闭票的修订（已同步到对应文件）：
->
-> - `ProviderError` 增加 `partial_usage: Option<Usage>`（#11）。
-> - `AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`（#3）。
-> - core 增加 `SessionCatalog` 合约，由存储模块实现（#2/#5）；#73 起并入 `SessionStore`。
+> 相关 ADR：[0011 追踪与用量是日志投影](../adr/0011-native-tracing.md)。
 
 ## 1. 决策摘要
 

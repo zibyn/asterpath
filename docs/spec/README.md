@@ -11,13 +11,12 @@
 ## 状态
 
 - 内核、打包、保留/归档与测试工具链已定稿（[#2](https://github.com/zibyn/asterpath/issues/2)–[#19](https://github.com/zibyn/asterpath/issues/19)）。
-- 扩展 seam：[#21](https://github.com/zibyn/asterpath/issues/21) 沙箱已定（[sandbox.md](../design/sandbox.md)）；[#20](https://github.com/zibyn/asterpath/issues/20) MCP 映射已定（ACP 出界）。这些不影响 M0–M4 开工。
-- `asterpath-mcp`（#80 前为 `asterpath-plugin-host`）、MCP adapter 与沙箱归 **M5（post-v1）**，不进 v1 workspace 与 v1 验收；插件分发、ACP 与 WASM 出界（见 [packaging.md §5](../design/packaging.md#5-交付清单与里程碑)）。
+- 扩展：MCP 工具来源 `asterpath-mcp`、沙箱（合约在 protocol，Linux 后端 `asterpath-sandbox-linux`）属 M5，技能 `asterpath-skills` 属 M6；均已交付并在 workspace 中，但不属于 v1 验收闸门。插件分发、ACP 与 WASM 出界（见 [packaging.md §5](../design/packaging.md#5-交付清单与里程碑)）。
 
 ## 阅读顺序
 
 1. [打包、公共 API 与参考 CLI](../design/packaging.md)：crate 图、稳定面、CLI、交付清单、验证协议。
-2. [模块边界、内核契约与插件宿主](../design/module-contracts.md)：内核契约、扩展钩子（`Hooks`）、生命周期。
+2. [适配器契约与钩子](../design/module-contracts.md)：适配器 trait、扩展钩子（`Hooks`）、生命周期。
 3. [事件日志与检查点恢复语义](../design/event-log-recovery.md)：日志拓扑、提交单位、恢复与等待。
 4. [Agent loop](../design/agent-loop.md)：turn/step、取消、steering、失败重试。
 5. [工具契约、执行管线与审批边界](../design/tools.md)：管线、审批、并行、超时。
@@ -26,13 +25,13 @@
 8. [验收场景](acceptance.md)：三段验收的精确断言。
 9. [ADR 目录](../adr/) 与 [GLOSSARY](../../GLOSSARY.md)。
 
-**M5（post-v1）**：[插件](../design/plugins.md)、[MCP adapter](../design/mcp.md)、[沙箱](../design/sandbox.md)。设计已定，不是 v1 的实现依据。
+**M5 扩展**：[MCP 服务配置](../design/plugins.md)、[MCP adapter](../design/mcp.md)、[沙箱](../design/sandbox.md)。
 
-**M6（post-v1）**：[技能](../design/skills.md)。设计已定，不是 v1 的实现依据。
+**M6 扩展**：[技能](../design/skills.md)。
 
 ## 规范与历史
 
-- `docs/design/*.md` 与 `docs/spec/*.md` 是**规范**；`docs/adr/*.md` 是需要长期保留的决策与理由。
+- `docs/design/*.md` 与 `docs/spec/*.md` 是**规范**，只描述当前状态，不写修订日志（历史在 git）；`docs/adr/*.md` 是需要长期保留的决策与理由，写法见 [ADR README](../adr/README.md)。
 - GitHub issue 是**历史**：每张票的提问与 resolution 记录在那里，不作为实现依据。
 - 文档冲突时，以被链接为"最终"的章节为准；实现前发现的冲突属于 spec 缺陷，先修文档。
 
@@ -47,8 +46,7 @@ G1 计划闸与 G2 骨架闸的 prompt、通过条件与回灌流程见 [packagi
 ## 未决问题
 
 - 内核与打包：无。
-- 扩展 seam：保留/归档的退役接缝（`SessionStore::retire`）属 v1（[retention.md](../design/retention.md)）；测试工具链已定（[testing.md](../design/testing.md)）；MCP adapter、沙箱与插件宿主已定但归 M5（[mcp.md](../design/mcp.md)、[sandbox.md](../design/sandbox.md)、[plugins.md](../design/plugins.md)），都不属于 v1 交付闸门。
-- 已知解释：验收 (b) 验证 adapter 等价，不验证 turn 内切换 provider；v1 的 provider/model 在 session 创建时快照。
+- 会话配置在创建时快照，会话中途无法切换模型、工具或 system：设计中，见 [#108](https://github.com/zibyn/asterpath/issues/108)。验收 (b) 验证 adapter 等价，不验证切换 provider。
 
 ## 出界
 

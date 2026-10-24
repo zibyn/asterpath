@@ -1,20 +1,10 @@
 # 子智能体：子会话、上下文、等待与恢复
 
-> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)；API 接缝由 [#17](https://github.com/zibyn/asterpath/issues/17) 定形（[ADR-0014](../adr/0014-subagent-scheduling-api.md)）。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复与恢复接缝。`Item` / `Part` / `ConfigSnapshot` / `Usage` 类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，token 聚合口径见 [usage.md](usage.md)（#13）。
+> 来源：[#8](https://github.com/zibyn/asterpath/issues/8)、[#17](https://github.com/zibyn/asterpath/issues/17)。本文件定义子智能体的**语义**：spawn 入口、上下文策略、结果形状、配置继承、并发与深度、取消传播、孤儿恢复与恢复接缝。`Item` / `Part` / `ConfigSnapshot` / `Usage` 类型见 [protocol.md](protocol.md)，token 聚合口径见 [usage.md](usage.md)。
 >
-> 对齐：[#3 事件日志与检查点恢复](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)、[#7 工具契约](./tools.md)。
+> 对齐：[事件日志与检查点恢复](./event-log-recovery.md)、[agent loop](./agent-loop.md)、[工具契约](./tools.md)。
 >
-> 本票对 #3 的修订（已同步到 `event-log-recovery.md`）：
->
-> - 新增子流事件 `ContextForked`。
-> - `ChildSessionSpawned` 增加 `config` 与 `context`。
-> - `ChildOutcome` 在本文件定形。
->
-> 2026-10-22 [#29](https://github.com/zibyn/asterpath/issues/29) 修订：父流记录不变量纳入 timeout timer 与审批 `SignalReceived`；排队按 open `ToolCallRequested` 重建；子快照字段以 [packaging.md](packaging.md) §2.1 为准；超时先查子终态，再取消子会话；spawn 的 timeout timer 归 spawn 重放收尾。
->
-> 2026-10-23 [#65](https://github.com/zibyn/asterpath/issues/65) 修订：spawn 超时改为 `ChildSessionSpawned.deadline`（与 spawn 同一次 append），不再有 timeout timer 记录；补充宽限到期后 spawn future 被丢弃时的交接规则（§8）。见 [ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)。
->
-> 相关 ADR：[0008 子智能体是同步工具调用拥有的独立子会话](../adr/0008-subagent-model.md)。
+> 相关 ADR：[0008 子智能体](../adr/0008-subagent-model.md)。
 
 ## 1. 决策摘要
 
@@ -51,7 +41,7 @@
 1. `Scheduler`：spawn / 等待 / 取消，下列方法均为 `pub(crate)`；
 2. 模型可见的 spawn 工具（`spawn_agent`；宿主可经 `AsterpathConfig.spawn_tool = false` 不注册它，此时模型无法派生，调度器与子会话恢复照常；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突）。工具表里的 `SpawnTool` 只是描述符：agent 执行 `spawn_agent` 时调用 `Scheduler::run_spawn_tool(&agent, args, ctx)`，把自己作为子会话的驱动者传入。agent 持有 scheduler，scheduler 不持有 agent，没有循环引用。
 
-形状（[#17](https://github.com/zibyn/asterpath/issues/17) 定形，见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；#79 改为内部方法）：
+形状（[#17](https://github.com/zibyn/asterpath/issues/17) 定形，见 [ADR-0008](../adr/0008-subagent-model.md)；#79 改为内部方法）：
 
 ```rust
 impl Scheduler {
@@ -93,14 +83,14 @@ pub enum ContextPolicy {
 - **`spawn` = 意图 + R1/R2**：按 `parent_tool_call_id` 查已有 `ChildSessionSpawned`（R1），没有才创建；物化子流缺失记录并重新入队（R2）；返回 `ChildRef` 后立即返回，不等待完成。幂等。
 - **`await_completion` = R3 + 持久等待**：先读父流已记录的 `ChildSessionCompleted`（R3）；否则再次幂等补齐 R2，然后经引擎持久等待（`Waits::await_wake`）等待子完成；等待期间用传入的 agent 驱动子会话。子终态到达时由 scheduler 写 `ChildSessionCompleted`。
 - **`cancel_wait` = 父侧收尾**：用传入的 agent 驱动子会话并经共享的取消表取消，请求子会话取消，最多等 `cancel_grace`；已记录 outcome 不覆盖，否则写 `ChildSessionCompleted{Cancelled{Parent}}`。
-- **`timeout` = spawn 记录上的截止时间**（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）：`spawn` 用注入时钟算 `now + timeout`，写进同一次 append 的 `ChildSessionSpawned.deadline`（绝对时间）；`await_completion` sleep 到 deadline，到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
+- **`timeout` = spawn 记录上的截止时间**（[ADR-0008](../adr/0008-subagent-model.md)）：`spawn` 用注入时钟算 `now + timeout`，写进同一次 append 的 `ChildSessionSpawned.deadline`（绝对时间）；`await_completion` sleep 到 deadline，到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
 - **排队是内存状态**：Queued/Running、每父与全局并发计数、wake 注册表都不落日志。**排队 = open 的 spawn `ToolCallRequested` 且无对应 `ChildSessionSpawned`**；FIFO 按 `ToolCallRequested.seq` 重建。已有 `ChildSessionSpawned` 的恢复项是已准入（Running），不重新排队；`ChildSessionSpawned` 只表示「已占槽」。没有 `spawn_many` / join：fan-out 靠 #7 的并行工具调用。
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
 - **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的宿主取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
 持久等待（引擎内部的 `Waits`）见 [module-contracts.md](module-contracts.md) §3.4（[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
-- 持久等待只有审批与子会话完成；没有通用 timer / signal（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。审批决定按 `tool_call_id` 记录，等待意图由 open 的 `ToolCallRequested` 承担（#7）；等待本身不写任何记录。
+- 持久等待只有审批与子会话完成；没有通用 timer / signal（[ADR-0008](../adr/0008-subagent-model.md)）。审批决定按 `tool_call_id` 记录，等待意图由 open 的 `ToolCallRequested` 承担（#7）；等待本身不写任何记录。
 - 唤醒由终态记录的写者在 append 之后调用；注册表只在内存，恢复靠扫描日志重建。
 
 工具描述：
@@ -321,7 +311,7 @@ pub struct Summary {
 
 ### 父恢复
 
-open 的 child 等待由 **spawn 工具重放** 收尾（#17：[ADR-0014](../adr/0014-subagent-scheduling-api.md)），不另设 `recover()` 入口，也不在 #3 §6.2 的等待预扫描里预先写 `ChildSessionCompleted`：
+open 的 child 等待由 **spawn 工具重放** 收尾（#17：[ADR-0008](../adr/0008-subagent-model.md)），不另设 `recover()` 入口，也不在 #3 §6.2 的等待预扫描里预先写 `ChildSessionCompleted`：
 
 ```text
 for spawn tool call in open ToolCallRequested, 按 seq:
@@ -453,6 +443,6 @@ pub struct SubagentConfig {
 - **#13**：已定。session 树 rollup、去重口径与子 usage 查询见 [usage.md](usage.md)；树边由 protocol 的 `SessionStore` 会话目录提供。
 - **#15**：spawn 工具的最终命名/参数 schema；#79 起调度在引擎内部（ADR-0026）。
 - **#16**：已定。`spawn_agent` 是进程内工具的裸名；外部工具一律 `<plugin_id>__<tool>`，`__` 保留，因此不与 `spawn_agent` 冲突。见 [plugins.md](plugins.md) §6。
-- **#17**：已定。spawn/await/cancel 分工、持久超时、恢复委托与持久等待见 §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)；原型在 `prototype/subagent-api` 分支。
+- **#17**：已定。spawn/await/cancel 分工、持久超时、恢复委托与持久等待见 §3.1/§9 与 [ADR-0008](../adr/0008-subagent-model.md)；原型在 `prototype/subagent-api` 分支。
 - **#18**：已定。退役要求会话 `idle`、无活子会话、父会话 `idle`，因此父子任一方仍活跃时不会被删除；子侧父记录缺失分支保留为防御性违约处理。见 [retention.md](retention.md)。
 - **#19**：R1–R4 的崩溃注入点与确定性测试。

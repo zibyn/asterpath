@@ -1,16 +1,10 @@
 # 沙箱扩展模块：SandboxProvider 接缝与策略边界
 
-> 来源：[#21](https://github.com/zibyn/asterpath/issues/21)，2026-10-22 已定。本文件定义沙箱的接缝形状、策略模型、调用点、强制完整性与错误分类，以及与审批/MCP 服务/子会话的边界。
+> 来源：[#21](https://github.com/zibyn/asterpath/issues/21)。本文件定义沙箱的接缝形状、策略模型、调用点、强制完整性与错误分类，以及与审批/MCP 服务/子会话的边界。
 >
-> 对齐：[#7 工具契约](./tools.md)、[#8 子智能体](./subagents.md)、[#15 打包](./packaging.md)、[#16 MCP 服务配置](./plugins.md)、[#20 MCP adapter](./mcp.md)、[#3 事件日志](./event-log-recovery.md)。
+> 对齐：[工具契约](./tools.md)、[子智能体](./subagents.md)、[打包](./packaging.md)、[MCP 服务配置](./plugins.md)、[MCP adapter](./mcp.md)、[事件日志](./event-log-recovery.md)。
 >
-> 相关 ADR：[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
->
-> **2026-10-22 #32 范围调整 / 2026-10-23 M5 范围**：本文件的设计保留，实现归 **M5（post-v1，已交付）**；不属于 v1 交付，也不进 M0–M4 验收。M5 只实现 MCP stdio 的 spawn 点。
->
-> 本票对 #7 的修订（已同步到 `tools.md`）：
->
-> - `ToolError` 增加 `Denied` 变体：沙箱在进程启动前按策略拒绝 spawn 时，需要模型可见的「被拒绝」分类；`ToolErrorKind` 不变。
+> 相关 ADR：[0019 沙箱接缝](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
@@ -217,7 +211,7 @@ pub enum SandboxError {
 ## 12. 测试与验收场景
 
 - `asterpath-testing` 在合约 crate 落地时增加 `FakeSandboxProvider`：可配置返回 `Full` / `Partial` / `Unsupported` / `Refused` / `Setup`，并记录每次 `SpawnRequest`。
-- **不新增 core 注入点**：`confine` 发生在 `Tool::invoke` 内部，[#19](./testing.md) 的 `tool:before_effect` / `tool:after_effect` 已经覆盖；后端级失败（bwrap 缺失、profile 构造失败）是后端 crate 的单测。
+- **不新增 protocol 注入点**：`confine` 发生在 `Tool::invoke` 内部，[#19](./testing.md) 的 `tool:before_effect` / `tool:after_effect` 已经覆盖；后端级失败（bwrap 缺失、profile 构造失败）是后端 crate 的单测。
 - 运行中热换 provider 不测——v1 不支持。
 
 | # | 场景 | 断言 |

@@ -1,20 +1,8 @@
 # 事件日志与检查点恢复语义
 
-> 来源：[#3](https://github.com/zibyn/asterpath/issues/3)。本文件定义日志的**逻辑语义**；物理持久性归 [#5](https://github.com/zibyn/asterpath/issues/5)，schema 版本与 upcasting 归 [#4](https://github.com/zibyn/asterpath/issues/4)。
+> 来源：[#3](https://github.com/zibyn/asterpath/issues/3)。本文件定义日志的**逻辑语义**：只有会话流，子智能体是子会话；物理持久性见 [storage.md](storage.md)。
 >
-> **2026-10-22 范围调整**：移除 `Workflow` 流、确定性重放与 activity/timer 编排引擎，见 [ADR-0003](../adr/0003-single-session-stream-topology.md)。本文件只描述 session 流；子智能体是子 session。
->
-> **2026-10-22 #12 修订**：信封增加诊断时间 `recorded_at`（只供 trace/审计读取，不参与逻辑）；新增 `CompactionStarted` 与 `SignalAwaited` 意图记录。追踪模型见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
->
-> **2026-10-22 #13 修订**：`AssistantMessage` / `ModelCallAborted` / `CompactionApplied` 增加 `model: ModelSpec`；用量桶、聚合与去重口径见 [usage.md](usage.md) 与 [ADR-0012](../adr/0012-usage-accounting.md)。实时观察经 `Hooks::on_record`（ADR-0025；原 `UsageRecorded` 总线通知已删除），不落日志。
->
-> **2026-10-22 #28 修订**：`ToolCallRequested` 增加 `provider_call_id`，与框架生成的 `tool_call_id` 分开；恢复不重跑已记录意图的 pre-execute。语义见 [tools.md](tools.md) §3/§6。
->
-> **2026-10-22 #30 修订**：`StreamState` 改名为 `SessionState` 并补 `turn`，与 `SessionHandle::state()` 共用；「前缘」专指最后一条已提交记录，恢复目标是它之后的「恢复点」。
->
-> **2026-10-22 #31 修订**：未知工具恢复统一写 `Failed{NotFound}`；`ModelCallAborted` 增加 `backoff_ms`；`SessionEvent` 加 `#[non_exhaustive]`。
->
-> **2026-10-23 #65 修订**：删除通用持久 timer 与通用 signal（`TimerScheduled` / `TimerFired` / `TimerCancelled` / `SignalAwaited`）；持久等待只剩审批与子会话完成。spawn 超时是 `ChildSessionSpawned.deadline`。见 [ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)。下文旧修订记录中的 timer / `SignalAwaited` 仅作历史。
+> 相关 ADR：[0002 日志模型](../adr/0002-log-topology-and-commit-semantics.md)。
 
 ## 1. 决策摘要
 
@@ -22,14 +10,10 @@
 - **终态条目**是提交单位；流式 delta 不落盘。
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
-- **2026-10-22 #6 修订**：`AssistantMessage` 携带 `usage` / `stop_reason`，`StepCommitted` 只作检查点标记；新增 `TimerCancelled`；恢复时若 `AssistantMessage` 已存在则不重调模型。loop 语义见 [agent-loop.md](agent-loop.md)。
-- **2026-10-22 #7 修订**：`ToolResult` 增加 `error` / `truncated`；`ToolCallRequested.raw_args` 是 pre-execute 之后的 effective args；审批决定复用 `SignalReceived`（name = `tool.approval.<tool_call_id>`），不新增审批事件（2026-10-24 改为类型化的 `ApprovalDecided`）。工具语义见 [tools.md](tools.md)。
-- **2026-10-22 #8 修订**：新增子流事件 `ContextForked`；`ChildSessionSpawned` 增加 `config` 与 `context`；`ChildOutcome` 定形。子智能体语义见 [subagents.md](subagents.md)。
-- **2026-10-22 #29 修订**：`caused_by` 指向 `ChildSessionSpawned` 的 timer 不在恢复预扫描里收尾，交给 spawn 重放（先 R3 查子终态，再处理 deadline）；排队按 open spawn `ToolCallRequested` 重建。
 - 日志层**没有 ack**：完成 = 写了终态记录。存储也没有租约或 ack；唤醒是只读发现（[storage.md](storage.md) §7）。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
-- **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。storage 的派生索引与恢复折叠共用同一个 `OpenIntents` 函数（§6、[storage.md](storage.md) §5）。
-- **等待是事件**：持久等待只有两种——人工审批（意图是 open `ToolCallRequested`，终态是 `ApprovalDecided`）与子会话完成（`ChildSessionSpawned` → `ChildSessionCompleted`）；崩溃后重新挂起。spawn 超时是 spawn 记录上的截止时间，不是独立 timer（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
+- **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。恢复、唤醒发现与退役共用同一份会话事实折叠（`SessionFacts`，§6、[storage.md](storage.md) §7）。
+- **等待是事件**：持久等待只有两种——人工审批（意图是 open `ToolCallRequested`，终态是 `ApprovalDecided`）与子会话完成（`ChildSessionSpawned` → `ChildSessionCompleted`）；崩溃后重新挂起。spawn 超时是 spawn 记录上的截止时间，不是独立 timer（[ADR-0008](../adr/0008-subagent-model.md)）。
 - **压缩先写意图**：摘要调用前写 `CompactionStarted`，成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合。
 - 幂等：`(session, 事件类型, dedup_key)` 唯一，重复 append 返回原 `LogId`。
 - 信封的 `recorded_at` 是诊断时间，只供 trace/审计读取；任何恢复、投影或分支逻辑不得读取它。`seq` 仍是唯一排序依据。
@@ -134,17 +118,17 @@ pub enum TurnEndReason {
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-protocol` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
 - `ApprovalDecided` 的等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
-- 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0014](../adr/0014-subagent-scheduling-api.md)）；存储投递归 #5。
+- 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0008](../adr/0008-subagent-model.md)）；存储投递归 #5。
 
 ## 4. 信封与幂等键
 
 ```rust
-// core：唯一的日志信封；字段定义以 storage.md §3 为准
+// protocol：唯一的日志信封；字段定义以 storage.md §3 为准
 pub struct NewEntry {
     pub session: SessionId,
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
-    pub payload: serde_json::Value, // 调用方已序列化；core 不解释内容
+    pub payload: serde_json::Value, // 调用方已序列化；存储不解释内容
 }
 
 pub struct LogEntry {
@@ -161,7 +145,7 @@ pub struct LogEntry {
 pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 ```
 
-- `decode_entry` 先按 `schema_version` 逐级 upcast（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)），再反序列化为 `SessionEvent`；未知变体、缺失必填字段或无法 upcast 都是 `LogDecodeError` 硬错误。本文件后续说“事件”时均指解码后的 `SessionEvent`；core 与存储层只处理信封，不依赖 protocol（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）。
+- `decode_entry` 先检查 `schema_version`（版本规则见 [storage.md](storage.md) §4），再反序列化为 `SessionEvent`；版本不符、未知变体或缺失必填字段都是 `LogDecodeError` 硬错误。本文件后续说“事件”时均指解码后的 `SessionEvent`；存储层只处理信封，不解释事件（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 - `recorded_at` 只由 trace/审计读取，**任何恢复、投影或分支逻辑都不得读取它**。`ChildSessionSpawned.deadline` 是调度逻辑使用的截止时间，不属于诊断时间。
 - `dedup_key` 在 `(session, 事件类型, key)` 上唯一；命中已存在键时 `append` 返回原 `LogId`，不报错、不写入。事件类型取自 `payload` 的顶层键（解码前），是键判别式的一部分；物理存储见 [storage.md](storage.md) §4。
 
@@ -178,7 +162,7 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `ApprovalDecided` | `tool_call_id` |
 
-表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
+表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
@@ -298,12 +282,12 @@ recover(session):
 
 ## 8. 留给下游
 
-- **#4**：`schema_version`、upcasting 时机、未知事件与未知字段、兼容性测试（ADR-0004）。
-- **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0005](../adr/0005-storage-contract-and-sqlite.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
+- **#4**：`schema_version` 与发布前的兼容口径见 [storage.md](storage.md) §4；首个发布版的兼容策略届时另立 ADR。
+- **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0023](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
 - **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。
-- **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
-- **#17**：已定。子等待恢复委托给 spawn 工具重放；持久等待与调度见 [subagents.md](subagents.md) §3.1/§9 与 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#9**：已定。触发、保留、摘要调用与归因见 [compaction.md](compaction.md) 与 [ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)。
+- **#17**：已定。子等待恢复委托给 spawn 工具重放；持久等待与调度见 [subagents.md](subagents.md) §3.1/§9 与 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#12**：已定。trace 是日志的确定性投影；`recorded_at`、`CompactionStarted` 的追踪挂接见 [tracing.md](tracing.md) 与 [ADR-0011](../adr/0011-native-tracing.md)。
 - **#16**：已定。插件清单、加载、版本协商与外部能力边界见 [plugins.md](plugins.md)；v1 不做插件发现。`Provenance` 新增 `Unknown`，只用于工具不存在的请求记录。

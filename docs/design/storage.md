@@ -1,17 +1,17 @@
 # 存储抽象与 SQLite 首实现
 
-> 来源：[#5](https://github.com/zibyn/asterpath/issues/5)，2026-10-22 已定。
-> 相关 ADR：[0005 存储契约与 SQLite 首实现](../adr/0005-storage-contract-and-sqlite.md)。
-> 前置：[#3 事件日志与检查点恢复](event-log-recovery.md)、[#4 schema 版本](../adr/0004-log-schema-version-and-upcasting.md)。
-> 范围：v1 单进程、单写者、崩溃安全。Postgres 只在 seam 层面被考虑，不实现。
-> **2026-10-22 #31 修订**：`InputRecorded` 也进入唤醒发现，使 `submit_input` 后崩溃仍可唤醒。
-> **2026-10-22 #32 修订**：v1 是单进程显式驱动，没有并发消费者；删除 `claim` / `ack` / 租约 / `writer_lease`，唤醒改为只读 `Storage::wakeable`，待处理输入由 `pending_inputs` 派生。
-> **2026-10-23 #73 修订**（[ADR-0023](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)）：存储只有一个 `SessionStore` trait（日志 + 会话目录 + 可选退役）；`Storage` 与 `open_intents` / `timers` / `pending_inputs` 派生表删除，唤醒由 facade 对会话事实折叠发现。
+> 来源：[#5](https://github.com/zibyn/asterpath/issues/5)。
+>
+> 前置：[事件日志与检查点恢复](event-log-recovery.md)。
+>
+> 范围：单进程、单写者、崩溃安全；存储只有一个 `SessionStore` trait（日志 + 会话目录 + 可选退役），唤醒由 facade 折叠会话事实发现。
+>
+> 相关 ADR：[0023 存储契约](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)、[0002 日志模型](../adr/0002-log-topology-and-commit-semantics.md)。
 
 ## 1. 决策摘要
 
 - **一个 SQLite 文件装全部 session。** 后端只实现一个 `SessionStore` trait（日志、会话目录、可选退役），由 `asterpath-storage-sqlite` 一个模块实现。
-- **信封强类型列 + `payload` JSON。** `SessionEvent` 不拆成 typed columns；upcast 继续在读取时对 `Value` 做（ADR-0004）。
+- **信封强类型列 + `payload` JSON。** `SessionEvent` 不拆成 typed columns，事件形状变化不改 DDL（ADR-0002）。
 - **`journal_mode=WAL` + `synchronous=FULL` 为默认。** `NORMAL` 只作为显式配置项，供测试/开发用。
 - **写者是进程独占的。** `flock` 写者锁在打开时非阻塞获取，进程死亡由 OS 释放；不续约、不过期。第二个进程打开即 `WriterBusy`。
 - **一条日志记录 = 一个 savepoint；同时排队的记录 group commit 进一个事务**（#97）。不设等待窗口；`seq` 在事务内用 `MAX(seq)+1` 分配，同批内的查重与 `seq` 看得到同批前面的记录，结果与逐条提交一致。
@@ -65,7 +65,7 @@ pub trait SessionStore: Send + Sync {
         -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 
     /// 有 `SessionCreated` 且未退役的会话的目录项，按父会话过滤，
-    /// 按 `(created_at, session)` 降序，游标分页（ADR-0028）。
+    /// 按 `(created_at, session)` 降序，游标分页（ADR-0023）。
     fn sessions(&self, query: SessionQuery)
         -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>>;
     /// `SessionCreated` 记录的父会话；根或未知会话为 `None`。
@@ -87,7 +87,7 @@ pub enum StorageError {
 }
 ```
 
-这套信封是 protocol 的唯一形状（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
+这套信封是 protocol 的唯一形状（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
 存储不提供 `enqueue`、租约或 ack，也不回答「哪些会话要唤醒」：唤醒是 facade 的只读折叠（§7）。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。子会话与审批的等待唤醒属于引擎的持久等待（module-contracts.md §3.4），存储不参与。
 
@@ -129,11 +129,11 @@ CREATE TABLE retired_sessions (
 - **日志 schema 版本**：每条记录带写入时的 `schema_version`（`LOG_SCHEMA_VERSION`，当前固定为 1）；读到高于自身支持的版本即拒绝打开，不降级。发布前不承担历史数据兼容：不写 upcaster、不维护历史 fixture、持久 payload 不用 `#[serde(default)]`，形状变化直接改，开发库删掉重建。首个发布版的兼容策略（upcast 位置、逐版本黄金 fixture、兼容性门禁）届时以新 ADR 决定。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
-- `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0004](../adr/0004-log-schema-version-and-upcasting.md)）。
+- `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
 - `recorded_at` 由 `append` 分配，不接受调用方传入；只供 trace/审计读取，不参与任何逻辑。
 - 无外键：单写者 + 派生索引，外键只会增加写放大。
-- 物理 DDL 版本记在 `PRAGMA user_version`：0 → 建表；打开时发现更高版本 → `SchemaTooNew`。逐级前向迁移从首个发布版起才写。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0004）。
+- 物理 DDL 版本记在 `PRAGMA user_version`：0 → 建表；打开时发现更高版本 → `SchemaTooNew`。逐级前向迁移从首个发布版起才写。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0002）。
 
 ## 5. 写路径与事务边界
 
@@ -154,7 +154,7 @@ BEGIN IMMEDIATE
 COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
-- 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0004 的硬错误一致）。
+- 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0002 的硬错误一致）。
 - 唯一的派生动作：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`）。其余事件只写日志。
 - 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。`ApprovalDecided` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。
 - **`idle` = 没有非 compaction 的未闭合意图。** compaction 意图只供恢复重做（#24/#27），不影响退役与唤醒发现。
@@ -196,7 +196,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G2 幂等**：`(session, event_kind, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写目录行；同 key 不同事件类型互不抑制。
 - **G3 全序**：`seq` 在 session 内严格单调、无洞，只由存储分配。
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
-- **G5 会话目录完备**：`sessions(query)` 列出每个有 `SessionCreated` 且未退役的会话（含子会话）一次，按 `(created_at, session)` 降序；父会话过滤、`parent` 与 `SessionCreated.parent` 一致；游标翻页不重不漏；`last_activity` 是最后一条日志的 `recorded_at`（ADR-0028）。唤醒发现建立在它之上（§7），不是后端契约。
+- **G5 会话目录完备**：`sessions(query)` 列出每个有 `SessionCreated` 且未退役的会话（含子会话）一次，按 `(created_at, session)` 降序；父会话过滤、`parent` 与 `SessionCreated.parent` 一致；游标翻页不重不漏；`last_activity` 是最后一条日志的 `recorded_at`（ADR-0023）。唤醒发现建立在它之上（§7），不是后端契约。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
 - **G7 索引可重建**：`sessions` 可完全由日志重建，不是真相源。
 - **G8 退役原子性（可选能力）**：`SessionStore::retire` 在同一事务里折叠会话事实判定空闲、写墓碑、删日志与 `sessions` 行；要么全部生效，要么全部不生效；退役后的会话对 `SessionStore` 的全部读取不可见。契约见 [retention.md](retention.md)。
@@ -205,7 +205,7 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 
 ## 9. 故障注入与测试
 
-`asterpath-testing` 提供五个注入点（装饰器实现，不进 core/protocol）；API 形状、动作与 CI 编排见 [testing.md](testing.md) 与 [ADR-0017](../adr/0017-fault-injection-and-test-tooling.md)。前四个点是 trait 装饰器，`clock:advance` 由 `ManualClock::advance` 提供。
+`asterpath-testing` 提供五个注入点（装饰器实现，不进 protocol）；API 形状、动作与 CI 编排见 [testing.md](testing.md)。前四个点是 trait 装饰器，`clock:advance` 由 `ManualClock::advance` 提供。
 
 | 注入点 | 模拟 |
 | --- | --- |

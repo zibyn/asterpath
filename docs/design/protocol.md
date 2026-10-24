@@ -1,27 +1,10 @@
 # 规范化协议模型与 adapter 契约
 
-> 来源：[#11](https://github.com/zibyn/asterpath/issues/11)，2026-10-22 已定。本文件定义规范条目模型、请求/流式事件、能力标志、usage 与错误归一化、原始 JSON 保留与回放、Anthropic Messages / OpenAI Responses 双向映射，以及 adapter 与 loop 的责任边界。
+> 来源：[#11](https://github.com/zibyn/asterpath/issues/11)。本文件定义规范条目模型、请求/流式事件、能力标志、usage 与错误归一化、原始 JSON 保留与回放、Anthropic Messages / OpenAI Responses 双向映射，以及 adapter 与 loop 的责任边界。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)、[#7 工具契约](./tools.md)、[#9 压缩](./compaction.md)。
+> 对齐：[模块契约](./module-contracts.md)、[事件日志](./event-log-recovery.md)、[agent loop](./agent-loop.md)、[工具契约](./tools.md)、[压缩](./compaction.md)。
 >
-> 相关 ADR：[0010 规范协议模型](../adr/0010-canonical-protocol-model.md)。
->
-> 本票对既有文档的修订（已同步）：
->
-> - 引入 `Part`：`ToolOutput.content`、`ToolResult.output`、`InputRecorded.input`、`CompactionApplied.summary`、`SpawnRequest.task`、`Summary.items` 由 `Vec<Item>` 改为 `Vec<Part>`；`ContextForked.items`、`AssistantMessage.items`、`ModelCallAborted.partial` 仍是 `Vec<Item>`。
-> - `Provider::capabilities` 接收 `&ModelSpec`。
-> - `ModelRequest` 增加 `prefix_epoch` 与 `reasoning`；`Reasoning` 增加 `binding`。
->
-> 2026-10-22 补齐（[#26](https://github.com/zibyn/asterpath/issues/26)）：
->
-> - 新增 `RequestConfig`，作为 `ModelRequest` 五个请求参数的唯一来源（`SessionSpec.request` / `ConfigSnapshot.request`）。
-> - `Provider` 增加 `id()`；新增 `ProviderCatalog` 值类型，按 `ProviderId` 解析并拒绝重复 id。
-> - 能力匹配不在 `create_session` 预检，仍由 adapter 在发 HTTP 前返回 `Unsupported`。
->
-> 2026-10-22 补齐（[#28](https://github.com/zibyn/asterpath/issues/28)）：
->
-> - `ReasoningBinding` 增加 `tools_hash`；工具集变化的请求不回放旧 reasoning（§9）。
-> - `tools` 从 `ConfigSnapshot.tools`（`Vec<ToolDescriptor>`）渲染，session 内固定（[packaging.md](packaging.md) §2.1）。
+> 相关 ADR：[0010 规范协议模型](../adr/0010-canonical-protocol-model.md)、[0029 provider 实例](../adr/0029-provider-instance-is-a-vendor-endpoint.md)。
 
 ## 1. 决策摘要
 
@@ -50,7 +33,7 @@
 
 `ProviderId`、`ModelId`、`ToolName`、`ModelAlias`、`JsonString` 是 protocol 里的 opaque newtype；`JsonString` 保存原始 JSON 文本，不保证与 `serde_json::Value` 往返一致。`JsonValue` 与 `JsonSchema` 是 `serde_json::Value` 的别名（任意 JSON 值 / JSON Schema 文档）；`ToolArgs = JsonString`。
 
-日志信封的 `LogEntry` / `NewEntry` 定义在 core，payload 是不透明 `serde_json::Value`；protocol 提供 `decode_entry(&LogEntry) -> Result<SessionEvent, LogDecodeError>`，先按 `schema_version` 逐级 upcast 再解码（[ADR-0020](../adr/0020-log-envelope-core-typed-decoding-protocol.md)）。`LogDecodeError` 分 `UnsupportedVersion` / `Upcast` / `Decode`，均为硬错误。
+日志信封 `LogEntry` / `NewEntry` 与 `decode_entry(&LogEntry) -> Result<SessionEvent, LogDecodeError>` 都在 protocol，payload 是存储不解释的 `serde_json::Value`（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）；`schema_version` 不等于 `LOG_SCHEMA_VERSION` 即拒绝（[storage.md](storage.md) §4）。`LogDecodeError` 分 `UnsupportedVersion` / `Decode`，均为硬错误。
 
 ## 3. 规范条目模型
 
@@ -495,7 +478,7 @@ pub enum CompactionError {
 - `first_kept` 必须是 `step_starts` 中的某个 `LogId`；`replaces.first` = `history` 首条的 origin 起点；`replaces.last` = `first_kept` 之前**最后一个模型可见 origin**（不是原始日志的前一条）。见 [compaction.md](compaction.md) §4。
 - 估算：`estimated_input = last_usage.usage.input_total() + bytes/3(history 中 origin > last_usage.origin 的条目)`；无 `last_usage` 时不做自动压缩。
 - `CompactResult` 是 `SessionHandle::compact_now` 与 loop 的公开展示；`NotConfigured` / `NothingToDo` / `Insufficient` 是状态，不是错误。
-- 类型归属：本节 trait 与值类型在 `asterpath-protocol`；`LogIdRange` 在 `core`；`CompactionConfig` 见 [compaction.md](compaction.md) §8。
+- 类型归属：本节 trait 与值类型在 `asterpath-protocol`；`LogIdRange` 也在 protocol；`CompactionConfig` 见 [compaction.md](compaction.md) §8。
 
 ## 7. Usage 归一化
 
@@ -595,7 +578,7 @@ pub enum ProviderErrorKind {
 - `request_id` 来自响应头或响应 id；`raw` 保存错误 body 的原始文本。
 - `partial_usage` 是 adapter 的 best-effort：只填 provider 已明确给出的部分（例如 Anthropic `message_start` 的输入侧），缺的部分按 0，不估算。loop 原样写入 `ModelCallAborted.usage`（#13）。
 - 流中途失败前已 `ItemCompleted` 的 item 由 loop 组成 `ModelCallAborted.partial`；不写 `AssistantMessage`（#6 I9）。
-- loop 把每次失败的 `kind` / `message` / `request_id` 写入 `ModelCallAborted.error`（`ProviderErrorInfo`，#107）；`raw` 不入日志。取消与崩溃补写为 `None`。发布前加字段，不 bump `LOG_SCHEMA_VERSION`、不写 upcaster（ADR-0004）。脱敏、截断归宿主。
+- loop 把每次失败的 `kind` / `message` / `request_id` 写入 `ModelCallAborted.error`（`ProviderErrorInfo`，#107）；`raw` 不入日志。取消与崩溃补写为 `None`。发布前加字段，不 bump `LOG_SCHEMA_VERSION`、不写 upcaster（ADR-0002）。脱敏、截断归宿主。
 
 ## 9. 原始 JSON 保留与回放
 

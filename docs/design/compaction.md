@@ -2,7 +2,9 @@
 
 > 来源：[#9](https://github.com/zibyn/asterpath/issues/9)。本文件定义触发条件、保留策略、摘要调用、事件与投影语义、默认参数，以及与缓存 / 追踪 / token 统计的交互。
 >
-> 对齐：[#3 事件日志与恢复](./event-log-recovery.md)、[#6 Agent loop](./agent-loop.md)、[#2 模块契约](./module-contracts.md)。
+> 对齐：[事件日志与恢复](./event-log-recovery.md)、[Agent loop](./agent-loop.md)、[模块契约](./module-contracts.md)。
+>
+> 相关 ADR：[0002 日志模型](../adr/0002-log-topology-and-commit-semantics.md)（压缩只追加、只改投影、不是 step）。
 
 ## 1. 决策摘要
 
@@ -238,4 +240,4 @@ pub struct CompactionConfig {
 - **#13**：已定。`compaction` 桶、turn / session / 子会话 rollup 与估算边界见 [usage.md](usage.md)。
 - **#15**：已定。`Compactor` 契约与 `SessionHandle::compact_now()` 见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。
 - **#19**：C3 / C4 / C10 的崩溃注入点与确定性测试。
-- **#27**：已定。两段式 trait、可选装配与 M0 组装见 [protocol.md](protocol.md) §6.1 与 [ADR-0009](../adr/0009-context-compaction.md)。
+- **#27**：已定。两段式 trait、可选装配与 M0 组装见 [protocol.md](protocol.md) §6.1 与 [ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)。

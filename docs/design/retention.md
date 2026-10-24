@@ -1,11 +1,12 @@
 # 日志保留与退役
 
-> 来源：[#18](https://github.com/zibyn/asterpath/issues/18)，2026-10-22 已定；同日按参考实现收敛范围。
-> 相关 ADR：[0016 只保留安全退役接缝](../adr/0016-retention-and-archive-seam.md)。
-> 前置：[#3 事件日志与恢复](event-log-recovery.md)、[#5 存储契约](storage.md)、[#4 schema 版本](../adr/0004-log-schema-version-and-upcasting.md)、[#9 压缩](compaction.md)、[#13 用量](usage.md)。
-> 范围：**只定义安全退役的 seam**。导出是宿主用现有 `SessionStore` 读取的配方；导入/恢复、归档文件管理、保留策略都不在 v1。
-> **2026-10-22 #32 范围调整**：退役接缝属 v1（`asterpath-storage-sqlite` 交付）；策略、归档与导出配方归宿主，不属于 v1 验收。
-> **2026-10-23 #73 修订**（[ADR-0023](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)）：`SessionRetirement` 并入 `SessionStore::retire`（默认 `Unsupported`）；空闲判定在退役事务内折叠会话事实，不再读派生表；in-memory 后端也实现退役。
+> 来源：[#18](https://github.com/zibyn/asterpath/issues/18)。
+>
+> 前置：[事件日志与恢复](event-log-recovery.md)、[存储契约](storage.md)、[压缩](compaction.md)、[用量](usage.md)。
+>
+> 范围：**只定义安全退役的 seam**（`SessionStore::retire`，默认 `Unsupported`）。导出是宿主用现有 `SessionStore` 读取的配方；导入/恢复、归档文件管理、保留策略归宿主。
+>
+> 相关 ADR：[0023 存储契约](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)。
 
 ## 1. 决策摘要
 

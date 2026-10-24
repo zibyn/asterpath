@@ -2,14 +2,9 @@
 
 > 来源：[#6](https://github.com/zibyn/asterpath/issues/6)。本文件定义 loop 的状态机、步进管线、取消与 steering 规则、默认配置。
 >
-> 对齐：[#3 事件日志与检查点恢复](./event-log-recovery.md)、[#2 模块契约](./module-contracts.md)。
+> 对齐：[事件日志与检查点恢复](./event-log-recovery.md)、[模块契约](./module-contracts.md)。
 >
-> 本票对 #3 的修订（已同步到 `event-log-recovery.md`）：
->
-> - `AssistantMessage` 携带 `usage` 与 `stop_reason`；`StepCommitted` 只作检查点标记。
-> - 新增 `TimerCancelled`；`TimerScheduled` 增加 `caused_by`。
-> - `AbortKind` 增加 `Rejected`；`TurnEndReason` 的改名与新增见 §8。
-> - `SessionState`（原名 `StreamState`）增加 `TurnOpen`；恢复时若 `AssistantMessage` 已存在，不重调模型。
+> 相关 ADR：[0006 Agent loop](../adr/0006-agent-loop-execution-model.md)。
 
 ## 1. 决策摘要
 
@@ -366,10 +361,10 @@ pub struct TurnConfig {
 
 - **#7**：已定。工具契约、审批、并行/独占调度、超时与结果形状见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；取消、`ChildSessionCompleted{Cancelled}` 与孤儿策略见 [subagents.md](subagents.md)。
-- **#9**：已定。触发、保留、摘要调用、事件与归因见 [compaction.md](compaction.md) 与 [ADR-0009](../adr/0009-context-compaction.md)。
+- **#9**：已定。触发、保留、摘要调用、事件与归因见 [compaction.md](compaction.md) 与 [ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)。
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
 - **#13**：已定。token 聚合、`partial` 桶与实时观察（`on_record` + `usage_of`）见 [usage.md](usage.md)。
 - **#15**：已定。`SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名（agent 是引擎内部类型，ADR-0026）与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
-- **#17**：已定。timer/signal API、spawn 工具重放吸收 R1–R3、持久等待见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#17**：已定。spawn 工具重放吸收 R1–R3、子会话等待见 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#27**：已定。`Compactor` 契约、未装配时的 `NotConfigured` 路径见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。

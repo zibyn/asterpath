@@ -1,23 +1,10 @@
 # MCP 外部工具 adapter 与 ACP 边界
 
-> 来源：[#20](https://github.com/zibyn/asterpath/issues/20)，2026-10-22 已定。本文件定义 MCP 工具 adapter 的协议版本、传输、生命周期、adapter 契约、字段与错误映射、失败矩阵，以及 ACP 的边界。
+> 来源：[#20](https://github.com/zibyn/asterpath/issues/20)。本文件定义 MCP 工具 adapter 的协议版本、传输、生命周期、adapter 契约、字段与错误映射、失败矩阵，以及 ACP 的边界。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#7 工具契约与执行管线](./tools.md)、[#16 MCP 服务配置与加载](./plugins.md)、[#11 规范协议模型](./protocol.md)。
+> 对齐：[模块契约](./module-contracts.md)、[工具契约与执行管线](./tools.md)、[MCP 服务配置与加载](./plugins.md)、[规范协议模型](./protocol.md)。
 >
-> 相关 ADR：[0018 MCP adapter 无会话、只做快照；ACP 不属于工具层](../adr/0018-mcp-adapter-and-acp-scope.md)。
->
-> **2026-10-22 #32 范围调整 / 2026-10-23 M5 范围**：本文件的设计保留，实现归 **M5（post-v1，已交付）**；M5 只实现 MCP 传输；不属于 v1 交付，也不进 M0–M4 验收。
->
-> 本票对 #7 的修订（已同步到 tools.md）：
->
-> - `ToolError` 增加 `NotFound` 变体：运行期目标消失（MCP server 报 unknown tool）需要它；`ToolErrorKind` 不变。
-> - 截断以 `Part` 为单位：文本 Part 可在 UTF-8 边界截断，非文本 Part 不拆分。
->
-> **2026-10-23 #80 / ADR-0027**：`asterpath-plugin-host` 改名 `asterpath-mcp`（工具来源 `McpServers`）；插件清单改为 `McpServerConfig`（无 `protocol` / `capabilities` / `manifest_version`）；adapter 契约为 crate 私有；状态类型为 `ServerStatus` / `LoadStage`。
->
-> 本票对 #16 的修订（已同步到 plugins.md）：
->
-> - MCP 只支持 `2026-07-28`；`server/discover` 取代 `initialize`；不自动重连/重启；ACP 不实现。
+> 相关 ADR：[0027 MCP 是工具来源](../adr/0027-mcp-is-a-tool-source-not-a-plugin-host.md)。
 
 ## 1. 决策摘要
 

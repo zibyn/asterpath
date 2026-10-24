@@ -1,21 +1,10 @@
 # 原生执行链追踪模型
 
-> 来源：[#12](https://github.com/zibyn/asterpath/issues/12)。本文件定义 Asterpath 原生 trace 的数据模型、挂接点、查询与导出 seam。
+> 来源：[#12](https://github.com/zibyn/asterpath/issues/12)。本文件定义原生 trace 的数据模型、挂接点与查询：查询是 facade 方法 `Asterpath::trace(session)`，返回 `Vec<Span>`，折叠在引擎模块 `views::trace`；实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 >
-> 对齐：[#3 事件日志与检查点恢复](event-log-recovery.md)、[#6 Agent loop](agent-loop.md)、[#8 子智能体](subagents.md)、[#9 上下文压缩](compaction.md)、[#11 协议模型](protocol.md)、[#14 OTel GenAI 研究](../research/otel-genai-conventions.md)。
+> 对齐：[事件日志与检查点恢复](event-log-recovery.md)、[Agent loop](agent-loop.md)、[子智能体](subagents.md)、[上下文压缩](compaction.md)、[协议模型](protocol.md)、[OTel GenAI 研究](../research/otel-genai-conventions.md)。
 >
-> 相关 ADR：[0011 追踪是事件日志的确定性投影](../adr/0011-native-tracing.md)；查询形状见 [0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)。
->
-> **2026-10-23 #79 修订**：查询是 facade 方法 `Asterpath::trace(session)`，直接返回 `Vec<Span>`；`TraceQuery` / `TraceTap` trait、`SpanUpdate` 与实时推送删除。实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。折叠在引擎内部模块 `views::trace`。
->
-> 本票对已关闭票的修订（已同步到对应文件）：
->
-> - `LogEntry` 增加诊断时间 `recorded_at`；I4 改为“时间只影响 trace/审计，不参与逻辑”（#3 / ADR-0002）。
-> - 新增 `CompactionStarted` 意图记录（#9）。
-> - 新增 `SignalAwaited` 意图记录（#3；API 见 ADR-0014）。
-> - `asterpath-storage-sqlite` 的 `log` 表增加 `recorded_at` 列（#5）。
-> - #65：删除 timer 与通用 signal 的 wait span（`WaitKind` 只剩 `Approval`，`WaitAttrs` 去掉 `deadline`）；spawn 超时表现为 subagent span 以 `Cancelled{Timeout}` 结束（[ADR-0024](../adr/0024-durable-waits-only-approval-and-child.md)）。
-> - `Span` 增加 `parent_trace` / `child_trace`，原 `parent` 改名 `parent_span`；补全 `SpanAttributes` 子结构；`ErrorType` 增加 `ToolCancelled` / `ToolNotFound`；`backoff_before_ms` 来自 `ModelCallAborted.backoff_ms`；`TraceTap` 只在终态发 `Ended`（#31）。
+> 相关 ADR：[0011 追踪与用量是日志投影](../adr/0011-native-tracing.md)。
 
 ## 1. 决策摘要
 

@@ -2,20 +2,11 @@
 
 > 来源：[#7](https://github.com/zibyn/asterpath/issues/7)。本文件定义 `Tool` 契约、执行管线、审批、并行调度、外部进程边界、结果形状与截断规则。
 >
-> 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)。
+> 对齐：[模块契约](./module-contracts.md)、[事件日志](./event-log-recovery.md)、[agent loop](./agent-loop.md)。
 >
-> 本票对 #3 的修订（已同步到 `event-log-recovery.md`）：
+> 本文的 “pre-execute” / “post-execute” 指宿主注册的 `Hooks::before_tool` / `Hooks::after_tool`：多个钩子按注册顺序调用，首个 `ToolGate::Deny` 短路，改写逐个传递；钩子错误或 panic 使该调用 `Failed{Internal}`。
 >
-> - `ToolResult` 增加 `error` 与 `truncated`。
-> - `ToolCallRequested.raw_args` 明确为 pre-execute 之后的 **effective args**。
-> - 审批决定复用 `SignalReceived`，signal name = `tool.approval.<tool_call_id>`；不新增审批事件。（2026-10-24 改为类型化的 `ApprovalDecided`，见 §4。）
-> - `ToolError` 增加 `Cancelled`（#31）。
->
-> 2026-10-22 #28 修订：`ToolCallRequested` 增加 `provider_call_id`；已有意图的调用恢复时不重跑 pre-execute；每个调用由单一 supervisor 写终态（真实结果 > 取消 > 超时）。
->
-> 2026-10-23 #78 修订（[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）：pre-execute / post-execute 不再是事件总线 waterfall，而是宿主注册的 `Hooks::before_tool` / `Hooks::after_tool`。调用点与恢复语义不变；本文的 “pre-execute” / “post-execute” 即指这两个钩子。多个钩子按注册顺序调用，首个 `ToolGate::Deny` 短路，改写逐个传递；钩子错误或 panic 使该调用 `Failed{Internal}`。
->
-> 相关 ADR：[0007 审批是框架管线，隔离与内容安全是扩展模块责任](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱是 spawn 点变换，策略归宿主](../adr/0019-sandbox-seam-and-policy.md)。
+> 相关 ADR：[0007 审批管线](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱接缝](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
@@ -345,7 +336,7 @@ pub struct ToolConfig {
 - **#13**：已定。工具输出计入下一次模型请求的 input tokens，不单独统计；见 [usage.md](usage.md)。
 - **#15**：参考 CLI 的审批端/默认策略、内置工具集与配置。
 - **#16**：已定。工具名命名空间与重名策略、插件清单与版本协商见 [plugins.md](plugins.md)；`ToolErrorKind::NotFound` 与未知工具路径已回写本文件。
-- **#17**：已定。审批等待不写意图记录（#65 删除通用 signal，2026-10-24 审批决定类型化为 `ApprovalDecided`）；见 [ADR-0014](../adr/0014-subagent-scheduling-api.md)。
+- **#17**：已定。审批等待不写意图记录（#65 删除通用 signal，2026-10-24 审批决定类型化为 `ApprovalDecided`）；见 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#8**：已定。spawn 是同步工具调用，沿用同一审批/等待/取消规则；`ReplaySafety::Safe` 由查找幂等保证。见 [subagents.md](subagents.md)。
 - **#20**：已定。MCP 外部工具的发现、结果/错误映射、失败矩阵与 ACP 出界见 [mcp.md](mcp.md)；`Provenance` 只带 `TransportKind::{Stdio, Http}`。
 - **#21**：已定。沙箱是 spawn 点变换；启动前拒绝映射为 `ToolError::Denied`。接缝与策略见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。
