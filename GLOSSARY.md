@@ -140,7 +140,7 @@ _Avoid_: 初始工具、顶层工具（作为规范名）
 _Avoid_: 当前 system、合并 system
 
 **片段（Part）**：
-条目内部的内容单元：文本、图像、拒绝或不透明内容块。
+条目内部的内容单元：文本、图像、文件、拒绝或不透明内容块。
 _Avoid_: 块、content
 
 **模型请求（Model Request）**：
@@ -176,7 +176,7 @@ _Avoid_: 原始响应、provider payload
 _Avoid_: 签名、reasoning key
 
 **工具集指纹（Tools Hash）**：
-一次请求渲染出的顶层工具定义（名称、说明、参数 schema）的确定性摘要；Anthropic adapter 据此判断推理条目能否回放（服务端 prefix 校验的本地近似）；OpenAI 不比较它。Anthropic inline 路径下顶层工具是基线工具集，会话中途增删不改变指纹。
+一次请求渲染出的顶层工具定义（名称、说明、参数 schema、显式设置的严格模式）与同供应商服务端工具声明的确定性摘要；Anthropic adapter 据此判断推理条目能否回放（服务端 prefix 校验的本地近似）；OpenAI 不比较它。Anthropic inline 路径下顶层工具是基线工具集，会话中途增删不改变指纹。
 _Avoid_: 工具版本、schema hash
 
 **前缀代次（Prefix Epoch）**：
@@ -190,6 +190,18 @@ _Avoid_: 未知块、passthrough
 **归一化（Normalization）**：
 把供应商格式转成规范模型；不改变语义，不静默丢弃。
 _Avoid_: 转换、适配
+
+**服务端工具（Server Tool）**：
+由供应商在其服务端执行的内置工具（如网页搜索、代码执行）；宿主按供应商声明，框架不执行、不审批，调用与结果只回放给同一供应商。与客户端执行的工具不同。
+_Avoid_: 内置工具（不分执行方时的泛称）、builtin tool、provider tool
+
+**结构化输出（Structured Output）**：
+请求要求模型的最终文本符合给定 JSON schema；产出仍是普通消息文本，解析与校验归宿主。
+_Avoid_: JSON 模式、response format
+
+**供应商文件引用（Provider File Reference）**：
+指向某供应商文件存储中已上传文件的 ID；只能发给该供应商，换供应商时由宿主改为内联或重新上传。
+_Avoid_: file id、附件
 
 **原始回放（Raw Replay）**：
 把原始供应商数据原样送回同一供应商，用于不透明 reasoning 与服务端工具。

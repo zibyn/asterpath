@@ -147,6 +147,7 @@ pub enum AdapterError {
 | `resource_link` | `Part::Text`：名称、URI 与 mime |
 | `resource` text | `Part::Text` |
 | `resource` blob 且图片 mime | `Part::Image` |
+| `resource` blob 且 `application/pdf` | `Part::File { media_type, filename: None, source: Base64 }`（ADR-0031） |
 | `resource` blob 其他 | `Part::Text` 占位 |
 | 未知类型 | `Part::Text` 占位：`[unsupported MCP content: <type>]` |
 | `structuredContent` | 追加一条 `Part::Text`（紧凑 JSON 文本） |

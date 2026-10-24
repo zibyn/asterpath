@@ -1,6 +1,6 @@
 # 规范协议模型：扁平 item 历史、不透明数据原样回放、能力标志
 
-**Status**: accepted (2026-10-22)；2026-10-24 整理；部分修订 by [ADR-0030](0030-session-config-is-a-fold-of-log-records.md)（会话中途的指令与工具变更作为带位置的条目进入历史）
+**Status**: accepted (2026-10-22)；2026-10-24 整理；部分修订 by [ADR-0030](0030-session-config-is-a-fold-of-log-records.md)（会话中途的指令与工具变更作为带位置的条目进入历史）、[ADR-0031](0031-server-tools-structured-output-and-file-input.md)（服务端工具声明、结构化输出与文件片段）
 **来源**: [#11](https://github.com/zibyn/asterpath/issues/11)、[#26](https://github.com/zibyn/asterpath/issues/26)、[#28](https://github.com/zibyn/asterpath/issues/28)、[#96](https://github.com/zibyn/asterpath/issues/96)
 **规范**: [protocol.md](../design/protocol.md)
 
