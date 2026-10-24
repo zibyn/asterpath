@@ -142,6 +142,14 @@ pub fn edit_file(root: PathBuf) -> Result<Arc<dyn Tool>, RelativeRoot> {
 
 /// Runs `bash -c <command>` in the root through `sandbox`. Without a provider
 /// only `FullAccess` starts a process; any other policy fails closed.
+///
+/// On Unix the process (the sandbox launcher, if any) leads its own process
+/// group. Cancelling sends the group SIGTERM, then SIGKILL after 500ms;
+/// dropping the call mid-run SIGKILLs the group. After bash exits the pipes
+/// are read for at most 1s more, so a background process holding them cannot
+/// hang the call; the output then says reading stopped. After a successful
+/// exit, background processes keep running and are no longer subject to
+/// cancellation. Elsewhere only bash itself is killed.
 pub fn bash(
     root: PathBuf,
     sandbox: Option<Arc<dyn SandboxProvider>>,
@@ -590,27 +598,68 @@ async fn run_bash(
         .envs(&confined.env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
+    // Own process group (the sandbox launcher's, if any), so killpg reaches every descendant.
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(not(unix))]
+    process.kill_on_drop(true);
     if let Some(cwd) = &confined.cwd {
         process.current_dir(cwd);
     }
-    // shortcut: kill_on_drop signals only the direct child; put it in its own process group and killpg if backgrounded grandchildren must die too.
     let mut child = process.spawn().map_err(|error| ToolError::Internal {
         message: format!("cannot start bash: {error}"),
     })?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let output = async { tokio::try_join!(drain(stdout), drain(stderr), child.wait()) };
-    let ((stdout, stdout_cut), (stderr, stderr_cut), status) = tokio::select! {
-        output = output => output.map_err(|error| ToolError::Internal {
-            message: format!("bash failed: {error}"),
-        })?,
+    let mut group = GroupGuard(child.id());
+    let out_pipe = child.stdout.take().expect("piped stdout");
+    let err_pipe = child.stderr.take().expect("piped stderr");
+    let (mut stdout, mut stdout_cut, mut stderr, mut stderr_cut) =
+        (Vec::new(), false, Vec::new(), false);
+    let failed = |error: std::io::Error| ToolError::Internal {
+        message: format!("bash failed: {error}"),
+    };
+    let output = async {
+        let mut reads = std::pin::pin!(async {
+            tokio::try_join!(
+                drain(out_pipe, &mut stdout, &mut stdout_cut),
+                drain(err_pipe, &mut stderr, &mut stderr_cut)
+            )
+        });
+        let status = tokio::select! {
+            read = &mut reads => {
+                read?;
+                child.wait().await?
+            }
+            status = child.wait() => {
+                group.0 = None;
+                let status = status?;
+                // A background process that inherited the pipes may hold them open forever.
+                match tokio::time::timeout(READ_AFTER_EXIT, &mut reads).await {
+                    Ok(read) => read.map(|_| ())?,
+                    Err(_) => return Ok((status, false)),
+                }
+                status
+            }
+        };
+        group.0 = None;
+        Ok::<_, std::io::Error>((status, true))
+    };
+    let (status, drained) = tokio::select! {
+        output = output => output.map_err(failed)?,
         () = ctx.cancel.cancelled() => {
+            if let Some(pid) = group.0.take() {
+                signal_group(pid, Signal::Term);
+                let _ = tokio::time::timeout(KILL_WAIT, child.wait()).await;
+                // Even if bash exited, a descendant may have ignored SIGTERM.
+                signal_group(pid, Signal::Kill);
+            }
             return Err(ToolError::Cancelled { message: "bash cancelled".to_owned() });
         }
     };
     let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    if !drained {
+        text.push_str("\n[a background process still holds the output; stopped reading]");
+    }
     if stdout_cut {
         text.push_str("\n[stdout truncated]");
     }
@@ -627,18 +676,66 @@ async fn run_bash(
 
 /// Read `pipe` to the end, keeping the first [`MAX_BYTES`] / 2 bytes; draining
 /// the rest keeps the child from blocking on a full pipe.
-async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, bool)> {
+/// Writes into `kept`/`cut` as it goes, so a read abandoned midway keeps what arrived.
+async fn drain(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    kept: &mut Vec<u8>,
+    cut: &mut bool,
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut kept = Vec::new();
-    let mut cut = false;
     let mut buf = [0u8; 8192];
     loop {
         let read = pipe.read(&mut buf).await?;
         if read == 0 {
-            return Ok((kept, cut));
+            return Ok(());
         }
         let room = (MAX_BYTES / 2).saturating_sub(kept.len());
         kept.extend_from_slice(&buf[..read.min(room)]);
-        cut |= read > room;
+        *cut |= read > room;
     }
 }
+
+/// How long to keep reading the pipes after bash exits.
+const READ_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Grace between SIGTERM and SIGKILL on cancel.
+const KILL_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// SIGKILLs bash's process group when dropped while armed (the `invoke`
+/// future was dropped mid-run); disarmed once bash has exited.
+struct GroupGuard(Option<u32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            signal_group(pid, Signal::Kill);
+        }
+    }
+}
+
+enum Signal {
+    Term,
+    Kill,
+}
+
+/// Signals the process group led by `pid`; if the group is already gone,
+/// falls back to the direct pid.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: Signal) {
+    // `kill(0)` would signal our own group; never do that.
+    if pid == 0 {
+        return;
+    }
+    let signal = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: kill(2) with our own child's pid and a valid signal.
+    if unsafe { libc::kill(-(pid as libc::pid_t), signal) } != 0 {
+        // SAFETY: same child, direct-pid fallback.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+}
+
+/// Without process groups, dropping the child (`kill_on_drop`) kills bash only.
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: Signal) {}
