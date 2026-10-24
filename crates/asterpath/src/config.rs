@@ -35,6 +35,8 @@ pub struct AsterpathConfig {
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
     /// Extension hooks, called in this order (ADR-0025).
     pub hooks: Vec<Arc<dyn Hooks>>,
+    /// Registers the model-visible `spawn_agent` tool. Defaults to `true`.
+    pub spawn_tool: bool,
 }
 
 impl Default for AsterpathConfig {
@@ -53,6 +55,7 @@ impl Default for AsterpathConfig {
             max_live_children: NonZeroUsize::new(32).expect("non-zero"),
             model_aliases: BTreeMap::new(),
             hooks: Vec::new(),
+            spawn_tool: true,
         }
     }
 }
@@ -137,6 +140,13 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn model_aliases(mut self, model_aliases: BTreeMap<ModelAlias, ModelSpec>) -> Self {
         self.config.model_aliases = model_aliases;
+        self
+    }
+
+    /// `false` leaves `spawn_agent` unregistered; the scheduler still runs.
+    #[must_use]
+    pub fn spawn_tool(mut self, enabled: bool) -> Self {
+        self.config.spawn_tool = enabled;
         self
     }
 
