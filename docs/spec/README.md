@@ -46,7 +46,7 @@ G1 计划闸与 G2 骨架闸的 prompt、通过条件与回灌流程见 [packagi
 ## 未决问题
 
 - 内核与打包：无。
-- 会话配置在创建时快照，会话中途无法切换模型、工具或 system：设计中，见 [#108](https://github.com/zibyn/asterpath/issues/108)。验收 (b) 验证 adapter 等价，不验证切换 provider。
+- 会话配置在创建时快照，会话中途无法切换模型、工具或 system：已由 [ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md) 决定改为日志折叠，待实现（[#108](https://github.com/zibyn/asterpath/issues/108)）。验收 (b) 验证 adapter 等价，不验证切换 provider。
 
 ## 出界
 
