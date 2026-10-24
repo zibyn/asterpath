@@ -40,10 +40,10 @@ use crate::views::usage::UsageService;
 use crate::waits::Waits;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
-    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ProjectedEntry,
-    ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState,
-    Span, SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
-    UsageScope, UserInput, dedup,
+    AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigUpdate,
+    ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent, SessionFacts,
+    SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError, UsageError,
+    UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{ApprovalGate, Clock, SessionQuery, SessionStore, unique_bytes};
 use futures_core::stream::BoxStream;
@@ -270,6 +270,7 @@ impl Asterpath {
         SessionHandle {
             session,
             store: Arc::clone(&self.store),
+            providers: Arc::clone(&self.providers),
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
@@ -364,6 +365,7 @@ fn totals_filter(scope: UsageScope) -> UsageFilter {
 pub struct SessionHandle {
     session: SessionId,
     store: Arc<dyn SessionStore>,
+    providers: Arc<ProviderCatalog>,
     agent: Arc<Agent>,
     waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
@@ -395,6 +397,34 @@ impl SessionHandle {
         })?;
         self.store.append(entry).await?;
         Ok(input.id)
+    }
+
+    /// Change the session's model or request parameters (ADR-0030). Validated
+    /// first: an unregistered provider is a `Config` error and nothing is
+    /// logged. Otherwise one `ConfigChanged` is appended; it may be called
+    /// mid-turn and takes effect at the next `StepStarted`, so a step already
+    /// running keeps its config.
+    pub async fn update_config(&self, update: ConfigUpdate) -> Result<(), AsterError> {
+        if let Some(model) = &update.model
+            && self.providers.get(&model.provider).is_none()
+        {
+            return Err(AsterError::Config {
+                message: format!("unknown provider {}", model.provider),
+            });
+        }
+        let event = SessionEvent::ConfigChanged {
+            patch: update.patch(),
+        };
+        // No dedup key: a patch overrides whole fields, so a repeated write
+        // folds to the same config.
+        let entry =
+            asterpath_protocol::encode_entry(self.session, None, &event).map_err(|error| {
+                AsterError::Config {
+                    message: error.to_string(),
+                }
+            })?;
+        self.store.append(entry).await?;
+        Ok(())
     }
 
     /// Stream live `AgentEvent`s until `TurnCommitted` or `Idle`.

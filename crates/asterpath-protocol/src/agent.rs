@@ -9,8 +9,8 @@ use crate::{
 };
 
 use crate::config::{
-    CompactionConfig, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety, RequestConfig,
-    SideEffect, SubagentConfig, ToolDescriptor, TurnConfig,
+    CompactionConfig, ConfigPatch, ConfigSnapshot, ModelSpec, Provenance, ReplaySafety,
+    RequestConfig, SideEffect, SubagentConfig, ToolDescriptor, TurnConfig,
 };
 use crate::event::{ToolResultStatus, TurnEndReason};
 use crate::ids::{JsonString, ToolName};
@@ -29,6 +29,26 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
+}
+
+/// A host change to a running session's configuration, validated by
+/// `SessionHandle::update_config` and recorded as one `ConfigChanged`.
+/// Each present field replaces the effective value whole.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigUpdate {
+    pub model: Option<ModelSpec>,
+    pub request: Option<RequestConfig>,
+}
+
+impl ConfigUpdate {
+    /// The patch recorded for this update.
+    pub fn patch(&self) -> ConfigPatch {
+        let mut patch = ConfigPatch::default();
+        patch.model = self.model.clone();
+        patch.request = self.request.clone();
+        patch
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -29,7 +29,7 @@ use asterpath_protocol::{
     ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorInfo, ProviderErrorKind,
     ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx, StopReason,
     StreamEvent, ToolConfig, ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor,
-    UsageLookup, decode_entry, dedup,
+    UsageLookup, decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
@@ -178,16 +178,9 @@ impl Agent {
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let mut decoded = scan_decoded(&*self.log, session).await?;
-        let config = decoded
-            .iter()
-            .find_map(|(_, event)| match event {
-                SessionEvent::SessionCreated { config, .. } => Some(config.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| AgentError::Corrupt {
-                session,
-                detail: "session log has no SessionCreated".to_owned(),
-            })?;
+        // Only the immutable turn/compaction/subagent fields are read from
+        // this; each step folds its own model and request (ADR-0030).
+        let config = config_at(session, &decoded, u64::MAX)?;
 
         let mut facts =
             SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
@@ -201,9 +194,7 @@ impl Agent {
         // A dangling compaction intent is redone only when a compactor is
         // assembled; otherwise it stays open and never blocks Idle.
         if self.compactor.is_some()
-            && let Some(reason) = self
-                .resolve_open_compaction(session, &facts, &config)
-                .await?
+            && let Some(reason) = self.resolve_open_compaction(session, &facts).await?
         {
             decoded = scan_decoded(&*self.log, session).await?;
             facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
@@ -311,7 +302,7 @@ impl Agent {
                             attempt: 1,
                             kind: AbortKind::Crash,
                             partial: None,
-                            model: config.model.clone(),
+                            model: config_at(session, &current, watermark)?.model,
                             backoff_ms: 0,
                             usage: None,
                             error: None,
@@ -454,12 +445,7 @@ impl Agent {
                         && auto_compactions < config.compaction.max_auto_compactions_per_turn
                     {
                         let (input, frontier) = self
-                            .compaction_input(
-                                session,
-                                config,
-                                CompactionTrigger::Threshold,
-                                u64::MAX,
-                            )
+                            .compaction_input(session, CompactionTrigger::Threshold, u64::MAX)
                             .await?;
                         match self
                             .perform_compaction(session, input, frontier, Some(turn), None)
@@ -549,10 +535,7 @@ impl Agent {
                 }
             };
 
-            match self
-                .run_step(session, config, turn, open, cancel, events)
-                .await?
-            {
+            match self.run_step(session, turn, open, cancel, events).await? {
                 StepOutcome::Continue => {}
                 StepOutcome::Turn(reason) => {
                     return self.commit_turn(session, turn, reason, events).await;
@@ -600,7 +583,6 @@ impl Agent {
     async fn run_step(
         &self,
         session: SessionId,
-        config: &ConfigSnapshot,
         turn: TurnId,
         open: OpenAttempt,
         cancel: &CancelToken,
@@ -612,6 +594,13 @@ impl Agent {
             mut history,
             mut next,
         } = open;
+        // The step's effective config: changes recorded after its
+        // `StepStarted` wait for the next step (ADR-0030).
+        let config = &config_at(
+            session,
+            &scan_decoded(&*self.log, session).await?,
+            watermark,
+        )?;
         // The projection is computed once per step; retries reuse it (L12).
         // A forced compaction re-projects the same step.
         let mut request = self.build_request(session, config, watermark).await?;
@@ -625,7 +614,7 @@ impl Agent {
                 }
                 Next::ForceCompact => {
                     history.compacted = true;
-                    let forced = self.force_compact(session, config, turn, watermark).await?;
+                    let forced = self.force_compact(session, turn, watermark).await?;
                     if forced == Forced::Applied {
                         request = self.build_request(session, config, watermark).await?;
                     }
@@ -827,12 +816,11 @@ impl Agent {
     async fn force_compact(
         &self,
         session: SessionId,
-        config: &ConfigSnapshot,
         turn: TurnId,
         watermark: u64,
     ) -> Result<Forced, AgentError> {
         let (input, frontier) = self
-            .compaction_input(session, config, CompactionTrigger::ProviderError, watermark)
+            .compaction_input(session, CompactionTrigger::ProviderError, watermark)
             .await?;
         Ok(
             match self
@@ -1110,18 +1098,8 @@ impl Agent {
                 busy: Arc::clone(&self.busy),
                 session,
             };
-            let config = entries
-                .iter()
-                .find_map(|(_, event)| match event {
-                    SessionEvent::SessionCreated { config, .. } => Some(config.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| AgentError::Corrupt {
-                    session,
-                    detail: "session log has no SessionCreated".to_owned(),
-                })?;
             let (input, frontier) = self
-                .compaction_input(session, &config, CompactionTrigger::Manual, u64::MAX)
+                .compaction_input(session, CompactionTrigger::Manual, u64::MAX)
                 .await?;
             match self
                 .perform_compaction(session, input, frontier, None, None)
@@ -1141,11 +1119,13 @@ impl Agent {
     async fn compaction_input(
         &self,
         session: SessionId,
-        config: &ConfigSnapshot,
         trigger: CompactionTrigger,
         watermark: u64,
     ) -> Result<(CompactionInput, LogId), AgentError> {
-        let entries = scan_all(&*self.log, session).await?;
+        let decoded = scan_decoded(&*self.log, session).await?;
+        // The effective model when the compaction runs, at the same watermark.
+        let config = config_at(session, &decoded, watermark)?;
+        let entries: Vec<LogEntry> = decoded.into_iter().map(|(entry, _)| entry).collect();
         let frontier = entries
             .last()
             .map(|entry| entry.log_id)
@@ -1205,9 +1185,9 @@ impl Agent {
         Ok((
             CompactionInput {
                 trigger,
-                model: config.model.clone(),
-                config: config.compaction.clone(),
-                turn: config.turn.clone(),
+                model: config.model,
+                config: config.compaction,
+                turn: config.turn,
                 history,
                 step_starts,
                 last_usage,
@@ -1322,7 +1302,6 @@ impl Agent {
         &self,
         session: SessionId,
         facts: &SessionFacts,
-        config: &ConfigSnapshot,
     ) -> Result<Option<TurnEndReason>, AgentError> {
         let Some(open) = facts.open_compactions().max_by_key(|open| open.seq) else {
             return Ok(None);
@@ -1334,9 +1313,7 @@ impl Agent {
             (CompactionTrigger::ProviderError, Some(step)) => step.seq,
             _ => u64::MAX,
         };
-        let (input, frontier) = self
-            .compaction_input(session, config, trigger, watermark)
-            .await?;
+        let (input, frontier) = self.compaction_input(session, trigger, watermark).await?;
         match self
             .perform_compaction(session, input, frontier, None, Some(key))
             .await?
@@ -1467,6 +1444,22 @@ async fn caught<'a, T>(
             .unwrap_or_else(|_| Err(panicked())),
         Err(_) => Err(panicked()),
     }
+}
+
+/// The effective config at `watermark`; the agent's one config fold.
+fn config_at(
+    session: SessionId,
+    decoded: &[(LogEntry, SessionEvent)],
+    watermark: u64,
+) -> Result<ConfigSnapshot, AgentError> {
+    effective_config(
+        decoded.iter().map(|(entry, event)| (entry, event)),
+        watermark,
+    )
+    .ok_or_else(|| AgentError::Corrupt {
+        session,
+        detail: "session log has no SessionCreated".to_owned(),
+    })
 }
 
 /// The open step of `turn`, with its `StepStarted.seq` waterline.
