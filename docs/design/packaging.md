@@ -330,7 +330,7 @@ pub enum AsterError {
 | `-i, --image <file>` | 交互、`exec` | 给首条输入附图（文件输入，ADR-0031） |
 | `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
 | `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
-| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031） |
+| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031）；写进新会话或分叉会话的配置，因此只用于新会话与 `--fork-session`，续原会话时是用法错误（没有单回合的请求选项，写进去会留在会话里） |
 
 - Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
 - 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。

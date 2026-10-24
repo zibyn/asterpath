@@ -471,6 +471,41 @@ fn output_schema_constrains_the_request() {
     );
 }
 
+/// A schema would stay in a continued session's config after this exec, so
+/// it is refused there; a fork is a new session and takes it.
+#[test]
+fn output_schema_on_a_continued_session_is_a_usage_error() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("first")),
+        Reply::sse(common::text_sse("{}")),
+    ]);
+    let dir = TestDir::new("schema-resume");
+    dir.config(&config_body(&server, &dir.db()));
+    let schema = dir.path.join("schema.json");
+    fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+
+    let schema = schema.to_str().unwrap();
+    assert_eq!(
+        code(
+            dir.exec(&dir.path)
+                .args(["-r", &session, "--output-schema", schema, "again"])
+        ),
+        Some(2)
+    );
+    assert_eq!(server.requests().len(), 1, "nothing was sent");
+    ok(dir.exec(&dir.path).args([
+        "-r",
+        &session,
+        "--fork-session",
+        "-m",
+        "claude-fable-5-1",
+        "--output-schema",
+        schema,
+        "again",
+    ]));
+}
+
 #[test]
 fn image_flag_attaches_the_file_to_the_first_input() {
     let server = MockServer::start(vec![Reply::sse(common::text_sse("a picture"))]);

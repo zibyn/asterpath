@@ -58,6 +58,13 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
             "--input-format stream-json needs --output-format stream-json",
         ));
     }
+    // No per-turn request option exists, and a schema patched into a continued
+    // session would outlive this exec.
+    if args.output_schema.is_some() && continuing && !args.session.fork_session {
+        return Err(CliError::config(
+            "--output-schema applies to new or forked sessions only",
+        ));
+    }
     // Files are read before the work root changes the process directory.
     let schema = args.output_schema.as_deref().map(read_schema).transpose()?;
     let mut parts = Vec::new();
