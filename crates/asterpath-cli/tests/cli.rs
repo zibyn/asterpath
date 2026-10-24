@@ -355,7 +355,13 @@ fn inspect_output_is_byte_stable() {
             "text": "Hello from the mock"
           }
         }
-      ]
+      ],
+      "raw": {
+        "provider": "anthropic",
+        "model": "claude-test",
+        "kind": "anthropic.text",
+        "json": "{\"text\":\"Hello from the mock\",\"type\":\"text\"}"
+      }
     }
   }
 ]

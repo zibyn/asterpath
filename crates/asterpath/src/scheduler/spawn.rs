@@ -995,6 +995,7 @@ fn summary_parts(events: &[(LogEntry, SessionEvent)]) -> Vec<Part> {
             Item::Message {
                 role: Role::Assistant,
                 parts,
+                ..
             } => Some(parts),
             _ => None,
         })

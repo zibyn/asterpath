@@ -85,3 +85,24 @@ fn current_version_round_trips_written_entries() {
         Some(LogId::from_i64(5))
     );
 }
+
+#[test]
+fn v1_messages_without_raw_decode_with_raw_none() {
+    // The v1 fixture predates `Item::Message.raw`.
+    let fixture = include_str!("fixtures/log/v1/basic_turn.jsonl");
+    let entries: Vec<LogEntry> = fixture
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(parse_entry)
+        .collect();
+    let raws: Vec<_> = history(&entries)
+        .expect("projection")
+        .into_iter()
+        .filter_map(|item| match item {
+            asterpath_protocol::Item::Message { raw, .. } => Some(raw),
+            _ => None,
+        })
+        .collect();
+    assert!(!raws.is_empty());
+    assert!(raws.iter().all(Option::is_none));
+}

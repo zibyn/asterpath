@@ -76,6 +76,7 @@ fn assistant(text_value: &str) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts: vec![text(text_value)],
+        raw: None,
     }
 }
 

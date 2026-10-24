@@ -255,6 +255,7 @@ async fn completed_child(
                             text: "refusal".to_owned(),
                         },
                     ],
+                    raw: None,
                 },
             ],
             raw: None,
@@ -841,6 +842,7 @@ async fn driving_a_fresh_child_opens_exactly_one_turn() {
         vec![Item::Message {
             role: Role::Assistant,
             parts: vec![text("child answer")],
+            raw: None,
         }],
         StopReason::EndTurn,
         Usage::default(),
@@ -1133,6 +1135,7 @@ async fn seed_fork_parent(log: &dyn SessionStore, subagents: &SubagentConfig) ->
                 Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("earlier answer")],
+                    raw: None,
                 },
                 Item::ToolCall {
                     call_id: "call-A".to_owned(),
@@ -1199,6 +1202,7 @@ async fn seed_fork_parent(log: &dyn SessionStore, subagents: &SubagentConfig) ->
                 Item::Message {
                     role: Role::Assistant,
                     parts: vec![text("spawn now")],
+                    raw: None,
                 },
                 Item::ToolCall {
                     call_id: "spawn-call".to_owned(),
@@ -1311,11 +1315,13 @@ async fn fork_materializes_the_parent_projection_at_the_step_watermark() {
             Item::Message {
                 role: Role::User,
                 parts: vec![text("earlier request")],
+                raw: None,
             },
             reasoning("p"),
             Item::Message {
                 role: Role::Assistant,
                 parts: vec![text("earlier answer")],
+                raw: None,
             },
             Item::ToolCall {
                 call_id: "call-A".to_owned(),
@@ -1393,6 +1399,7 @@ async fn fork_snapshot_respects_compaction_and_is_independent_of_later_changes()
             vec![Item::Message {
                 role: Role::Assistant,
                 parts: vec![text("old answer")],
+                raw: None,
             }],
         ),
     )

@@ -793,6 +793,7 @@ fn final_assistant_text(entries: &[LogEntry]) -> Option<String> {
         if let Item::Message {
             role: Role::Assistant,
             parts,
+            ..
         } = item
         {
             let text: String = parts
@@ -970,6 +971,7 @@ mod tests {
             parts: vec![Part::Text {
                 text: "done".into(),
             }],
+            raw: None,
         }
     }
 

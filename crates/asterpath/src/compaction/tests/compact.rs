@@ -23,6 +23,7 @@ fn message(value: &str) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts: vec![text(value)],
+        raw: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn job(usable: u32, retained: u64) -> CompactionJob {
             Item::Message {
                 role: Role::User,
                 parts: vec![text("hello")],
+                raw: None,
             },
             Item::ToolCall {
                 call_id: "c1".to_owned(),
@@ -123,7 +125,7 @@ async fn summary_request_is_independent_of_the_session_request() {
     // Fixed prompt first, then the supplied text view.
     assert!(matches!(
         &request.items[0],
-        Item::Message { role: Role::User, parts }
+        Item::Message { role: Role::User, parts, .. }
             if matches!(&parts[0], Part::Text { text } if text.contains("Summarize"))
     ));
     assert_eq!(request.items.len(), 3);

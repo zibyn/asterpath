@@ -100,6 +100,7 @@ fn final_items() -> Vec<Item> {
     vec![Item::Message {
         role: Role::Assistant,
         parts: vec![text("done")],
+        raw: None,
     }]
 }
 
@@ -383,6 +384,7 @@ async fn s18_input_submitted_before_a_crash_is_projected_exactly_once() {
             Item::Message {
                 role: Role::User,
                 parts,
+                ..
             } => Some(parts),
             _ => None,
         })

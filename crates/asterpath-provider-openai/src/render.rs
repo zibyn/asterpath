@@ -209,8 +209,22 @@ fn render_input(
     let mut input = Vec::with_capacity(request.items.len());
     for item in &request.items {
         match item {
-            Item::Message { role, parts } => {
-                input.push(raw(message_item(*role, parts, provider, trace)?)?);
+            Item::Message {
+                role,
+                parts,
+                raw: data,
+            } => {
+                let mut message = message_item(*role, parts, provider, trace)?;
+                // Only `phase` is merged from same-provider raw; the id is never replayed (ADR 0010).
+                if let Some(phase) = data
+                    .as_ref()
+                    .filter(|data| &data.provider == provider)
+                    .and_then(|data| serde_json::from_str::<Value>(data.json.as_str()).ok())
+                    .and_then(|mut value| value.get_mut("phase").map(Value::take))
+                {
+                    message["phase"] = phase;
+                }
+                input.push(raw(message)?);
             }
             Item::Reasoning {
                 binding, raw: data, ..

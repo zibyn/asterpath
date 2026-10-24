@@ -35,6 +35,7 @@ fn user_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::User,
         parts,
+        raw: None,
     }
 }
 
@@ -42,6 +43,7 @@ fn assistant_message(parts: Vec<Part>) -> Item {
     Item::Message {
         role: Role::Assistant,
         parts,
+        raw: None,
     }
 }
 

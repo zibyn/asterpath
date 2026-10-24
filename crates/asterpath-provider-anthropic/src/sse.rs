@@ -365,6 +365,19 @@ impl Decoder {
                 Ok(Vec::new())
             }
             // Citations stay in provider raw data; v1 has no typed citations.
+            "citations_delta" => {
+                let citation = delta.get("citation").cloned().unwrap_or(Value::Null);
+                let block = self.open_block(index)?;
+                match block
+                    .start
+                    .get_mut("citations")
+                    .and_then(Value::as_array_mut)
+                {
+                    Some(citations) => citations.push(citation),
+                    None => block.start["citations"] = json!([citation]),
+                }
+                Ok(Vec::new())
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -459,10 +472,15 @@ impl Decoder {
 
     fn build_item(&self, block: Block) -> Result<Item, ProviderError> {
         match block.kind.as_str() {
-            "text" => Ok(Item::Message {
-                role: Role::Assistant,
-                parts: vec![Part::Text { text: block.text }],
-            }),
+            "text" => {
+                let mut raw = block.start;
+                raw["text"] = json!(&block.text);
+                Ok(Item::Message {
+                    role: Role::Assistant,
+                    parts: vec![Part::Text { text: block.text }],
+                    raw: Some(self.raw("anthropic.text", &raw)),
+                })
+            }
             "thinking" => {
                 let mut raw = block.start;
                 raw["thinking"] = json!(&block.thinking);
