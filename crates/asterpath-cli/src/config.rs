@@ -1,7 +1,8 @@
-//! `asterpath.toml`, environment and flag resolution.
+//! `config.toml`, `-c key=value` overrides and flag resolution.
 //!
-//! Precedence is flag > environment > file. API keys are deliberately not part
-//! of this model: they are read only from the environment.
+//! Precedence is flag > `-c` > file. The only environment variables are
+//! `ASTERPATH_CONFIG` and the provider API keys; keys are deliberately not part
+//! of this model.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -21,65 +22,106 @@ use asterpath_protocol::{
 use clap::ValueEnum;
 use serde::Deserialize;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, ValueEnum)]
+/// `-a` and `[approval] default`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
+    /// Read-only in-process tools run; mutating and external tools ask.
     #[default]
-    Ask,
-    Allow,
-    Deny,
+    Untrusted,
+    /// Never ask; the sandbox is the only guard.
+    Never,
 }
 
-/// Values resolved from flags, environment and the file, in that order.
+/// `-s` and `[sandbox] mode`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    FullAccess,
+}
+
+/// The file with `-c` overrides merged in, then the dedicated flags.
 pub struct Settings {
     pub db: PathBuf,
-    pub provider: Option<String>,
-    pub model: Option<String>,
     pub approval: ApprovalMode,
     pub file: FileConfig,
 }
 
-pub struct Overrides {
-    pub config: Option<PathBuf>,
-    pub db: Option<PathBuf>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub approval: Option<ApprovalMode>,
-}
-
-/// Load the configuration file (when named) and apply flag and environment
-/// overrides. A missing file means defaults.
-pub fn load(overrides: Overrides) -> Result<Settings, String> {
-    let path = overrides
-        .config
-        .or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from));
-    let file = match path {
+/// Load the configuration file (`--config`, else `ASTERPATH_CONFIG`, else
+/// `$XDG_CONFIG_HOME/asterpath/config.toml`; missing means defaults) and merge
+/// each `-c key=value` over it.
+pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, String> {
+    let path = config
+        .or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from))
+        .or_else(|| config_home().map(|home| home.join("asterpath/config.toml")));
+    let mut table = match path {
         Some(path) if path.exists() => {
             let contents = std::fs::read_to_string(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            parse(&contents)?
+            toml::from_str(&contents).map_err(|error| format!("invalid config: {error}"))?
         }
-        _ => FileConfig::default(),
+        _ => toml::Table::new(),
     };
+    for raw in overrides {
+        merge(&mut table, parse_override(raw)?);
+    }
+    let value = toml::Value::Table(table);
+    if let Some(field) = secret_field(&value) {
+        return Err(format!(
+            "config must not contain `{field}`; API keys are read from the environment"
+        ));
+    }
+    let file: FileConfig = value
+        .try_into()
+        .map_err(|error| format!("invalid config: {error}"))?;
 
-    let db = overrides
-        .db
-        .or_else(|| env_os("ASTERPATH_DB").map(PathBuf::from))
-        .or_else(|| file.storage.path.clone())
-        .unwrap_or_else(default_db);
-
+    let db = expand_tilde(file.storage.path.clone().unwrap_or_else(default_db));
+    // Absolute now: the work root may change the process directory later.
+    let db = std::path::absolute(&db).unwrap_or(db);
     Ok(Settings {
-        db: expand_tilde(db),
-        provider: overrides
-            .provider
-            .or_else(|| env_string("ASTERPATH_PROVIDER")),
-        model: overrides.model.or_else(|| env_string("ASTERPATH_MODEL")),
-        approval: overrides
-            .approval
-            .or(file.approval.default)
-            .unwrap_or_default(),
+        db,
+        approval: file.approval.default.unwrap_or_default(),
         file,
     })
+}
+
+/// `key=value` as a one-line TOML document: the key may be dotted or quoted,
+/// and a value that is not valid TOML is taken as a string.
+fn parse_override(raw: &str) -> Result<toml::Table, String> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("-c {raw}: expected key=value"))?;
+    let key = key.trim();
+    toml::from_str(&format!("{key} = {value}"))
+        .or_else(|_| {
+            toml::from_str(&format!(
+                "{key} = {}",
+                toml::Value::String(value.to_owned())
+            ))
+        })
+        .map_err(|_| format!("-c {raw}: invalid key {key}"))
+}
+
+/// Tables merge key by key; anything else replaces.
+fn merge(target: &mut toml::Table, source: toml::Table) {
+    for (key, value) in source {
+        match (target.get_mut(&key), value) {
+            (Some(toml::Value::Table(target)), toml::Value::Table(source)) => merge(target, source),
+            (_, value) => {
+                target.insert(key, value);
+            }
+        }
+    }
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+pub fn config_home() -> Option<PathBuf> {
+    env_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
 }
 
 /// Parse and validate without opening any module.
@@ -102,15 +144,15 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
             ));
         }
     }
-    if let Some(provider) = &settings.provider
+    if let Some(provider) = &settings.file.model.provider
         && !provider_available(provider, &settings.file)
     {
         return Err(format!("unknown provider {provider}"));
     }
-    if let Some(model) = &settings.model
+    if let Some(model) = &settings.file.model.id
         && model.trim().is_empty()
     {
-        return Err("--model must not be empty".to_owned());
+        return Err("the model id must not be empty".to_owned());
     }
     // Resolve the value-shaped sections now so type errors exit 2, not at run.
     settings.file.request_config()?;
@@ -120,10 +162,7 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
 
 /// The selected provider plus every provider a model alias targets.
 pub fn providers(settings: &Settings) -> Result<Vec<Arc<dyn Provider>>, String> {
-    let selected = settings
-        .provider
-        .as_deref()
-        .ok_or_else(|| "a provider is required (--provider or ASTERPATH_PROVIDER)".to_owned())?;
+    let selected = settings.provider()?;
     let mut ids = vec![selected.to_owned()];
     for model in settings.file.model_aliases.values() {
         if !ids.contains(&model.provider) {
@@ -136,14 +175,13 @@ pub fn providers(settings: &Settings) -> Result<Vec<Arc<dyn Provider>>, String> 
 }
 
 pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSpec, String> {
-    let provider = settings
-        .provider
-        .clone()
-        .ok_or_else(|| "a provider is required (--provider or ASTERPATH_PROVIDER)".to_owned())?;
+    let provider = settings.provider()?.to_owned();
     let model = settings
+        .file
         .model
+        .id
         .clone()
-        .ok_or_else(|| "a model is required (--model or ASTERPATH_MODEL)".to_owned())?;
+        .ok_or_else(|| "a model is required ([model] id or -m)".to_owned())?;
     Ok(asterpath_protocol::SessionSpec {
         model: ModelSpec {
             provider: ProviderId::new(provider),
@@ -195,14 +233,13 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
     config
 }
 
-/// `Ask` asks for every `Mutating` tool (the framework default allows all
-/// in-process tools) and otherwise keeps the default; the pipeline denies
-/// `Ask` when no endpoint is open.
+/// `untrusted` asks for every `Mutating` tool and otherwise keeps the
+/// framework default (in-process allowed, external asked); the pipeline
+/// denies `Ask` when no endpoint is open. `never` allows everything.
 pub fn approval_policy(mode: ApprovalMode, gate: Arc<ApprovalGate>) -> Arc<dyn ApprovalPolicy> {
     match mode {
-        ApprovalMode::Ask => Arc::new(AskMutating(DefaultApprovalPolicy::new(gate))),
-        ApprovalMode::Allow => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
-        ApprovalMode::Deny => Arc::new(FixedApproval(ApprovalVerdict::Deny { reason: None })),
+        ApprovalMode::Untrusted => Arc::new(AskMutating(DefaultApprovalPolicy::new(gate))),
+        ApprovalMode::Never => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
     }
 }
 
@@ -223,17 +260,6 @@ impl ApprovalPolicy for FixedApproval {
     fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
         self.0.clone()
     }
-}
-
-fn parse(contents: &str) -> Result<FileConfig, String> {
-    let value: toml::Value =
-        toml::from_str(contents).map_err(|error| format!("invalid config: {error}"))?;
-    if let Some(field) = secret_field(&value) {
-        return Err(format!(
-            "config must not contain `{field}`; API keys are read from the environment"
-        ));
-    }
-    toml::from_str(contents).map_err(|error| format!("invalid config: {error}"))
 }
 
 fn secret_field(value: &toml::Value) -> Option<String> {
@@ -677,17 +703,12 @@ struct SkillsSection {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ModelSection {
+    /// The provider id of new sessions.
+    provider: Option<String>,
+    /// The model id of new sessions.
+    id: Option<String>,
     /// Maps to `ModelSpec.context_window`; absent leaves compaction `NotConfigured`.
     context_window: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum SandboxMode {
-    ReadOnly,
-    #[default]
-    WorkspaceWrite,
-    FullAccess,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -712,6 +733,28 @@ struct McpServerSection {
 }
 
 impl Settings {
+    /// `-m`: the model id of a new session.
+    pub fn set_model(&mut self, model: String) {
+        self.file.model.id = Some(model);
+    }
+
+    /// The provider of a continued session comes from its log, not the file.
+    pub fn set_provider(&mut self, provider: String) {
+        self.file.model.provider = Some(provider);
+    }
+
+    /// `-s`.
+    pub fn set_sandbox(&mut self, mode: SandboxMode) {
+        self.file.sandbox.mode = mode;
+    }
+
+    /// `[model] provider`.
+    pub fn provider(&self) -> Result<&str, String> {
+        self.file.model.provider.as_deref().ok_or_else(|| {
+            "a provider is required ([model] provider or -c model.provider=…)".to_owned()
+        })
+    }
+
     /// `[skills] enabled`; absent means enabled.
     pub fn skills_enabled(&self) -> bool {
         self.file.skills.enabled.unwrap_or(true)
@@ -896,10 +939,50 @@ mod tests {
         assert!(parse_effort("none").is_err());
     }
 
+    fn overridden(file: &str, overrides: &[&str]) -> toml::Table {
+        let mut table: toml::Table = toml::from_str(file).unwrap();
+        for raw in overrides {
+            merge(&mut table, parse_override(raw).unwrap());
+        }
+        table
+    }
+
+    #[test]
+    fn overrides_parse_toml_values_and_fall_back_to_strings() {
+        let table = overridden(
+            "[model]\nprovider = \"openai\"\ncontext_window = 1\n",
+            &[
+                "model.id=claude-test",
+                "model.context_window=200000",
+                "tools.enabled=[\"read_file\"]",
+                "skills.enabled=false",
+                "providers.deepseek.models.\"v4-pro\".efforts=[\"low\"]",
+            ],
+        );
+        let expected: toml::Table = toml::from_str(concat!(
+            "[model]\nprovider = \"openai\"\nid = \"claude-test\"\ncontext_window = 200000\n",
+            "[tools]\nenabled = [\"read_file\"]\n[skills]\nenabled = false\n",
+            "[providers.deepseek.models.\"v4-pro\"]\nefforts = [\"low\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(table, expected);
+    }
+
+    #[test]
+    fn overrides_reject_a_missing_value_or_a_bad_key() {
+        assert!(parse_override("model.id").is_err());
+        assert!(parse_override("a b=1").is_err());
+        assert!(parse_override("=1").is_err());
+    }
+
+    fn file(contents: &str) -> FileConfig {
+        toml::from_str(contents).unwrap()
+    }
+
     #[test]
     fn subagents_max_live_children_is_the_global_cap() {
-        let file = parse("[subagents]\nmax_live_children = 4\n").unwrap();
-        assert_eq!(file.max_live_children().get(), 4);
-        assert_eq!(parse("").unwrap().max_live_children().get(), 32);
+        let config = file("[subagents]\nmax_live_children = 4\n");
+        assert_eq!(config.max_live_children().get(), 4);
+        assert_eq!(file("").max_live_children().get(), 32);
     }
 }

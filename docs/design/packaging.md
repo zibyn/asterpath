@@ -85,7 +85,7 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI `resume` 都经它取值。
+  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -161,7 +161,7 @@ impl Asterpath {
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
-- 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `--provider <id>` + `--model <id>` 组装该值。
+- 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `[model] provider` + `[model] id`（`-m` 覆盖）组装该值。
 - 注入 `store` 时 `database` 被忽略；未注入时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
 - `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
@@ -473,7 +473,7 @@ default = "untrusted"         # untrusted | never
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；默认 compactor 可选接入 | 场景 (c) 通过 |
 | M4 CLI | `asterpath-cli` 六命令、配置、审批端 | CLI 场景测试通过 |
 | M5 扩展（已交付） | `asterpath-mcp`（MCP 服务配置、子进程、MCP adapter；#80 前为 `asterpath-plugin-host`）、沙箱合约（#80 起在 protocol）与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
-| M6 技能（已交付） | `asterpath-skills`、CLI `[skills]` 与 `run --no-skills`、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
+| M6 技能（已交付） | `asterpath-skills`、CLI `[skills]`（`enabled` 开关）、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
 
 - M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；M5 / M6 的成员已在 workspace 中，但不属于 v1 验收闸门。插件分发、ACP 与 WASM 出界，归 host 或生态工具。
 - M6 与 M5 同性质：不属于 v1 验收闸门；技能不新增事件，日志 schema 不变。

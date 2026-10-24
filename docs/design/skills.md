@@ -89,7 +89,7 @@ description: 一句话说明这个技能何时有用。  # 必填
 - **每个新 session 创建时扫描一次**。没有热加载：新技能对下一个新 session 生效；已有 session 的索引不变，但 `load_skill` 读当前磁盘。
 - **开关**：`[skills] enabled = false`（或 `-c skills.enabled=false`）只影响新 session（不扫描、不渲染索引、不注册工具）。续会话总是注册 `load_skill`，索引来自 `SessionCreated.config.system`（见 §5）。
 - **`.claude/skills` 不自动扫描**。需要时写进 `[skills] paths`；格式兼容不等于替别的产品做发现。
-- **项目信任**：M6 不提供信任提示；项目技能默认加载，宿主用 `enabled` / `--no-skills` 退出。需要信任门的宿主应在组装 `system` 之前自行拦截。
+- **项目信任**：M6 不提供信任提示；项目技能默认加载，宿主用 `enabled = false`（参考 CLI 也可 `-c skills.enabled=false`）退出。需要信任门的宿主应在组装 `system` 之前自行拦截。
 
 ## 5. 会话集成
 
@@ -155,7 +155,7 @@ pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 - **资源与脚本不执行**：M6 不读 `references/`、不跑 `scripts/`。技能可以提到它们，但模型没有对应工具（除非宿主另外提供）。
 - **路径**：名称正则排除了 `/` 与 `.`，只读 `<root>/<name>/SKILL.md`；根在发现时规范化。不存在任意路径读取。
 - **YAML 解析是信任边界**：frontmatter 先限 16 KiB 再交给 `saphyr`；只读取顶层 `name` / `description` 标量；不执行标签、锚点或自定义构造。解析失败即跳过该技能。
-- **没有签名、registry 或信任提示**；项目技能默认加载，`enabled = false` / `--no-skills` 是退出开关。需要更强信任模型的宿主应在组装前自行判断。
+- **没有签名、registry 或信任提示**；项目技能默认加载，`enabled = false`（或 `-c skills.enabled=false`）是退出开关。需要更强信任模型的宿主应在组装前自行判断。
 - **诊断不包含正文**：只报路径、技能名与原因，避免把技能内容里的秘密带进 stderr 或日志。
 
 ## 8. 宿主接口
@@ -214,7 +214,7 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 ```
 
 - 新会话：若启用，扫描 → 渲染索引 → 放进 `SessionSpec.system` → 注册 `LoadSkillTool`；无效技能警告到 stderr。
-- `run --no-skills`：覆盖 `enabled`，本次新 session 不扫描、不注册工具。
+- `-c skills.enabled=false`：覆盖文件里的 `enabled`，本次新 session 不扫描、不注册工具。
 - 续会话（`--continue` / `-r`）：不重新扫描索引；总是注册 `LoadSkillTool`（索引来自快照）。
 - `doctor`：扫描并打印诊断，包括被忽略的权限字段和被遮蔽/超预算的技能。
 
@@ -264,14 +264,14 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 | S4 | 模型调用 `load_skill` | 返回正文；日志出现 `ReadOnly` + `Safe` 的调用与结果；不触发审批 |
 | S5 | 崩溃恢复 | 已加载正文来自日志；未闭合调用按 `Safe` 重跑 |
 | S6 | 文件在 resume 前被删除 | `load_skill` 返回 `NotFound`；session 不失败 |
-| S7 | `run --no-skills` / `enabled = false` | 新 session 无索引、无工具；resume 的已有 session 仍可加载 |
+| S7 | `enabled = false`（含 `-c skills.enabled=false`） | 新 session 无索引、无工具；续会话（`--continue` / `-r`）的已有 session 仍可加载 |
 | S8 | fresh 子智能体 | 继承 system 与工具集，可 `load_skill`；父收窄工具集后子不可用 |
 | S9 | 索引超过 8,000 字符 | 按优先级省略低优先级条目并诊断；高优先级条目完整 |
 | S10 | 省略 `name` / `name` 与目录不符 | 省略时用目录名正常加载；不符时跳过并诊断 |
 
 ## 12. M6 出界
 
-- 用户调用（`/skill`、`run --skill`）与命令 seam。
+- 用户调用（`/skill`、`exec --skill`）与命令 seam。
 - 读取 `references/` / `assets/`，执行 `scripts/`。
 - 热加载、运行期增删技能。
 - 插件打包技能、远程 registry、安装/更新。

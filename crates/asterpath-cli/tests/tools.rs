@@ -1,6 +1,6 @@
 //! Reference CLI tool selection: the six `asterpath-tools` tools are on by
-//! default, `[tools] enabled` and `--tools` pick a subset, `--no-tools` drops
-//! them all.
+//! default, `[tools] enabled` (or `-c tools.enabled=[...]`) picks a subset, an
+//! empty list drops them all.
 
 mod common;
 
@@ -32,12 +32,12 @@ fn run(file: &str, flags: &[&str]) -> Vec<String> {
     )
     .expect("config");
     let mut args = vec![
-        "run",
+        "exec",
         "--config",
         config.to_str().unwrap(),
-        "--provider",
-        "anthropic",
-        "--model",
+        "-c",
+        "model.provider=anthropic",
+        "-m",
         "claude-test",
     ];
     args.extend_from_slice(flags);
@@ -79,34 +79,43 @@ fn all_six_tools_are_registered_by_default() {
 }
 
 #[test]
-fn no_tools_drops_every_tool() {
-    assert!(run("", &["--no-tools"]).is_empty());
+fn an_empty_list_drops_every_tool() {
+    assert!(run("", &["-c", "tools.enabled=[]"]).is_empty());
 }
 
 #[test]
-fn tools_flag_selects_a_subset() {
-    assert_eq!(run("", &["--tools", "read_file"]), ["read_file"]);
-    assert_eq!(run("", &["--tools", "grep,bash"]), ["bash", "grep"]);
+fn an_override_selects_a_subset() {
+    assert_eq!(
+        run("", &["-c", r#"tools.enabled=["read_file"]"#]),
+        ["read_file"]
+    );
+    assert_eq!(
+        run("", &["-c", r#"tools.enabled=["grep","bash"]"#]),
+        ["bash", "grep"]
+    );
 }
 
 #[test]
-fn config_selects_a_subset_and_the_flag_wins() {
+fn config_selects_a_subset_and_the_override_wins() {
     let file = "[tools]\nenabled = [\"list_dir\"]\n";
     assert_eq!(run(file, &[]), ["list_dir"]);
-    assert_eq!(run(file, &["--tools", "read_file"]), ["read_file"]);
-    assert!(run(file, &["--no-tools"]).is_empty());
+    assert_eq!(
+        run(file, &["-c", r#"tools.enabled=["read_file"]"#]),
+        ["read_file"]
+    );
+    assert!(run(file, &["-c", "tools.enabled=[]"]).is_empty());
 }
 
 #[test]
 fn an_unknown_tool_name_is_a_usage_error() {
     let output = bin()
         .args([
-            "run",
-            "--tools",
-            "nope",
-            "--provider",
-            "anthropic",
-            "--model",
+            "exec",
+            "-c",
+            r#"tools.enabled=["nope"]"#,
+            "-c",
+            "model.provider=anthropic",
+            "-m",
             "m",
             "hi",
         ])
