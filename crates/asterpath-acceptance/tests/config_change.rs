@@ -127,6 +127,7 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
             provenance: Provenance::InProcess,
             timeout: None,
             max_output_bytes: None,
+            strict: None,
         },
         handle: OnceLock::new(),
         calls: AtomicUsize::new(0),
@@ -242,6 +243,7 @@ async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
             provenance: Provenance::InProcess,
             timeout: None,
             max_output_bytes: None,
+            strict: None,
         },
         handle: OnceLock::new(),
     });
@@ -409,6 +411,7 @@ fn plain_tool(name: &str) -> ToolDescriptor {
         provenance: Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

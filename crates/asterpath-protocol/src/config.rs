@@ -30,6 +30,17 @@ pub struct RequestConfig {
     /// Per-provider JSON objects merged into the top level of that provider's
     /// request body; entries for other providers are ignored. Values are host policy.
     pub provider_options: BTreeMap<ProviderId, JsonString>,
+    /// Constrain the reply to a JSON schema. The reply is still ordinary
+    /// message text; the framework neither parses nor validates it.
+    #[serde(default)]
+    pub output_format: Option<OutputFormat>,
+}
+
+/// A named JSON schema the model's reply must follow (structured output).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputFormat {
+    pub name: String,
+    pub schema: JsonSchema,
 }
 
 impl Default for RequestConfig {
@@ -42,6 +53,7 @@ impl Default for RequestConfig {
             reasoning: None,
             stop_sequences: Vec::new(),
             provider_options: BTreeMap::new(),
+            output_format: None,
         }
     }
 }
@@ -288,6 +300,9 @@ pub struct ToolDescriptor {
     pub provenance: Provenance,
     pub timeout: Option<Duration>,
     pub max_output_bytes: Option<usize>,
+    /// Provider strict schema adherence; `None` sends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

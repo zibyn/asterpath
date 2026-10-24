@@ -8,7 +8,8 @@ use std::time::Duration;
 use futures_core::stream::BoxStream;
 
 use crate::config::{
-    ModelSpec, ReasoningParams, RequestConfig, SamplingParams, ToolChoice, ToolDescriptor,
+    ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
+    ToolDescriptor,
 };
 use crate::ids::{JsonString, ProviderId};
 use crate::item::{Item, Part, RawProviderData};
@@ -37,6 +38,8 @@ pub struct ModelRequest {
     pub stop_sequences: Vec<String>,
     /// See [`RequestConfig::provider_options`].
     pub provider_options: BTreeMap<ProviderId, JsonString>,
+    /// See [`RequestConfig::output_format`].
+    pub output_format: Option<OutputFormat>,
 }
 
 impl ModelRequest {
@@ -65,6 +68,7 @@ impl ModelRequest {
             reasoning: request.reasoning.clone(),
             stop_sequences: request.stop_sequences.clone(),
             provider_options: request.provider_options.clone(),
+            output_format: request.output_format.clone(),
         }
     }
 }
@@ -117,6 +121,8 @@ pub struct ProviderCapabilities {
     pub reasoning_roundtrip: bool,
     pub citations: bool,
     pub builtin_tools: bool,
+    /// Accepts `ModelRequest::output_format`.
+    pub structured_output: bool,
     pub cache_control: bool,
     pub image_input: bool,
     pub parallel_tool_calls: bool,
@@ -140,6 +146,9 @@ impl ProviderCapabilities {
         }
         if !self.parallel_tool_calls && request.disable_parallel_tool_use {
             return Some("disabling parallel tool calls");
+        }
+        if !self.structured_output && request.output_format.is_some() {
+            return Some("structured output");
         }
         let has_image = request.items.iter().any(|item| {
             matches!(item, Item::Message { parts, .. }

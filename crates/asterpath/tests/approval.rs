@@ -56,6 +56,7 @@ fn descriptor(name: &str, timeout: Option<Duration>) -> ToolDescriptor {
         provenance: asterpath::protocol::Provenance::InProcess,
         timeout,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

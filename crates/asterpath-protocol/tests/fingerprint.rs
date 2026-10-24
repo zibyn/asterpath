@@ -17,6 +17,7 @@ fn descriptor(name: &str, schema: serde_json::Value) -> ToolDescriptor {
         provenance: Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 
@@ -44,5 +45,18 @@ fn tools_hash_ignores_tool_order() {
     assert_eq!(
         tools_hash(&[first.clone(), second.clone()]),
         tools_hash(&[second, first])
+    );
+}
+
+#[test]
+fn tools_hash_includes_strict_only_when_set() {
+    // Expected value computed independently: as above, with `"strict": true`
+    // added to the one tool that sets it.
+    let mut echo = descriptor("echo", json!({"type": "object"}));
+    echo.strict = Some(true);
+    let tools = [echo, descriptor("search", json!({"type": "object"}))];
+    assert_eq!(
+        tools_hash(&tools),
+        "d8c7f8099d9f86f5da7d09792c17b56452247bcc6e9613030be9c74945ad3d58"
     );
 }

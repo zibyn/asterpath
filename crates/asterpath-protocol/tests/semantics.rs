@@ -394,6 +394,29 @@ fn model_request_copies_stop_sequences_and_provider_options() {
 }
 
 #[test]
+fn model_request_copies_output_format() {
+    let request = RequestConfig {
+        output_format: Some(OutputFormat {
+            name: "answer".to_owned(),
+            schema: serde_json::json!({"type": "object"}),
+        }),
+        ..RequestConfig::default()
+    };
+    let model_request = ModelRequest::new(model(), 0, vec![], vec![], vec![], vec![], &request);
+    assert_eq!(model_request.output_format, request.output_format);
+}
+
+#[test]
+fn request_config_recorded_before_output_format_decodes_without_it() {
+    let mut json = serde_json::to_value(RequestConfig::default()).expect("serialize");
+    json.as_object_mut()
+        .expect("object")
+        .remove("output_format");
+    let back: RequestConfig = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back.output_format, None);
+}
+
+#[test]
 fn usage_totals_use_the_exclusive_rule() {
     let usage = Usage {
         input: InputTokens {
@@ -660,6 +683,7 @@ fn tool(name: &str) -> ToolDescriptor {
         provenance: Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

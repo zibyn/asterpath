@@ -158,14 +158,25 @@ fn capability_check_names_the_unsupported_feature() {
     });
     assert_eq!(none.unsupported_feature(&image), Some("image input"));
 
+    let mut structured = capability_request();
+    structured.output_format = Some(asterpath_protocol::OutputFormat {
+        name: "answer".to_owned(),
+        schema: serde_json::json!({"type": "object"}),
+    });
+    assert_eq!(
+        none.unsupported_feature(&structured),
+        Some("structured output")
+    );
+
     let all = ProviderCapabilities {
         forced_tool_choice: true,
         sampling: true,
         parallel_tool_calls: true,
         image_input: true,
+        structured_output: true,
         ..ProviderCapabilities::default()
     };
-    for request in [forced, sampling, serial, image] {
+    for request in [forced, sampling, serial, image, structured] {
         assert_eq!(all.unsupported_feature(&request), None);
     }
 }

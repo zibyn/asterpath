@@ -1548,3 +1548,81 @@ async fn without_inline_changes_a_tool_change_rewrites_the_top_level_tools_and_d
         "{body}"
     );
 }
+
+fn answer_format() -> Option<asterpath_protocol::OutputFormat> {
+    Some(asterpath_protocol::OutputFormat {
+        name: "answer".to_owned(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    })
+}
+
+#[tokio::test]
+async fn output_format_renders_as_output_config_format_beside_effort() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = request_for("claude-opus-5-5");
+    request.output_format = answer_format();
+    request.reasoning = effort(ReasoningEffort::High);
+
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert_eq!(
+        sent.json_body()["output_config"],
+        serde_json::json!({
+            "effort": "high",
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    );
+    assert!(
+        !sent.head.to_ascii_lowercase().contains("anthropic-beta"),
+        "structured outputs are GA"
+    );
+}
+
+#[tokio::test]
+async fn output_format_is_unsupported_before_http_where_the_model_lacks_it() {
+    let server = MockServer::start(Vec::new());
+    // Claude Sonnet 4 and Claude 3 predate structured outputs; unrecognized
+    // ids (third-party endpoints) are not assumed to have them.
+    for model in [
+        "claude-sonnet-4-20250514",
+        "claude-3-haiku",
+        "deepseek-v4-pro",
+    ] {
+        let mut request = request_for(model);
+        request.output_format = answer_format();
+        let error = one_request(&server, request).await;
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported, "{model}");
+    }
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn tool_strict_is_sent_only_when_set() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = base_request();
+    let mut strict = descriptor("strict");
+    strict.strict = Some(true);
+    let mut loose = descriptor("loose");
+    loose.strict = Some(false);
+    request.tools = vec![strict, loose, descriptor("unset")];
+    request.baseline_tools = request.tools.clone();
+
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    assert_eq!(body["tools"][0]["strict"], true);
+    assert_eq!(body["tools"][1]["strict"], false);
+    assert!(body["tools"][2].get("strict").is_none());
+}

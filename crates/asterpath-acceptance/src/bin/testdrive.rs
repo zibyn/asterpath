@@ -809,6 +809,7 @@ fn descriptor(name: &str, replay: asterpath_protocol::ReplaySafety) -> ToolDescr
         provenance: asterpath_protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

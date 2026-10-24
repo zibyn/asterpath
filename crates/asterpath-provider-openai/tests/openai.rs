@@ -63,6 +63,7 @@ fn request(items: Vec<Item>) -> ModelRequest {
         reasoning: None,
         stop_sequences: Vec::new(),
         provider_options: Default::default(),
+        output_format: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn tool(name: &str) -> ToolDescriptor {
         provenance: asterpath_protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 
@@ -326,6 +328,7 @@ async fn provider_declares_openai_capabilities() {
             reasoning_roundtrip: true,
             citations: false,
             builtin_tools: false,
+            structured_output: true,
             cache_control: false,
             image_input: true,
             parallel_tool_calls: true,
@@ -411,6 +414,47 @@ async fn request_renders_forced_choice_sampling_parallel_and_reasoning() {
         body["reasoning"],
         json!({"effort": "high", "summary": "auto"})
     );
+}
+
+#[tokio::test]
+async fn output_format_renders_as_strict_text_format_and_tool_strict_only_when_set() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("{}"))]);
+    let provider = provider(&server);
+    let mut request = request(vec![user_text("hello")]);
+    request.output_format = Some(asterpath_protocol::OutputFormat {
+        name: "answer".to_owned(),
+        schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    });
+    let mut strict = tool("strict_tool");
+    strict.strict = Some(true);
+    let mut loose = tool("loose_tool");
+    loose.strict = Some(false);
+    request.tools = vec![strict, loose, tool("get_weather")];
+    let events = collect(&provider, request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert_eq!(
+        body["text"],
+        json!({"format": {
+            "type": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "strict": true
+        }})
+    );
+    assert_eq!(body["tools"][0]["strict"], json!(true));
+    assert_eq!(body["tools"][1]["strict"], json!(false));
+    assert!(body["tools"][2].get("strict").is_none());
+}
+
+#[tokio::test]
+async fn text_is_omitted_without_output_format() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let events = collect(&provider(&server), request(vec![user_text("hello")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = serde_json::from_str(&server.requests()[0].body).expect("request json");
+    assert!(body.get("text").is_none());
 }
 
 #[tokio::test]

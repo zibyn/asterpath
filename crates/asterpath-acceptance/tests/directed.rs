@@ -67,6 +67,7 @@ fn descriptor(name: &str, replay: ReplaySafety, provenance: Provenance) -> ToolD
         provenance,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

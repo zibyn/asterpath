@@ -44,11 +44,15 @@ pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Opt
 }
 
 fn tool_definition(tool: &ToolDescriptor) -> Value {
-    json!({
+    let mut definition = json!({
         "name": tool.name.as_str(),
         "description": tool.description,
         "input_schema": tool.schema,
-    })
+    });
+    if let Some(strict) = tool.strict {
+        definition["strict"] = json!(strict);
+    }
+    definition
 }
 
 /// One rendered JSON fragment: ordinary values are serialized compactly,
@@ -271,6 +275,13 @@ pub(crate) fn render(
             }
         } else {
             render_reasoning(&mut fields, reasoning, rules);
+        }
+    }
+    if let Some(format) = &request.output_format {
+        let format = json!({"type": "json_schema", "schema": format.schema});
+        match fields.iter_mut().find(|(name, _)| *name == "output_config") {
+            Some((_, Frag::Json(config))) => config["format"] = format,
+            _ => fields.push(("output_config", Frag::Json(json!({"format": format})))),
         }
     }
     if !request.stop_sequences.is_empty() {

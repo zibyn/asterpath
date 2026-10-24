@@ -24,6 +24,12 @@
 //! unrecognized ids (third-party endpoints such as DeepSeek reach
 //! [`UNRECOGNIZED`]): only listed models render inline.
 //!
+//! `structured_output`: the `supportedModels` list of build-with-claude/
+//! structured-outputs (checked 2026-10-24; GA, no beta header): every table
+//! row from Sonnet 4.5 / Haiku 4.5 / Opus 4.5 on. Opus 4 / 4.1, Sonnet 4 and
+//! Claude 3 are not listed; unrecognized ids are not assumed to have it, as
+//! with `inline_changes`.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`claude-opus-5-5`) before its prefix
 //! (`claude-opus-5`). Ids no row matches get [`UNRECOGNIZED`], so a new model works
@@ -69,11 +75,14 @@ pub struct AnthropicModelProfile {
     /// instruction joins the top-level `system` and a tool change rewrites the
     /// top-level `tools`; thinking from before the change is dropped.
     pub inline_changes: bool,
+    /// Accepts `output_config.format` (structured outputs).
+    pub structured_output: bool,
 }
 
 impl AnthropicModelProfile {
     /// The rules unrecognized model ids get: the newest generation's, without
-    /// inline system messages or tools, which only listed models accept.
+    /// inline system messages or tools or structured outputs, which only listed
+    /// models accept.
     pub fn latest() -> Self {
         UNRECOGNIZED
     }
@@ -114,6 +123,12 @@ impl AnthropicModelProfile {
         self
     }
 
+    #[must_use]
+    pub fn with_structured_output(mut self, structured: bool) -> Self {
+        self.structured_output = structured;
+        self
+    }
+
     /// Accepts `thinking.display`; earlier models always summarize.
     pub(crate) fn thinking_display(&self) -> bool {
         self.thinking != Thinking::Extended
@@ -133,6 +148,7 @@ const fn rules(
         forced_tool_choice: forced,
         sampling,
         inline_changes: false,
+        structured_output: true,
     }
 }
 
@@ -141,14 +157,20 @@ const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile
 }
 
+const fn unstructured(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+    profile.structured_output = false;
+    profile
+}
+
 const LOW_TO_MAX: &[ReasoningEffort] = &[Low, Medium, High, XHigh, Max];
 const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
-const LATEST: AnthropicModelProfile = inline(UNRECOGNIZED);
-/// Unrecognized ids: [`LATEST`] without inline changes.
-const UNRECOGNIZED: AnthropicModelProfile = rules(Thinking::Adaptive, LOW_TO_MAX, false, false);
+const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
+/// Unrecognized ids: [`LATEST`] without inline changes or structured outputs.
+const UNRECOGNIZED: AnthropicModelProfile =
+    unstructured(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
 /// Opus 5 and Haiku 5.5: thinking is on by default and accepts `disabled`.
 const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     thinking: Thinking::Adaptive,
@@ -157,6 +179,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     forced_tool_choice: true,
     sampling: false,
     inline_changes: true,
+    structured_output: true,
 };
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
@@ -175,6 +198,8 @@ const BOTH: AnthropicModelProfile =
 const EXTENDED: AnthropicModelProfile = rules(Thinking::Extended, &[Off], true, true);
 const EXTENDED_EFFORT: AnthropicModelProfile =
     rules(Thinking::Extended, &[Off, Low, Medium, High], true, true);
+/// Opus 4 / 4.1, Sonnet 4 and Claude 3: no structured outputs.
+const LEGACY: AnthropicModelProfile = unstructured(EXTENDED);
 
 static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-opus-5-5", LATEST),
@@ -194,9 +219,9 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
     ("claude-opus-4-5", EXTENDED_EFFORT),
     ("claude-sonnet-4-5", EXTENDED),
     ("claude-haiku-4-5", EXTENDED),
-    ("claude-opus-4", EXTENDED),
-    ("claude-sonnet-4", EXTENDED),
-    ("claude-3", EXTENDED),
+    ("claude-opus-4", LEGACY),
+    ("claude-sonnet-4", LEGACY),
+    ("claude-3", LEGACY),
 ];
 
 static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;
@@ -233,8 +258,8 @@ mod tests {
         assert_eq!(*builtin("claude-opus-5"), ADAPTIVE);
         assert_eq!(*builtin("claude-opus-4-6"), BOTH);
         assert_eq!(*builtin("claude-opus-4-5-20251101"), EXTENDED_EFFORT);
-        assert_eq!(*builtin("claude-opus-4-1-20250805"), EXTENDED);
-        assert_eq!(*builtin("claude-sonnet-4-20250514"), EXTENDED);
+        assert_eq!(*builtin("claude-opus-4-1-20250805"), LEGACY);
+        assert_eq!(*builtin("claude-sonnet-4-20250514"), LEGACY);
         assert_eq!(*builtin("claude-next"), UNRECOGNIZED);
     }
 

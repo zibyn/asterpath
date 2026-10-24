@@ -175,6 +175,7 @@ impl DefaultCompactor {
             reasoning: None,
             stop_sequences: Vec::new(),
             provider_options: Default::default(),
+            output_format: None,
         };
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {

@@ -36,10 +36,10 @@ pub use compactor::{
     CompactPlan, CompactSummary, CompactionInput, CompactionJob, Compactor, UsageAnchor,
 };
 pub use config::{
-    CompactionConfig, ConfigPatch, ConfigSnapshot, ContextPolicy, ModelSpec, Parallelism,
-    Provenance, ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig, SamplingParams,
-    SideEffect, SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig,
-    effective_config,
+    CompactionConfig, ConfigPatch, ConfigSnapshot, ContextPolicy, ModelSpec, OutputFormat,
+    Parallelism, Provenance, ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig,
+    SamplingParams, SideEffect, SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor,
+    TransportKind, TurnConfig, effective_config,
 };
 pub use contracts::{
     ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, DedupKey, LogEntry, LogQuery,

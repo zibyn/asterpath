@@ -110,7 +110,7 @@ pub struct ReasoningBinding {
 
 /// Deterministic fingerprint of the model-visible tool set (protocol.md §9):
 /// SHA-256 hex of the name-sorted, key-sorted compact JSON array of
-/// `{name, description, schema}`. Persisted in [`ReasoningBinding::tools_hash`].
+/// `{name, description, schema}`, plus `strict` when set. Persisted in [`ReasoningBinding::tools_hash`].
 pub fn tools_hash(tools: &[crate::ToolDescriptor]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
@@ -120,11 +120,16 @@ pub fn tools_hash(tools: &[crate::ToolDescriptor]) -> String {
     let canonical: Vec<serde_json::Value> = tools
         .iter()
         .map(|tool| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "name": tool.name.as_str(),
                 "description": tool.description,
                 "schema": tool.schema,
-            })
+            });
+            // Added only when set, so fingerprints recorded before `strict` still match.
+            if let Some(strict) = tool.strict {
+                entry["strict"] = strict.into();
+            }
+            entry
         })
         .collect();
     let text = serde_json::to_string(&sort_keys(serde_json::Value::Array(canonical)))

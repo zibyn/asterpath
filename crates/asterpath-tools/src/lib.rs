@@ -258,6 +258,7 @@ impl RootTool {
                 Op::Fs(_) => None,
             },
             max_output_bytes: None,
+            strict: None,
         };
         Ok(Arc::new(Self {
             root,

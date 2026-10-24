@@ -130,6 +130,7 @@ impl Provider for OpenAiProvider {
             citations: false,
             // Only `function` tools are rendered today.
             builtin_tools: false,
+            structured_output: true,
             cache_control: false,
             image_input: true,
             parallel_tool_calls: true,

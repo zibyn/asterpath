@@ -205,6 +205,7 @@ impl McpServers {
                 provenance: Provenance::External { transport },
                 timeout: Some(config.timeouts.call_timeout()),
                 max_output_bytes: None,
+                strict: None,
             };
             self.tools.push(Arc::new(ExternalTool {
                 descriptor,

@@ -69,6 +69,7 @@ async fn p8_in_process_tool_names_must_not_contain_the_external_separator() {
         provenance: Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }));
     let error = Asterpath::builder()
         .tools(vec![tool])
@@ -91,6 +92,7 @@ async fn p2_external_tool_names_are_validated_at_the_facade() {
         provenance,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     };
     let external = Provenance::External {
         transport: TransportKind::Stdio,

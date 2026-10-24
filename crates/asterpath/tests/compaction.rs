@@ -90,6 +90,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
         provenance: asterpath::protocol::Provenance::InProcess,
         timeout: None,
         max_output_bytes: None,
+        strict: None,
     }
 }
 

@@ -978,6 +978,7 @@ mod tests {
                 provenance: Provenance::InProcess,
                 timeout: None,
                 max_output_bytes: None,
+                strict: None,
             },
             calls,
         })

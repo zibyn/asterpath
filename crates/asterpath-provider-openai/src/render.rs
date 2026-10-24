@@ -32,14 +32,26 @@ pub(crate) fn render(
         .tools
         .iter()
         .map(|tool| {
-            json!({
+            let mut function = json!({
                 "type": "function",
                 "name": tool.name.as_str(),
                 "description": tool.description,
                 "parameters": tool.schema,
-            })
+            });
+            if let Some(strict) = tool.strict {
+                function["strict"] = json!(strict);
+            }
+            function
         })
         .collect();
+    let text = request.output_format.as_ref().map(|format| {
+        json!({"format": {
+            "type": "json_schema",
+            "name": format.name,
+            "schema": format.schema,
+            "strict": true,
+        }})
+    });
 
     #[derive(serde::Serialize)]
     struct Body<'a> {
@@ -59,6 +71,8 @@ pub(crate) fn render(
         top_p: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<Value>,
         store: bool,
         stream: bool,
         include: &'static [&'static str],
@@ -76,6 +90,7 @@ pub(crate) fn render(
         temperature: sampling.and_then(|params| params.temperature),
         top_p: sampling.and_then(|params| params.top_p),
         reasoning: request.reasoning.as_ref().map(reasoning),
+        text,
         store: false,
         stream: true,
         include: &["reasoning.encrypted_content"],
