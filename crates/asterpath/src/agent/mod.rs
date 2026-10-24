@@ -29,8 +29,7 @@ use asterpath_protocol::{
     ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorInfo, ProviderErrorKind,
     ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx, StopReason,
     StorageError, StreamEvent, ToolConfig, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
-    UsageAnchor, UsageError, UsageFilter, UsageLookup, UsageScope, decode_entry, dedup,
-    effective_config,
+    UsageAnchor, UsageError, UsageLookup, decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
@@ -41,7 +40,7 @@ use futures_core::Stream;
 use crate::scan::scan_decoded;
 use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
-use crate::views::usage::UsageService;
+use crate::views::usage;
 use crate::waits::Waits;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -1052,31 +1051,20 @@ impl Agent {
         Ok(())
     }
 
-    /// Model calls plus compactions of one turn, as `UsageScope::Turn` sums them.
+    /// Model calls plus compactions of one turn, folded from its own records.
     async fn turn_usage(&self, session: SessionId, turn: TurnId) -> Result<Usage, AgentError> {
-        let report = UsageService::new(Arc::clone(&self.log))
-            .totals(UsageFilter {
-                scope: UsageScope::Turn { session, turn },
-                bucket: None,
-                model: None,
-                since: None,
-                until: None,
-                limit: None,
+        let entries = scan_all(&*self.log, session).await?;
+        let start = entries
+            .iter()
+            .rposition(|entry| {
+                matches!(decode_entry(entry), Ok(SessionEvent::TurnStarted { turn_id }) if turn_id == turn)
             })
-            .await
-            .map_err(|error| match error {
-                UsageError::NotFound { session } => AgentError::NotFound { session },
-                UsageError::Corrupt { session, detail } => AgentError::Corrupt { session, detail },
-                other => AgentError::Storage(StorageError::Backend(other.to_string())),
-            })?;
-        let (calls, compaction) = (report.own.model_calls, report.own.compaction);
-        let mut usage = calls;
-        usage.input.uncached += compaction.input.uncached;
-        usage.input.cache_read += compaction.input.cache_read;
-        usage.input.cache_write += compaction.input.cache_write;
-        usage.output.total += compaction.output.total;
-        usage.output.reasoning += compaction.output.reasoning;
-        Ok(usage)
+            .unwrap_or(0);
+        usage::turn_usage(session, turn, &entries[start..]).map_err(|error| match error {
+            UsageError::NotFound { session } => AgentError::NotFound { session },
+            UsageError::Corrupt { session, detail } => AgentError::Corrupt { session, detail },
+            other => AgentError::Storage(StorageError::Backend(other.to_string())),
+        })
     }
 
     async fn seq_of(&self, session: SessionId, log_id: LogId) -> Result<u64, AgentError> {
