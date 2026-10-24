@@ -12,7 +12,7 @@
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
 - `protocol` 无 feature；feature 只出现在 facade、CLI 与后端 crate。
 - 没有后台 driver：宿主显式调用 `SessionHandle::drive()`；同一 session 单飞；丢弃流不等于取消。
-- 参考 CLI 六命令，退出码 `0/1/2`；审批在 TTY 上默认 `ask`，非 TTY 默认 `deny`。
+- 参考 CLI 对齐 Codex / Claude Code 共有核心子集：交互、`exec`、`doctor`、`debug`；专用 flag 有准入规则，其余配置走 `-c key=value`；退出码 `0/1/2`（§4）。
 - 三段验收由 `asterpath-acceptance` 的 `testdrive` 二进制 + 真 `SIGKILL` 驱动；#19 只负责五个注入点工具链。
 - v1 的 provider/model 在 session 创建时快照，**不支持 turn 内切换**；验收 (b) 验证的是 adapter 可替换性与规范化历史等价。
 
@@ -287,37 +287,90 @@ pub enum AsterError {
 
 ## 4. 参考 CLI
 
-二进制名 `asterpath`，包名 `asterpath-cli`。
+二进制名 `asterpath`，包名 `asterpath-cli`。命令面对齐 Codex CLI 与 Claude Code 的**共有核心子集**（对比见 [cli-codex-vs-claude-code.md](../research/cli-codex-vs-claude-code.md)）：命令骨架与安全模型取 Codex，无头输出协议与续会话开关取 Claude Code。全屏 TUI、后台会话、守护进程、云端与 IDE 集成不在范围内。
+
+**flag 准入规则**：只有两者共有核心子集里存在对应物的选项才做专用 flag；其余框架参数一律走配置文件或 `-c key=value`。满足规则是必要条件，不是充分条件。新增 flag 先过这条规则。
+
+### 4.1 命令
 
 | 命令 | 行为边界 |
 | --- | --- |
-| `asterpath run [OPTIONS] <PROMPT>` | 创建新 session，`submit_input` 后 `drive()` 到 `TurnCommitted`；stdout 输出最终 assistant 文本，stderr 输出 session id 与诊断 |
-| `asterpath resume [OPTIONS] <SESSION>` | `open_session` 后 `drive()`；有 open turn 或待处理输入则继续，否则输出 `idle` |
-| `asterpath inspect [OPTIONS] <SESSION>` | 打印投影摘要与未闭合意图；`--json` 输出完整投影 |
-| `asterpath trace [OPTIONS] <SESSION>` | 打印 span 树（`Asterpath::trace`）；`--json` |
-| `asterpath usage [OPTIONS] <SESSION>` | 分列 `own` / `descendants`；`--json` |
-| `asterpath config check [OPTIONS]` | 解析与校验配置，不打开数据库、不初始化引擎；加载 `[mcp_servers]` 并逐个打印状态后关闭（`mcp: <id> loaded: <tools>` / `mcp: <id> failed at <stage>: <message>`）；成功退出 0，配置错误或 `required` 服务失败退出 2 |
+| `asterpath [OPTIONS] [PROMPT]` | 交互会话（按行读写的 REPL）；给了 `PROMPT` 则作为第一条输入 |
+| `asterpath exec [OPTIONS] [PROMPT]` | 无头运行一个回合；没有 `PROMPT` 或为 `-` 时读 stdin；同时给了 `PROMPT` 且 stdin 是管道时，stdin 作为 `<stdin>` 块追加 |
+| `asterpath doctor [OPTIONS]` | 解析与校验配置，不打开数据库、不初始化引擎；加载 `[mcp_servers]` 并逐个打印状态后关闭（`mcp: <id> loaded: <tools>` / `mcp: <id> failed at <stage>: <message>`）；扫描技能并打印诊断；成功退出 0，配置错误或 `required` 服务失败退出 2 |
+| `asterpath debug prompt-input <SESSION>` | 打印投影（模型可见输入）与未闭合意图，JSON |
+| `asterpath debug trace <SESSION>` | 打印 span 树（`Asterpath::trace`），JSON |
 
-通用选项：`--config <path>`、`--db <path>`、`--provider <id>`、`--model <id>`、`--approval <ask|allow|deny>`、`--json`。
+`debug` 组不在顶层 `--help` 中展开。
 
-- `run` 不接受 `--session`；要续跑已有 session 用 `resume`。
+### 4.2 选项
+
+| 选项 | 适用 | 含义 |
+| --- | --- | --- |
+| `--config <path>` | 全部 | 配置文件，见 §4.5 |
+| `-c, --config-override <key=value>` | 全部 | 覆盖配置文件任意键；点分路径，值按 TOML 解析，解析失败按字符串；可重复 |
+| `-m, --model <id>` | 交互、`exec` | 新会话的模型 id（provider 取 `[model] provider`）；续会话时等价于一次 `update_config` 换模型 |
+| `-a, --ask-for-approval <untrusted\|never>` | 交互、`exec` | 审批策略，见 §4.4 |
+| `-s, --sandbox <read-only\|workspace-write\|full-access>` | 交互、`exec` | 覆盖 `[sandbox] mode` |
+| `-C, --cd <dir>` | 交互、`exec` | 工作根目录（工具根、沙箱可写根、`AGENTS.md` 位置、会话 `cwd` 元数据），默认进程 cwd |
+| `--continue` | 交互、`exec` | 续当前工作根目录下最后活动的会话 |
+| `-r, --resume [id\|name]` | 交互、`exec` | 续指定会话；不给值时列出当前目录最近 20 个会话并读入编号（非 TTY 下是用法错误） |
+| `--fork-session` | 与 `--continue` / `-r` 合用 | 不续原会话，而是以它为源做会话分叉 |
+| `-n, --name <name>` | 新会话 | 写入宿主元数据 `name`；续会话时给出是用法错误 |
+| `-i, --image <file>` | 交互、`exec` | 给首条输入附图（文件输入，ADR-0031） |
+| `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
+| `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
+| `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031） |
+
+- Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
+- 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。
+- 已移除：`run`、`resume`、`inspect`、`trace`、`usage`、`config check` 子命令，`--db`、`--provider`、`--approval`、`--json`、`--tools`、`--no-tools`、`--no-skills`。对应配置走 `-c storage.path=…`、`-c model.provider=…`、`-c tools.enabled=[…]`、`-c skills.enabled=false`。
+
+**续会话的驱动语义**：`--continue` / `-r` 打开会话后，先检查会话事实；有未闭合回合或待处理输入则先 `drive()` 到结束（崩溃恢复），再处理新输入。`exec -r <id>` 不带 `PROMPT` 只做恢复，没有可恢复的内容时输出 `idle`、退出 0；交互模式恢复后进入提示符。
+
+**续会话的工作根目录**：取会话元数据里的 `cwd`，显式 `-C` 时取 `-C`；目录不存在是配置错误（退出 2）。`--continue` 与选择器按当前工作根目录（或 `-C`）匹配元数据 `cwd`。名字重复时 `-r <name>` 取最后活动的一个。
+
+### 4.3 无头输出与输入
+
+- `--output-format text`（默认）：stdout 只有最终助手文本；stderr 输出 session id 与诊断。
+- `--output-format json`：stdout 一个对象 `{ "session": <hex>, "result": <最终助手文本>, "reason": <TurnEndReason>, "usage": <本回合用量> }`；字段只增不改。
+- `--output-format stream-json`：stdout 每行一个 `AgentEvent` 的 serde 序列化（`tag = "type"`），最后一行是上面的结果对象。
+- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
-- 审批端：`drive()` 流里的 `ApprovalRequested` 由 CLI 处理。策略取 `--approval` > `[approval] default` > `ask`。TTY 上 `ask` 提示工具名、参数、`replay` / `side_effect` / `provenance`；非 TTY 上来自配置或缺省的 `ask` 一律降级为 `deny`（无法提示），而显式 `--approval ask` 是用法错误（退出码 2）。CLI 仅在会提示时（TTY + `ask`）注册端点；没注册时框架的 `Ask` 立即按 `Deny` 处理（[tools.md](tools.md) §4）。
+
+### 4.4 审批
+
+- `-a untrusted`（默认）：进程内只读工具放行；`SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）与外部工具（MCP，`<id>__<tool>`）执行前问人。`-a never`：从不问人，靠沙箱兜底。优先级 `-a` > `[approval] default` > `untrusted`。
+- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`；`exec` 只有 `--input-format stream-json` 时经流交给宿主。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
+- "由策略决定"：问不问人由宿主 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
-- MCP（ADR-0027）：`run` / `resume` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。外部工具（`<id>__<tool>`）默认 `Ask`，走上面的审批路径。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
-- 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：`run` 默认以工作目录为根、按 `[sandbox]` 策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 或 `run --tools a,b` 选子集（flag 优先），`run --no-tools` 全关，未知工具名是配置错误（退出码 2）。`resume` 总是注册全部六个，模型可见的子集由 `SessionCreated` 快照决定。`ask` 模式下 `SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）在端点打开时 `Ask`、关闭时以 `NO_APPROVAL_ENDPOINT` 拒绝；其余按框架默认策略。
-- 压缩：`run` / `resume` 总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
 
-### 4.1 配置
+### 4.5 交互模式
 
-`asterpath.toml`，默认从 `--config` 或 `ASTERPATH_CONFIG` 取；不存在时使用默认值。优先级：CLI flag > 环境变量 > 文件。
+- 斜杠命令：`/help`、`/new`（新建会话）、`/model <id>`（`update_config` 换模型，同 provider）、`/compact`（`compact_now`）、`/status`（会话状态与 `usage`）、`/exit`。不做 `/resume`（用启动时的 `-r`）、`/init`、`/diff`、`/mcp`。
+- 回合进行中第一次 Ctrl-C 调用 `cancel()`；空闲时 Ctrl-C 或 Ctrl-D 退出。
+- 显示：`ModelDelta` 文本增量直接输出；`ToolStarted` 显示工具名与参数，`ToolFinished` 显示状态与截断后的结果。显示前的脱敏是 CLI 的策略。
+
+### 4.6 会话装配
+
+- 新会话：宿主元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
+- MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
+- 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：新会话以工作根目录为根、按沙箱策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 选子集，未知工具名是配置错误（退出 2）。续会话总是注册全部六个，模型可见的子集由日志里的生效配置决定。
+- 技能：`[skills] enabled` 只影响新会话（[skills.md](skills.md)）。
+- 压缩：总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
+
+### 4.7 配置
+
+默认读 `$XDG_CONFIG_HOME/asterpath/config.toml`（`--config` 或 `ASTERPATH_CONFIG` 可换文件）；不存在时使用默认值。只有用户级一层，没有项目级配置。优先级：专用 flag > `-c key=value` > 文件。
 
 ```toml
 [model]
+provider = "anthropic"        # 新会话的 provider id；-c model.provider=… 覆盖
+id = "claude-fable-5-1"       # 新会话的模型 id；-m 覆盖
 context_window = 200000       # 映射到 ModelSpec.context_window；省略 = 不自动压缩
 
 [sandbox]
-mode = "workspace-write"      # read-only | workspace-write（默认，可写根 = 工作目录）| full-access
+mode = "workspace-write"      # read-only | workspace-write（默认，可写根 = 工作根目录）| full-access
 
 [mcp_servers.docs]            # 表名即 server id（[a-z0-9-]{1,32}），工具名为 docs__<tool>
 command = "docs-mcp"          # stdio：command / args / env / cwd
@@ -379,12 +432,12 @@ model = "claude-fable-5-1"
 # max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
-default = "ask"               # ask | allow | deny；TTY 默认，非 TTY 降级为 deny
+default = "untrusted"         # untrusted | never
 ```
 
 - `max_steps_per_turn = 0` 是配置错误（退出码 2）；不设上限靠省略该字段。
 - API key **只从环境变量读**：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`。配置文件出现 `api_key` / `secret` / `token` 字段直接报错（退出码 2）。
-- 环境变量覆盖：`ASTERPATH_CONFIG`、`ASTERPATH_DB`、`ASTERPATH_PROVIDER`、`ASTERPATH_MODEL`。
+- 环境变量只有 `ASTERPATH_CONFIG` 与各 provider 的 API key 变量；其余覆盖用 `-c`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。
 - 未知字段（任一层级）是配置错误（退出码 2）。
 - 沙箱约束 stdio MCP 服务进程（HTTP 不沙箱）与内置 `bash` 工具启动的进程；没有后端时 `bash` 同样 fail closed（返回 `Denied`，不启动进程）。Linux 上受限模式用 `LinuxSandbox`（bwrap）；找不到 bwrap 或在其他平台上，受限模式没有后端，stdio 服务按 fail closed 在 `Sandbox` 阶段加载失败，原因见状态行；只有显式 `full-access` 才不经沙箱启动。

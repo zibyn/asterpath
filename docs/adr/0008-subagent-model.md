@@ -1,6 +1,6 @@
 # 子智能体是工具调用拥有的独立子会话
 
-**Status**: accepted (2026-10-22)；2026-10-24 整理：并入 ADR-0014
+**Status**: accepted (2026-10-22)；2026-10-24 整理：并入 ADR-0014；部分扩展 by [ADR-0033](0033-session-fork-reuses-context-fork-snapshot.md)（fork 快照也用于宿主发起的会话分叉）
 **来源**: [#8](https://github.com/zibyn/asterpath/issues/8)、[#17](https://github.com/zibyn/asterpath/issues/17)、[#29](https://github.com/zibyn/asterpath/issues/29)
 **规范**: [subagents.md](../design/subagents.md)
 

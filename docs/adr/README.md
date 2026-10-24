@@ -42,5 +42,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0029](0029-provider-instance-is-a-vendor-endpoint.md) | provider 实例 = 供应商端点，模型规则可由宿主注入 |
 | [0030](0030-session-config-is-a-fold-of-log-records.md) | 会话配置是日志记录的折叠，变更是历史中的一个位置 |
 | [0031](0031-server-tools-structured-output-and-file-input.md) | 服务端工具按 provider 声明，文件引用绑定 provider，结构化输出是请求约束 |
+| [0032](0032-sessions-carry-opaque-host-metadata.md) | 会话携带创建时写入、不可变、框架不解释的宿主元数据 |
+| [0033](0033-session-fork-reuses-context-fork-snapshot.md) | 会话分叉是宿主创建的独立会话，复用上下文分叉的快照 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩。

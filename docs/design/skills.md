@@ -65,7 +65,7 @@ description: 一句话说明这个技能何时有用。  # 必填
 - `description` 必填、非空（trim 后）、≤1024 字符。它是模型选择技能的唯一路由文本。
 - `name` 可选；缺省等于目录名。提供时必须等于目录名，否则该技能无效。名称必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`，长度 1–64。
 - `name` 与 `description` 必须是 YAML 字符串；其他标量类型（数字、布尔、null）按无效处理。
-- 未知 frontmatter 字段忽略。`allowed-tools`、`disallowed-tools`、`model`、`hooks`、`context`、`agent` 被识别但不执行，`config check` 会逐条提示“Asterpath 不执行该字段”。
+- 未知 frontmatter 字段忽略。`allowed-tools`、`disallowed-tools`、`model`、`hooks`、`context`、`agent` 被识别但不执行，`doctor` 会逐条提示“Asterpath 不执行该字段”。
 - frontmatter 必须以文件开头的 `---` 开始；缺失 frontmatter、缺失 `description`、YAML 解析失败都是无效技能。
 - 整个 `SKILL.md` ≤64 KiB（UTF-8 字节）；frontmatter 在解析前单独限制为 ≤16 KiB。超限的技能无效，避免交给 YAML 解析器一个无界文档。
 - 正文原样返回给模型；索引里的 `description` 把换行和控制字符压平成一行。
@@ -84,10 +84,10 @@ description: 一句话说明这个技能何时有用。  # 必填
 
 - **只扫一层**：技能是 `<root>/<name>/SKILL.md`；不递归 `**/SKILL.md`。根下的散落 `.md` 文件不视为技能。
 - **跟随符号链接**；同一规范路径被多个根发现时按最高优先级去重。
-- **跨层同名**：高优先级胜出，低优先级被遮蔽；`config check` 报告被遮蔽的技能。
+- **跨层同名**：高优先级胜出，低优先级被遮蔽；`doctor` 报告被遮蔽的技能。
 - **同层同名**：两个都跳过并诊断，不做“先到先得”。
 - **每个新 session 创建时扫描一次**。没有热加载：新技能对下一个新 session 生效；已有 session 的索引不变，但 `load_skill` 读当前磁盘。
-- **开关**：`[skills] enabled = false` 或 `run --no-skills` 只影响新 session（不扫描、不渲染索引、不注册工具）。`resume` 总是注册 `load_skill`，索引来自 `SessionCreated.config.system`（见 §5）。
+- **开关**：`[skills] enabled = false`（或 `-c skills.enabled=false`）只影响新 session（不扫描、不渲染索引、不注册工具）。续会话总是注册 `load_skill`，索引来自 `SessionCreated.config.system`（见 §5）。
 - **`.claude/skills` 不自动扫描**。需要时写进 `[skills] paths`；格式兼容不等于替别的产品做发现。
 - **项目信任**：M6 不提供信任提示；项目技能默认加载，宿主用 `enabled` / `--no-skills` 退出。需要信任门的宿主应在组装 `system` 之前自行拦截。
 
@@ -114,7 +114,7 @@ Call `load_skill` with a skill name when the task matches its description.
 
 ### 5.2 恢复与子会话
 
-- **恢复**：`resume` 不重新扫描索引，使用日志里的 `ConfigSnapshot.system`；`load_skill` 仍按当前根解析。技能文件消失 → 工具返回 `NotFound`；文件变化 → 返回新内容并作为新的工具结果入日志。已加载过的正文以日志为准。
+- **恢复**：续会话不重新扫描索引，使用日志里的 `ConfigSnapshot.system`；`load_skill` 仍按当前根解析。技能文件消失 → 工具返回 `NotFound`；文件变化 → 返回新内容并作为新的工具结果入日志。已加载过的正文以日志为准。
 - **子会话**：fresh 子继承父的 system 与工具集，因此索引与 `load_skill` 一起继承。模型通过 spawn 参数收窄工具集时可能留下索引却没有 `load_skill`；这是宿主选择收窄的后果，M6 不做特殊处理。
 - **compaction**：索引在 system，不参与压缩；技能正文是普通工具结果，可能被摘要替换，模型需要时可以再次 `load_skill`。
 
@@ -151,7 +151,7 @@ pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
 - **技能是不可信的仓库内容**。加载技能等于让模型读一段仓库里的文本；提示注入是固有风险。缓解手段是：技能没有任何权限，只能影响模型看到什么。
 - **宿主仍是唯一权威**：工具集、审批、沙箱、system 只能由宿主改变。技能不能提权、不能绕过审批、不能放宽沙箱。
-- **`allowed-tools` 等字段不执行**。不要把它们当作限制或预批准；Claude Code 的同类字段是“预批准”而非限制，已有越权问题（anthropics/claude-code#89195）。`config check` 提示这些字段被忽略。
+- **`allowed-tools` 等字段不执行**。不要把它们当作限制或预批准；Claude Code 的同类字段是“预批准”而非限制，已有越权问题（anthropics/claude-code#89195）。`doctor` 提示这些字段被忽略。
 - **资源与脚本不执行**：M6 不读 `references/`、不跑 `scripts/`。技能可以提到它们，但模型没有对应工具（除非宿主另外提供）。
 - **路径**：名称正则排除了 `/` 与 `.`，只读 `<root>/<name>/SKILL.md`；根在发现时规范化。不存在任意路径读取。
 - **YAML 解析是信任边界**：frontmatter 先限 16 KiB 再交给 `saphyr`；只读取顶层 `name` / `description` 标量；不执行标签、锚点或自定义构造。解析失败即跳过该技能。
@@ -213,10 +213,10 @@ enabled = true      # 缺省 true
 paths = []          # 显式根；相对路径按进程 cwd 解析
 ```
 
-- `run`：若启用，扫描 → 渲染索引 → 放进 `SessionSpec.system` → 注册 `LoadSkillTool`；无效技能警告到 stderr。
+- 新会话：若启用，扫描 → 渲染索引 → 放进 `SessionSpec.system` → 注册 `LoadSkillTool`；无效技能警告到 stderr。
 - `run --no-skills`：覆盖 `enabled`，本次新 session 不扫描、不注册工具。
-- `resume`：不重新扫描索引；总是注册 `LoadSkillTool`（索引来自快照）。
-- `config check`：扫描并打印诊断，包括被忽略的权限字段和被遮蔽/超预算的技能。
+- 续会话（`--continue` / `-r`）：不重新扫描索引；总是注册 `LoadSkillTool`（索引来自快照）。
+- `doctor`：扫描并打印诊断，包括被忽略的权限字段和被遮蔽/超预算的技能。
 
 ## 9. 失败与诊断
 
@@ -234,9 +234,9 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 | `DuplicateInLayer` | 同一根内同名 | 两个都跳过 |
 | `Shadowed` | 跨层同名 | 低优先级被遮蔽，报告 |
 | `IndexBudgetExceeded` | 索引超过 8,000 字符 | 省略低优先级条目，报告 |
-| `AuthorityFieldIgnored` | 出现 `allowed-tools` 等字段 | 正常加载，`config check` 提示不执行 |
+| `AuthorityFieldIgnored` | 出现 `allowed-tools` 等字段 | 正常加载，`doctor` 提示不执行 |
 
-- 诊断出口：`run` 的 stderr 与 `config check`。不新增事件、trace 类型或 `skill list` 子命令。
+- 诊断出口：新会话的 stderr 与 `doctor`。不新增事件、trace 类型或 `skill list` 子命令。
 - 一个坏技能不影响其他技能，也不让 session 失败。
 - 加载期错误是普通工具结果：`InvalidArgs` / `NotFound` / `Internal`。
 

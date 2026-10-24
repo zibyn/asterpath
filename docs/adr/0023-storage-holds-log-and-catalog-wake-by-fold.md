@@ -1,6 +1,6 @@
 # 存储契约只有日志、会话目录与整会话退役；单写者；唤醒由引擎折叠发现
 
-**Status**: accepted (2026-10-23)；2026-10-24 整理：并入 ADR-0005、ADR-0016、ADR-0028 的存储原则
+**Status**: accepted (2026-10-23)；2026-10-24 整理：并入 ADR-0005、ADR-0016、ADR-0028 的存储原则；部分扩展 by [ADR-0032](0032-sessions-carry-opaque-host-metadata.md)（目录项携带宿主元数据）
 **来源**: [#5](https://github.com/zibyn/asterpath/issues/5)、[#18](https://github.com/zibyn/asterpath/issues/18)、[#32](https://github.com/zibyn/asterpath/issues/32)、[#73](https://github.com/zibyn/asterpath/issues/73)、[#84](https://github.com/zibyn/asterpath/issues/84)
 **规范**: [storage.md](../design/storage.md)、[retention.md](../design/retention.md)
 
