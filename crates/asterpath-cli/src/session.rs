@@ -6,9 +6,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
-use asterpath_host::config::{self, ApprovalMode};
+use asterpath_host::config;
 use asterpath_host::{
-    NAME, SandboxMode, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
+    NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
     metadata, new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
@@ -17,13 +17,47 @@ use asterpath_protocol::{
     StorageError, decode_entry,
 };
 use asterpath_skills::SkillDiagnosticKind;
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::drive::scan;
 use crate::{CliError, CliResult, GlobalArgs, aster_error, not_found};
 
 /// How many sessions the `-r` picker lists.
 const PICKER_SIZE: usize = 20;
+
+/// `-a`: the host kit's `config::ApprovalMode` (ADR-0040 keeps clap out of it).
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ApprovalMode {
+    Untrusted,
+    Never,
+}
+
+impl From<ApprovalMode> for config::ApprovalMode {
+    fn from(mode: ApprovalMode) -> Self {
+        match mode {
+            ApprovalMode::Untrusted => Self::Untrusted,
+            ApprovalMode::Never => Self::Never,
+        }
+    }
+}
+
+/// `-s`: the host kit's `SandboxMode`.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl From<SandboxMode> for asterpath_host::SandboxMode {
+    fn from(mode: SandboxMode) -> Self {
+        match mode {
+            SandboxMode::ReadOnly => Self::ReadOnly,
+            SandboxMode::WorkspaceWrite => Self::WorkspaceWrite,
+            SandboxMode::FullAccess => Self::FullAccess,
+        }
+    }
+}
 
 /// Options of the session-running commands (interactive and `exec`).
 #[derive(Args)]
@@ -109,10 +143,10 @@ pub async fn open(
     args.check()?;
     let mut settings = global.settings()?;
     if let Some(mode) = args.approval {
-        settings.approval = mode;
+        settings.approval = mode.into();
     }
     if let Some(mode) = args.sandbox {
-        settings.set_sandbox(mode);
+        settings.set_sandbox(mode.into());
     }
     let explicit_root = args
         .cd

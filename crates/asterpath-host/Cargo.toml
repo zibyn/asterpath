@@ -8,8 +8,6 @@ publish.workspace = true
 default = []
 # `config.toml` and environment parsing (CLI and desktop).
 config = ["dep:serde", "dep:toml"]
-# `ValueEnum` on the mode enums, for hosts with a clap command line.
-clap = ["dep:clap"]
 anthropic = ["asterpath/anthropic"]
 openai = ["asterpath/openai"]
 
@@ -19,7 +17,6 @@ asterpath-mcp = { path = "../asterpath-mcp" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-skills = { path = "../asterpath-skills" }
 asterpath-tools = { path = "../asterpath-tools" }
-clap = { version = "4", features = ["derive"], optional = true }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"

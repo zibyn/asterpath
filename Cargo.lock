@@ -207,7 +207,6 @@ dependencies = [
  "asterpath-skills",
  "asterpath-testing",
  "asterpath-tools",
- "clap",
  "futures-util",
  "serde",
  "serde_json",

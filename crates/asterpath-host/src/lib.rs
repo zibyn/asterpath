@@ -33,7 +33,6 @@ pub const NAME: &str = "name";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "config", derive(serde::Deserialize))]
 #[cfg_attr(feature = "config", serde(rename_all = "kebab-case"))]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum SandboxMode {
     ReadOnly,
     #[default]

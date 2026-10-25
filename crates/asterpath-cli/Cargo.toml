@@ -16,7 +16,7 @@ sqlite = ["asterpath/sqlite"]
 
 [dependencies]
 asterpath = { path = "../asterpath", default-features = false }
-asterpath-host = { path = "../asterpath-host", features = ["config", "clap"] }
+asterpath-host = { path = "../asterpath-host", features = ["config"] }
 asterpath-mcp = { path = "../asterpath-mcp" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-skills = { path = "../asterpath-skills" }

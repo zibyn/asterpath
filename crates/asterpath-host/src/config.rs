@@ -30,7 +30,6 @@ use crate::{SandboxMode, WorkRoot, Workspace};
 
 /// `-a` and `[approval] default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
     /// Read-only in-process tools run; mutating and external tools ask.
