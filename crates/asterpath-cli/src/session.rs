@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
 use asterpath_host::config;
 use asterpath_host::{
-    NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
-    metadata, new_session_spec, work_root, workspace_tools,
+    NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp, metadata,
+    new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{

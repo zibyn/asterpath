@@ -80,17 +80,17 @@ pub struct CliError {
 }
 
 impl CliError {
-    pub fn config(message: impl Into<String>) -> Self {
+    pub fn config(message: impl std::fmt::Display) -> Self {
         Self {
             code: 2,
-            message: message.into(),
+            message: message.to_string(),
         }
     }
 
-    pub fn run(message: impl Into<String>) -> Self {
+    pub fn run(message: impl std::fmt::Display) -> Self {
         Self {
             code: 1,
-            message: message.into(),
+            message: message.to_string(),
         }
     }
 }

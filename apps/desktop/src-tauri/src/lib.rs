@@ -264,10 +264,10 @@ impl Desktop {
 
     /// The default `config.toml` (or `ASTERPATH_CONFIG`) and its database.
     pub async fn open(projects_file: PathBuf) -> Result<Self, String> {
-        let settings: Settings = config::load(None, &[])?;
-        config::validate(&settings)?;
-        let workspace = settings.workspace()?;
-        let template = config::session_spec(&settings)?;
+        let settings: Settings = config::load(None, &[]).map_err(text)?;
+        config::validate(&settings).map_err(text)?;
+        let workspace = settings.workspace().map_err(text)?;
+        let template = config::session_spec(&settings).map_err(text)?;
         let environment = WorkRoot {
             workspace: workspace.clone(),
             new: false,
@@ -301,14 +301,14 @@ impl Desktop {
 
     /// Remember `dir` (canonical) as a project.
     pub fn add_project(&self, dir: &Path) -> Result<Project, String> {
-        let root = work_root(dir)?.display().to_string();
+        let root = work_root(dir).map_err(text)?.display().to_string();
         let mut added = self.added()?;
         if !added.contains(&root) {
             added.push(root.clone());
             if let Some(parent) = self.projects_file.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                std::fs::create_dir_all(parent).map_err(text)?;
             }
-            let json = serde_json::to_string_pretty(&added).map_err(|error| error.to_string())?;
+            let json = serde_json::to_string_pretty(&added).map_err(text)?;
             std::fs::write(&self.projects_file, json).map_err(|error| {
                 format!("cannot write {}: {error}", self.projects_file.display())
             })?;
@@ -336,19 +336,16 @@ impl Desktop {
         root: &Path,
         name: Option<&str>,
     ) -> Result<SessionSummary, String> {
-        let root = work_root(root)?;
+        let root = work_root(root).map_err(text)?;
         let mut spec = self.template.clone();
         // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
-        new_session_spec(&self.workspace, &root, name, &mut spec)?;
+        new_session_spec(&self.workspace, &root, name, &mut spec).map_err(text)?;
         let fresh = WorkRoot {
             workspace: self.workspace.clone(),
             new: true,
             pinned: None,
         };
-        let environment = fresh
-            .resolve(&spec.metadata)
-            .await
-            .map_err(|error| error.to_string())?;
+        let environment = fresh.resolve(&spec.metadata).await.map_err(text)?;
         spec.tools = ToolSelection::Names(
             environment
                 .tools
@@ -405,13 +402,11 @@ impl Desktop {
 
     pub async fn session_info(&self, session: SessionId) -> Result<SessionInfo, String> {
         let store = self.asterpath.store();
-        let entries = scan_all(&*store, session)
-            .await
-            .map_err(|e| e.to_string())?;
+        let entries = scan_all(&*store, session).await.map_err(text)?;
         let records = entries
             .into_iter()
             .map(|entry| {
-                let event = decode_entry(&entry).map_err(|e| e.to_string())?;
+                let event = decode_entry(&entry).map_err(text)?;
                 Ok((entry, event))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -422,7 +417,7 @@ impl Desktop {
             .asterpath
             .usage(UsageScope::SessionSubtree(session))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(text)?;
         Ok(SessionInfo {
             model,
             tokens: usage.own.total() + usage.descendants.total(),
@@ -559,7 +554,7 @@ impl Desktop {
     async fn root(&self, session: SessionId) -> Result<SessionId, String> {
         root_of(&*self.asterpath.store(), session)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(text)
     }
 
     /// Writer access to `session`; refused while another process drives it.
@@ -648,6 +643,6 @@ fn lock<T>(map: &Mutex<T>) -> MutexGuard<'_, T> {
     map.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn text(error: AsterError) -> String {
+fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }

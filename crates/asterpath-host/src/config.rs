@@ -26,7 +26,7 @@ use asterpath_protocol::{
 use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
-use crate::{SandboxMode, WorkRoot, Workspace};
+use crate::{HostError, SandboxMode, WorkRoot, Workspace};
 
 /// `-a` and `[approval] default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -50,31 +50,34 @@ pub struct Settings {
 /// Load the configuration file (`--config`, else `ASTERPATH_CONFIG`, else
 /// `$XDG_CONFIG_HOME/asterpath/config.toml`; only that default may be missing) and merge
 /// each `-c key=value` over it.
-pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, String> {
+pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, HostError> {
     let explicit = config.or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from));
     // Only the default file may be missing; a named one that is not there is a typo.
     let named = explicit.is_some();
     let path = explicit.or_else(|| config_home().map(|home| home.join("asterpath/config.toml")));
     let mut table = match path {
         Some(path) if named || path.exists() => {
-            let contents = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            toml::from_str(&contents).map_err(|error| format!("invalid config: {error}"))?
+            let contents = std::fs::read_to_string(&path).map_err(|source| HostError::Io {
+                context: format!("cannot read {}", path.display()),
+                source,
+            })?;
+            toml::from_str(&contents)
+                .map_err(|error| HostError::Config(format!("invalid config: {error}")))?
         }
         _ => toml::Table::new(),
     };
     for raw in overrides {
-        merge(&mut table, parse_override(raw)?);
+        merge(&mut table, parse_override(raw).map_err(HostError::Config)?);
     }
     let value = toml::Value::Table(table);
     if let Some(field) = secret_field(&value) {
-        return Err(format!(
+        return Err(HostError::Config(format!(
             "config must not contain `{field}`; API keys are read from the environment"
-        ));
+        )));
     }
     let file: FileConfig = value
         .try_into()
-        .map_err(|error| format!("invalid config: {error}"))?;
+        .map_err(|error| HostError::Config(format!("invalid config: {error}")))?;
 
     let db = expand_tilde(file.storage.path.clone().unwrap_or_else(default_db));
     // Absolute now: the work root may change the process directory later.
@@ -123,7 +126,11 @@ pub fn config_home() -> Option<PathBuf> {
 }
 
 /// Parse and validate without opening any module.
-pub fn validate(settings: &Settings) -> Result<(), String> {
+pub fn validate(settings: &Settings) -> Result<(), HostError> {
+    check(settings).map_err(HostError::Config)
+}
+
+fn check(settings: &Settings) -> Result<(), String> {
     if settings.file.turn.max_steps_per_turn == Some(0) {
         return Err("max_steps_per_turn must be greater than zero".to_owned());
     }
@@ -154,12 +161,12 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
     }
     // Resolve the value-shaped sections now so type errors exit 2, not at run.
     settings.file.request_config()?;
-    settings.mcp_servers()?;
+    settings.mcp_servers().map_err(|error| error.to_string())?;
     Ok(())
 }
 
 /// The selected provider plus every provider a model alias targets.
-pub fn providers(settings: &Settings) -> Result<Vec<Arc<dyn Provider>>, String> {
+pub fn providers(settings: &Settings) -> Result<Vec<Arc<dyn Provider>>, HostError> {
     let selected = settings.provider()?;
     let mut ids = vec![selected.to_owned()];
     for model in settings.file.model_aliases.values() {
@@ -168,18 +175,16 @@ pub fn providers(settings: &Settings) -> Result<Vec<Arc<dyn Provider>>, String> 
         }
     }
     ids.iter()
-        .map(|id| build_provider(id, &settings.file))
+        .map(|id| build_provider(id, &settings.file).map_err(HostError::Config))
         .collect()
 }
 
-pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSpec, String> {
+pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSpec, HostError> {
     let provider = settings.provider()?.to_owned();
-    let model = settings
-        .file
-        .model
-        .id
-        .clone()
-        .ok_or_else(|| "a model is required ([model] id or -m)".to_owned())?;
+    let model =
+        settings.file.model.id.clone().ok_or_else(|| {
+            HostError::Config("a model is required ([model] id or -m)".to_owned())
+        })?;
     Ok(asterpath_protocol::SessionSpec {
         model: ModelSpec {
             provider: ProviderId::new(provider),
@@ -188,7 +193,7 @@ pub fn session_spec(settings: &Settings) -> Result<asterpath_protocol::SessionSp
         },
         system: Vec::new(),
         tools: asterpath_protocol::ToolSelection::All,
-        request: settings.file.request_config()?,
+        request: settings.file.request_config().map_err(HostError::Config)?,
         turn: turn_config(settings),
         compaction: compaction_config(settings),
         subagents: subagent_config(settings),
@@ -243,7 +248,7 @@ pub async fn assemble(
     approval: Arc<dyn ApprovalPolicy>,
 ) -> Result<Asterpath, AsterError> {
     let config_error = |message: String| AsterError::Config { message };
-    let providers = providers(settings).map_err(config_error)?;
+    let providers = providers(settings).map_err(|error| config_error(error.to_string()))?;
     // Sessions without a context window still report `NotConfigured`.
     let catalog =
         ProviderCatalog::new(providers.clone()).map_err(|error| config_error(error.to_string()))?;
@@ -817,9 +822,11 @@ impl Settings {
     }
 
     /// `[model] provider`.
-    pub fn provider(&self) -> Result<&str, String> {
+    pub fn provider(&self) -> Result<&str, HostError> {
         self.file.model.provider.as_deref().ok_or_else(|| {
-            "a provider is required ([model] provider or -c model.provider=…)".to_owned()
+            HostError::Config(
+                "a provider is required ([model] provider or -c model.provider=…)".to_owned(),
+            )
         })
     }
 
@@ -827,7 +834,7 @@ impl Settings {
     /// (absent `enabled` means enabled) with the user roots under
     /// `$XDG_CONFIG_HOME` and `$HOME`, the `[sandbox] env` variables this
     /// process has, and `[mcp_servers]`.
-    pub fn workspace(&self) -> Result<Workspace, String> {
+    pub fn workspace(&self) -> Result<Workspace, HostError> {
         let mut user_skill_roots = Vec::new();
         if let Some(home) = config_home() {
             user_skill_roots.push(SkillRoot {
@@ -859,7 +866,7 @@ impl Settings {
     }
 
     /// `[mcp_servers.<id>]` mapped to adapter configs, in id order.
-    pub fn mcp_servers(&self) -> Result<Vec<McpServerConfig>, String> {
+    pub fn mcp_servers(&self) -> Result<Vec<McpServerConfig>, HostError> {
         self.file
             .mcp_servers
             .iter()
@@ -876,14 +883,14 @@ impl Settings {
                         headers: server.headers.clone(),
                     },
                     _ => {
-                        return Err(format!(
+                        return Err(HostError::Config(format!(
                             "mcp_servers.{id}: set exactly one of `command` or `url`"
-                        ));
+                        )));
                     }
                 };
                 Ok(McpServerConfig {
                     id: ServerId::new(id.clone())
-                        .map_err(|error| format!("mcp_servers.{id}: {error}"))?,
+                        .map_err(|error| HostError::Config(format!("mcp_servers.{id}: {error}")))?,
                     transport,
                     required: server.required,
                     protocol_versions: server.protocol_versions.clone().unwrap_or_else(|| {

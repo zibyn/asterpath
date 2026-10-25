@@ -11,7 +11,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use asterpath_mcp::{McpServerConfig, McpServers, McpTransport};
+use asterpath::AsterError;
+use asterpath_mcp::{McpError, McpServerConfig, McpServers, McpTransport};
 use asterpath_protocol::{
     CatalogEntry, EnvironmentAdapter, EnvironmentError, Part, SandboxPolicy, SandboxProvider,
     SessionEnvironment, SessionId, SessionSpec, SpawnEnv, Tool,
@@ -24,6 +25,39 @@ use futures_util::future::BoxFuture;
 
 #[cfg(feature = "config")]
 pub mod config;
+
+/// What the host kit fails with; every variant displays as a message ready
+/// to show.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum HostError {
+    /// `config.toml`, an override, a tool name or another host value is
+    /// invalid.
+    #[error("{0}")]
+    Config(String),
+    /// A file or directory the host needs cannot be read.
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// No session matches.
+    #[error("{0}")]
+    NotFound(String),
+    /// A `required` MCP server did not load.
+    #[error(transparent)]
+    Mcp(#[from] McpError),
+    /// The engine or its store failed (boxed: `AsterError` is large).
+    #[error(transparent)]
+    Engine(Box<AsterError>),
+}
+
+impl From<AsterError> for HostError {
+    fn from(error: AsterError) -> Self {
+        Self::Engine(Box::new(error))
+    }
+}
 
 /// Host metadata keys (ADR-0032): the work root and the session name.
 pub const CWD: &str = "cwd";
@@ -101,7 +135,7 @@ pub fn new_session_spec(
     root: &Path,
     name: Option<&str>,
     spec: &mut SessionSpec,
-) -> Result<Vec<SkillDiagnostic>, String> {
+) -> Result<Vec<SkillDiagnostic>, HostError> {
     let (index, diagnostics) = skill_index(workspace, root);
     if let Some(agents) = agents_md(root)? {
         spec.system.push(agents);
@@ -128,20 +162,24 @@ fn skill_index(workspace: &Workspace, root: &Path) -> (Option<Part>, Vec<SkillDi
 }
 
 /// `<root>/AGENTS.md` only: no parent directories, no user-level file.
-pub fn agents_md(root: &Path) -> Result<Option<Part>, String> {
+pub fn agents_md(root: &Path) -> Result<Option<Part>, HostError> {
     let path = root.join("AGENTS.md");
     if !path.is_file() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let text = std::fs::read_to_string(&path).map_err(|source| HostError::Io {
+        context: format!("cannot read {}", path.display()),
+        source,
+    })?;
     Ok(Some(Part::Text { text }))
 }
 
 /// A directory made absolute and canonical.
-pub fn work_root(dir: &Path) -> Result<PathBuf, String> {
-    dir.canonicalize()
-        .map_err(|error| format!("work root {}: {error}", dir.display()))
+pub fn work_root(dir: &Path) -> Result<PathBuf, HostError> {
+    dir.canonicalize().map_err(|source| HostError::Io {
+        context: format!("work root {}", dir.display()),
+        source,
+    })
 }
 
 /// The work root of a continued session and the root to pin its environment
@@ -151,7 +189,7 @@ pub fn continued_root(
     metadata: &BTreeMap<String, String>,
     explicit: Option<PathBuf>,
     fallback: PathBuf,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+) -> Result<(PathBuf, Option<PathBuf>), HostError> {
     let root = match explicit {
         Some(root) => root,
         None => match metadata.get(CWD) {
@@ -181,19 +219,21 @@ pub fn by_id_or_name(
     sessions: &[CatalogEntry],
     root: &Path,
     value: &str,
-) -> Result<CatalogEntry, String> {
+) -> Result<CatalogEntry, HostError> {
     if let Ok(id) = serde_json::from_value::<SessionId>(serde_json::Value::String(value.to_owned()))
     {
         return sessions
             .iter()
             .find(|entry| entry.session == id)
             .cloned()
-            .ok_or_else(|| format!("session {id:?} not found"));
+            .ok_or_else(|| HostError::NotFound(format!("session {id:?} not found")));
     }
     in_root(sessions, root)
         .into_iter()
         .find(|entry| entry.metadata.get(NAME).map(String::as_str) == Some(value))
-        .ok_or_else(|| format!("no session named {value} in {}", root.display()))
+        .ok_or_else(|| {
+            HostError::NotFound(format!("no session named {value} in {}", root.display()))
+        })
 }
 
 /// The session environment of a work root (ADR-0037): workspace tools, the
@@ -210,7 +250,7 @@ pub struct WorkRoot {
 }
 
 impl WorkRoot {
-    fn tools(&self, root: &Path) -> Result<Vec<Arc<dyn Tool>>, String> {
+    fn tools(&self, root: &Path) -> Result<Vec<Arc<dyn Tool>>, HostError> {
         let selection = if self.new {
             self.workspace.tools.as_deref()
         } else {
@@ -238,7 +278,9 @@ impl EnvironmentAdapter for WorkRoot {
                 (None, Some(cwd)) => PathBuf::from(cwd),
                 (None, None) => return Err(EnvironmentError::new("the session has no cwd")),
             };
-            let tools = self.tools(&root).map_err(EnvironmentError::new)?;
+            let tools = self
+                .tools(&root)
+                .map_err(|error| EnvironmentError::new(error.to_string()))?;
             let mut spawn = SpawnEnv::default();
             spawn.vars = self.workspace.spawn_vars.clone();
             Ok(SessionEnvironment::new(tools, spawn))
@@ -274,7 +316,7 @@ pub fn workspace_tools(
     workspace: &Workspace,
     root: &Path,
     selection: Option<&[String]>,
-) -> Result<Vec<Arc<dyn Tool>>, String> {
+) -> Result<Vec<Arc<dyn Tool>>, HostError> {
     let policy = workspace.sandbox_policy(root);
     let all = asterpath_tools::coding(
         root.to_path_buf(),
@@ -282,7 +324,7 @@ pub fn workspace_tools(
         policy,
         asterpath_tools::DEFAULT_BASH_TIMEOUT,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| HostError::Config(error.to_string()))?;
     let Some(selection) = selection else {
         return Ok(all);
     };
@@ -292,14 +334,14 @@ pub fn workspace_tools(
             all.iter()
                 .find(|tool| tool.descriptor().name.as_str() == name)
                 .cloned()
-                .ok_or_else(|| format!("unknown tool {name}"))
+                .ok_or_else(|| HostError::Config(format!("unknown tool {name}")))
         })
         .collect()
 }
 
 /// Start every configured MCP server under the sandbox policy; a stdio
 /// server without `cwd` starts in `root`. A `required` failure is an error.
-pub async fn load_mcp(workspace: &Workspace, root: &Path) -> Result<McpServers, String> {
+pub async fn load_mcp(workspace: &Workspace, root: &Path) -> Result<McpServers, HostError> {
     let mut configs = workspace.mcp_servers.clone();
     for config in &mut configs {
         if let McpTransport::Stdio {
@@ -310,9 +352,7 @@ pub async fn load_mcp(workspace: &Workspace, root: &Path) -> Result<McpServers, 
         }
     }
     let policy = workspace.sandbox_policy(root);
-    McpServers::load(configs, sandbox_provider(&policy), policy)
-        .await
-        .map_err(|error| error.to_string())
+    Ok(McpServers::load(configs, sandbox_provider(&policy), policy).await?)
 }
 
 /// bwrap on Linux. Elsewhere a restricted policy has no backend, so stdio
