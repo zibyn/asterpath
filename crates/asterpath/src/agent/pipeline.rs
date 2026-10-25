@@ -337,6 +337,11 @@ impl ToolPipeline {
         .await
     }
 
+    /// The live tool of that name in the drive's session environment.
+    fn tool(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        crate::environment::tool(&self.tools, crate::environment::current().as_deref(), name)
+    }
+
     /// One read of the log per step: this step's recorded intents and which
     /// of them are closed.
     async fn recorded(&self, step: &ToolStep<'_>) -> Result<Recorded, AgentError> {
@@ -373,7 +378,7 @@ impl ToolPipeline {
                 tool_call_id: intent.tool_call_id,
                 output_index: call.output_index,
                 provider_call_id: call.provider_call_id,
-                tool: self.tools.get(&intent.name),
+                tool: self.tool(&intent.name),
                 name: intent.name.clone(),
                 args: intent.args.clone(),
                 replay: intent.replay,
@@ -388,7 +393,7 @@ impl ToolPipeline {
             .tools
             .iter()
             .any(|tool| tool.name == call.name)
-            .then(|| self.tools.get(&call.name))
+            .then(|| self.tool(&call.name))
             .flatten();
         let (replay, provenance) = match &tool {
             Some(tool) => (tool.descriptor().replay, tool.descriptor().provenance),
@@ -611,6 +616,11 @@ impl ToolPipeline {
                 step.step,
                 item.tool_call_id,
                 cancel.clone(),
+            )
+            .with_spawn(
+                crate::environment::current()
+                    .map(|env| env.spawn.clone())
+                    .unwrap_or_default(),
             );
             let timeout = item
                 .descriptor

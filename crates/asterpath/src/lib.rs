@@ -12,6 +12,7 @@ mod agent;
 mod commit;
 mod compaction;
 pub mod config;
+mod environment;
 pub mod error;
 mod fork;
 mod owner;
@@ -50,7 +51,8 @@ use asterpath_protocol::{
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Claim, Clock, OwnerToken, SessionQuery, SessionStore, unique_bytes,
+    ApprovalGate, CatalogEntry, Claim, Clock, EnvironmentAdapter, LogQuery, OwnerToken,
+    SessionEnvironment, SessionQuery, SessionStore, Tool, unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -75,6 +77,7 @@ pub struct Asterpath {
     cancellations: Arc<CancellationRegistry>,
     clock: Arc<dyn Clock>,
     trace: TracingQuery,
+    environment: Option<Arc<dyn EnvironmentAdapter>>,
 }
 
 impl std::fmt::Debug for Asterpath {
@@ -93,25 +96,7 @@ impl Asterpath {
     }
 
     pub(crate) async fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
-        for tool in &config.tools {
-            let name = tool.descriptor().name.as_str();
-            let validated = match tool.descriptor().provenance {
-                asterpath_protocol::Provenance::InProcess => {
-                    asterpath_protocol::validate_tool_name(name)
-                }
-                asterpath_protocol::Provenance::External { .. } => {
-                    asterpath_protocol::validate_external_tool_name(name)
-                }
-                // `Unknown` and `Output` are intent-only; they are not registrable.
-                asterpath_protocol::Provenance::Unknown
-                | asterpath_protocol::Provenance::Output => {
-                    Err(asterpath_protocol::ToolNameError::InvalidToolName)
-                }
-            };
-            validated.map_err(|error| AsterError::Config {
-                message: format!("invalid tool name {name}: {error}"),
-            })?;
-        }
+        check_tool_names(&config.tools)?;
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {
             AsterError::Config {
@@ -214,6 +199,7 @@ impl Asterpath {
             cancellations,
             clock,
             trace,
+            environment: config.environment,
         })
     }
 
@@ -238,19 +224,19 @@ impl Asterpath {
             });
         }
         check_metadata(&spec.metadata)?;
-        agent::output::check(&spec.request, |name| self.tools.get(name).is_some())
+        let env = self.resolve(&spec.metadata).await?;
+        let lookup = |name: &_| environment::tool(&self.tools, env.as_deref(), name);
+        agent::output::check(&spec.request, |name| lookup(name).is_some())
             .map_err(|message| AsterError::Config { message })?;
         let tools = match &spec.tools {
-            ToolSelection::All => self
-                .tools
-                .list()
+            ToolSelection::All => environment::tools(&self.tools, env.as_deref())
                 .iter()
                 .map(|tool| tool.descriptor().clone())
                 .collect(),
             ToolSelection::Names(names) => {
                 let mut selected = Vec::with_capacity(names.len());
                 for name in names {
-                    let tool = self.tools.get(name).ok_or_else(|| AsterError::Config {
+                    let tool = lookup(name).ok_or_else(|| AsterError::Config {
                         message: format!("unknown tool {}", name.as_str()),
                     })?;
                     selected.push(tool.descriptor().clone());
@@ -274,7 +260,7 @@ impl Asterpath {
             message: error.to_string(),
         })?;
         self.store.append(entry).await?;
-        Ok(self.handle(session))
+        Ok(self.handle(session, env))
     }
 
     /// Fork `source` into a new, parentless session (ADR-0033). The snapshot
@@ -290,6 +276,7 @@ impl Asterpath {
         metadata: BTreeMap<String, String>,
     ) -> Result<SessionHandle, AsterError> {
         check_metadata(&metadata)?;
+        let env = self.resolve(&metadata).await?;
         let records = scan::scan_decoded(&*self.store, source)
             .await
             .map_err(AgentError::from)?;
@@ -331,12 +318,13 @@ impl Asterpath {
                 .map_err(|error| corrupt(error.to_string()))?;
             self.store.append(entry).await?;
         }
-        Ok(self.handle(session))
+        Ok(self.handle(session, env))
     }
 
-    fn handle(&self, session: SessionId) -> SessionHandle {
+    fn handle(&self, session: SessionId, env: Option<Arc<SessionEnvironment>>) -> SessionHandle {
         SessionHandle {
             session,
+            env,
             store: Arc::clone(&self.store),
             providers: Arc::clone(&self.providers),
             tools: Arc::clone(&self.tools),
@@ -353,7 +341,35 @@ impl Asterpath {
         if self.store.frontier(id).await?.is_none() {
             return Err(AsterError::Agent(AgentError::NotFound { session: id }));
         }
-        Ok(self.handle(id))
+        // A child uses its root's environment (ADR-0037).
+        let env = match &self.environment {
+            Some(_) => {
+                let root = root_of(&*self.store, id).await?;
+                self.resolve(&created_metadata(&*self.store, root).await?)
+                    .await?
+            }
+            None => None,
+        };
+        Ok(self.handle(id, env))
+    }
+
+    /// The session environment for root metadata (ADR-0037); `None` without
+    /// an adapter.
+    async fn resolve(
+        &self,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<Option<Arc<SessionEnvironment>>, AsterError> {
+        let Some(adapter) = &self.environment else {
+            return Ok(None);
+        };
+        let env = adapter
+            .resolve(metadata)
+            .await
+            .map_err(|error| AsterError::Config {
+                message: error.to_string(),
+            })?;
+        check_tool_names(&env.tools)?;
+        Ok(Some(Arc::new(env)))
     }
 
     /// Release the engine. Nothing runs in the background, so there is
@@ -472,6 +488,52 @@ async fn root_of(store: &dyn SessionStore, session: SessionId) -> Result<Session
     }))
 }
 
+/// The metadata `session` was created with.
+async fn created_metadata(
+    store: &dyn SessionStore,
+    session: SessionId,
+) -> Result<BTreeMap<String, String>, AsterError> {
+    let first = store
+        .scan(LogQuery {
+            session,
+            after: None,
+            limit: Some(1),
+        })
+        .next()
+        .await
+        .transpose()?;
+    match first.as_ref().map(asterpath_protocol::decode_entry) {
+        Some(Ok(SessionEvent::SessionCreated { metadata, .. })) => Ok(metadata),
+        _ => Err(AsterError::Agent(AgentError::Corrupt {
+            session,
+            detail: "the log does not start with SessionCreated".to_owned(),
+        })),
+    }
+}
+
+/// Names a tool may be registered under; `Unknown` and `Output` are
+/// intent-only and never registrable.
+fn check_tool_names(tools: &[Arc<dyn Tool>]) -> Result<(), AsterError> {
+    for tool in tools {
+        let name = tool.descriptor().name.as_str();
+        let validated = match tool.descriptor().provenance {
+            asterpath_protocol::Provenance::InProcess => {
+                asterpath_protocol::validate_tool_name(name)
+            }
+            asterpath_protocol::Provenance::External { .. } => {
+                asterpath_protocol::validate_external_tool_name(name)
+            }
+            asterpath_protocol::Provenance::Unknown | asterpath_protocol::Provenance::Output => {
+                Err(asterpath_protocol::ToolNameError::InvalidToolName)
+            }
+        };
+        validated.map_err(|error| AsterError::Config {
+            message: format!("invalid tool name {name}: {error}"),
+        })?;
+    }
+    Ok(())
+}
+
 /// Host metadata limits (storage.md §5).
 fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
     if metadata.len() > 64
@@ -506,6 +568,8 @@ fn totals_filter(scope: UsageScope) -> UsageFilter {
 #[derive(Clone)]
 pub struct SessionHandle {
     session: SessionId,
+    /// Resolved when the handle was made; `None` without an adapter.
+    env: Option<Arc<SessionEnvironment>>,
     store: Arc<dyn SessionStore>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
@@ -535,10 +599,17 @@ impl SessionHandle {
     pub async fn claim(&self) -> Result<OwnedSession, AsterError> {
         let root = root_of(&*self.store, self.session).await?;
         let claim = self.store.claim(root).await?;
-        Ok(OwnedSession {
+        let owned = OwnedSession {
             handle: self.clone(),
             claim: Arc::new(claim),
-        })
+        };
+        owned.follow_environment().await?;
+        Ok(owned)
+    }
+
+    /// The live tool of that name for this session.
+    fn tool(&self, name: &asterpath_protocol::ToolName) -> Option<Arc<dyn Tool>> {
+        environment::tool(&self.tools, self.env.as_deref(), name)
     }
 
     /// Append `InputRecorded` only. Never starts a turn.
@@ -592,7 +663,7 @@ impl SessionHandle {
             });
         }
         if let Some(request) = &patch.request {
-            agent::output::check(request, |name| self.tools.get(name).is_some())
+            agent::output::check(request, |name| self.tool(name).is_some())
                 .map_err(|message| AsterError::Config { message })?;
         }
         let key = patch.id.map(dedup::config_changed);
@@ -641,7 +712,7 @@ impl SessionHandle {
             |name: &asterpath_protocol::ToolName| effective.iter().any(|tool| &tool.name == name);
         for (index, added) in patch.add_tools.iter().enumerate() {
             let name = &added.name;
-            match self.tools.get(name) {
+            match self.tool(name) {
                 None => return error(format!("unknown tool {name}")),
                 Some(tool) if tool.descriptor() != added => {
                     return error(format!(
@@ -731,6 +802,48 @@ impl std::ops::Deref for OwnedSession {
 }
 
 impl OwnedSession {
+    /// Bring the effective tool set in line with the resolved environment
+    /// (ADR-0037, ADR-0030): a tool whose descriptor changed is replaced,
+    /// one that no longer resolves is removed. Tools are never added; that
+    /// stays the host's `update_config`.
+    async fn follow_environment(&self) -> Result<(), AsterError> {
+        if self.env.is_none() {
+            return Ok(());
+        }
+        let records = scan::scan_decoded(&*self.store, self.session)
+            .await
+            .map_err(AgentError::from)?;
+        let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
+            AsterError::Agent(AgentError::NotFound {
+                session: self.session,
+            }),
+        )?;
+        let mut patch = ConfigPatch::default();
+        for recorded in &effective.tools {
+            match self.tool(&recorded.name) {
+                None => patch.remove_tools.push(recorded.name.clone()),
+                Some(live) if live.descriptor() != recorded => {
+                    patch.add_tools.push(live.descriptor().clone());
+                }
+                Some(_) => {}
+            }
+        }
+        if !patch.changes_tools() {
+            return Ok(());
+        }
+        // Folds the same if a concurrent claim in this process appends it too.
+        let entry = asterpath_protocol::encode_entry(
+            self.session,
+            None,
+            &SessionEvent::ConfigChanged { patch },
+        )
+        .map_err(|error| AsterError::Config {
+            message: error.to_string(),
+        })?;
+        self.store.append(entry).await?;
+        Ok(())
+    }
+
     /// The claim this handle holds: the tree's root and its epoch.
     pub fn owner(&self) -> OwnerToken {
         self.claim.token()
@@ -828,6 +941,7 @@ impl OwnedSession {
                 trigger: RunTrigger::Resume,
             },
             Some(self.owner()),
+            self.env.clone(),
         );
         run.map(|event| event.map_err(AsterError::from)).boxed()
     }

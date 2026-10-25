@@ -34,8 +34,8 @@ use asterpath_protocol::{
     decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
-    ApprovalGate, Clock, DedupKey, LogEntry, LogId, OwnerToken, SessionId, SessionStore, StepId,
-    Timestamp, TurnId, unique_bytes,
+    ApprovalGate, Clock, DedupKey, LogEntry, LogId, OwnerToken, SessionEnvironment, SessionId,
+    SessionStore, StepId, Timestamp, TurnId, unique_bytes,
 };
 use futures_core::Stream;
 
@@ -1165,16 +1165,18 @@ impl Agent {
 
 impl Agent {
     pub(crate) fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
-        self.run_as(req, None)
+        self.run_as(req, None, None)
     }
 
     /// Drive under `owner`, a held claim of the session's tree; every append
     /// the drive makes carries it (ADR-0036). `None` keeps the claim of the
-    /// drive this one is polled in: a child drive inside its parent's.
+    /// drive this one is polled in: a child drive inside its parent's. The
+    /// same holds for `env`, the session environment (ADR-0037).
     pub(crate) fn run_as(
         &self,
         req: RunRequest,
         owner: Option<OwnerToken>,
+        env: Option<Arc<SessionEnvironment>>,
     ) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
         let session = req.session;
         if !self.acquire(session) {
@@ -1198,6 +1200,7 @@ impl Agent {
             // Dropping the stream releases single-flight; it does not cancel.
             _guard: guard,
             owner,
+            env,
             done: false,
         })
     }
@@ -1525,6 +1528,7 @@ struct DriveStream<'a> {
     sink: Arc<EventSink>,
     _guard: BusyGuard,
     owner: Option<OwnerToken>,
+    env: Option<Arc<SessionEnvironment>>,
     done: bool,
 }
 
@@ -1540,7 +1544,11 @@ impl Stream for DriveStream<'_> {
             if this.done {
                 return Poll::Ready(None);
             }
-            match crate::owner::within(this.owner, || this.future.as_mut().poll(cx)) {
+            let future = &mut this.future;
+            let polled = crate::owner::within(this.owner, || {
+                crate::environment::within(this.env.as_ref(), || future.as_mut().poll(cx))
+            });
+            match polled {
                 Poll::Ready(()) => this.done = true,
                 // The loop already ran and queued events before parking; they
                 // must be yielded now, not on some later wake.

@@ -48,6 +48,46 @@ impl<'a> SpawnRequest<'a> {
     }
 }
 
+/// What a session's spawned processes start with (ADR-0037). The host's
+/// session environment supplies it; tools receive it in `ToolContext`.
+/// `Debug` prints variable names only: values may be secrets.
+#[non_exhaustive]
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SpawnEnv {
+    /// The session's policy; `None` leaves the tool's own.
+    pub sandbox: Option<SandboxPolicy>,
+    /// Passed on top of [`INHERITED_ENV`]; nothing else of the process
+    /// environment reaches a child.
+    pub vars: BTreeMap<OsString, OsString>,
+}
+
+impl SpawnEnv {
+    /// The complete environment of a spawned process: the [`INHERITED_ENV`]
+    /// variables this process has, overridden by `vars`.
+    pub fn complete(&self) -> BTreeMap<OsString, OsString> {
+        let mut env: BTreeMap<OsString, OsString> = INHERITED_ENV
+            .iter()
+            .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?)))
+            .collect();
+        env.extend(self.vars.clone());
+        env
+    }
+}
+
+impl fmt::Debug for SpawnEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpawnEnv")
+            .field("sandbox", &self.sandbox)
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The only process variables a spawned child inherits (ADR-0037).
+pub const INHERITED_ENV: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TERM",
+];
+
 /// The command to actually start. Owns everything the caller needs.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]

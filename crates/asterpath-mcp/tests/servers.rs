@@ -877,6 +877,20 @@ async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
         recorded[0].env.get(OsStr::new("WEATHER_API_KEY")),
         Some(&OsString::from("test-token"))
     );
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "cargo sets it for the test process"
+    );
+    assert!(
+        !recorded[0]
+            .env
+            .contains_key(OsStr::new("CARGO_MANIFEST_DIR")),
+        "the process environment is not inherited"
+    );
+    assert_eq!(
+        recorded[0].env.get(OsStr::new("PATH")),
+        std::env::var_os("PATH").as_ref()
+    );
 }
 
 #[tokio::test]

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SystemClock};
 use asterpath_protocol::{
-    ApprovalPolicy, Compactor, DefaultApprovalPolicy, Hooks, ModelAlias, ModelSpec, Provider, Tool,
-    ToolConfig,
+    ApprovalPolicy, Compactor, DefaultApprovalPolicy, EnvironmentAdapter, Hooks, ModelAlias,
+    ModelSpec, Provider, Tool, ToolConfig,
 };
 
 use crate::error::AsterError;
@@ -37,6 +37,10 @@ pub struct AsterpathConfig {
     pub hooks: Vec<Arc<dyn Hooks>>,
     /// Registers the model-visible `spawn_agent` tool. Defaults to `true`.
     pub spawn_tool: bool,
+    /// Resolves each session's tools and spawn settings from its metadata
+    /// (ADR-0037). `None`: builder tools only, and spawned processes still
+    /// get only the minimal inherited environment.
+    pub environment: Option<Arc<dyn EnvironmentAdapter>>,
 }
 
 impl Default for AsterpathConfig {
@@ -56,6 +60,7 @@ impl Default for AsterpathConfig {
             model_aliases: BTreeMap::new(),
             hooks: Vec::new(),
             spawn_tool: true,
+            environment: None,
         }
     }
 }
@@ -147,6 +152,13 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn spawn_tool(mut self, enabled: bool) -> Self {
         self.config.spawn_tool = enabled;
+        self
+    }
+
+    /// Register the session environment adapter (ADR-0037).
+    #[must_use]
+    pub fn environment(mut self, environment: Arc<dyn EnvironmentAdapter>) -> Self {
+        self.config.environment = Some(environment);
         self
     }
 

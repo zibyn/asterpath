@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use asterpath_protocol::{
-    CancelToken, JsonString, Part, ReplaySafety, SessionId, SideEffect, StepId, Tool, ToolCallId,
-    ToolContext, ToolError, TurnId,
+    CancelToken, JsonString, Part, ReplaySafety, SessionId, SideEffect, SpawnEnv, StepId, Tool,
+    ToolCallId, ToolContext, ToolError, TurnId,
 };
 use asterpath_tools::{DEFAULT_BASH_TIMEOUT, coding, read_only};
 
@@ -272,6 +272,54 @@ async fn bash_spawns_through_the_sandbox_provider_in_the_root() {
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].cwd.as_deref(), Some(real_root.as_path()));
     assert_eq!(recorded[0].policy, policy);
+}
+
+async fn bash_with(
+    bash: &Arc<dyn Tool>,
+    command: &str,
+    spawn: SpawnEnv,
+) -> Result<String, ToolError> {
+    let output = bash
+        .invoke(
+            JsonString::new(serde_json::json!({ "command": command }).to_string()),
+            ctx(CancelToken::new()).with_spawn(spawn),
+        )
+        .await?;
+    match &output.content[..] {
+        [Part::Text { text }] => Ok(text.clone()),
+        other => panic!("unexpected output {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bash_sees_only_the_session_env_and_the_inherited_minimum() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "cargo sets it for the test process"
+    );
+    let mut spawn = SpawnEnv::default();
+    spawn.vars.insert("GREETING".into(), "hi".into());
+    let output = bash_with(
+        &bash,
+        r#"echo "${GREETING-} ${CARGO_MANIFEST_DIR-unset} ${PATH:+path}""#,
+        spawn,
+    )
+    .await
+    .expect("bash");
+    assert!(output.starts_with("hi unset path\n"), "{output}");
+}
+
+#[tokio::test]
+async fn the_session_sandbox_policy_overrides_the_tools_own() {
+    let (_dir, root) = root();
+    let bash = tool(&full_access(&root), "bash");
+    let mut spawn = SpawnEnv::default();
+    spawn.sandbox = Some(asterpath_protocol::SandboxPolicy::ReadOnly);
+    let error = bash_with(&bash, "touch ran", spawn).await.unwrap_err();
+    assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
+    assert!(!root.join("ran").exists(), "no process was started");
 }
 
 #[tokio::test]

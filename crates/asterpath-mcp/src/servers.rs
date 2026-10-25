@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use asterpath_protocol::{
     ConfinedSpawn, Enforcement, JsonString, Parallelism, Provenance, SandboxPolicy,
-    SandboxProvider, SpawnRequest, Tool, ToolContext, ToolDescriptor, ToolError, ToolName,
-    ToolOutput, TransportKind, external_tool_name, validate_server_id,
+    SandboxProvider, SpawnEnv, SpawnRequest, Tool, ToolContext, ToolDescriptor, ToolError,
+    ToolName, ToolOutput, TransportKind, external_tool_name, validate_server_id,
 };
 
 use crate::adapter::{AdapterError, AdapterTool, BoxFuture, McpAdapter};
@@ -268,10 +268,13 @@ impl Loader<'_> {
         cwd: &Option<std::path::PathBuf>,
     ) -> Result<ConfinedSpawn, Failure> {
         let sandbox_failure = |message: String| (LoadStage::Sandbox, message);
-        let mut spawn_env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-        for (key, value) in env {
-            spawn_env.insert(OsString::from(key), OsString::from(value));
-        }
+        // Only the minimal inherited set plus the configured env (ADR-0037).
+        let mut spawn = SpawnEnv::default();
+        spawn.vars = env
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect();
+        let spawn_env = spawn.complete();
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let request = SpawnRequest::new(
             OsStr::new(command),

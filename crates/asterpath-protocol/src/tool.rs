@@ -19,6 +19,7 @@ use crate::config::{Provenance, ToolDescriptor};
 use crate::event::ToolErrorKind;
 use crate::ids::ToolArgs;
 use crate::item::Part;
+use crate::sandbox::SpawnEnv;
 
 /// One executable tool. `descriptor` is immutable for the tool's lifetime.
 pub trait Tool: Send + Sync + 'static {
@@ -40,9 +41,18 @@ pub struct ToolContext {
     pub step: StepId,
     pub tool_call_id: ToolCallId,
     pub cancel: CancelToken,
+    /// The session environment's spawn settings (ADR-0037); empty when the
+    /// host registered no session environment.
+    pub spawn: SpawnEnv,
 }
 
 impl ToolContext {
+    #[must_use]
+    pub fn with_spawn(mut self, spawn: SpawnEnv) -> Self {
+        self.spawn = spawn;
+        self
+    }
+
     pub fn new(
         session: SessionId,
         turn: TurnId,
@@ -56,6 +66,7 @@ impl ToolContext {
             step,
             tool_call_id,
             cancel,
+            spawn: SpawnEnv::default(),
         }
     }
 }
