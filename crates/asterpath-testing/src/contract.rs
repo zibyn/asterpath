@@ -794,6 +794,18 @@ async fn retirement(log: &dyn SessionStore) {
             .await
             .is_empty()
     );
+    // A retired id is never written again: appends fail instead of landing
+    // in a log no read can see.
+    match append_raw(
+        log,
+        entry_for(target, LOG_SCHEMA_VERSION, &input_recorded(), None),
+    )
+    .await
+    {
+        Err(StorageError::Retired { session }) => assert_eq!(session, target),
+        other => panic!("expected Retired for an append after retirement, got {other:?}"),
+    }
+    assert!(scan(log, target).await.is_empty());
     retire(log, target, captured)
         .await
         .expect("same-frontier retry is idempotent");

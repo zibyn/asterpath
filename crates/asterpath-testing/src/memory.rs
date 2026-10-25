@@ -162,6 +162,11 @@ impl InMemoryEventLog {
         let kind = event.kind().to_owned();
 
         let mut state = self.state();
+        if state.retired.contains_key(&entry.session) {
+            return Err(StorageError::Retired {
+                session: entry.session,
+            });
+        }
         let dedup = entry
             .dedup_key
             .as_ref()

@@ -98,6 +98,7 @@ pub enum RetirementError {
 - **幂等重试**：退役是单事务，提交后、调用方收到结果前崩溃时，用同一 `expected_frontier` 重试返回成功。frontier 不同说明会话在导出后被推进过，必须先重新导出。
 - 退役由单写者串行化；CAS 针对的是同进程内并发驱动，不是多进程。
 - 删除后 `retired_sessions` 行**永不自动清理**。墓碑清理与 id 复用不在 v1 合约内。
+- 对已退役会话的 `append` 返回 `StorageError::Retired`，不写入（含去重命中的重试）；两个后端一致，进 contract suite。
 
 ## 6. 导出（宿主配方）
 

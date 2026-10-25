@@ -15,6 +15,8 @@ pub enum StorageError {
         session: Option<SessionId>,
         detail: String,
     },
+    #[error("session {session:?} is retired")]
+    Retired { session: SessionId },
     #[error("storage backend error: {0}")]
     Backend(String),
 }

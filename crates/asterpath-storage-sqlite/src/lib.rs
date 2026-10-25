@@ -309,6 +309,20 @@ fn append_in(
         .map_err(|error| StorageError::InvalidEntry(error.to_string()))?;
     let kind = event.kind().to_owned();
 
+    let retired = tx
+        .query_row(
+            "SELECT 1 FROM retired_sessions WHERE session_id = ?1",
+            [entry.session.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(backend)?;
+    if retired.is_some() {
+        return Err(StorageError::Retired {
+            session: entry.session,
+        });
+    }
+
     if let Some(key) = &entry.dedup_key {
         let existing = tx
             .query_row(
