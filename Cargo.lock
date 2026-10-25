@@ -186,6 +186,7 @@ dependencies = [
  "asterpath-host",
  "asterpath-protocol",
  "asterpath-testing",
+ "futures-util",
  "serde",
  "serde_json",
  "tauri",

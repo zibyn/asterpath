@@ -1,9 +1,15 @@
 //! The Tauri window: one command per `Desktop` method (ADR-0035). The
 //! frontend's `src/lib/commands.ts` mirrors these names and types.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use asterpath_desktop::{Desktop, Project, SessionSummary};
+use asterpath::{LogId, SessionId};
+use asterpath_desktop::{Access, Desktop, Project, SessionSummary, ViewEvent};
+use futures_util::StreamExt;
+use tauri::async_runtime::JoinHandle;
+use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -15,6 +21,11 @@ impl Backend {
         self.0.as_ref().map_err(Clone::clone)
     }
 }
+
+/// The open conversation views, by channel id.
+// shortcut: a webview reload leaves its views running until the app exits; stop them on page load if that matters
+#[derive(Default)]
+struct Views(Mutex<HashMap<u32, JoinHandle<()>>>);
 
 #[tauri::command]
 async fn projects(backend: State<'_, Backend>) -> Result<Vec<Project>, String> {
@@ -42,16 +53,87 @@ async fn sessions(
     backend.get()?.sessions(&root).await
 }
 
+#[tauri::command]
+async fn create_session(
+    backend: State<'_, Backend>,
+    root: PathBuf,
+    name: Option<String>,
+) -> Result<SessionSummary, String> {
+    backend.get()?.create_session(&root, name.as_deref()).await
+}
+
+#[tauri::command]
+async fn access(backend: State<'_, Backend>, session: SessionId) -> Result<Access, String> {
+    backend.get()?.access(session).await
+}
+
+/// Stream the session to `on_event` until `unwatch` with the channel's id.
+#[tauri::command]
+async fn watch(
+    backend: State<'_, Backend>,
+    views: State<'_, Views>,
+    session: SessionId,
+    after: Option<LogId>,
+    on_event: Channel<ViewEvent>,
+) -> Result<(), String> {
+    let mut stream = backend.get()?.watch(session, after).await?;
+    let id = on_event.id();
+    let view = tauri::async_runtime::spawn(async move {
+        while let Some(Ok(event)) = stream.next().await {
+            if on_event.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    let replaced = views.0.lock().unwrap().insert(id, view);
+    if let Some(replaced) = replaced {
+        replaced.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch(views: State<'_, Views>, channel: u32) {
+    if let Some(view) = views.0.lock().unwrap().remove(&channel) {
+        view.abort();
+    }
+}
+
+#[tauri::command]
+async fn send(
+    backend: State<'_, Backend>,
+    session: SessionId,
+    message: String,
+) -> Result<(), String> {
+    backend.get()?.send(session, message).await
+}
+
+#[tauri::command]
+async fn cancel(backend: State<'_, Backend>, session: SessionId) -> Result<(), String> {
+    backend.get()?.cancel(session).await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(Views::default())
         .setup(|app| {
             let projects_file = app.path().app_data_dir()?.join("projects.json");
             let desktop = tauri::async_runtime::block_on(Desktop::open(projects_file));
             app.manage(Backend(desktop));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![projects, add_project, sessions])
+        .invoke_handler(tauri::generate_handler![
+            projects,
+            add_project,
+            sessions,
+            create_session,
+            access,
+            watch,
+            unwatch,
+            send,
+            cancel
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop app");
 }
