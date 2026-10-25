@@ -7,7 +7,9 @@
 #     `allow` list ("*" = any workspace member, apps only);
 #   - role rules: `protocol` depends on no member and declares no features;
 #     an `adapter` depends only on protocol and other adapters; the `engine`
-#     depends only on protocol and the adapters it re-exports or feature-gates.
+#     depends only on protocol and the adapters it re-exports or feature-gates;
+#     the `host` kit (ADR-0040) depends on protocol, adapters and the engine,
+#     and only apps depend on it.
 #
 # Only normal dependencies are checked. Dev-dependencies are intentionally exempt
 # (crates may dev-depend on `asterpath-testing` for contract suites).
@@ -76,6 +78,20 @@ allow = [
     "asterpath-provider-anthropic",
     "asterpath-provider-openai",
     "asterpath-storage-sqlite",
+]
+
+# Host kit shared by the reference hosts (ADR-0040): work-root assembly and,
+# behind the `config` feature, `config.toml` parsing.
+[[package]]
+name = "asterpath-host"
+role = "host"
+allow = [
+    "asterpath",
+    "asterpath-protocol",
+    "asterpath-mcp",
+    "asterpath-skills",
+    "asterpath-tools",
+    "asterpath-sandbox-linux",
 ]
 
 [[package]]

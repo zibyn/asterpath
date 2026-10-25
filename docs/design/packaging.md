@@ -7,7 +7,7 @@
 ## 1. 决策摘要
 
 - 引擎是一个 crate（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，[#79](https://github.com/zibyn/asterpath/issues/79)）：agent、scheduler、durable waits、工具表、trace / usage 视图与默认压缩是 `asterpath` 的内部模块；`asterpath-core` 并入 `asterpath-protocol`。workspace = 13 个库/应用成员 + `xtask`（§2；#80 以 `asterpath-mcp` 取代 `asterpath-plugin-host` 与 `asterpath-sandbox`）。独立 crate 只为真实适配器或可选重依赖。
-- 依赖规则按角色（`protocol` / `adapter` / `engine` / `app` / `tool`），由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查（§2）。
+- 依赖规则按角色（`protocol` / `adapter` / `engine` / `host` / `app` / `tool`），由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查（§2）。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade（`asterpath`）、`asterpath-protocol` 与日志 schema**，适配器 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
 - `protocol` 无 feature；feature 只出现在 facade、CLI 与后端 crate。
@@ -31,12 +31,13 @@
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
 | `asterpath-tools` | adapter | 按根目录构造的 `read_file` / `list_dir` / `grep` / `write_file` / `edit_file` / `bash` 工具与 `read_only` / `coding` 预设（#83） | `protocol` |
 | `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件、`FakeSandboxProvider` | `protocol` |
+| `asterpath-host` | host | 参考宿主共用层（ADR-0040）：按工作根组装（工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`）、宿主元数据键与续会话规则，入参是普通值；`config` feature 解析 `config.toml` 与环境变量，`clap` feature 给模式枚举加 `ValueEnum`，默认都不开；不属于稳定面 | `asterpath`, `protocol`, `mcp`, `skills`, `tools`, `sandbox-linux` |
 | `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
 | `asterpath-mcp-fixture` | tool | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） |
 | `xtask` | tool | `check-deps` 与 CI 辅助；`publish = false` | 无 |
 
-- 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`app` / `tool` 只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
+- 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`host` 只依赖 `protocol`、适配器与 `engine`，且只有 `app` 能依赖它；`app` / `tool` 其余只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
 - `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-skills` 是可选适配器（M6 交付）；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。技能不新增事件，日志 schema 不变。
 - `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核或日志。多工作根的宿主在 builder 上注册会话环境适配器（`EnvironmentAdapter`，ADR-0037）：创建、分叉、打开会话时按根会话的宿主元数据解析出该会话的工具、沙箱策略与子进程变量（`SessionEnvironment`），子会话用根会话的；同名时会话环境的工具优先于 builder 的。认领时若解析出的描述符与生效配置不同就替换，解析不到的工具移除（追加一条 `ConfigChanged`），从不自动新增。`ToolContext::spawn` 把沙箱策略与变量交给工具；`bash` 与 MCP stdio 只继承 `INHERITED_ENV` 白名单。一个 `Asterpath`（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
@@ -391,6 +392,8 @@ pub enum AsterError {
 - 显示：`ModelDelta` 文本增量直接输出；`ToolStarted` 显示工具名与参数，`ToolFinished` 显示状态与截断后的结果。显示前的脱敏是 CLI 的策略。
 
 ### 4.6 会话装配
+
+组装规则在 `asterpath-host`（ADR-0040），CLI 只解析 flag、打印与选退出码；桌面端调用同一份。
 
 - 新会话：宿主元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
 - MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。

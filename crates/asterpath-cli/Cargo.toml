@@ -10,29 +10,26 @@ path = "src/main.rs"
 
 [features]
 default = ["anthropic", "openai", "sqlite"]
-anthropic = ["asterpath/anthropic"]
-openai = ["asterpath/openai"]
+anthropic = ["asterpath/anthropic", "asterpath-host/anthropic"]
+openai = ["asterpath/openai", "asterpath-host/openai"]
 sqlite = ["asterpath/sqlite"]
 
 [dependencies]
 asterpath = { path = "../asterpath", default-features = false }
+asterpath-host = { path = "../asterpath-host", features = ["config", "clap"] }
 asterpath-mcp = { path = "../asterpath-mcp" }
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-skills = { path = "../asterpath-skills" }
-asterpath-tools = { path = "../asterpath-tools" }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
-toml = "0.9"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-asterpath-sandbox-linux = { path = "../asterpath-sandbox-linux" }
 
 [dev-dependencies]
 assert_cmd = "2"
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite" }
 asterpath-testing = { path = "../asterpath-testing" }
+asterpath-tools = { path = "../asterpath-tools" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }

@@ -18,6 +18,7 @@
 
 ### 新增
 
+- `asterpath-host`（ADR-0040）：参考宿主共用的按工作根组装、宿主元数据键与续会话规则；可选 `config` feature 解析 `config.toml`。参考 CLI 改用它，行为不变。
 - 会话环境适配器 `EnvironmentAdapter`（`AsterpathBuilder::environment`）：按会话的宿主元数据解析该会话的工具、沙箱策略与子进程变量，子会话用根会话的；`ToolContext::spawn` 把策略与变量交给工具。
 - 会话目录按元数据等值过滤：`SessionQuery.metadata`（`SessionQuery` 不再是 `Copy`）。
 - `ModelRequest.session: Option<SessionContext>` 带上会话、根会话与根会话的宿主元数据，宿主包装 provider 可按用户选凭据；压缩摘要调用经 `CompactionJob.session` 同样带上。

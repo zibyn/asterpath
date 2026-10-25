@@ -1,35 +1,27 @@
-//! Session assembly (packaging.md §4.6): the work root, the composition root,
-//! and a new, continued (`--continue` / `-r`) or forked session.
+//! Session assembly (packaging.md §4.6): the flags, the work root and a
+//! new, continued (`--continue` / `-r`) or forked session. The work-root
+//! assembly and metadata conventions are `asterpath-host`'s (ADR-0040).
 
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use asterpath::{
-    AsterError, Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor, OwnedSession,
-    SessionHandle,
+use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
+use asterpath_host::config::{self, ApprovalMode};
+use asterpath_host::{
+    NAME, SandboxMode, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
+    metadata, new_session_spec, work_root, workspace_tools,
 };
-use asterpath_mcp::{McpServers, McpTransport, ServerStatus};
+use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
-    CatalogEntry, ConfigPatch, ConfigSnapshot, EnvironmentAdapter, EnvironmentError, ModelId,
-    OutputFormat, Part, ProviderCatalog, SandboxPolicy, SandboxProvider, SessionEnvironment,
-    SessionId, SessionQuery, SpawnEnv, StorageError, Tool, decode_entry,
+    CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, SessionId, SessionQuery,
+    StorageError, decode_entry,
 };
-use asterpath_skills::{
-    DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
-    SkillRootLabel, discover, render_index,
-};
+use asterpath_skills::SkillDiagnosticKind;
 use clap::Args;
-use futures_util::future::BoxFuture;
 
-use crate::config::{self, ApprovalMode, SandboxMode};
 use crate::drive::scan;
-use crate::{CliError, CliResult, GlobalArgs, aster_error, not_found, parse_session};
+use crate::{CliError, CliResult, GlobalArgs, aster_error, not_found};
 
-/// Host metadata keys this CLI writes (ADR-0032).
-const CWD: &str = "cwd";
-const NAME: &str = "name";
 /// How many sessions the `-r` picker lists.
 const PICKER_SIZE: usize = 20;
 
@@ -122,7 +114,12 @@ pub async fn open(
     if let Some(mode) = args.sandbox {
         settings.set_sandbox(mode);
     }
-    let explicit_root = args.cd.as_deref().map(work_root).transpose()?;
+    let explicit_root = args
+        .cd
+        .as_deref()
+        .map(work_root)
+        .transpose()
+        .map_err(CliError::config)?;
 
     if !args.continuing() {
         if let Some(model) = &args.model {
@@ -137,27 +134,24 @@ pub async fn open(
     let match_root = explicit_root.clone().map_or_else(current_root, Ok)?;
     let (target, snapshot) = find(&settings, args, &match_root).await?;
     // The session's own directory unless `-C` says otherwise.
-    let root = match explicit_root {
-        Some(root) => root,
-        None => match target.metadata.get(CWD) {
-            Some(cwd) => work_root(Path::new(cwd))?,
-            None => match_root,
-        },
-    };
+    let (root, pinned) =
+        continued_root(&target.metadata, explicit_root, match_root).map_err(CliError::config)?;
 
     // The session's model provider comes from its log; the file cannot move it.
     settings.set_provider(snapshot.model.provider.as_str().to_owned());
-    let mcp = load_mcp(&settings, &root).await?;
-    report_mcp_failures(&settings, &mcp)?;
-    // `-C`, or the directory matched for a session without `cwd`, wins.
-    let pinned =
-        (target.metadata.get(CWD) != Some(&root.display().to_string())).then(|| root.clone());
+    let workspace = settings.workspace().map_err(CliError::config)?;
+    let mcp = load_mcp(&workspace, &root)
+        .await
+        .map_err(CliError::config)?;
+    report_mcp_failures(&workspace, &mcp);
     let environment = WorkRoot {
-        settings: settings.clone(),
+        workspace,
         new: false,
         pinned,
     };
-    let asterpath = assemble(&settings, mcp.tools(), environment).await?;
+    let asterpath = config::assemble(&settings, mcp.tools(), environment)
+        .await
+        .map_err(aster_error)?;
     let (handle, continued) = if args.fork_session {
         let metadata = metadata(&root, args.name.as_deref());
         let handle = asterpath
@@ -220,33 +214,29 @@ async fn create(
     name: Option<&str>,
     output_format: Option<OutputFormat>,
 ) -> CliResult<Opened> {
+    let workspace = settings.workspace().map_err(CliError::config)?;
     // An unknown `[tools] enabled` name fails before anything starts.
-    workspace_tools(settings, root, settings.tool_names())?;
-    let mut skills = skill_setup(settings, root);
-    for diagnostic in skills
-        .diagnostics
+    workspace_tools(&workspace, root, workspace.tools.as_deref()).map_err(CliError::config)?;
+    let mut spec = config::session_spec(settings).map_err(CliError::config)?;
+    let diagnostics =
+        new_session_spec(&workspace, root, name, &mut spec).map_err(CliError::config)?;
+    for diagnostic in diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.kind != SkillDiagnosticKind::AuthorityFieldIgnored)
     {
         eprintln!("skill: {diagnostic}");
     }
-    let mut spec = config::session_spec(settings).map_err(CliError::config)?;
-    let mcp = load_mcp(settings, root).await?;
-    report_mcp_failures(settings, &mcp)?;
-    if let Some(agents) = agents_md(root)? {
-        spec.system.push(agents);
-    }
-    if let Some(index) = skills.index.take() {
-        spec.system.push(index);
-    }
+    let mcp = load_mcp(&workspace, root).await.map_err(CliError::config)?;
+    report_mcp_failures(&workspace, &mcp);
     spec.request.output_format = output_format;
-    spec.metadata = metadata(root, name);
     let environment = WorkRoot {
-        settings: settings.clone(),
+        workspace,
         new: true,
         pinned: None,
     };
-    let asterpath = assemble(settings, mcp.tools(), environment).await?;
+    let asterpath = config::assemble(settings, mcp.tools(), environment)
+        .await
+        .map_err(aster_error)?;
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
     let owned = Some(handle.claim().await.map_err(aster_error)?);
@@ -259,87 +249,10 @@ async fn create(
     })
 }
 
-fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::from([(CWD.to_owned(), root.display().to_string())]);
-    if let Some(name) = name {
-        metadata.insert(NAME.to_owned(), name.to_owned());
-    }
-    metadata
-}
-
-/// `<root>/AGENTS.md` only: no parent directories, no user-level file.
-fn agents_md(root: &Path) -> CliResult<Option<Part>> {
-    let path = root.join("AGENTS.md");
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| CliError::config(format!("cannot read {}: {error}", path.display())))?;
-    Ok(Some(Part::Text { text }))
-}
-
-/// A directory made absolute and canonical; missing is a configuration error.
-fn work_root(dir: &Path) -> CliResult<PathBuf> {
-    dir.canonicalize()
-        .map_err(|error| CliError::config(format!("work root {}: {error}", dir.display())))
-}
-
 pub fn current_root() -> CliResult<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|error| CliError::config(format!("cannot read working directory: {error}")))?;
-    work_root(&cwd)
-}
-
-/// The CLI's session environment (ADR-0037): workspace tools, the skill
-/// loader and the sandbox policy rooted at the root session's `cwd`, and
-/// the `[sandbox] env` variables for bash.
-struct WorkRoot {
-    settings: config::Settings,
-    /// New sessions get `[tools] enabled` and the skill switch; continued
-    /// ones every workspace tool and the skill loader, so whatever their
-    /// effective config names still resolves.
-    new: bool,
-    /// Overrides the `cwd` metadata.
-    pinned: Option<PathBuf>,
-}
-
-impl WorkRoot {
-    fn tools(&self, root: &Path) -> CliResult<Vec<Arc<dyn Tool>>> {
-        let selection = if self.new {
-            self.settings.tool_names()
-        } else {
-            None
-        };
-        let mut tools = workspace_tools(&self.settings, root, selection)?;
-        if !self.new || self.settings.skills_enabled() {
-            tools.push(Arc::new(LoadSkillTool::new(skill_roots(
-                &self.settings,
-                root,
-            ))));
-        }
-        Ok(tools)
-    }
-}
-
-impl EnvironmentAdapter for WorkRoot {
-    fn resolve<'a>(
-        &'a self,
-        metadata: &'a BTreeMap<String, String>,
-    ) -> BoxFuture<'a, Result<SessionEnvironment, EnvironmentError>> {
-        Box::pin(async move {
-            let root = match (&self.pinned, metadata.get(CWD)) {
-                (Some(root), _) => root.clone(),
-                (None, Some(cwd)) => PathBuf::from(cwd),
-                (None, None) => return Err(EnvironmentError::new("the session has no cwd")),
-            };
-            let tools = self
-                .tools(&root)
-                .map_err(|error| EnvironmentError::new(error.message))?;
-            let mut spawn = SpawnEnv::default();
-            spawn.vars = self.settings.spawn_vars();
-            Ok(SessionEnvironment::new(tools, spawn))
-        })
-    }
+    work_root(&cwd).map_err(CliError::config)
 }
 
 /// The session `--continue` or `-r` names, and its effective config.
@@ -369,7 +282,7 @@ async fn find(
                 here.truncate(PICKER_SIZE);
                 pick(&here, io::stdin().lock(), io::stderr())?
             }
-            Some(value) => by_id_or_name(&sessions, root, value)?,
+            Some(value) => by_id_or_name(&sessions, root, value).map_err(CliError::run)?,
         };
         let snapshot = snapshot(&asterpath, target.session).await?;
         Ok((target, snapshot))
@@ -399,34 +312,6 @@ async fn catalog(asterpath: &Asterpath) -> CliResult<Vec<CatalogEntry>> {
         query.after = Some(last.cursor());
         all.extend(page);
     }
-}
-
-/// Sessions created in `root`, last active first.
-// shortcut: reads the whole catalog and sorts by last_activity here; move to a store-side filter when catalogs grow large
-fn in_root(sessions: &[CatalogEntry], root: &Path) -> Vec<CatalogEntry> {
-    let root = root.display().to_string();
-    let mut here: Vec<CatalogEntry> = sessions
-        .iter()
-        .filter(|entry| entry.metadata.get(CWD) == Some(&root))
-        .cloned()
-        .collect();
-    here.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
-    here
-}
-
-/// A hex id (any root), else the last active session of that name in `root`.
-fn by_id_or_name(sessions: &[CatalogEntry], root: &Path, value: &str) -> CliResult<CatalogEntry> {
-    if let Ok(id) = parse_session(value) {
-        return sessions
-            .iter()
-            .find(|entry| entry.session == id)
-            .cloned()
-            .ok_or_else(|| not_found(id));
-    }
-    in_root(sessions, root)
-        .into_iter()
-        .find(|entry| entry.metadata.get(NAME).map(String::as_str) == Some(value))
-        .ok_or_else(|| CliError::run(format!("no session named {value} in {}", root.display())))
 }
 
 /// List the candidates and read a number.
@@ -475,152 +360,10 @@ pub async fn snapshot(asterpath: &Asterpath, session: SessionId) -> CliResult<Co
     asterpath_protocol::effective_config(&decoded, u64::MAX).ok_or_else(|| not_found(session))
 }
 
-struct SkillSetup {
-    index: Option<Part>,
-    diagnostics: Vec<SkillDiagnostic>,
-}
-
-/// New-session skill policy: `[skills] enabled`. The loader tool comes from
-/// the session environment.
-fn skill_setup(settings: &config::Settings, root: &Path) -> SkillSetup {
-    if !settings.skills_enabled() {
-        return SkillSetup {
-            index: None,
-            diagnostics: Vec::new(),
-        };
-    }
-    let discovery = discover(&skill_roots(settings, root));
-    let (index, budget) = render_index(&discovery.skills, DEFAULT_INDEX_BUDGET);
-    SkillSetup {
-        index,
-        diagnostics: discovery.diagnostics.into_iter().chain(budget).collect(),
-    }
-}
-
-/// Explicit paths, then the project and user roots in priority order.
-pub fn skill_roots(settings: &config::Settings, root: &Path) -> Vec<SkillRoot> {
-    let mut roots: Vec<SkillRoot> = settings
-        .skill_paths()
-        .iter()
-        .map(|path| SkillRoot {
-            path: path.clone(),
-            label: SkillRootLabel::Explicit,
-        })
-        .collect();
-    roots.push(SkillRoot {
-        path: root.join(".asterpath/skills"),
-        label: SkillRootLabel::ProjectNative,
-    });
-    roots.push(SkillRoot {
-        path: root.join(".agents/skills"),
-        label: SkillRootLabel::ProjectAgents,
-    });
-    if let Some(home) = config::config_home() {
-        roots.push(SkillRoot {
-            path: home.join("asterpath/skills"),
-            label: SkillRootLabel::UserNative,
-        });
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(SkillRoot {
-            path: PathBuf::from(home).join(".agents/skills"),
-            label: SkillRootLabel::UserAgents,
-        });
-    }
-    roots
-}
-
-/// `asterpath-tools` rooted at `root` under the `[sandbox]` policy,
-/// filtered to `selection` (`None` = all) in the order given.
-pub fn workspace_tools(
-    settings: &config::Settings,
-    root: &Path,
-    selection: Option<&[String]>,
-) -> CliResult<Vec<Arc<dyn Tool>>> {
-    let policy = settings.sandbox_policy(root);
-    let all = asterpath_tools::coding(
-        root.to_path_buf(),
-        sandbox_provider(&policy),
-        policy,
-        asterpath_tools::DEFAULT_BASH_TIMEOUT,
-    )
-    .map_err(|error| CliError::config(error.to_string()))?;
-    let Some(selection) = selection else {
-        return Ok(all);
-    };
-    selection
-        .iter()
-        .map(|name| {
-            all.iter()
-                .find(|tool| tool.descriptor().name.as_str() == name)
-                .cloned()
-                .ok_or_else(|| CliError::config(format!("unknown tool {name}")))
-        })
-        .collect()
-}
-
-/// The composition root. No approval endpoint is registered here: a command
-/// that can ask the operator registers one around its drive.
-async fn assemble(
-    settings: &config::Settings,
-    tools: Vec<Arc<dyn Tool>>,
-    environment: WorkRoot,
-) -> CliResult<Asterpath> {
-    let providers = config::providers(settings).map_err(CliError::config)?;
-    // Sessions without a context window still report `NotConfigured`.
-    let catalog = ProviderCatalog::new(providers.clone())
-        .map_err(|error| CliError::config(error.to_string()))?;
-    let config = AsterpathConfig::default();
-    let approval = config::approval_policy(settings.approval);
-    AsterpathBuilder::from_config(config)
-        .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
-        .database(&settings.db)
-        .providers(providers)
-        .tools(tools)
-        .environment(Arc::new(environment))
-        .tool(config::tool_config(settings))
-        .max_live_children(config::max_live_children(settings))
-        .model_aliases(config::model_aliases(settings))
-        .approval(approval)
-        .build()
-        .await
-        .map_err(aster_error)
-}
-
-/// Start every configured MCP server under the `[sandbox]` policy; a stdio
-/// server without `cwd` starts in `root`. A `required` failure is a
-/// configuration error.
-pub async fn load_mcp(settings: &config::Settings, root: &Path) -> CliResult<McpServers> {
-    let mut configs = settings.mcp_servers().map_err(CliError::config)?;
-    for config in &mut configs {
-        if let McpTransport::Stdio {
-            cwd: cwd @ None, ..
-        } = &mut config.transport
-        {
-            *cwd = Some(root.to_path_buf());
-        }
-    }
-    let policy = settings.sandbox_policy(root);
-    McpServers::load(configs, sandbox_provider(&policy), policy)
-        .await
-        .map_err(|error| CliError::config(error.to_string()))
-}
-
-/// bwrap on Linux. Elsewhere a restricted policy has no backend, so stdio
-/// servers fail closed at the sandbox stage unless the mode is `full-access`.
-fn sandbox_provider(policy: &SandboxPolicy) -> Option<Arc<dyn SandboxProvider>> {
-    #[cfg(target_os = "linux")]
-    if !matches!(policy, SandboxPolicy::FullAccess) {
-        return Some(Arc::new(asterpath_sandbox_linux::LinuxSandbox::new()));
-    }
-    let _ = policy;
-    None
-}
-
 /// One `mcp: <id> ...` line per configured server, in config order.
-pub fn mcp_status_lines(settings: &config::Settings, mcp: &McpServers) -> CliResult<Vec<String>> {
-    let configs = settings.mcp_servers().map_err(CliError::config)?;
-    Ok(configs
+pub fn mcp_status_lines(workspace: &Workspace, mcp: &McpServers) -> Vec<String> {
+    workspace
+        .mcp_servers
         .iter()
         .zip(mcp.statuses())
         .map(|(config, status)| match status {
@@ -634,18 +377,17 @@ pub fn mcp_status_lines(settings: &config::Settings, mcp: &McpServers) -> CliRes
             }
             other => format!("mcp: {} {other:?}", config.id),
         })
-        .collect())
+        .collect()
 }
 
 /// Optional servers that failed are reported and skipped.
-fn report_mcp_failures(settings: &config::Settings, mcp: &McpServers) -> CliResult<()> {
-    let lines = mcp_status_lines(settings, mcp)?;
+fn report_mcp_failures(workspace: &Workspace, mcp: &McpServers) {
+    let lines = mcp_status_lines(workspace, mcp);
     for (line, status) in lines.iter().zip(mcp.statuses()) {
         if !matches!(status, ServerStatus::Loaded { .. }) {
             eprintln!("{line}");
         }
     }
-    Ok(())
 }
 
 /// No providers and no drive: enough for the catalog and log-derived views.
@@ -660,6 +402,7 @@ pub async fn bare(settings: &config::Settings) -> CliResult<Asterpath> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
 
     use asterpath_protocol::SessionId;
@@ -678,54 +421,6 @@ mod tests {
                 .insert((*key).to_owned(), (*value).to_owned());
         }
         entry
-    }
-
-    #[test]
-    fn in_root_keeps_the_root_and_puts_the_last_active_first() {
-        let sessions = [
-            entry(1, 10, &[(CWD, "/a")]),
-            entry(2, 30, &[(CWD, "/a")]),
-            entry(3, 50, &[(CWD, "/b")]),
-            entry(4, 60, &[]),
-        ];
-        let here = in_root(&sessions, Path::new("/a"));
-        let ids: Vec<_> = here.iter().map(|entry| entry.session).collect();
-        assert_eq!(
-            ids,
-            [
-                SessionId::from_bytes([2; 16]),
-                SessionId::from_bytes([1; 16])
-            ]
-        );
-    }
-
-    #[test]
-    fn a_name_resolves_to_its_last_active_session_in_the_root_and_an_id_to_itself() {
-        let sessions = [
-            entry(1, 10, &[(NAME, "fix"), (CWD, "/a")]),
-            entry(2, 30, &[(NAME, "fix"), (CWD, "/a")]),
-            entry(3, 50, &[(NAME, "other"), (CWD, "/a")]),
-            entry(4, 70, &[(NAME, "fix"), (CWD, "/b")]),
-        ];
-        let root = Path::new("/a");
-        assert_eq!(
-            by_id_or_name(&sessions, root, "fix").unwrap().session,
-            SessionId::from_bytes([2; 16])
-        );
-        let hex = SessionId::from_bytes([4; 16]).to_hex();
-        assert_eq!(
-            by_id_or_name(&sessions, root, &hex).unwrap().session,
-            SessionId::from_bytes([4; 16]),
-            "an id resolves outside the root"
-        );
-        assert_eq!(by_id_or_name(&sessions, root, "nope").unwrap_err().code, 1);
-        assert_eq!(
-            by_id_or_name(&sessions, Path::new("/c"), "fix")
-                .unwrap_err()
-                .code,
-            1,
-            "a name resolves only in the root"
-        );
     }
 
     #[test]

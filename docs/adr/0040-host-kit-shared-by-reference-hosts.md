@@ -1,6 +1,6 @@
 # 宿主共用层：组装约定从 CLI 下沉为 `asterpath-host`
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-25)
 **调研**: [kernel-host-boundary-audit.md](../research/kernel-host-boundary-audit.md)
 
 ## Context

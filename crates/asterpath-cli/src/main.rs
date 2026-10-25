@@ -4,13 +4,13 @@
 //! The binary owns host policy (exit codes, stdout/stderr, approval prompts) and
 //! error reporting; it composes the same facade an embedder would.
 //!
-//! Layout: `config` resolves the file, `-c` and flags; `session` assembles the
-//! composition root and opens a new, continued or forked session; `drive`
+//! Layout: `config` (from `asterpath-host`) resolves the file and `-c`;
+//! `session` resolves the flags and opens a new, continued or forked session
+//! with the host kit's work-root assembly (ADR-0040); `drive`
 //! runs it to the end of a turn; `exec`, `doctor` and `debug` are the
 //! commands; `interactive` is the bare command (`command: None`) and reuses
 //! `session::open` and `drive`.
 
-mod config;
 mod debug;
 mod doctor;
 mod drive;
@@ -22,6 +22,7 @@ mod stream;
 use std::path::PathBuf;
 
 use asterpath::AsterError;
+use asterpath_host::config;
 use asterpath_protocol::SessionId;
 use clap::parser::ValueSource;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};

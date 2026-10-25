@@ -1,0 +1,34 @@
+[package]
+name = "asterpath-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# `config.toml` and environment parsing (CLI and desktop).
+config = ["dep:serde", "dep:toml"]
+# `ValueEnum` on the mode enums, for hosts with a clap command line.
+clap = ["dep:clap"]
+anthropic = ["asterpath/anthropic"]
+openai = ["asterpath/openai"]
+
+[dependencies]
+asterpath = { path = "../asterpath", default-features = false }
+asterpath-mcp = { path = "../asterpath-mcp" }
+asterpath-protocol = { path = "../asterpath-protocol" }
+asterpath-skills = { path = "../asterpath-skills" }
+asterpath-tools = { path = "../asterpath-tools" }
+clap = { version = "4", features = ["derive"], optional = true }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = "1"
+toml = { version = "0.9", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+asterpath-sandbox-linux = { path = "../asterpath-sandbox-linux" }
+
+[dev-dependencies]
+asterpath-testing = { path = "../asterpath-testing" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
