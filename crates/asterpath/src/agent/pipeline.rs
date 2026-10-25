@@ -138,11 +138,11 @@ impl ToolPipeline {
         for call in tool_calls(items) {
             // An output call never enters the pipeline; a recorded intent is
             // known by its provenance, whatever the config says now.
-            let output = match recorded.intents.get(&call.provider_call_id) {
+            let is_output_call = match recorded.intents.get(&call.provider_call_id) {
                 Some(intent) => intent.provenance == Provenance::Output,
                 None => step.output == Some(&call.name),
             };
-            if output {
+            if is_output_call {
                 done = ToolOutcome::Delivered;
                 self.deliver(step, &recorded, call).await?;
                 continue;

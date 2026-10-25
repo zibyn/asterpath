@@ -139,7 +139,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         .await
         .map_err(CliError::run)?;
     let delivered = ran.then(|| output_result(&entries)).flatten();
-    let undelivered = ran && delivered.is_none() && args.output_mode == Some(OutputModeArg::Tool);
+    let undelivered = ran && delivered.is_none() && mode == OutputMode::Tool;
     let text = delivered.or_else(|| ran.then(|| final_assistant_text(&entries)).flatten());
     match args.output_format {
         OutputFormat::Text if !ran => println!("idle"),

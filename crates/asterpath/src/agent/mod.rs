@@ -27,11 +27,11 @@ use asterpath_protocol::{
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
     Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, ModelRequest, OpenStep,
-    OpenTool, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorInfo,
-    ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx,
-    StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName, ToolResultStatus,
-    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup, decode_entry, dedup,
-    effective_config,
+    OpenTool, OutputFormat, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
+    ProviderErrorInfo, ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts,
+    SessionState, StepCtx, StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName,
+    ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup,
+    decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
@@ -742,32 +742,23 @@ impl Agent {
                 )
                 .await?;
 
-                let had_calls = has_tool_calls(&items);
-                let mut delivered = false;
-                if had_calls {
-                    let tools = StepTools {
-                        recovering: false,
-                        output: output.as_ref(),
-                    };
-                    let outcome = self
-                        .run_tools(session, config, turn, step, &indexed, tools, cancel, events)
-                        .await?;
-                    if outcome == ToolOutcome::Cancelled {
-                        self.commit_step(session, turn, step).await?;
-                        return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
-                    }
-                    delivered = outcome == ToolOutcome::Delivered;
-                }
-
-                self.commit_step(session, turn, step).await?;
-                if cancel.is_cancelled() {
-                    return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
-                }
-                if delivered {
-                    return Ok(StepOutcome::Turn(TurnEndReason::Completed));
-                }
-                let pending_input = self.pending_input(session).await?;
-                return Ok(step_outcome(&stop_reason, had_calls, pending_input));
+                let calls = StepCalls {
+                    recovering: false,
+                    output: output.as_ref(),
+                };
+                return self
+                    .finish_step(
+                        session,
+                        config,
+                        turn,
+                        step,
+                        &indexed,
+                        &stop_reason,
+                        calls,
+                        cancel,
+                        events,
+                    )
+                    .await;
             }
 
             // A stream that ends without a terminal event violates S2/S8.
@@ -934,18 +925,51 @@ impl Agent {
         // Upgrade by recording output_index on AssistantMessage items if hosts
         // need to correlate resumed ToolStarted with pre-crash deltas.
         let indexed: Vec<(u32, Item)> = (0..).zip(items.iter().cloned()).collect();
-        let had_calls = has_tool_calls(&items);
+        // Recorded output intents are known by provenance; this only names
+        // the output tool for calls whose intent is not recorded.
+        let output = self
+            .output_tool(config)
+            .map(|format| ToolName::new(&format.name));
+        let calls = StepCalls {
+            recovering: true,
+            output: output.as_ref(),
+        };
+        self.finish_step(
+            session,
+            config,
+            turn,
+            step,
+            &indexed,
+            &stop_reason,
+            calls,
+            cancel,
+            events,
+        )
+        .await
+    }
+
+    /// Finish a step whose `AssistantMessage` is committed, live or resumed:
+    /// run its tool calls, commit it, and decide whether the turn goes on.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_step(
+        &self,
+        session: SessionId,
+        config: &ConfigSnapshot,
+        turn: TurnId,
+        step: StepId,
+        items: &[(u32, Item)],
+        stop_reason: &StopReason,
+        calls: StepCalls<'_>,
+        cancel: &CancelToken,
+        events: &EventSink,
+    ) -> Result<StepOutcome, AgentError> {
+        let had_calls = items
+            .iter()
+            .any(|(_, item)| matches!(item, Item::ToolCall { .. }));
         let mut delivered = false;
         if had_calls {
-            // Recorded output intents are known by provenance; this only
-            // names the output tool for calls whose intent is not recorded.
-            let output = self.output_tool(config);
-            let tools = StepTools {
-                recovering: true,
-                output: output.as_ref(),
-            };
             let outcome = self
-                .run_tools(session, config, turn, step, &indexed, tools, cancel, events)
+                .run_tools(session, config, turn, step, items, calls, cancel, events)
                 .await?;
             if outcome == ToolOutcome::Cancelled {
                 self.commit_step(session, turn, step).await?;
@@ -962,7 +986,7 @@ impl Agent {
             return Ok(StepOutcome::Turn(TurnEndReason::Completed));
         }
         let pending_input = self.pending_input(session).await?;
-        Ok(step_outcome(&stop_reason, had_calls, pending_input))
+        Ok(step_outcome(stop_reason, had_calls, pending_input))
     }
 
     /// Hand this step's tool calls to the pipeline; `spawn_agent` calls are
@@ -975,7 +999,7 @@ impl Agent {
         turn: TurnId,
         step: StepId,
         items: &[(u32, Item)],
-        tools: StepTools<'_>,
+        calls: StepCalls<'_>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolOutcome, AgentError> {
@@ -991,10 +1015,10 @@ impl Agent {
             session,
             turn,
             step,
-            recovering: tools.recovering,
+            recovering: calls.recovering,
             cancel_grace: config.turn.cancel_grace,
             tools: &config.tools,
-            output: tools.output,
+            output: calls.output,
             events,
             spawn,
         };
@@ -1027,11 +1051,11 @@ impl Agent {
         )
     }
 
-    /// The output tool `config` puts in this model's requests (ADR-0034).
-    fn output_tool(&self, config: &ConfigSnapshot) -> Option<ToolName> {
+    /// The format `config` delivers through the output tool for this model,
+    /// or `None` for the native constraint (ADR-0034).
+    fn output_tool<'a>(&self, config: &'a ConfigSnapshot) -> Option<&'a OutputFormat> {
         let provider = self.providers.get(&config.model.provider)?;
         output::tool(&config.request, &provider.capabilities(&config.model))
-            .map(|format| ToolName::new(&format.name))
     }
 
     /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
@@ -1076,11 +1100,11 @@ impl Agent {
             history.tools,
             &config.request,
         );
-        let output = self.output_tool(config);
-        if let Some(format) = output.as_ref().and(config.request.output_format.as_ref()) {
+        let format = self.output_tool(config);
+        if let Some(format) = format {
             output::apply(&mut request, format);
         }
-        Ok((request, output))
+        Ok((request, format.map(|format| ToolName::new(&format.name))))
     }
 
     async fn commit_turn(
@@ -1556,9 +1580,10 @@ fn last_log_id(facts: &SessionFacts) -> LogId {
         .unwrap_or_else(|| LogId::from_i64(0))
 }
 
-/// How the pipeline treats one step's calls.
+/// How the pipeline treats one step's calls: as a resumed step's, and with
+/// the output tool the step's request carried.
 #[derive(Clone, Copy)]
-struct StepTools<'a> {
+struct StepCalls<'a> {
     recovering: bool,
     output: Option<&'a ToolName>,
 }
