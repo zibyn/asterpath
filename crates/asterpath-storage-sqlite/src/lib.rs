@@ -52,13 +52,13 @@ pub struct OpenOptions {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     session_id  BLOB    PRIMARY KEY,
     parent_id   BLOB,
     created_at  INTEGER NOT NULL,
     metadata    TEXT    NOT NULL
 );
-CREATE TABLE log (
+CREATE TABLE IF NOT EXISTS log (
     log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      BLOB    NOT NULL,
     seq             INTEGER NOT NULL,
@@ -70,7 +70,7 @@ CREATE TABLE log (
     UNIQUE (session_id, seq),
     UNIQUE (session_id, event_kind, dedup_key)
 );
-CREATE TABLE retired_sessions (
+CREATE TABLE IF NOT EXISTS retired_sessions (
     session_id   BLOB    PRIMARY KEY,
     parent_id    BLOB,
     last_log_id  INTEGER NOT NULL,
@@ -101,9 +101,8 @@ pub fn open_with_clock(
     let path = path.as_ref();
     create_private_file(path)?;
     let conn = Connection::open(path).map_err(backend)?;
-    configure(&conn, options.synchronous)?;
     let lock = acquire_writer_lock(path)?;
-    migrate(&conn)?;
+    prepare(&conn, options.synchronous)?;
     let reader = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -710,10 +709,30 @@ fn create_private_file(path: &Path) -> Result<(), StorageError> {
         .map_err(backend)
 }
 
+/// Connection setup and schema migration every opener runs before serving.
+fn prepare(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageError> {
+    configure(conn, synchronous)?;
+    migrate(conn)?;
+    // Setup above waits out other openers (rusqlite's default busy timeout);
+    // serving never waits.
+    conn.pragma_update(None, "busy_timeout", 0).map_err(backend)
+}
+
 fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageError> {
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-        .map_err(backend)?;
+    // Switching a fresh file to WAL can return BUSY without consulting the busy
+    // handler (lock-upgrade deadlock between concurrent first openers), so retry.
+    let mut attempts = 0;
+    let mode: String = loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)) {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 5_000 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => break result.map_err(backend)?,
+        }
+    };
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(StorageError::Backend(format!(
             "could not enable WAL (journal_mode={mode})"
@@ -724,8 +743,6 @@ fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageE
         Synchronous::Normal => "NORMAL",
     };
     conn.pragma_update(None, "synchronous", synchronous)
-        .map_err(backend)?;
-    conn.pragma_update(None, "busy_timeout", 0)
         .map_err(backend)?;
     Ok(())
 }
@@ -763,8 +780,11 @@ fn acquire_writer_lock(path: &Path) -> Result<WriterLock, StorageError> {
     Err(StorageError::WriterBusy)
 }
 
+/// Concurrent first opens race here: the version is read under the write lock
+/// (`BEGIN IMMEDIATE`) so exactly one opener builds the schema.
 fn migrate(conn: &Connection) -> Result<(), StorageError> {
-    let version: i64 = conn
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(backend)?;
+    let version: i64 = tx
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(backend)?;
     if version > SUPPORTED_SCHEMA_VERSION {
@@ -775,13 +795,11 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     // Pre-release: no DDL migrations; a database from an older layout is rebuilt.
     if version == 0 {
-        let tx = conn.unchecked_transaction().map_err(backend)?;
         tx.execute_batch(SCHEMA).map_err(backend)?;
         tx.pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
             .map_err(backend)?;
-        tx.commit().map_err(backend)?;
     }
-    Ok(())
+    tx.commit().map_err(backend)
 }
 
 type RawEntry = (i64, Vec<u8>, i64, i64, i64, Option<String>, String);
@@ -921,6 +939,55 @@ mod tests {
                 "reads use a read-only connection"
             );
             drop(storage);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn concurrent_first_opens_all_migrate_to_one_schema() {
+        // The writer lock serializes `open` today; ADR-0036 removes it, so race the
+        // connection setup and migration that every opener runs (#143).
+        for round in 0..20 {
+            let dir = std::env::temp_dir().join(format!(
+                "asterpath-sqlite-migrate-race-{}-{round}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("db.sqlite");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let openers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let conn = Connection::open(&path).expect("open connection");
+                        barrier.wait();
+                        prepare(&conn, Synchronous::Normal)?;
+                        let schema: Vec<String> = conn
+                            .prepare(
+                                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+                            )
+                            .and_then(|mut statement| {
+                                statement
+                                    .query_map([], |row| row.get(0))?
+                                    .collect::<Result<_, _>>()
+                            })
+                            .map_err(backend)?;
+                        let version: i64 = conn
+                            .query_row("PRAGMA user_version", [], |row| row.get(0))
+                            .map_err(backend)?;
+                        Ok::<_, StorageError>((version, schema))
+                    })
+                })
+                .collect();
+            let results: Vec<_> = openers
+                .into_iter()
+                .map(|opener| opener.join().expect("opener thread"))
+                .collect();
+            let first = results[0].as_ref().expect("first opener").clone();
+            assert_eq!(first.0, SUPPORTED_SCHEMA_VERSION);
+            for result in &results {
+                assert_eq!(result.as_ref().expect("every opener succeeds"), &first);
+            }
             std::fs::remove_dir_all(&dir).ok();
         }
     }
