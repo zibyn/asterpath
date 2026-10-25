@@ -1,6 +1,6 @@
 # 原生执行链追踪模型
 
-> 来源：[#12](https://github.com/zibyn/asterpath/issues/12)。本文件定义原生 trace 的数据模型、挂接点与查询：查询是 facade 方法 `Asterpath::trace(session)`，返回 `Vec<Span>`，折叠在引擎模块 `views::trace`；实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
+> 来源：[#12](https://github.com/zibyn/asterpath/issues/12)。本文件定义原生 trace 的数据模型、挂接点与查询：查询是 facade 方法 `Asterpath::trace(session)`，返回 `Vec<Span>`，折叠在引擎模块 `views::trace`；实时导出由应用在 `Hooks::on_record` 上自行增量折叠。
 >
 > 对齐：[事件日志与检查点恢复](event-log-recovery.md)、[Agent loop](agent-loop.md)、[子智能体](subagents.md)、[上下文压缩](compaction.md)、[协议模型](protocol.md)、[OTel GenAI 研究](../research/otel-genai-conventions.md)。
 >
@@ -14,8 +14,8 @@
 - **一个逻辑模型调用一个 span**，所有 transport attempt 折叠为 span event；等待（approval / child）是独立 span。
 - **身份确定**：`TraceId = SessionId`，`SpanId` 由开启该 span 的日志记录确定性派生。重建得到相同 ID；恢复复用已存在的开启记录，不产生重复 span。
 - **恢复不新建 trace**：`StreamResumed` 记为 session span 上的 `resume` event；跨恢复的 span 标 `replay`。
-- **只有 pull 查询**：`Asterpath::trace(session)` 按需从 `SessionStore` 的日志折叠该会话的全部 span。值类型在 `asterpath-protocol`，折叠在引擎内部（`views::trace`）。没有推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠（ADR-0026）。
-- **内容永不进 trace**：span 只带 `log_range` 引用。采样、过滤、格式、内容捕获与脱敏由 exporter/host 决定，默认关闭内容。
+- **只有 pull 查询**：`Asterpath::trace(session)` 按需从 `SessionStore` 的日志折叠该会话的全部 span。值类型在 `asterpath-protocol`，折叠在引擎内部（`views::trace`）。没有推送：实时导出由应用在 `Hooks::on_record` 上自行增量折叠（ADR-0026）。
+- **内容永不进 trace**：span 只带 `log_range` 引用。采样、过滤、格式、内容捕获与脱敏由 exporter/应用 决定，默认关闭内容。
 
 ## 2. 类型（`asterpath-protocol`）
 
@@ -257,8 +257,8 @@ pub enum TraceError {
 - `trace(session)` 从注入的 `SessionStore` 折叠该会话；没有 trace 表，也不需要额外索引。`SpanFilter` 是引擎内部按 turn / step / kind 等收窄的同一折叠，facade 只按会话查询。
 - 日志被退役后，该会话的 span 一并消失：`trace(session)` 返回 `NotFound`，存活会话的重建范围随之缩小（[retention.md](retention.md) §9）。已导出的 trace 不受影响。
 - 不提供 tree API：调用方按 `parent` 自建树。
-- 实时导出：宿主在 `Hooks::on_record` 上按本文的开启 / 终态规则自行增量折叠（每条开启记录开 span，只有终态记录关 span；session span 不关）。框架不维护推送状态，trace 不改变日志，也不参与恢复。
-- **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由 host 注入 `SessionStore` 读取权限，并自行脱敏。默认导出不含内容。
+- 实时导出：应用在 `Hooks::on_record` 上按本文的开启 / 终态规则自行增量折叠（每条开启记录开 span，只有终态记录关 span；session span 不关）。框架不维护推送状态，trace 不改变日志，也不参与恢复。
+- **内容边界**：`Span.log_range` 指向日志区间。exporter 需要 prompt/completion/工具参数时，由应用注入 `SessionStore` 读取权限，并自行脱敏。默认导出不含内容。
 - **采样、过滤、格式、批量、重试**：全归 exporter。内核与 tracing 模块不做 head sampling。
 - 导出格式（OTLP/JSON/其他）与 `gen_ai.*` 映射只在 exporter 中出现；核心类型不使用字符串属性名。
 
@@ -297,9 +297,9 @@ pub enum TraceError {
 
 ## 10. 非目标
 
-- trace 持久化、索引、保留策略：exporter/host 或 storage 扩展负责。
-- head sampling、尾部采样、成本预算：exporter/host。
-- 内容捕获、脱敏、PII 规则：exporter/host。
+- trace 持久化、索引、保留策略：exporter/应用 或 storage 扩展负责。
+- head sampling、尾部采样、成本预算：exporter/应用。
+- 内容捕获、脱敏、PII 规则：exporter/应用。
 - OTel SDK/OTLP 依赖、`gen_ai.*` 字符串进入核心：出界。
 - 跨进程分布式 trace 上下文传播：v1 单进程。
 - 每个 transport attempt 一个 span、workflow/plan span：不做。

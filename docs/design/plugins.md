@@ -8,13 +8,13 @@
 
 ## 1. 决策摘要
 
-- **进程内模块与 MCP 服务分开**：进程内模块随宿主编译，由组装根显式选择；只有 MCP 服务有配置。
+- **进程内模块与 MCP 服务分开**：进程内模块随应用编译，由组装根显式选择；只有 MCP 服务有配置。
 - **配置是嵌入者提供的数据，框架只定义形状**：`McpServerConfig` 在 `asterpath-mcp`；框架不读配置文件、不做发现、不展开环境变量、不持久化配置。
 - **工具来源，不是插件宿主**：`McpServers::load` 返回已加载的工具；嵌入者把 `tools()` 交给 engine builder。facade 不新增工具来源接口（ADR-0027）。
 - **加载是启动期一次性动作**：不做动态发现、热替换、运行期安装/卸载；换服务 = 重启进程。
 - **命名空间强制**：外部工具以 `<server_id>__<tool_name>` 暴露；`__` 保留；碰撞或超长 = 整个服务加载失败，绝不 last-write-wins。
 - **版本协商是精确白名单**：`protocol_versions` 列出接受的协议版本；握手结果必须命中。
-- **失败按服务隔离**：可选服务失败不阻止宿主启动；`required: true` 的服务失败中止启动；没有部分能力降级。
+- **失败按服务隔离**：可选服务失败不阻止应用启动；`required: true` 的服务失败中止启动；没有部分能力降级。
 - **秘密不进日志**：`env` 与 HTTP `headers` 在 `Debug` 中脱敏，配置永不进事件日志。
 - **沙箱 fail closed**：stdio 进程启动前，provider 给出的强制级别不是 `Full` 即加载失败（§5、[sandbox.md](sandbox.md) §9）。
 
@@ -37,8 +37,8 @@ let engine = AsterpathBuilder::new().tools(mcp.tools()) /* … */ .build().await
 engine.shutdown().await; mcp.shutdown().await; // 先引擎、后 MCP
 ```
 
-- 依赖：`asterpath` + `asterpath-mcp`（受限策略再加 `asterpath-sandbox-linux` 或宿主自己的 `SandboxProvider`）。
-- `statuses()` 按输入顺序给出每个配置的结果，供宿主展示。
+- 依赖：`asterpath` + `asterpath-mcp`（受限策略再加 `asterpath-sandbox-linux` 或应用自己的 `SandboxProvider`）。
+- `statuses()` 按输入顺序给出每个配置的结果，供应用展示。
 - `shutdown(self)` 对每个服务优雅关闭（stdio：关 stdin → 等宽限 → SIGTERM → SIGKILL）；之后仍被引擎持有的工具调用返回 `Transport`。不调用 `shutdown` 时，所有工具 drop 后 stdio 进程仍会被 kill。
 
 ## 4. MCP 服务配置
@@ -59,7 +59,7 @@ pub enum McpTransport {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,   // 追加到继承环境；同键覆盖
-        cwd: Option<PathBuf>,            // 缺省为宿主进程 cwd
+        cwd: Option<PathBuf>,            // 缺省为应用进程 cwd
     },
     Http {
         url: String,
@@ -99,9 +99,9 @@ pub struct McpTimeouts {
 ### 4.1 传输与环境
 
 - `command` 直接交给操作系统执行，**不经过 shell**；`args` 原样传递。
-- `env` 追加到宿主进程的环境；同键覆盖。框架不做 `${VAR}` 展开。
+- `env` 追加到应用进程的环境；同键覆盖。框架不做 `${VAR}` 展开。
 - 秘密可以放在 `env` 或 HTTP `headers` 里；`Debug` 脱敏，错误信息只报字段名，不报值。
-- 服务进程**继承宿主进程的环境变量**；配置不声明沙箱档位，受限策略由宿主的 `SandboxProvider` 在进程启动前施加，provider 可经 `ConfinedSpawn.env` 收窄环境（[sandbox.md](sandbox.md)）。
+- 服务进程**继承应用进程的环境变量**；配置不声明沙箱档位，受限策略由应用的 `SandboxProvider` 在进程启动前施加，provider 可经 `ConfinedSpawn.env` 收窄环境（[sandbox.md](sandbox.md)）。
 
 ## 5. 加载规则
 
@@ -111,7 +111,7 @@ pub struct McpTimeouts {
 
 - **配置校验**在启动任何进程之前完成：`id` 字符集、`protocol_versions` 非空且与 adapter 支持集有交集、超时为正。
 - **重复 `id`**：加载集合里共享同一 `id` 的所有配置都失败（`Config`）；其中任一 `required` 则加载返回 `McpError`。
-- **沙箱**：策略非 `FullAccess` 而没有 provider、provider 返回错误、或强制级别不是 `Full` → `Failed{Sandbox}`，进程不启动。`Enforcement::Partial` 暂时一律失败；`allow_partial` 落地后放开，并把强制级别透给宿主。
+- **沙箱**：策略非 `FullAccess` 而没有 provider、provider 返回错误、或强制级别不是 `Full` → `Failed{Sandbox}`，进程不启动。`Enforcement::Partial` 暂时一律失败；`allow_partial` 落地后放开，并把强制级别透给应用。
 - **握手、发现**由 adapter 完成（[mcp.md](mcp.md)）。
 - **原子登记**：先校验该服务的全部合成名称，再一次性加入工具集；任何名称非法、超长或与已加载工具碰撞，该服务不贡献任何工具。
 - 首个 `required` 失败即中止并返回 `McpError`；此前已加载的服务随之 drop（进程被 kill）。
@@ -131,7 +131,7 @@ pub struct McpTimeouts {
 
 ## 8. 升级、恢复与在途调用
 
-- **没有热替换**：升级服务 = 重启宿主进程；会话靠日志恢复。
+- **没有热替换**：升级服务 = 重启应用进程；会话靠日志恢复。
 - **工具消失**：新请求写 `ToolCallRequested`（`provenance = Unknown`，`replay = Unsafe`）并以 `Failed{NotFound}` 闭合；恢复遇 open intent 按记录的 `replay` / `provenance` 处理（#3）。
 - **服务在运行中崩溃**：不自动重连（[mcp.md](mcp.md) §7.3）；stdio 在途调用记 `Failed{Transport}`。
 
@@ -155,7 +155,7 @@ pub struct McpError { pub server: ServerId, pub stage: LoadStage, pub message: S
 
 - 动态发现、运行期安装/卸载、热替换。
 - WASM / dylib 插件、registry、OAuth 与凭据管理。
-- MCP 之外的协议（ACP 若实现，是宿主 / 会话接口，不复用本工具来源，见 [mcp.md](mcp.md) §9）。
+- MCP 之外的协议（ACP 若实现，是应用 / 会话接口，不复用本工具来源，见 [mcp.md](mcp.md) §9）。
 - 部分工具登记；实现指纹恢复校验。
 
 ## 11. 验收场景

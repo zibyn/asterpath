@@ -4,14 +4,14 @@
 >
 > 对齐：[模块契约](./module-contracts.md)、[事件日志](./event-log-recovery.md)、[agent loop](./agent-loop.md)。
 >
-> 本文的 “pre-execute” / “post-execute” 指宿主注册的 `Hooks::before_tool` / `Hooks::after_tool`：多个钩子按注册顺序调用，首个 `ToolGate::Deny` 短路，改写逐个传递；钩子错误或 panic 使该调用 `Failed{Internal}`。
+> 本文的 “pre-execute” / “post-execute” 指应用注册的 `Hooks::before_tool` / `Hooks::after_tool`：多个钩子按注册顺序调用，首个 `ToolGate::Deny` 短路，改写逐个传递；钩子错误或 panic 使该调用 `Failed{Internal}`。
 >
 > 相关 ADR：[0007 审批管线](../adr/0007-approval-and-sandbox-layers.md)、[0019 沙箱接缝](../adr/0019-sandbox-seam-and-policy.md)。
 
 ## 1. 决策摘要
 
 - **管线固定**：pre-execute → 意图记录 → 审批 → 执行 → 截断 → post-execute → 结果记录。只有 pre-execute（`before_tool`）与 post-execute（`after_tool`）可拦截；其余只能经 `on_record` 观察。
-- **审批是框架管线阶段**。框架定义策略 seam、请求/决定事件与持久等待；具体审批 UI 与策略由 host 提供。
+- **审批是框架管线阶段**。框架定义策略 seam、请求/决定事件与持久等待；具体审批 UI 与策略由应用提供。
 - **审批决定记录为 `ApprovalDecided { tool_call_id, decision }`**，跨崩溃；审批请求是进程内 typed event，不进日志。
 - **`External` 默认 fail closed**：没有审批端时按 Deny 处理；`ReplaySafety` 默认 `Unsafe`。
 - **并行/独占按 step 内锁调度**；结果完成即追加，模型投影按调用顺序重排。
@@ -102,7 +102,7 @@ AssistantMessage(tool_calls)
     acquire Parallel / Exclusive lock
     invoke (timeout + cancel)
     truncate                       # 单次 + 本 step 累计上限
-    Hooks::after_tool              # 宿主塑形（脱敏、格式化）
+    Hooks::after_tool              # 应用塑形（脱敏、格式化）
     append ToolResult { final }
 ```
 
@@ -110,7 +110,7 @@ AssistantMessage(tool_calls)
 
 - **每个模型发起的调用都会写 `ToolCallRequested`**，即使随后被拒绝；意图与终态一一对应（I2）。
 - 工具不在注册表时：pre-execute 照常运行；若未被拒绝，写意图（`replay = Unsafe`、`provenance = Unknown`），跳过审批与执行，写 `ToolResult{Failed, NotFound}`。模型幻觉、插件升级后移除工具都走这条路径。
-- 工具不在本 step 的生效工具集中时同样按「不在注册表」处理，即使注册表里有它：宿主经 `update_config` 移除的工具、或创建时没选中的工具（ADR-0030，[packaging.md](packaging.md) §2.1）。生效集合按 `StepStarted` 水位折叠，step 内的移除等下一个 step 才生效；已记录意图的调用照常收尾，不受之后移除的影响。
+- 工具不在本 step 的生效工具集中时同样按「不在注册表」处理，即使注册表里有它：应用经 `update_config` 移除的工具、或创建时没选中的工具（ADR-0030，[packaging.md](packaging.md) §2.1）。生效集合按 `StepStarted` 水位折叠，step 内的移除等下一个 step 才生效；已记录意图的调用照常收尾，不受之后移除的影响。
 - pre-execute 在写意图前运行。它可以改写参数，日志记录改写后的 **effective args**；模型原始参数仍在 `AssistantMessage` 中。
 - `ToolCallRequested` 同时记录框架生成的 `tool_call_id` 与模型响应中的 `provider_call_id`（`ToolCall.call_id` 原值）；投影与恢复按 `provider_call_id` 配对，两个同名同参的并行调用不会串位。
 - pre-execute 崩溃或报错不产生副作用；恢复时重跑该调用的 pre-execute。
@@ -118,7 +118,7 @@ AssistantMessage(tool_calls)
 - deny（来自 pre-execute、策略或审批）写 `ToolResult{Failed, error.kind = Denied}`，跳过执行与 post-execute。
 - **`ToolCallRequested` 是副作用的点无回退**：写完它之后，任何执行都必须以重放安全规则收尾。
 - post-execute 在结果落盘前运行，可以改写 `content` / `error.message`（格式化、脱敏、审计改写），但**不得产生副作用、不得写日志**。
-- 除这两个钩子外，宿主只能经 `Hooks::on_record` 观察已提交记录，不能阻止或改写管线。框架补写的 `Interrupted` / `Denied` / `NotFound` 不经过 `after_tool`。
+- 除这两个钩子外，应用只能经 `Hooks::on_record` 观察已提交记录，不能阻止或改写管线。框架补写的 `Interrupted` / `Denied` / `NotFound` 不经过 `after_tool`。
 
 ## 4. 审批
 
@@ -133,7 +133,7 @@ pub enum ApprovalVerdict {
     Deny { reason: Option<String> },
 }
 
-/// 宿主对一次审批请求的回答，记录为 `ApprovalDecided.decision`。
+/// 应用对一次审批请求的回答，记录为 `ApprovalDecided.decision`。
 #[non_exhaustive]
 pub enum ApprovalDecision {
     Allow,
@@ -155,18 +155,18 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
 - `Ask` 时先沿父会话找到调用所在会话树的根，查 `ApprovalGate::is_open(root)`（是否有端点在照看这棵树，ADR-0039）；同进程里其他会话树的端点不算数。关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后经引擎持久等待该调用的 `ApprovalDecided`。
-- 决定由 host 的审批端经 `SessionHandle::approve(tool_call_id, decision)` 写为 `ApprovalDecided { tool_call_id, decision: ApprovalDecision }`，dedup key 为 `tool_call_id`。
-- `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是宿主的回答；两者不合并，`Ask` 只在策略侧存在。
+- 决定由应用的审批端经 `SessionHandle::approve(tool_call_id, decision)` 写为 `ApprovalDecided { tool_call_id, decision: ApprovalDecision }`，dedup key 为 `tool_call_id`。
+- `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是应用的回答；两者不合并，`Ask` 只在策略侧存在。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
 - Deny 的 `reason` 写入 `ToolResult.error.message`；没有 reason 时用固定文本。
 - **恢复**：open `ToolCallRequested` + 无 `ApprovalDecided` + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有 `ApprovalDecided` 则按记录执行，**不再看当前策略**。
-- 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。host 不得在调用 open 期间热换策略（v1 无热替换，#2）。
-- 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
-- 不引入独立的 `Approver` trait：host 在能够应答某会话树时用 `Asterpath::approval_gate().register(root)` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并调用 `approve` 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
+- 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。应用 不得在调用 open 期间热换策略（v1 无热替换，#2）。
+- 审批粒度是单次调用；session 级「本次全部允许」是应用的缓存策略，不落日志、不改变已记录的决定。
+- 不引入独立的 `Approver` trait：应用 在能够应答某会话树时用 `Asterpath::approval_gate().register(root)` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并调用 `approve` 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - 一个调用最多一条 `ApprovalDecided`：重复回答被 dedup 吸收，先写入者生效。等待按 session 作用域。
 - 等待不写意图记录：open 的 `ToolCallRequested` 已承担意图。
 - 会话树没有注册审批端点时，`Ask` 按 `Deny` 处理（fail closed，reason 为 `NO_APPROVAL_ENDPOINT`），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
-- **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序）；`pending_in(root)` 只返回一棵会话树的（含子会话），供新连上的客户端找回待审批项。子会话的请求不进父会话的 drive 流，宿主轮询 `pending_in(root)` 发现它们，按 `ApprovalRequest::session` 打开该会话再 `approve`。等待因任何原因结束（决定、取消、宿主丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
+- **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序）；`pending_in(root)` 只返回一棵会话树的（含子会话），供新连上的客户端找回待审批项。子会话的请求不进父会话的 drive 流，应用轮询 `pending_in(root)` 发现它们，按 `ApprovalRequest::session` 打开该会话再 `approve`。等待因任何原因结束（决定、取消、应用丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：
 
@@ -198,7 +198,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - 单次调用取 `ToolDescriptor.timeout`；`None` 时进程内工具不设超时，external adapter 用默认 `120s`。
 - 到期：发取消信号 → 宽限 `kill_grace`（默认 5s）→ drop future / SIGKILL；写 `ToolResult{Failed, Timeout}`。
 - 到期时若回合与该调用都未被取消，工具在宽限内自报的 `Err(Cancelled)` 记为 `Failed{Timeout}`，保留工具的 message（工具只看到取消，引擎知道原因是 deadline）；回合取消引起的 `Cancelled` 不变。`Ok` 或其他错误照常记录。
-- 内置 `bash`（`asterpath-tools`）的 `timeout` 由宿主传入（`DEFAULT_BASH_TIMEOUT` = 120s），模型不能修改；被取消时 message 带已捕获输出的末尾（stdout/stderr 合计约 4 KiB），超时结果因此含部分输出。
+- 内置 `bash`（`asterpath-tools`）的 `timeout` 由应用传入（`DEFAULT_BASH_TIMEOUT` = 120s），模型不能修改；被取消时 message 带已捕获输出的末尾（stdout/stderr 合计约 4 KiB），超时结果因此含部分输出。
 - 超时不重试。
 
 **取消**
@@ -332,7 +332,7 @@ pub struct ToolConfig {
 以下能力由模块/插件实现，内核只提供接入点：
 
 - **沙箱/隔离**：`SandboxProvider` 在进程启动点变换命令；内核只带 `Provenance`。纯进程内工具没有进程边界，包装器只能在 `invoke` 前后拒绝或审计。接缝、策略与错误分类见 [sandbox.md](sandbox.md) 与 [ADR-0019](../adr/0019-sandbox-seam-and-policy.md)。
-- **内容脱敏/密钥**：宿主的 `Hooks::after_tool`；内核不提供默认规则。它在落盘前运行，是唯一接入点。
+- **内容脱敏/密钥**：应用的 `Hooks::after_tool`；内核不提供默认规则。它在落盘前运行，是唯一接入点。
 - **成本/预算**：不是工具层扩展；usage 与 `Hooks::before_step` 见 [usage.md](usage.md) / [agent-loop.md](agent-loop.md)。
 - **内置工具**：可选模块或参考 CLI，不在内核。
 

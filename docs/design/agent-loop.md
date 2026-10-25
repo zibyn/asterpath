@@ -15,7 +15,7 @@
 - steering 只排队，**不打断**在途模型流；输入到达即写 `InputRecorded`。
 - 取消是回合级、协作式；宽限期后 drop 在途工具并写 `Interrupted`；取消同时闭合本 step 的等待意图。
 - 模型失败在 step 内按 attempt 重试；工具失败不重试，作为模型可见结果交回模型。
-- 默认不设 step 上限；宿主通过 `Hooks::before_step`（pre-step gate，ADR-0025）实施自己的停止策略。
+- 默认不设 step 上限；应用通过 `Hooks::before_step`（pre-step gate，ADR-0025）实施自己的停止策略。
 
 ## 2. 回合与步骤
 
@@ -82,7 +82,7 @@ run_turn(session):
     loop:
         if cancelled:
             append(TurnCommitted(Cancelled)); return      # 零 step 取消
-        # pre-step：压缩（#9）→ 宿主 gate
+        # pre-step：压缩（#9）→应用gate
         match compact_if_needed(session):                 # 可写 CompactionStarted / CompactionApplied / CompactionAborted
             Ok(NotNeeded | NothingToDo | NotConfigured | Applied) -> {}
             Ok(Insufficient) -> append(TurnCommitted(ContextExhausted)); return
@@ -299,13 +299,13 @@ C5 重试每 step 至多一次，且不占 `max_attempts` 预算：即使超限�
 | 用户取消 | `Cancelled` |
 | 模型错误不可重试 / 重试耗尽 | `Failed` |
 | `max_steps_per_turn` 达到 | `MaxStepsExceeded` |
-| 宿主 gate 返回停止 | `Stopped { reason }` |
+| 应用的 gate 返回停止 | `Stopped { reason }` |
 | 上下文窗口耗尽：`stop_reason` 超限，或强制压缩后仍超限 | `ContextExhausted` |
 | 压缩阶段失败 | `CompactionFailed` |
 | gate 自身出错 | `Failed` |
 
 - `pause_turn` 是「继续」控制信号，不新增输入、不结束回合。
-- 不自动续写被截断的输出；宿主可以再发输入。
+- 不自动续写被截断的输出；应用可以再发输入。
 
 ## 9. 追踪与 token 对齐
 
@@ -333,15 +333,15 @@ pub struct TurnConfig {
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `max_steps_per_turn` | `None` | 宿主可设；`Some(0)` 在构建期被拒绝（`AsterError::Config`）；超限 `MaxStepsExceeded` |
+| `max_steps_per_turn` | `None` | 应用可设；`Some(0)` 在构建期被拒绝（`AsterError::Config`）；超限 `MaxStepsExceeded` |
 | `max_attempts` | `3` | 含首次 |
 | `retry_backoff` | 1s 指数 ×2，cap 30s，jitter | 仅 retryable |
 | `request_timeout` | `600s` | 每次 attempt；`None` 关闭 |
 | `cancel_grace` | `10s` | 0 = 立即 drop |
 | `tool_timeout` | `None` | 由 `ToolDescriptor` 决定；external 缺省 120s |
 | `kill_grace` | `5s` | 超时/取消后强杀外部工具的宽限；属 `ToolConfig`（[tools.md](tools.md) §9，#7） |
-| pre-step gate | 无 | 宿主注册 `Hooks::before_step` |
-| host stop | 无 | 宿主经 gate 返回 `Stopped { reason }` |
+| pre-step gate | 无 | 应用注册 `Hooks::before_step` |
+| 应用停止 | 无 | 应用经 gate 返回 `Stopped { reason }` |
 | cost/budget 扩展 | 无 | `before_step` 读 `StepCtx::usage()` 返回 `Gate::EndTurn` → `Stopped { reason }`；最多超支一个 step；价格表/币种不在内核（#13） |
 
 ## 11. 验收场景

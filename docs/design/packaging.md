@@ -7,11 +7,11 @@
 ## 1. 决策摘要
 
 - 引擎是一个 crate（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，[#79](https://github.com/zibyn/asterpath/issues/79)）：agent、scheduler、durable waits、工具表、trace / usage 视图与默认压缩是 `asterpath` 的内部模块；`asterpath-core` 并入 `asterpath-protocol`。workspace = 13 个库/应用成员 + `xtask`（§2；#80 以 `asterpath-mcp` 取代 `asterpath-plugin-host` 与 `asterpath-sandbox`）。独立 crate 只为真实适配器或可选重依赖。
-- 依赖规则按角色（`protocol` / `adapter` / `engine` / `host` / `app` / `tool`），由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查（§2）。
+- 依赖规则按角色（`protocol` / `adapter` / `engine` / `app` / `tool`，ADR-0048 去掉了 `host`），由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查（§2）。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade（`asterpath`）、`asterpath-protocol` 与日志 schema**，适配器 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
 - `protocol` 无 feature；feature 只出现在 facade、CLI 与后端 crate。
-- 没有后台 driver：宿主认领会话树后显式调用 `OwnedSession::drive()`；同一 session 单飞；丢弃流不等于取消。
+- 没有后台 driver：应用认领会话树后显式调用 `OwnedSession::drive()`；同一 session 单飞；丢弃流不等于取消。
 - 参考 CLI 对齐 Codex / Claude Code 共有核心子集：交互、`exec`、`doctor`、`debug`；专用 flag 有准入规则，其余配置走 `-c key=value`；退出码 `0/1/2`（§4）。
 - 三段验收由 `asterpath-acceptance` 的 `testdrive` 二进制 + 真 `SIGKILL` 驱动；#19 只负责五个注入点工具链。
 - v1 的 provider/model 在 session 创建时快照，**不支持 turn 内切换**；验收 (b) 验证的是 adapter 可替换性与规范化历史等价。
@@ -21,7 +21,7 @@
 | crate | 角色 | 职责 | 允许的 workspace 依赖 |
 | --- | --- | --- | --- |
 | `asterpath-protocol` | protocol | ID、日志信封与存储契约（`SessionStore`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy` / `SandboxProvider` 及沙箱类型，ADR-0027）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
-| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite` |
+| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2）；可选 feature `workspace`（按工作根组装：工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`、`cwd` / `name` 元数据键与续会话规则）与 `config`（`config.toml` 与环境变量解析，依赖 `workspace`），都不在 `default`（ADR-0048） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite`；`workspace` 下 `tools`、`skills`、`mcp`、`sandbox-linux` |
 | `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；`provider_options` 深合并与同 provider raw 字段提取（#101、#103）；不属于稳定面（ADR-0026 修订） | `protocol` |
 | `asterpath-provider-anthropic` | adapter | Anthropic Messages adapter | `protocol`, `http` |
 | `asterpath-provider-openai` | adapter | OpenAI Responses adapter | `protocol`, `http` |
@@ -31,17 +31,16 @@
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
 | `asterpath-tools` | adapter | 按根目录构造的 `read_file` / `list_dir` / `grep` / `write_file` / `edit_file` / `bash` 工具与 `read_only` / `coding` 预设（#83） | `protocol` |
 | `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件、`FakeSandboxProvider` | `protocol` |
-| `asterpath-host` | host | 参考宿主共用层（ADR-0040）：按工作根组装（工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`）、宿主元数据键与续会话规则，入参是普通值；`config` feature 解析 `config.toml` 与环境变量，默认不开；不依赖 clap，CLI 用自己的 clap 枚举映射过来；不属于稳定面 | `asterpath`, `protocol`, `mcp`, `skills`, `tools`, `sandbox-linux` |
 | `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
-| `asterpath-desktop` | app | Tauri 桌面参考宿主（`apps/desktop/src-tauri`）；命令层是库，窗口在非默认 feature `tauri` 后（ADR-0035） | 任意 |
+| `asterpath-desktop` | app | Tauri 桌面参考应用（`apps/desktop/src-tauri`）；命令层是库，窗口在非默认 feature `tauri` 后（ADR-0035） | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
 | `asterpath-mcp-fixture` | tool | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） |
 | `xtask` | tool | `check-deps` 与 CI 辅助；`publish = false` | 无 |
 
-- 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`host` 只依赖 `protocol`、适配器与 `engine`，且只有 `app` 能依赖它；`app` / `tool` 其余只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
-- `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
+- 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`app` / `tool` 其余只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
+- `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由应用实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-skills` 是可选适配器（M6 交付）；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。技能不新增事件，日志 schema 不变。
-- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核或日志。多工作根的宿主在 builder 上注册会话环境适配器（`EnvironmentAdapter`，ADR-0037）：创建、分叉、打开会话时按根会话的宿主元数据解析出该会话的工具、沙箱策略与子进程变量（`SessionEnvironment`），子会话用根会话的；同名时会话环境的工具优先于 builder 的。认领时若解析出的描述符与生效配置不同就替换，解析不到的工具移除（追加一条 `ConfigChanged`），从不自动新增。`ToolContext::spawn` 把沙箱策略与变量交给工具；`bash` 与 MCP stdio 只继承 `INHERITED_ENV` 白名单。一个 `Asterpath`（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
+- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核或日志。多工作根的应用在 builder 上注册会话环境适配器（`EnvironmentAdapter`，ADR-0037）：创建、分叉、打开会话时按根会话的会话元数据解析出该会话的工具、沙箱策略与子进程变量（`SessionEnvironment`），子会话用根会话的；同名时会话环境的工具优先于 builder 的。认领时若解析出的描述符与生效配置不同就替换，解析不到的工具移除（追加一条 `ConfigChanged`），从不自动新增。`ToolContext::spawn` 把沙箱策略与变量交给工具；`bash` 与 MCP stdio 只继承 `INHERITED_ENV` 白名单。一个 `Asterpath`（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
 - `asterpath-testing` **不得**依赖 facade；需要组装真实引擎的测试放 facade 的 `tests/` 或 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：任何 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件或引擎内部测试，`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 
@@ -61,18 +60,18 @@ pub struct ConfigSnapshot {
 }
 ```
 
-- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolDescriptor>`；之后注册表增删不影响该 session 的模型可见工具集。工具集不再在会话内固定：宿主可经 `update_config` 的 `add_tools` / `remove_tools` 增删（ADR-0030）；新增的描述符同样按注册表解析后记进日志。
+- `SessionSpec.tools: ToolSelection`（`All | Names`）在创建时解析成显式 `Vec<ToolDescriptor>`；之后注册表增删不影响该 session 的模型可见工具集。工具集不再在会话内固定：应用可经 `update_config` 的 `add_tools` / `remove_tools` 增删（ADR-0030）；新增的描述符同样按注册表解析后记进日志。
 - 所有 `ModelRequest.tools` 只从日志里记录的描述符渲染（快照加 `ConfigChanged.add_tools`），恢复后重建出与崩溃前相同的工具定义，不重新解析。`timeout` / `parallelism` 等执行声明随描述符记录；注册表升级只影响新 session 与之后新增的工具。
 - 每个 step 只有生效集合内的工具可调用：模型调用集合外的名字（包括已移除的工具，即使它仍在注册表里）走 `NotFound`。执行仍调用活注册表：工具已消失同样走 `NotFound`（[plugins.md](plugins.md) §8）；已记录意图的调用照常收尾，恢复按 `ToolCallRequested` 上已记录的 `replay` / `provenance` 决定是否重跑，不受之后移除的影响。
 - `ReasoningBinding.tools_hash` 按渲染出的顶层 `tools` 的模型可见部分计算（[protocol.md](protocol.md) §9）。Anthropic inline 路径下顶层 `tools` 是基线工具集，会话中途增删不改变它；fork 收窄或退回路径改写顶层 `tools` 时自然不匹配。
-- 审批策略不进快照：它是宿主代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
-- MCP 服务配置不进快照：它是宿主装配；进快照的是 MCP 工具解析后的描述符。会话中途增减工具见下文 `ConfigPatch`；MCP `list_changed` 接入另开票。
+- 审批策略不进快照：它是应用代码，不持久化；日志只记录每次决定（[tools.md](tools.md) §4）。
+- MCP 服务配置不进快照：它是应用装配；进快照的是 MCP 工具解析后的描述符。会话中途增减工具见下文 `ConfigPatch`；MCP `list_changed` 接入另开票。
 - 快照是**初始配置**。会话中途的改动记成 `ConfigChanged { patch: ConfigPatch }`（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)），生效配置是折叠：
 
   ```rust
   #[non_exhaustive]
   pub struct ConfigPatch {
-      pub id: Option<UpdateId>,           // 宿主选的 dedup key；append_system 非空时必填（§3.3）
+      pub id: Option<UpdateId>,           // 应用选的 dedup key；append_system 非空时必填（§3.3）
       pub model: Option<ModelSpec>,
       pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
       pub append_system: Vec<Part>,       // 追加到 system，只含 Text；不替换已有 system
@@ -152,7 +151,7 @@ impl Asterpath {
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 无主会话的唤醒发现（storage.md §7）
     pub async fn owner(&self, session: SessionId)
         -> Result<Option<OwnerToken>, AsterError>;      // 会话树当前的认领（ADR-0036）
-    pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主按会话树注册审批端点；见 tools.md §4
+    pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 应用按会话树注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
     pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError>;
 }
@@ -162,22 +161,22 @@ impl Asterpath {
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应（`hooks(Arc<dyn Hooks>)` 可多次调用、逐个追加），`build().await` 按固定顺序直接构造内部组件。
 - `spawn_tool(false)`（= `AsterpathConfig.spawn_tool = false`）不注册 `spawn_agent`：`ToolSelection::All` 快照不含它，`Names` 点名它是 `AsterError::Config`；调度器与子会话恢复不受影响。
 - 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record` / `on_ownership_lost`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
-- 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
+- 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由应用在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
 - 模型只有 `SessionSpec.model` 一个来源，`AsterpathConfig` 不设默认模型；CLI 用 `[model] provider` + `[model] id`（`-m` 覆盖）组装该值。
 - 注入 `store` 时 `database` 被忽略；未注入时由 `sqlite` feature 从 `database` 构建，此时 `database` 必填。
-- `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是宿主运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
+- `AsterpathConfig` 手写 `Default`：`SystemClock`、内置审批策略、`ToolConfig::default()`、空 alias 集合。`approval` / `tool` / `model_aliases` 是应用运行时配置，**不进** `ConfigSnapshot`（与审批策略同规则，[tools.md](tools.md) §4）。
 - `model_aliases` 在 `build()` 时对照 `ProviderCatalog` 校验：alias 指向的 provider 必须存在，否则 `AsterError::Config`。`ModelAlias` 本身不持久化；spawn 只把解析后的 `ModelSpec` 写进子快照（[subagents.md](subagents.md) §5）。
 - 关闭 `sqlite` feature 时必须注入 `store`；退役仍是可选的。
-- v1 的 `AsterpathConfig` 没有 MCP 字段；MCP 服务配置属于 `asterpath-mcp`，嵌入者把 `McpServers::tools()` 交给 builder（[plugins.md](plugins.md)）。也没有技能字段：技能由宿主发现并组成 `system` / 工具，见 [skills.md](skills.md) §8。
+- v1 的 `AsterpathConfig` 没有 MCP 字段；MCP 服务配置属于 `asterpath-mcp`，嵌入者把 `McpServers::tools()` 交给 builder（[plugins.md](plugins.md)）。也没有技能字段：技能由应用发现并组成 `system` / 工具，见 [skills.md](skills.md) §8。
 - 没有 `agent` / `executor` 注入：agent 循环与持久等待是引擎内部类型，不可替换（ADR-0026）。
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
-- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、宿主元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
-- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由宿主重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
-- `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序、前缀或范围匹配由宿主在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
-- 多用户内嵌（ADR-0039）：用户是宿主写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, metadata }>`，`metadata` 是根会话的元数据，宿主包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
+- `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、会话元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
+- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
+- `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带会话元数据。按元数据排序、前缀或范围匹配由应用在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
+- 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
 ### 3.3 Session 驱动
 
@@ -190,7 +189,7 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
-    pub metadata: BTreeMap<String, String>,   // 宿主元数据（ADR-0032），不进 ConfigSnapshot
+    pub metadata: BTreeMap<String, String>,   // 会话元数据（ADR-0032），不进 ConfigSnapshot
 }
 
 pub enum ToolSelection { All, Names(Vec<ToolName>) }
@@ -233,10 +232,10 @@ impl OwnedSession {
 }
 ```
 
-- `create_session` / `open_session` / `fork_session` 都返回只读句柄；驱动、手动压缩、取消（子会话调度在驱动内）只在 `claim()` 得到的 `OwnedSession` 上。认领的是会话所在树的根：同一个 `Asterpath` 内重复认领共享同一纪元，另一个进程持有时得到 `AsterError::Storage(StorageError::OwnedElsewhere)`。非属主进程要取消，先用 `Asterpath::owner` 找到属主，由宿主路由过去。
+- `create_session` / `open_session` / `fork_session` 都返回只读句柄；驱动、手动压缩、取消（子会话调度在驱动内）只在 `claim()` 得到的 `OwnedSession` 上。认领的是会话所在树的根：同一个 `Asterpath` 内重复认领共享同一纪元，另一个进程持有时得到 `AsterError::Storage(StorageError::OwnedElsewhere)`。非属主进程要取消，先用 `Asterpath::owner` 找到属主，由应用路由过去。
 - 驱动与手动压缩期间的每条 append 都携带认领的 `OwnerToken`，存储拒绝过期纪元；输入、审批决定与配置变更不携带，任何进程都可以写。
 - 认领随本进程的进程租约有效：`Asterpath` 在构建时所在的 tokio runtime 上每 `lease_renew_interval`（builder，默认 10 s）续约一次，TTL 是存储的参数（SQLite `OpenOptions::lease_ttl`，默认 30 s；见 [storage.md](storage.md) §6）。`Asterpath` 与它的句柄全部 drop 即正常退出，租约清除、树立即可被别的进程认领；进程被 kill 则别人要等一个 TTL。
-- 失去属主（续约失败，或树已被别的进程接管）时，该树在本进程内的 `drive` 流立刻结束并以 `OwnedElsewhere` 收尾，之后这个 `OwnedSession` 上的属主操作都得到 `OwnedElsewhere`，认领被释放，`Hooks::on_ownership_lost(owner)` 通知宿主；宿主丢掉这个 `OwnedSession`，需要时重新 `claim()`。
+- 失去属主（续约失败，或树已被别的进程接管）时，该树在本进程内的 `drive` 流立刻结束并以 `OwnedElsewhere` 收尾，之后这个 `OwnedSession` 上的属主操作都得到 `OwnedElsewhere`，认领被释放，`Hooks::on_ownership_lost(owner)` 通知应用；应用丢掉这个 `OwnedSession`，需要时重新 `claim()`。
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
 - `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。
@@ -244,10 +243,10 @@ impl OwnedSession {
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒本进程内该调用的等待；属主在另一个进程时，它的等待至多 500 ms 后从日志读到决定。
-- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。宿主直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是宿主选的 dedup key，随补丁落日志：追加与增删工具不幂等，宿主重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
+- `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。应用直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是应用选的 dedup key，随补丁落日志：追加与增删工具不幂等，应用重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - `watch(after)` 先订阅本进程的实时事件，再从游标（不含；`None` 为整条日志）重放已提交记录，追平处发一次 `Synced`，之后推送新提交。本进程的提交即时唤醒订阅者；另一进程的提交靠轮询存储，至多 500 ms 后到达。`Live` 是本进程内任何 `drive`（含父会话驱动的子会话）产生的 `AgentEvent`，扇出给该会话的所有订阅者，不只给驱动者；跨进程订阅者只看到记录。订阅者落后超过缓冲（1024 条）时跳过部分 `Live`，记录不丢。同一次唤醒中先给 `Live` 再给记录。续订时传最后一条 `Record` 的 `log_id`，不丢不重。
-- 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
+- 没有后台 driver；框架不 spawn。驱动者的生命周期由应用负责，应用退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。
 
 ### 3.4 驱动流（agent 在引擎内部）
@@ -288,7 +287,7 @@ pub enum AgentError {
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
 - `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。
-- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归宿主。输出工具调用（ADR-0034）的 `ToolFinished` 是 `Completed`，`output` 为框架补上的固定文本，不是结果本身（结果是该调用的参数，在日志的 `ToolCallRequested` 里）。每个落日志的 `ToolResult` 都有一条 `ToolFinished`，每条 `ToolFinished` 之前都恰有一条同一 `call` 的 `ToolStarted`，宿主不必处理只有其一的情况。执行的调用在拿到并发许可与 step 锁、开始执行时发 `ToolStarted`；不执行的调用在结束前紧接着补发，`args` 取记录的意图参数：输出工具调用、`Interrupted`（取消时尚未开始的调用）与预失败（`Failed`，`error.kind` 为 `Denied` / `NotFound` / `Internal`，来自审批拒绝、未注册工具或 `before_tool` 拒绝与出错）。因此 `ToolStarted` 表示调用进入结局，不保证工具被执行。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
+- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归应用。输出工具调用（ADR-0034）的 `ToolFinished` 是 `Completed`，`output` 为框架补上的固定文本，不是结果本身（结果是该调用的参数，在日志的 `ToolCallRequested` 里）。每个落日志的 `ToolResult` 都有一条 `ToolFinished`，每条 `ToolFinished` 之前都恰有一条同一 `call` 的 `ToolStarted`，应用不必处理只有其一的情况。执行的调用在拿到并发许可与 step 锁、开始执行时发 `ToolStarted`；不执行的调用在结束前紧接着补发，`args` 取记录的意图参数：输出工具调用、`Interrupted`（取消时尚未开始的调用）与预失败（`Failed`，`error.kind` 为 `Denied` / `NotFound` / `Internal`，来自审批拒绝、未注册工具或 `before_tool` 拒绝与出错）。因此 `ToolStarted` 表示调用进入结局，不保证工具被执行。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
@@ -357,7 +356,7 @@ pub enum AsterError {
 | `--continue` | 交互、`exec` | 续当前工作根目录下最后活动的会话 |
 | `-r, --resume [id\|name]` | 交互、`exec` | 续指定会话；不给值时列出当前目录最近 20 个会话并读入编号（非 TTY 下是用法错误） |
 | `--fork-session` | 与 `--continue` / `-r` 合用 | 不续原会话，而是以它为源做会话分叉 |
-| `-n, --name <name>` | 新会话 | 写入宿主元数据 `name`；续会话时给出是用法错误 |
+| `-n, --name <name>` | 新会话 | 写入会话元数据 `name`；续会话时给出是用法错误 |
 | `-i, --image <file>` | 交互、`exec` | 给首条输入附图（文件输入，ADR-0031） |
 | `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
 | `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
@@ -384,8 +383,8 @@ pub enum AsterError {
 ### 4.4 审批
 
 - `-a untrusted`（默认）：进程内只读工具放行；`SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）与外部工具（MCP，`<id>__<tool>`）执行前问人。`-a never`：从不问人，靠沙箱兜底。优先级 `-a` > `[approval] default` > `untrusted`。
-- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给宿主。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
-- "由策略决定"：问不问人由宿主 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
+- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
+- "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
 ### 4.5 交互模式
@@ -396,9 +395,9 @@ pub enum AsterError {
 
 ### 4.6 会话装配
 
-组装规则在 `asterpath-host`（ADR-0040），CLI 只解析 flag、打印与选退出码；桌面端调用同一份。
+组装规则在门面的 `workspace` / `config` feature（ADR-0048），CLI 只解析 flag、打印与选退出码，用自己的 clap 枚举映射过来；桌面端调用同一份。
 
-- 新会话：宿主元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
+- 新会话：会话元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
 - MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
 - 工作根（ADR-0037）：CLI 不改进程当前目录。它注册一个按元数据 `cwd`（续会话时显式 `-C` 优先）解析的会话环境，工作区工具、技能加载工具与 `workspace-write` 的可写根都以工作根为根；没配 `cwd` 的 MCP stdio 服务在工作根启动。
 - 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：新会话以工作根目录为根、按沙箱策略调用 `asterpath_tools::coding(...)` 解析出六个工具；`[tools] enabled = [...]` 选子集，未知工具名是配置错误（退出 2）。续会话总是解析全部六个，模型可见的子集由日志里的生效配置决定。
@@ -441,7 +440,7 @@ base_url = "https://api.anthropic.com"
 base_url = "https://api.openai.com/v1"
 
 # 供应商实例（ADR-0029）：表名即 provider id；非内置名必须写 protocol
-# 示例取值为宿主策略，DeepSeek 端点与档位按 2026-10-24 实测（#106），不随框架维护
+# 示例取值为应用策略，DeepSeek 端点与档位按 2026-10-24 实测（#106），不随框架维护
 [providers.deepseek]
 protocol = "anthropic"                          # anthropic | openai
 base_url = "https://api.deepseek.com/anthropic"
@@ -473,7 +472,7 @@ disable_parallel_tool_use = false
 max_parallel_calls = 8        # ToolConfig；缺省字段用 Default
 # enabled = ["read_file", "list_dir", "grep"]   # 新 session 的工作区工具；省略 = 全部六个
 
-[model_aliases.fast]          # 宿主提供的 alias 集合，spawn 用它收窄模型
+[model_aliases.fast]          # 应用提供的 alias 集合，spawn 用它收窄模型
 provider = "anthropic"
 model = "claude-fable-5-1"
 
@@ -518,7 +517,7 @@ default = "untrusted"         # untrusted | never
 | M5 扩展（已交付） | `asterpath-mcp`（MCP 服务配置、子进程、MCP adapter；#80 前为 `asterpath-plugin-host`）、沙箱合约（#80 起在 protocol）与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
 | M6 技能（已交付） | `asterpath-skills`、CLI `[skills]`（`enabled` 开关）、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
 
-- M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；M5 / M6 的成员已在 workspace 中，但不属于 v1 验收闸门。插件分发、ACP 与 WASM 出界，归 host 或生态工具。
+- M5 不是 v1 的验收闸门：它收纳设计已定、但不在 M0–M4 交付内的扩展（[#16](https://github.com/zibyn/asterpath/issues/16) / [#20](https://github.com/zibyn/asterpath/issues/20) / [#21](https://github.com/zibyn/asterpath/issues/21)）；M5 / M6 的成员已在 workspace 中，但不属于 v1 验收闸门。插件分发、ACP 与 WASM 出界，归应用或生态工具。
 - M6 与 M5 同性质：不属于 v1 验收闸门；技能不新增事件，日志 schema 不变。
 - 上表的 crate 名是各里程碑交付时的划分；2026-10-23 起引擎各模块已并入 `asterpath`（§2.2）。
 - M0 组装 `compactor: None`；默认 compactor（`DefaultCompactor`）从 M3 起可选接入，不进 M0–M4 通过条件（[compaction.md](compaction.md) §2）。

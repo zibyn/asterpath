@@ -18,7 +18,7 @@
 - 摘要输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、`ToolsChanged`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
 - 压缩**重新定基线**（ADR-0030）：被替换区间内追加的 system 指令并入基线 system、工具变更并入基线工具集，不进摘要；保留区间里的条目仍按位置投影（§5 投影）。压缩后基线工具集等于压缩时的生效工具集。
 - 窗口只有 `ModelSpec.context_window` 一个来源；`CompactionConfig` 不重复定义。
-- 进程重启上限归宿主：内核每次恢复写 `StreamResumed`，宿主据此计数并决定停车；内核不持有恢复计数器。
+- 进程重启上限归应用：内核每次恢复写 `StreamResumed`，应用据此计数并决定停车；内核不持有恢复计数器。
 - 保留最近一个完整 step，目标为 `0.5 × usable window`；每回合最多 1 次自动压缩。
 - 压缩后仍超窗 → `ContextExhausted`，不再压第二次。
 - 接受每次压缩带来一次前缀缓存未命中。
@@ -34,7 +34,7 @@ asterpath::agent（loop） --投影 + 配置--> Compactor（protocol trait）
 ```
 
 - `Compactor` 放在 `asterpath-protocol`，完整契约见 [protocol.md](protocol.md) §6.1；默认实现 `DefaultCompactor` 在引擎内部模块 `compaction`，由 facade 再导出为 `asterpath::DefaultCompactor`（ADR-0026）。
-- agent **只依赖 trait**，默认实现由宿主经 `AsterpathConfig.compactor` 注入；`compactor: None` 表示压缩不可用。M0 不装配 `DefaultCompactor`。
+- agent **只依赖 trait**，默认实现由应用经 `AsterpathConfig.compactor` 注入；`compactor: None` 表示压缩不可用。M0 不装配 `DefaultCompactor`。
 - **Compactor 只读不写**：`plan` 接收 agent 传入的投影、算出切点与估算；`compact` 调用摘要模型并返回 `CompactionOutcome`。agent 负责写 `CompactionStarted` 与终态，使 append 与 dedup key 只有一个写入点。
 - Compactor 在构造时注入 `ProviderCatalog`，不自行发现 provider，也不读事件日志。
 - 内核不含窗口、阈值、摘要提示词或保留规则。
@@ -67,7 +67,7 @@ pub enum CompactResult {
 
 ### 窗口与估算
 
-- **窗口**：`ModelSpec.context_window: Option<u32>` 是**唯一来源**，由宿主配置；`ProviderCapabilities` 可给 advisory 默认值，但不作为真相（两家 API 都不返回窗口）。类型归 [#11](https://github.com/zibyn/asterpath/issues/11)。窗口判断取当前回合下一次请求的 `ModelSpec`（模型路由见 [#26](https://github.com/zibyn/asterpath/issues/26)）；`CompactionConfig` 不再定义窗口。
+- **窗口**：`ModelSpec.context_window: Option<u32>` 是**唯一来源**，由应用配置；`ProviderCapabilities` 可给 advisory 默认值，但不作为真相（两家 API 都不返回窗口）。类型归 [#11](https://github.com/zibyn/asterpath/issues/11)。窗口判断取当前回合下一次请求的 `ModelSpec`（模型路由见 [#26](https://github.com/zibyn/asterpath/issues/26)）；`CompactionConfig` 不再定义窗口。
 - **usable window** = `context_window − reserve_output_tokens`。
 - **估算**：`estimated_input = 最近一次 AssistantMessage.usage 的归一化 input tokens + 其后新增模型可见内容的 bytes/3`。
   - 归一化沿用 #11 的 exclusive 口径（Anthropic 三者相加，OpenAI inclusive），聚合见 [usage.md](usage.md)。
@@ -97,8 +97,8 @@ pub enum CompactResult {
   - 摘要请求不挂工具，不启用 reasoning / thinking。
 - 摘要模型：默认 = 当前会话的 provider + 模型；可配 `compaction.summary_model` 单独指定；**不做跨 provider 自动回退**。
 - 摘要调用的 attempt / 退避 / `request_timeout` 取 `CompactionInput.turn`（`TurnConfig`），与模型调用一致。
-- 调用由 compactor 独立构造请求，**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（宿主包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
-- 提示词是 compactor 内的固定模板，v1 不开放给宿主；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
+- 调用由 compactor 独立构造请求，**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（应用包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
+- 提示词是 compactor 内的固定模板，v1 不开放给应用；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
 - 产出是单条 `Item::Compaction { parts: Vec<Part> }`（类型归 #11）；v1 两边都渲染为文本——Anthropic 为用户文本块，OpenAI 为普通 input 文本消息；原生 compaction item 出界。
 
 ## 5. 事件、投影与恢复
@@ -157,7 +157,7 @@ project(entries):
 
 ### 手动压缩
 
-- `OwnedSession::compact_now() -> Result<CompactResult, AsterError>` 委托引擎 agent 的 `compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，宿主先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
+- `OwnedSession::compact_now() -> Result<CompactResult, AsterError>` 委托引擎 agent 的 `compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，应用先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
 - 成功路径写 `CompactionStarted{trigger: Manual}` + `CompactionApplied` 两条事件，不写回合记录；无可删前缀返回 `NothingToDo`，未配置窗口或未装配 Compactor 返回 `NotConfigured`。
 - 摘要调用失败追加 `CompactionAborted{SummaryFailed}` 并返回 `Err(AsterError::Agent(AgentError::Compaction(..)))`；压后仍超窗追加 `CompactionAborted{Insufficient}` 并返回 `Ok(CompactResult::Insufficient)`，不改投影。
 - `NotConfigured` / `NothingToDo` / `Insufficient` 都是状态，不是错误；只有真正失败才是 `Err`。
@@ -168,7 +168,7 @@ project(entries):
 - `CompactionStarted` 无 `CompactionApplied` / `CompactionAborted` 是未闭合意图：恢复后重做摘要并补写终态；失败写 `CompactionAborted` 后按本文件 §6 收尾。
 - 重做 `ProviderError` 触发的压缩时，输入与实时相同：按开放 step 的水位线（`seq < StepStarted.seq`）投影，step 内记录的 steering 输入不进摘要；阈值 / 手动压缩仍看整个日志。之后是否重试同一 step 由尝试策略决定（[agent-loop.md](agent-loop.md) §7.1）。
 - 崩溃在摘要调用中 → 重新进入 pre-step，重新压缩；崩溃在 append 后 → 事件已提交，投影与下一次请求一致。
-- 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
+- 恢复次数上限不在内核：应用 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 
 ## 6. 失败映射
 

@@ -4,16 +4,16 @@
 >
 > 前置：[事件日志与恢复](event-log-recovery.md)、[存储契约](storage.md)、[压缩](compaction.md)、[用量](usage.md)。
 >
-> 范围：**只定义安全退役的 seam**（`SessionStore::retire`，默认 `Unsupported`）。导出是宿主用现有 `SessionStore` 读取的配方；导入/恢复、归档文件管理、保留策略归宿主。
+> 范围：**只定义安全退役的 seam**（`SessionStore::retire`，默认 `Unsupported`）。导出是应用用现有 `SessionStore` 读取的配方；导入/恢复、归档文件管理、保留策略归应用。
 >
 > 相关 ADR：[0023 存储契约](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)。
 
 ## 1. 决策摘要
 
-- **保留/归档是宿主/系统层能力**：何时归档、按时间还是大小、文件放哪、是否加密，全在宿主或扩展模块。内核不提供策略、调度、CLI 命令。
+- **保留/归档是应用/系统层能力**：何时归档、按时间还是大小、文件放哪、是否加密，全在应用或扩展模块。内核不提供策略、调度、CLI 命令。
 - **内核唯一接缝是可选 `SessionStore::retire`**：整会话退役，SQLite 与 in-memory 后端实现；其他后端可保留默认的 `Unsupported`。
 - **只允许整会话退役**：不做日志前缀裁剪、按事件/按工具输出保留、级联删除。
-- **导出没有新 API**：宿主用 `SessionStore::frontier()` + `scan()` 读到该 frontier 即可，天然是一致前缀。JSONL 只是宿主参考格式。
+- **导出没有新 API**：应用用 `SessionStore::frontier()` + `scan()` 读到该 frontier 即可，天然是一致前缀。JSONL 只是应用参考格式。
 - **导入/恢复不在 v1**：它是备份恢复，不是保留；整库备份或未来的运维工具承担。
 - **退役要求 `idle` + `expected_frontier` CAS + 无活子会话 + 父会话 `idle`**；墓碑同事务写入；重复退役幂等。
 - **退役后一律不可见**：打开、用量、追踪返回 `NotFound`；`scan` 空流；会话目录（`sessions` / `parent` / `children`）只覆盖活会话。
@@ -32,8 +32,8 @@
 结论：
 
 - 保留策略没有一家放进框架 API；它是应用/CLI 层的设置或命令。
-- 安全删除确实需要一个 store 层操作（Codex 的 `thread/delete`），因为删除必须维护索引与外部引用。Asterpath 是单 SQLite 文件 + 会话目录，宿主直接删行会破坏目录与恢复，因此保留一个退役接缝有依据。
-- 导出和导入不是这个接缝的必需项。导出已经是现有读能力的组合；导入是备份恢复，属于宿主/运维，不属于保留。
+- 安全删除确实需要一个 store 层操作（Codex 的 `thread/delete`），因为删除必须维护索引与外部引用。Asterpath 是单 SQLite 文件 + 会话目录，应用直接删行会破坏目录与恢复，因此保留一个退役接缝有依据。
+- 导出和导入不是这个接缝的必需项。导出已经是现有读能力的组合；导入是备份恢复，属于应用/运维，不属于保留。
 
 ## 3. 归属与接缝
 
@@ -41,12 +41,12 @@
 | --- | --- | --- |
 | `asterpath-protocol` | `SessionStore::retire`、`RetirementError`、会话事实 `is_idle()` | 策略、文件格式、调度、导出 |
 | `asterpath-storage-sqlite` | 退役事务、墓碑、目录行清理 | 何时退役、归档落盘、恢复 |
-| 宿主 / 未来扩展模块 | 保留策略、导出与 JSONL、重试、恢复 | 直接写 SQLite、绕过存储模块 |
+| 应用 / 未来扩展模块 | 保留策略、导出与 JSONL、重试、恢复 | 直接写 SQLite、绕过存储模块 |
 
 - 退役是 `SessionStore` 的可选方法：默认实现返回 `RetirementError::Unsupported`，后端覆盖它即提供退役。
-- 宿主调用 `Asterpath::store().retire(session, frontier)`；注入的自定义存储可能返回 `Unsupported`。
-- 写操作只能经过存储模块：目录行必须在同一事务维护，属主锁与纪元也由它维护。宿主进程可以经存储模块打开同一个 SQLite 文件（ADR-0036），但不得用自己的连接写它，也不得依赖具体模块 crate。
-- 保留策略**不进** `ConfigSnapshot`，与审批策略一样是宿主代码，不持久化。
+- 应用调用 `Asterpath::store().retire(session, frontier)`；注入的自定义存储可能返回 `Unsupported`。
+- 写操作只能经过存储模块：目录行必须在同一事务维护，属主锁与纪元也由它维护。应用进程可以经存储模块打开同一个 SQLite 文件（ADR-0036），但不得用自己的连接写它，也不得依赖具体模块 crate。
+- 保留策略**不进** `ConfigSnapshot`，与审批策略一样是应用代码，不持久化。
 
 ## 4. 合约
 
@@ -100,9 +100,9 @@ pub enum RetirementError {
 - 删除后 `retired_sessions` 行**永不自动清理**。墓碑清理与 id 复用不在 v1 合约内。
 - 对已退役会话的 `append` 返回 `StorageError::Retired`，不写入（含去重命中的重试）；两个后端一致，进 contract suite。
 
-## 6. 导出（宿主配方）
+## 6. 导出（应用配方）
 
-导出不新增合约。宿主按下面顺序做：
+导出不新增合约。应用按下面顺序做：
 
 ```text
 F = SessionStore::frontier(session)?
@@ -110,17 +110,17 @@ F = SessionStore::frontier(session)?
 
 for entry in SessionStore::scan(LogQuery { session, after: None, limit: None }):
     if entry.log_id > F: break        # 快照之后的新 append 不在导出里
-    write(entry)                      # 宿主自己的格式
+    write(entry)                      # 应用自己的格式
 
 SessionStore::retire(session, F)
 ```
 
 - **一致性**：`frontier` 是当前日志末条；append 只会分配更大的 `log_id`，所以读到 `F` 的前缀在读取期间稳定。分页导出时用同一个 `F` 作为上界。
-- **竞态**：如果另一个任务在导出期间用同一 `F` 退役成功，导出可能读到空流；宿主应串行化自己的保留任务。退役的 CAS 保证不会在 `F` 之后丢掉新记录。
-- **格式**：宿主自定。参考实现用每会话一个文件；Asterpath 的参考格式是 JSONL（§7），但合约不要求它。
+- **竞态**：如果另一个任务在导出期间用同一 `F` 退役成功，导出可能读到空流；应用应串行化自己的保留任务。退役的 CAS 保证不会在 `F` 之后丢掉新记录。
+- **格式**：应用自定。参考实现用每会话一个文件；Asterpath 的参考格式是 JSONL（§7），但合约不要求它。
 - **不做**：导入、恢复、跨库合并、按投影导出、upcast 后重写。
 
-## 7. 参考归档格式（宿主约定）
+## 7. 参考归档格式（应用约定）
 
 ```text
 {"format":"asterpath-archive","version":1,"session":"<32 位小写十六进制>"}
@@ -131,8 +131,8 @@ SessionStore::retire(session, F)
 
 - 首行 header，末行 footer，中间一行一个 `LogEntry` 信封；UTF-8、无 BOM。
 - `payload` 嵌入存储中的 JSON 文本，不重新序列化；`version` 是归档格式版本，与 `LOG_SCHEMA_VERSION` 独立。
-- footer 的 `entries` / `frontier` 用于检测截断；这是宿主约定，不是内核校验。
-- 不做压缩或加密；需要时由宿主在文件外层处理。
+- footer 的 `entries` / `frontier` 用于检测截断；这是应用约定，不是内核校验。
+- 不做压缩或加密；需要时由应用在文件外层处理。
 
 ## 8. SQLite 实现
 
@@ -198,11 +198,11 @@ CREATE TABLE retired_sessions (
 - 日志前缀裁剪、按事件/按工具输出保留：不做；破坏 `seq` 无洞与检查点恢复。
 - 级联删除整棵子树：不做；G6 无跨流原子性。
 - 单会话导入/恢复、跨库合并、`log_id` 重映射：v1 不做；恢复走整库备份或未来的运维工具。
-- 归档文件格式作为内核合约、归档压缩/加密/签名：不做；宿主约定。
+- 归档文件格式作为内核合约、归档压缩/加密/签名：不做；应用约定。
 - 墓碑清理、id 复用：v1 不做。
 - `VACUUM`、WAL checkpoint、`journal_size_limit`：不进合约；文件缩小是离线运维。
 - v1 workspace 新增 `asterpath-storage-admin`：不做。
-- 参考 CLI 的 `session delete/cleanup` 命令：宿主功能，若需要另开票。
+- 参考 CLI 的 `session delete/cleanup` 命令：应用功能，若需要另开票。
 
 ## 13. 下游修订
 

@@ -25,8 +25,8 @@
 | 层 | 负责 | 不负责 |
 | --- | --- | --- |
 | `SessionStore`（protocol） | append、按游标 scan、frontier；会话目录 `sessions` / `parent`；`claim` / `owner` / `renew`；可选 `retire` | 调度、唤醒判定、何时续约 |
-| facade 的属主登记（`owner.rs`） | 后台按间隔调 `renew`；失去属主时停驱动、拒写、释放、通知宿主 | 租约的存储形状 |
-| facade `Asterpath::wakeable()` | 唤醒发现：对 `sessions()` 逐个折叠会话事实 | 何时、按什么顺序驱动（宿主策略） |
+| facade 的属主登记（`owner.rs`） | 后台按间隔调 `renew`；失去属主时停驱动、拒写、释放、通知应用 | 租约的存储形状 |
+| facade `Asterpath::wakeable()` | 唤醒发现：对 `sessions()` 逐个折叠会话事实 | 何时、按什么顺序驱动（应用策略） |
 | `asterpath-storage-sqlite`（模块） | 实现 `SessionStore`；`sessions` 目录行；进程租约、属主行与纪元；WAL | 事件解码语义（归 protocol） |
 
 ## 3. 合约签名
@@ -105,7 +105,7 @@ pub struct CatalogEntry {
     pub parent: Option<SessionId>,
     pub created_at: Timestamp,                  // SessionCreated 的 recorded_at
     pub last_activity: Timestamp,               // 最后一条记录的 recorded_at；仅展示
-    pub metadata: BTreeMap<String, String>,     // SessionCreated 的宿主元数据（ADR-0032）
+    pub metadata: BTreeMap<String, String>,     // SessionCreated 的会话元数据（ADR-0032）
 }
 
 #[non_exhaustive]
@@ -137,7 +137,7 @@ CREATE TABLE sessions (
     session_id  BLOB    PRIMARY KEY,           -- SessionId 的 16 字节
     parent_id   BLOB,                          -- 子会话指向父会话
     created_at  INTEGER NOT NULL,               -- 诊断用，不参与任何逻辑
-    metadata    TEXT    NOT NULL                -- 宿主元数据，JSON 对象（ADR-0032）
+    metadata    TEXT    NOT NULL                -- 会话元数据，JSON 对象（ADR-0032）
 );
 
 CREATE TABLE log (
@@ -210,7 +210,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 
 - 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0002 的硬错误一致）。
 - 唯一的派生动作：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`，`metadata` 取 `SessionCreated.metadata`）。其余事件只写日志。
-- **宿主元数据上限**（ADR-0032）：至多 64 个键；键至多 128 字节，值至多 4096 字节（UTF-8）。超限由 `create_session` 报 `AsterError::Config`，不落日志；存储适配器原样保存，不再校验。子会话的元数据为空。
+- **会话元数据上限**（ADR-0032）：至多 64 个键；键至多 128 字节，值至多 4096 字节（UTF-8）。超限由 `create_session` 报 `AsterError::Config`，不落日志；存储适配器原样保存，不再校验。子会话的元数据为空。
 - **元数据过滤**（ADR-0039）：`SessionQuery.metadata` 的每个键值都要与目录项相等（AND，等值，区分大小写，不做前缀或范围）。SQLite 用 `json_each` 在查询里比对，没有索引，按目录大小线性扫描；需要时再按常用键加表达式索引。
 - 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。`ApprovalDecided` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。
 - **`idle` = 没有非 compaction 的未闭合意图。** compaction 意图只供恢复重做（#24/#27），不影响退役与唤醒发现。
@@ -247,10 +247,10 @@ COMMIT                                           -- FULL 下返回时已 fsync
 ## 7. 唤醒发现
 
 - **唤醒发现归 facade，不归存储**（ADR-0023）。`Asterpath::wakeable() -> Result<Vec<SessionId>, AsterError>` 遍历 `store.sessions()`，跳过根会话被任何进程（含本进程）持有的树（有属主行且属主进程租约未过期），再逐会话 `scan_all` + `SessionFacts::fold`，保留 `is_wakeable()` 为真者（存在非 compaction 未闭合意图，或有待处理输入），按 id 排序、每个会话一次。退役会话不在 `sessions()` 中，因此永不唤醒。
-- **没有持久队列或 ack；进程租约只管属主存活，不管排队。** 宿主的恢复循环是 `wakeable → open_session → claim → drive`；认领失败（`OwnedElsewhere`）说明别的进程刚拿走这棵树；同一进程内的并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
+- **没有持久队列或 ack；进程租约只管属主存活，不管排队。** 应用的恢复循环是 `wakeable → open_session → claim → drive`；认领失败（`OwnedElsewhere`）说明别的进程刚拿走这棵树；同一进程内的并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
 - 成本随会话总量线性增长（启动时全量折叠）；会话量大时在 SQLite 模块内部加索引，不改接口。
 - spawn 超时不经存储：截止时间在 `ChildSessionSpawned.deadline` 上，open 的子会话意图已让父会话可唤醒，到期由 spawn 重放处理（[subagents.md](subagents.md) §9）。
-- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 读 `user_version`（建表）→ 宿主对 `wakeable()` 结果逐个认领并驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
+- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 读 `user_version`（建表）→ 应用对 `wakeable()` 结果逐个认领并驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
 
 ## 8. 保证清单
 
@@ -272,7 +272,7 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 
 - **规模靠单进程**：一个进程内 writer 线程合并提交；进程之间没有合并提交，各自 fsync，多进程只用于共存（CLI 与桌面端）和滚动重启。
 - **`max_live_children` 是每进程上限**，不是整个存储的上限。
-- **`Hooks::on_record` 在每个进程内对每条记录恰好一次**；跨进程同一条记录可能被两个进程各展示一次（例如非属主写入审批决定后，属主下一次 append 补扫到它），实时导出的宿主按 `(session, log_id)` 去重。
+- **`Hooks::on_record` 在每个进程内对每条记录恰好一次**；跨进程同一条记录可能被两个进程各展示一次（例如非属主写入审批决定后，属主下一次 append 补扫到它），实时导出的应用按 `(session, log_id)` 去重。
 - **跨进程审批有轮询延迟**：属主等待审批或子会话时至少每 500 ms 重读日志，别的进程写入的 `ApprovalDecided` 在一个轮询间隔内生效。
 - **属主迁移时调度器的准入缓存按纪元重建**：一棵树在新的纪元下第一次调度子会话时，丢掉旧纪元在内存里的排队与 Running 计数，从日志重建。
 - **崩溃后的接管延迟等于租约 TTL**：被 kill 的进程的树要等它的租约过期才能被别的进程认领；正常退出（句柄 drop）立即释放。续约写入量与进程数成正比，与会话数无关。
@@ -321,5 +321,5 @@ FULL 下吞吐不随进程数增长（每个进程各自 fsync，WAL 写锁串�
 - **#8**：已定。父流何时 `ChildSessionCompleted`、启动时子会话缺失（R2 物化）与孤儿收尾（R4）见 [subagents.md](subagents.md) §9。
 - **#9**：压缩触发条件；`CompactionApplied` 只影响投影，不删日志。
 - **#17**：审批决定与子会话等待；唤醒发现见 §7。
-- **#18**：已定。只保留 `SessionStore::retire` 可选能力（整会话退役、墓碑）；导出由宿主用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
+- **#18**：已定。只保留 `SessionStore::retire` 可选能力（整会话退役、墓碑）；导出由应用用 `frontier` + `scan` 完成，导入不在 v1。见 [retention.md](retention.md)；本文件只承载墓碑 DDL 与 G8。
 - **#19**：五个注入点的工具链与 CI 场景。

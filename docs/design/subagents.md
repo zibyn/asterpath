@@ -23,7 +23,7 @@
 
 | 词 | 含义 | 本文件中的边界 |
 | --- | --- | --- |
-| 子智能体 | 父会话委托、独立上下文运行的模型会话 | 模型/宿主角度 |
+| 子智能体 | 父会话委托、独立上下文运行的模型会话 | 模型/应用角度 |
 | 子会话 | 子智能体的持久化形态：独立日志流与恢复单位 | 日志角度 |
 | 任务 | 交给子智能体、有明确开始与终态的工作单元 | 生命周期：spawn / wait / complete / cancel |
 | 工作流 | 作者代码固定的控制流 + 确定性重放 | v1 不存在；出界 |
@@ -36,10 +36,10 @@
 
 ### 3.1 能力与工具
 
-调度是引擎内部的 `scheduler` 模块（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，#79 起不是 trait、宿主不可直接调用）：
+调度是引擎内部的 `scheduler` 模块（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，#79 起不是 trait、应用不可直接调用）：
 
 1. `Scheduler`：spawn / 等待 / 取消，下列方法均为 `pub(crate)`；
-2. 模型可见的 spawn 工具（`spawn_agent`；宿主可经 `AsterpathConfig.spawn_tool = false` 不注册它，此时模型无法派生，调度器与子会话恢复照常；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突）。工具表里的 `SpawnTool` 只是描述符：agent 执行 `spawn_agent` 时调用 `Scheduler::run_spawn_tool(&agent, args, ctx)`，把自己作为子会话的驱动者传入。agent 持有 scheduler，scheduler 不持有 agent，没有循环引用。
+2. 模型可见的 spawn 工具（`spawn_agent`；应用可经 `AsterpathConfig.spawn_tool = false` 不注册它，此时模型无法派生，调度器与子会话恢复照常；#16 已定：进程内工具用裸名，外部工具有 `__` 命名空间，不冲突）。工具表里的 `SpawnTool` 只是描述符：agent 执行 `spawn_agent` 时调用 `Scheduler::run_spawn_tool(&agent, args, ctx)`，把自己作为子会话的驱动者传入。agent 持有 scheduler，scheduler 不持有 agent，没有循环引用。
 
 形状（[#17](https://github.com/zibyn/asterpath/issues/17) 定形，见 [ADR-0008](../adr/0008-subagent-model.md)；#79 改为内部方法）：
 
@@ -86,7 +86,7 @@ pub enum ContextPolicy {
 - **`timeout` = spawn 记录上的截止时间**（[ADR-0008](../adr/0008-subagent-model.md)）：`spawn` 用注入时钟算 `now + timeout`，写进同一次 append 的 `ChildSessionSpawned.deadline`（绝对时间）；`await_completion` sleep 到 deadline，到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
 - **排队是内存状态**：Queued/Running、每父与全局并发计数、wake 注册表都不落日志。**排队 = open 的 spawn `ToolCallRequested` 且无对应 `ChildSessionSpawned`**；FIFO 按 `ToolCallRequested.seq` 重建。已有 `ChildSessionSpawned` 的恢复项是已准入（Running），不重新排队；`ChildSessionSpawned` 只表示「已占槽」。没有 `spawn_many` / join：fan-out 靠 #7 的并行工具调用。
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
-- **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的宿主取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
+- **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的应用取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
 持久等待（引擎内部的 `Waits`）见 [module-contracts.md](module-contracts.md) §3.4（[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
@@ -102,11 +102,11 @@ pub enum ContextPolicy {
 | side_effect | `Mutating` |
 | provenance | `InProcess` |
 | timeout | `None`（可用按次 `timeout` 参数覆盖；管线执行，工具观察 `CancelToken`） |
-| approval | 默认策略 `InProcess → Allow`；宿主可用自定义策略收紧 |
+| approval | 默认策略 `InProcess → Allow`；应用可用自定义策略收紧 |
 
 - spawn 的 `ReplaySafety::Safe` 是框架声明：恢复会先按 `parent_tool_call_id` 查找已有子会话（R1），不会产生第二个子。
 - 工具参数 schema 与 `task` 的编码（字符串 → 一个 user text `Part`）归 #15/#17。
-- **host 不经 turn / tool call 直接 spawn 在 v1 不做**：等待需要一个 `caused_by` 锚点（#3）。宿主可以通过输入让模型决定（#79 起调度不对宿主公开）。
+- **应用不经 turn / tool call 直接 spawn 在 v1 不做**：等待需要一个 `caused_by` 锚点（#3）。应用可以通过输入让模型决定（#79 起调度不对应用公开）。
 
 ### 3.2 创建顺序
 
@@ -142,7 +142,7 @@ TurnCommitted { reason }
 ```
 
 - `caused_by` = spawn 那条 `ToolCallRequested` 的 `LogId`；`parent_tool_call_id` 是 `ToolCallId`。
-- 子会话创建后**自动开第一个 turn**，不需要宿主再投输入。
+- 子会话创建后**自动开第一个 turn**，不需要应用再投输入。
 - `ChildSessionSpawned` 与子流的 `SessionCreated` 由 scheduler 写；`ChildSessionCompleted` 也归 scheduler（正常运行时父流的子生命周期记录只有它写）；父驱动方只写 `ToolResult` 与其他 loop 事件。恢复期间由父驱动方代写缺失的 `ChildSessionCompleted`（#3 §6），二者不并发。
 - 父子之间没有原子性：父记录先写，子流后写；中间崩溃由 R2 物化。
 
@@ -162,7 +162,7 @@ stateDiagram-v2
     Queued --> Rejected: 深度超限 / 参数非法
     Running --> Completed: 子 TurnCommitted(Completed | Stopped)
     Running --> Failed: 子 TurnCommitted(Failed | ContextExhausted | MaxStepsExceeded | CompactionFailed | Refused)
-    Running --> Cancelled: 父取消 / 子被宿主取消 / 超时
+    Running --> Cancelled: 父取消 / 子被应用取消 / 超时
     Running --> Lost: 子状态不可读
     Completed --> [*]
     Failed --> [*]
@@ -192,11 +192,11 @@ ContextForked {
 
 pub enum ForkSource {
     Spawn(ParentRef),               // spawn 调用（本节）
-    Session { session: SessionId }, // 宿主会话分叉（ADR-0033）
+    Session { session: SessionId }, // 应用会话分叉（ADR-0033）
 }
 ```
 
-- **会话分叉**复用同一记录（[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）：宿主调用 `Asterpath::fork_session(source, metadata)`，新会话 `SessionCreated { parent: None, metadata }` 之后写 `ContextForked { source: Session { session }, source_log, items }`。`source_log` 是源会话最后一条 `TurnCommitted`（没有已提交回合时是 `SessionCreated`）；该回合最后一个 `StepStarted` 之后记录的输入属于下一回合，不复制。配置取源会话在水位处的生效配置，不收窄；`system` 取快照的基线 system（复制的历史已带着更早的 `Instruction`）；复制的历史去掉 `ToolsChanged`。新会话不进源会话的会话树，不等待、不返回任务总结、不参与取消传播。
+- **会话分叉**复用同一记录（[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）：应用调用 `Asterpath::fork_session(source, metadata)`，新会话 `SessionCreated { parent: None, metadata }` 之后写 `ContextForked { source: Session { session }, source_log, items }`。`source_log` 是源会话最后一条 `TurnCommitted`（没有已提交回合时是 `SessionCreated`）；该回合最后一个 `StepStarted` 之后记录的输入属于下一回合，不复制。配置取源会话在水位处的生效配置，不收窄；`system` 取快照的基线 system（复制的历史已带着更早的 `Instruction`）；复制的历史去掉 `ToolsChanged`。新会话不进源会话的会话树，不等待、不返回任务总结、不参与取消传播。
 
 - `items` 是**投影后的快照**，尊重 `CompactionApplied`；不是原始事件的复制。
 - 水位是 spawn 所在 step 的 `StepStarted.seq`：子看不到"自己这次 spawn"的 `AssistantMessage`，也看不到同 step 的兄弟工具结果。
@@ -207,13 +207,13 @@ pub enum ForkSource {
 
 ## 5. 配置继承
 
-- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父会话在 spawn 所在 step 水位（该 step 的 `StepStarted.seq`）的生效配置的拷贝（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)；父之后的 `ConfigChanged` 不影响子，子也可以有自己的变更；字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父生效 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析；父中途新增的工具也在其中，allowlist 作用于 spawn 水位的生效集合）。Fork 复制的历史去掉 `ToolsChanged` 条目：子的 `tools` 已是收窄后的生效集合，复制的变更会把收窄掉的工具加回（[protocol.md](protocol.md) §3.3）。`request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。`system` 按上下文策略取：`Fresh` 取生效 `system`（创建时 system 加全部追加指令）；`Fork` 取父在 fork 点的基线 system，再加 fork 点到 spawn 水位之间追加的指令，因为 fork 复制的历史已经带着更早的 `Instruction` 条目（[protocol.md](protocol.md) §3.3），避免重复。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（宿主代码，不持久化）。
+- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父会话在 spawn 所在 step 水位（该 step 的 `StepStarted.seq`）的生效配置的拷贝（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)；父之后的 `ConfigChanged` 不影响子，子也可以有自己的变更；字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父生效 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析；父中途新增的工具也在其中，allowlist 作用于 spawn 水位的生效集合）。Fork 复制的历史去掉 `ToolsChanged` 条目：子的 `tools` 已是收窄后的生效集合，复制的变更会把收窄掉的工具加回（[protocol.md](protocol.md) §3.3）。`request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。`system` 按上下文策略取：`Fresh` 取生效 `system`（创建时 system 加全部追加指令）；`Fork` 取父在 fork 点的基线 system，再加 fork 点到 spawn 水位之间追加的指令，因为 fork 复制的历史已经带着更早的 `Instruction` 条目（[protocol.md](protocol.md) §3.3），避免重复。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（应用代码，不持久化）。
 - 之后父配置变化不影响已 spawn 的子；子配置变化也不回写父。
 - 模型可见的 spawn 参数只能收窄：
-  - `model_alias` 必须来自宿主提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
+  - `model_alias` 必须来自应用提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
-  - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；宿主可程序化收紧。
-- 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；宿主解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
+  - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；应用可程序化收紧。
+- 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；应用解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
 - 子的工具调用走自己的 session 与审批策略；父的审批不覆盖子。
 - 恢复一致性：物化子会话时断言 `SessionCreated.config == ChildSessionSpawned.config`；不一致是硬错误。
 
@@ -238,7 +238,7 @@ pub enum ChildFailure {
 /// #17：取消必须带原因，恢复才能稳定还原 ToolResult 形态。
 pub enum CancelReason {
     Parent,   // 父取消等待
-    Host,     // 子被自己的宿主取消
+    Host,     // 子被自己的应用取消
     Timeout,  // spawn timeout 到期
 }
 
@@ -249,7 +249,7 @@ pub struct Summary {
 
 - `summary` 取子会话**最后一条已提交 `AssistantMessage`** 的 text/refusal item；剥掉 reasoning 与工具调用；可能为空（例如最后一步只有工具调用）。
 - 结果进入父上下文时受 #7 的截断上限（默认 64 KiB/调用）。
-- 父不自动获得子的完整 transcript；宿主可通过 `Asterpath::store()` 读取子流，或对子会话 `watch`（[ADR-0038](../adr/0038-watch-separates-observing-from-driving.md)）：已提交记录照常可见，子驱动的实时事件（`AgentEvent`）不进父的 `drive` 流，而是扇出给本进程内该子会话的订阅者。
+- 父不自动获得子的完整 transcript；应用可通过 `Asterpath::store()` 读取子流，或对子会话 `watch`（[ADR-0038](../adr/0038-watch-separates-observing-from-driving.md)）：已提交记录照常可见，子驱动的实时事件（`AgentEvent`）不进父的 `drive` 流，而是扇出给本进程内该子会话的订阅者。
 
 映射：
 
@@ -262,7 +262,7 @@ pub struct Summary {
 | `TurnCommitted(MaxStepsExceeded)` | `Failed { reason: MaxStepsExceeded, summary }` | `Completed` |
 | `TurnCommitted(CompactionFailed)` | `Failed { reason: CompactionFailed, summary }` | `Completed` |
 | `TurnCommitted(Refused)` | `Failed { reason: Refused, summary: 空 }`（不回找更早的消息） | `Completed` |
-| 子被宿主取消 | `Cancelled { reason: Host }` | `Completed`（output 标明 cancelled） |
+| 子被应用取消 | `Cancelled { reason: Host }` | `Completed`（output 标明 cancelled） |
 | 父取消 | `Cancelled { reason: Parent }` | `Interrupted`（#6 收尾） |
 | 超时 | `Cancelled { reason: Timeout }` | `Failed{Timeout}` |
 | 子状态不可读 | `Lost { reason }` | `Failed{Internal}` |
@@ -438,10 +438,10 @@ pub struct SubagentConfig {
 
 - 后台/异步子智能体与"完成时注入父上下文"：v1 只做同步持久等待。
 - 对已完成子会话续聊（`SendMessage` 类）：需要"恢复子会话"语义，v1 不做。
-- 宿主绕过 turn/tool call 直接 spawn：等待缺少 `caused_by` 锚点。
-- 子完整 transcript 自动注入父上下文：只给 summary；宿主可自行读子流。
-- planner / map-reduce / critic 等编排模式：宿主应用，不在框架。
-- 每子沙箱 profile、成本预算、内容脱敏：扩展模块/宿主（地图扩展点）。
+- 应用绕过 turn/tool call 直接 spawn：等待缺少 `caused_by` 锚点。
+- 子完整 transcript 自动注入父上下文：只给 summary；应用可自行读子流。
+- planner / map-reduce / critic 等编排模式：应用，不在框架。
+- 每子沙箱 profile、成本预算、内容脱敏：扩展模块/应用（地图扩展点）。
 - 跨父公平调度、抢占、优先级：v1 只有 FIFO。
 - 跨供应商不透明 reasoning 翻译：地图已出界。
 

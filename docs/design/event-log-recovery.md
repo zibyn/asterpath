@@ -42,7 +42,7 @@ pub struct ParentRef {
 ```rust
 #[non_exhaustive]
 pub enum SessionEvent {
-    SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef>, metadata: BTreeMap<String, String> },  // metadata：宿主元数据，ADR-0032
+    SessionCreated { config: ConfigSnapshot, parent: Option<ParentRef>, metadata: BTreeMap<String, String> },  // metadata：会话元数据，ADR-0032
     ContextForked { source: ForkSource, source_log: LogId,
                     items: Vec<Item> },                           // fork 子会话或会话分叉的首个模型可见记录（ADR-0033）
     StreamResumed { from: LogId, reason: ResumeReason },          // 非模型可见
@@ -120,7 +120,7 @@ pub enum TurnEndReason {
 - `Usage`、`Item` / `Part`、`JsonString`、`ConfigSnapshot`、`ContextPolicy`、能力标志的类型归 [#11](https://github.com/zibyn/asterpath/issues/11)，见 [protocol.md](protocol.md)；`ChildOutcome` 的形状见 [subagents.md](subagents.md)。
 - `LogIdRange { first: LogId, last: LogId }` 是 `asterpath-protocol` 的值类型，结构定义见 [tracing.md](tracing.md) §2；本文件与 [compaction.md](compaction.md)、[protocol.md](protocol.md) 共用该定义。
 - `ApprovalDecided` 的等待意图是 open 的 `ToolCallRequested`（[tools.md](tools.md)）。它本身不模型可见。
-- `ConfigChanged` 是宿主经 `update_config` 写入的字段补丁（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)，[packaging.md](packaging.md) §2.1），不是意图，没有终态，不影响 `SessionFacts`。生效配置按水位折叠：模型请求取 `seq < StepStarted.seq` 的变更，所以在 `ConfigChanged` 之后、下一个 `StepStarted` 之前崩溃，恢复渲染出的请求与不崩溃时相同；open step 恢复时沿用原水位，step 内追加的变更仍等下一个 step。`append_system` 由投影在下一个 `StepStarted` 处生成 `Instruction` 条目（[protocol.md](protocol.md) §3.3），位置只取决于日志，恢复同样确定。
+- `ConfigChanged` 是应用经 `update_config` 写入的字段补丁（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)，[packaging.md](packaging.md) §2.1），不是意图，没有终态，不影响 `SessionFacts`。生效配置按水位折叠：模型请求取 `seq < StepStarted.seq` 的变更，所以在 `ConfigChanged` 之后、下一个 `StepStarted` 之前崩溃，恢复渲染出的请求与不崩溃时相同；open step 恢复时沿用原水位，step 内追加的变更仍等下一个 step。`append_system` 由投影在下一个 `StepStarted` 处生成 `Instruction` 条目（[protocol.md](protocol.md) §3.3），位置只取决于日志，恢复同样确定。
 - 子会话等待的 API 与调度归 [#17](https://github.com/zibyn/asterpath/issues/17)（已定，[ADR-0008](../adr/0008-subagent-model.md)）；存储投递归 #5。
 
 ## 4. 信封与幂等键
@@ -164,9 +164,9 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 | `CompactionStarted` / `CompactionApplied` / `CompactionAborted` | `compaction:<意图提交前 frontier LogId>` |
 | `ChildSessionSpawned` / `ChildSessionCompleted` | child session id |
 | `ApprovalDecided` | `tool_call_id` |
-| `ConfigChanged` | `ConfigPatch.id`（宿主提供；可缺省，`append_system` / `add_tools` / `remove_tools` 非空时必填） |
+| `ConfigChanged` | `ConfigPatch.id`（应用提供；可缺省，`append_system` / `add_tools` / `remove_tools` 非空时必填） |
 
-表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 只由宿主调用写入，恢复从不补写；只覆盖字段的补丁重复写入时折叠结果不变，可以不带键；追加 system 与增删工具不幂等，所以带 `append_system` / `add_tools` / `remove_tools` 的更新必须带 `id`，宿主重试用同一个 `id`。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
+表中的 key 按事件类型隔离：`ToolCallRequested`、`ApprovalDecided` 与 `ToolResult` 都用 `tool_call_id`，但属于不同事件类型，互不抑制；`StepStarted` / `TurnStarted` 不设 dedup key，恢复时不重复写。`ConfigChanged` 只由应用调用写入，恢复从不补写；只覆盖字段的补丁重复写入时折叠结果不变，可以不带键；追加 system 与增删工具不幂等，所以带 `append_system` / `add_tools` / `remove_tools` 的更新必须带 `id`，应用重试用同一个 `id`。**判别式是持久值**：带 dedup key 的事件变体名一经发布不得改名；确需改名时，事件类型到判别式的映射必须保持旧值，upcast 只改内存表示（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 
 幂等键只保证**记录**不重复，不保证**副作用**不重复——后者由 `ReplaySafety` 与工具自身负责。
 
@@ -258,7 +258,7 @@ recover(session):
 - **恢复点**：最后一个已提交边界之后的位置；恢复直接跳到这里，不从 session 头部重跑。前缘（`SessionStore::frontier`，最后一条已提交记录）在它之前一条。
 - **已完成但未确认**：本层不存在这个状态。终态记录即完成；存储侧没有 ack，重复驱动由幂等 append 与 `drive()` 单飞吸收。
 - 补记完成后，驱动方从恢复点继续该回合（gate → drain → 下一个 step 或 `TurnCommitted`），见 [agent-loop.md](agent-loop.md)。
-- 恢复次数上限不在内核：宿主 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
+- 恢复次数上限不在内核：应用 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 - 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
 
 ## 7. 验收场景
@@ -282,7 +282,7 @@ recover(session):
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
 | S17 | 恢复遇到 `ToolCallRequested{provenance: Unknown}` | 恰写一条 `ToolResult{Failed, NotFound}`；不查审批、不重跑；模型可见 |
-| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Asterpath::wakeable()`；宿主 `open_session` + `claim()` + `drive()` 后输入恰被投影一次 |
+| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Asterpath::wakeable()`；应用 `open_session` + `claim()` + `drive()` 后输入恰被投影一次 |
 
 ## 8. 留给下游
 

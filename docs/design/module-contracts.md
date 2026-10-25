@@ -69,14 +69,14 @@ pub trait Hooks: Send + Sync {
 - 注册：`AsterpathBuilder::hooks(Arc<dyn Hooks>)`（可多次）或 `AsterpathConfig.hooks`。
 - 组合：按注册顺序调用；首个 `Gate::EndTurn` / `ToolGate::Deny` 短路，参数与结果改写逐个传递；没有环绕式 `next`。
 - 拦截式钩子（`before_*` / `after_tool`）的错误或 panic 按该钩子的错误处理：`before_step` → 回合 `Failed`；`before_tool` / `after_tool` → 该调用 `Failed`（`Internal`）。
-- `on_record` 在每条提交记录（所有会话，含子会话）提交后按会话内顺序调用一次；panic 被捕获、`tracing::warn!` 后继续，不影响循环。「一次」是每个进程内：多个进程共用一个存储时，同一条记录可能在两个进程各出现一次，宿主按 `(session, log_id)` 去重（ADR-0036）。
-- `on_ownership_lost` 在本进程失去一个认领时（续约失败，或树被别的进程接管）每个认领调用一次；此时该树的驱动已停、认领已释放，宿主丢掉对应的 `OwnedSession`（[storage.md](storage.md) §6）。panic 同样被捕获。
+- `on_record` 在每条提交记录（所有会话，含子会话）提交后按会话内顺序调用一次；panic 被捕获、`tracing::warn!` 后继续，不影响循环。「一次」是每个进程内：多个进程共用一个存储时，同一条记录可能在两个进程各出现一次，应用按 `(session, log_id)` 去重（ADR-0036）。
+- `on_ownership_lost` 在本进程失去一个认领时（续约失败，或树被别的进程接管）每个认领调用一次；此时该树的驱动已停、认领已释放，应用丢掉对应的 `OwnedSession`（[storage.md](storage.md) §6）。panic 同样被捕获。
 - 上下文只带数据：`StepCtx { session, turn, step_index }`、`ToolCallCtx { session, turn, step, tool_call_id, provider_call_id, tool, provenance, replay }`；两者的异步 `usage()` 返回本会话自身与子树的用量（`UsageReport`）。没有服务定位器。
 - 调用点：`before_step` 在每个新 step 前（恢复的未完成 step 不再调用）；`before_tool` 在写意图前，已记录意图恢复时不调用（#28）；`after_tool` 在截断后、写结果前，框架补写的 `Interrupted` / 拒绝不经过它。
 
 ### 3.2 单一 append 入口
 
-agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由宿主在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
+agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由应用在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
 
 ### 3.3 （已删除）事件总线
 
@@ -103,7 +103,7 @@ pub trait SessionStore: Send + Sync {
         -> BoxFuture<'_, Result<(), RetirementError>>;
 }
 
-// 一个会话的全部已提交记录（按 seq）：引擎与宿主共用的整段扫描（#77）。
+// 一个会话的全部已提交记录（按 seq）：引擎与应用共用的整段扫描（#77）。
 pub async fn scan_all(log: &dyn SessionStore, session: SessionId)
     -> Result<Vec<LogEntry>, StorageError>;
 
@@ -126,12 +126,12 @@ pub struct ApprovalEndpoint;
 pub async fn root_of(log: &dyn SessionStore, session: SessionId) -> Result<SessionId, StorageError>;
 ```
 
-- `ApprovalGate` 由宿主经 facade 的 `Asterpath::approval_gate()` 取得；宿主在能够应答某会话树的审批时 `register(root)`，句柄 drop 即失效。根 id 可由 `OwnedSession::owner().root` 或 `root_of` 得到。
+- `ApprovalGate` 由应用经 facade 的 `Asterpath::approval_gate()` 取得；应用在能够应答某会话树的审批时 `register(root)`，句柄 drop 即失效。根 id 可由 `OwnedSession::owner().root` 或 `root_of` 得到。
 - agent 管线在 `Ask` 前按调用所在会话找到根，查 `is_open(root)`；该树没有端点时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4），其他会话树的端点不算数。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
-- 子会话的请求登记在根会话的树下；`pending_in(root)` 列出整棵树的待审批项，按会话路由到具体 UI 是宿主的事。
+- 子会话的请求登记在根会话的树下；`pending_in(root)` 列出整棵树的待审批项，按会话路由到具体 UI 是应用的事。
 - `Clock` 是时间来源接缝：引擎（agent / scheduler）注入 `Arc<dyn Clock>` 取 `now`；存储不读时间（`recorded_at` 只供诊断）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - 唤醒发现不在存储：facade 的 `Asterpath::wakeable()` 对 `sessions()` 逐个折叠会话事实（[storage.md](storage.md) §7）。
-- 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），宿主经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
+- 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），应用经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
 - 事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `SessionStore::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
 - 持久等待是引擎内部的 `waits::Waits`，不是 trait，在 protocol 里没有值类型：持久等待只有审批与子会话完成。审批是 `await_approval` / `record_approval`，子会话是 `await_child` / `wake_child`。
@@ -150,7 +150,7 @@ pub async fn root_of(log: &dyn SessionStore, session: SessionId) -> Result<Sessi
 
 - tokio 是唯一支持的运行时；公共 async 签名按 tokio 生态的 `BoxFuture`/`BoxStream` 表达，不引入泛型 executor 或运行时无关抽象。
 - 可测试性所需的 clock / random / timer 用注入 seam 解决，不靠替换运行时。
-- protocol 与引擎都不 spawn 后台任务，驱动由宿主调用。
+- protocol 与引擎都不 spawn 后台任务，驱动由应用调用。
 - 配置装载不在 protocol 与引擎：只收显式构造参数，不读文件、不读环境变量。
 
 ## 4. 适配器 trait（`asterpath-protocol`）
@@ -194,13 +194,13 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | trait | 实现在 | 注入点 |
 | --- | --- | --- |
 | `Provider` | 两个 provider crate、`ScriptedProvider` | `AsterpathConfig.providers` |
-| `Tool` | 宿主、`asterpath-skills`、`asterpath-mcp` 的外部工具 | `AsterpathConfig.tools` |
+| `Tool` | 应用、`asterpath-skills`、`asterpath-mcp` 的外部工具 | `AsterpathConfig.tools` |
 | `SessionStore` | `asterpath-storage-sqlite`、`asterpath-testing` 的 in-memory 后端 | `sqlite` feature 或 `AsterpathConfig.store` |
 | `Compactor` | 引擎的 `DefaultCompactor`（facade 再导出） | `AsterpathConfig.compactor` |
-| `ApprovalPolicy` | 内置 `DefaultApprovalPolicy` 或宿主 | `AsterpathConfig.approval` |
-| `SandboxProvider` | `asterpath-sandbox-linux`、testing 的 fake（trait 在 protocol，ADR-0027） | `asterpath-mcp`、宿主 spawn 型工具 |
+| `ApprovalPolicy` | 内置 `DefaultApprovalPolicy` 或应用 | `AsterpathConfig.approval` |
+| `SandboxProvider` | `asterpath-sandbox-linux`、testing 的 fake（trait 在 protocol，ADR-0027） | `asterpath-mcp`、应用 spawn 型工具 |
 | `Clock` | `SystemClock`、`ManualClock` | `AsterpathConfig.clock` |
-| `Hooks` | 宿主 | `AsterpathConfig.hooks` |
+| `Hooks` | 应用 | `AsterpathConfig.hooks` |
 
 - 规范条目模型、流式事件、能力标志、usage 归一化由 #11 定，见 [protocol.md](protocol.md)。
 - `Provenance::Unknown` 只出现在 `ToolCallRequested`；`ToolDescriptor.provenance` 必须是 `InProcess` 或 `External`，它不进入审批（见 [tools.md](tools.md) §3/§4）。
@@ -214,12 +214,12 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | 扩展 | 接入方式 | 内核提供的 seam |
 | --- | --- | --- |
 | 沙箱/隔离 | 进程启动点的 `SandboxProvider` 变换（独立合约 crate，v1 不建） | 内核只带 `Provenance`；见 [sandbox.md](sandbox.md) |
-| 成本/预算 | 宿主钩子 | `Hooks::before_step` + `StepCtx::usage()`，或 `on_record` + `usage_of`（#13、ADR-0025） |
-| trace 导出/采样 | 宿主钩子 | `Hooks::on_record`、`Asterpath::trace(session)`、事件日志 |
+| 成本/预算 | 应用钩子 | `Hooks::before_step` + `StepCtx::usage()`，或 `on_record` + `usage_of`（#13、ADR-0025） |
+| trace 导出/采样 | 应用钩子 | `Hooks::on_record`、`Asterpath::trace(session)`、事件日志 |
 | 日志保留/归档 | storage admin 扩展 | `SessionStore::retire` 可选能力（#18，见 [retention.md](retention.md)） |
-| 内容脱敏/密钥 | 宿主钩子 | `Hooks::after_tool` |
+| 内容脱敏/密钥 | 应用钩子 | `Hooks::after_tool` |
 | 内置工具 | 可选适配器或参考 CLI | `Tool` + `AsterpathConfig.tools` |
-| 插件安装/分发 | 生态工具或 host | 插件清单/加载（#16） |
+| 插件安装/分发 | 生态工具或应用 | 插件清单/加载（#16） |
 
 这些扩展不是引擎职责，也不出界；它们通过适配器 trait 与 `Hooks` 接入。内核不内置策略、价格表、沙箱实现或脱敏规则。
 
@@ -236,10 +236,10 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 
 ## 6. 插件与信任
 
-- 进程内代码（含 `Hooks`）随宿主编译，永远是进程内、受信的。
+- 进程内代码（含 `Hooks`）随应用编译，永远是进程内、受信的。
 - 外部插件是子进程或 MCP server；由进程内 adapter 模块连接，并把它们的工具注册为 `Provenance::External { transport }`。
-- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/host 负责（#7）；沙箱接缝见 [sandbox.md](sandbox.md)（#21）。
-- 动态发现、热替换不属于 v1；安装/分发是 host 责任；清单、加载与版本协商见 [plugins.md](plugins.md) §7。
+- 信任是**来源标注**，不是沙箱：进程内代码本来就不可沙箱，真正的安全边界是进程边界。框架只记录 provenance；隔离与内容安全由 adapter/应用 负责（#7）；沙箱接缝见 [sandbox.md](sandbox.md)（#21）。
+- 动态发现、热替换不属于 v1；安装/分发是应用的责任；清单、加载与版本协商见 [plugins.md](plugins.md) §7。
 
 ## 7. 可检查的解耦
 

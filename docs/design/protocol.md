@@ -253,7 +253,7 @@ pub struct ModelRequest {
 pub struct SessionContext {
     pub session: SessionId,
     pub root: SessionId,                    // 会话树的根；根会话即自身
-    pub metadata: BTreeMap<String, String>, // 根会话的宿主元数据：子会话不继承，租户键在根上
+    pub metadata: BTreeMap<String, String>, // 根会话的会话元数据：子会话不继承，租户键在根上
 }
 
 pub enum ToolChoice {
@@ -305,14 +305,14 @@ pub enum ReasoningEffort {
 | R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
 | R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。adapter 尚不认识的 `Part` 变体（system 与所有 item 中）在发 HTTP 前经 `asterpath_http::unrenderable_part` 返回 `Unsupported`。 |
-| R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于宿主策略。 |
+| R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于应用策略。 |
 | R12 | `server_tools` 只取 `spec.provider` 对应的条目，每个值必须是 JSON 对象（否则 `InvalidRequest`），按序原样追加在函数工具之后；adapter 不校验内容。非空而模型 `server_tools` 能力为 false → `Unsupported`。只支持服务端执行的工具；客户端执行的供应商工具（OpenAI `shell` / `apply_patch` / `computer`，Anthropic `text_editor` / `computer` / `memory` 等）不在此机制内，误放时由供应商报错。`tool_choice` 不指向服务端工具。 |
-| R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。原生模式下结果是普通 `Message` 文本。输出模式（ADR-0034）由引擎在建请求时解析，adapter 不知道：`Tool`，或 `Auto` 且模型无 `structured_output` 而有 `forced_tool_choice`、宿主的 `tool_choice` 允许调用输出工具时，引擎把输出工具（名为 `OutputFormat.name`，参数 schema 为 `schema`）加入 `tools` 与 `baseline_tools`（计入工具集指纹），`tool_choice` 设为 `Required`（宿主指定的正是输出工具时保留 `Tool(name)`），清空 `output_format`；其余情况发原生约束，不支持时 `Unsupported`。输出工具调用以 `Provenance::Output` 记录意图，补一条固定内容的 `Completed` 结果，不经工具管线；该 step 其他调用照常执行，step 结束后回合 `Completed`。结果是该调用的参数；多个时取位置最前的。`create_session` / `update_config` 拒绝 `Tool` 加 `ToolChoice::None` 或指向其他工具，以及 `Tool` / `Auto` 下与已注册工具重名或不合法的输出工具名（`Config`）。框架不解析、不校验、不重试。 |
+| R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。原生模式下结果是普通 `Message` 文本。输出模式（ADR-0034）由引擎在建请求时解析，adapter 不知道：`Tool`，或 `Auto` 且模型无 `structured_output` 而有 `forced_tool_choice`、应用的 `tool_choice` 允许调用输出工具时，引擎把输出工具（名为 `OutputFormat.name`，参数 schema 为 `schema`）加入 `tools` 与 `baseline_tools`（计入工具集指纹），`tool_choice` 设为 `Required`（应用指定的正是输出工具时保留 `Tool(name)`），清空 `output_format`；其余情况发原生约束，不支持时 `Unsupported`。输出工具调用以 `Provenance::Output` 记录意图，补一条固定内容的 `Completed` 结果，不经工具管线；该 step 其他调用照常执行，step 结束后回合 `Completed`。结果是该调用的参数；多个时取位置最前的。`create_session` / `update_config` 拒绝 `Tool` 加 `ToolChoice::None` 或指向其他工具，以及 `Tool` / `Auto` 下与已注册工具重名或不合法的输出工具名（`Config`）。框架不解析、不校验、不重试。 |
 | R14 | `Part::File` 需要 `file_input` 能力；media type 不被模型接受、出现在 assistant 消息、或 `ProviderFile` 指向其他 provider → `Unsupported`（`ImageSource::ProviderFile` 同理）。 |
 | R15 | `ToolDescriptor.strict: Option<bool>`：`Some` 时 Anthropic / OpenAI 都发送 `strict`，`None` 不发送。 |
 
 - `RequestConfig` 在 `create_session` 时随 `SessionSpec` 写入 `ConfigSnapshot`；loop 每次都从快照读取，恢复后重建出同一请求。
-- R5–R8 用到的按模型规则（`forced_tool_choice`、`sampling`、可用档位、thinking 形态）由 adapter 的 profile 查找给出：实例的模型前缀条目 → 实例默认 → 内置官方表 → 未识别 id 的回退规则（OpenAI `LATEST`，Anthropic `UNRECOGNIZED`）；宿主可为第三方服务商注入（ADR-0029）。
+- R5–R8 用到的按模型规则（`forced_tool_choice`、`sampling`、可用档位、thinking 形态）由 adapter 的 profile 查找给出：实例的模型前缀条目 → 实例默认 → 内置官方表 → 未识别 id 的回退规则（OpenAI `LATEST`，Anthropic `UNRECOGNIZED`）；应用可为第三方服务商注入（ADR-0029）。
 - `create_session` 只做结构校验（provider 已注册、`system` 全为 `Part::Text`、工具名可解析）；`sampling` / `reasoning` / `Required` / `disable_parallel_tool_use` 的能力不匹配不在创建时预检，由 adapter 按 R5–R8 返回 `Unsupported`。
 
 `ReasoningParams` 映射：
@@ -321,7 +321,7 @@ pub enum ReasoningEffort {
 | --- | --- | --- |
 | `budget_tokens` | `thinking: {type:"enabled", budget_tokens}` | 不支持；非空 → `Unsupported` |
 | `effort` | `output_config.effort`（`xhigh` / `max` 按模型）；`Off` 不发 effort，thinking 默认开启的模型发 `thinking: {type:"disabled"}`，无法关闭的模型 → `Unsupported`；`Minimal` → `Unsupported` | `reasoning.effort`（`Off` → `none`）；模型不接受的档位 → `Unsupported` |
-| `summary` | 忽略（thinking 文本照常返回） | `reasoning.summary = "auto"`；false 时不请求摘要（宿主可经 `provider_options` 的 `{"reasoning":{"summary":"detailed"}}` 自选档位，R11） |
+| `summary` | 忽略（thinking 文本照常返回） | `reasoning.summary = "auto"`；false 时不请求摘要（应用可经 `provider_options` 的 `{"reasoning":{"summary":"detailed"}}` 自选档位，R11） |
 
 ## 5. 能力标志
 
@@ -346,8 +346,8 @@ pub struct ProviderCapabilities {
 - 默认值保守：未知即 `false`。能力标志是 adapter 的声明，不是运行时探测。
 - loop 只按标志分支，不按 provider 身份分支；需要的能力为 `false` 时，adapter 在发 HTTP 前返回 `Unsupported`。
 - `server_state` 在 v1 恒为 `false`；即使供应商支持，也不使用。
-- `citations` 在 v1 仅用于告知宿主；typed citations 出界，供应商数据仍保留在 `raw`。
-- `cache_control = true` 表示 adapter 在每个请求上自动设置缓存断点（Anthropic：最后一个 tool、system 最后一个 block、最后一条消息的最后一个可携带断点的 block，均为 `ephemeral`；原样回放的 raw block 不改动，断点前移或省略）。仅用于告知宿主；宿主指定断点出界。
+- `citations` 在 v1 仅用于告知应用；typed citations 出界，供应商数据仍保留在 `raw`。
+- `cache_control = true` 表示 adapter 在每个请求上自动设置缓存断点（Anthropic：最后一个 tool、system 最后一个 block、最后一条消息的最后一个可携带断点的 block，均为 `ephemeral`；原样回放的 raw block 不改动，断点前移或省略）。仅用于告知应用；应用指定断点出界。
 - `server_tools` 为 `true` 时，`ServerToolCall` / `ServerToolResult` 是普通历史 item；loop 不执行它们。
 - `image_input = false` 时，请求中的 user/assistant `Part::Image` 返回 `Unsupported`；工具结果图像按 §10.4 渲染为占位。
 - 能力匹配不在 `create_session` 预检；adapter 是唯一权威（#26）。
@@ -454,7 +454,7 @@ pub enum StopReason {
 
 ### 6.1 Compactor 契约（#27）
 
-压缩是**可选能力模块**：引擎的 agent 只依赖本节的 trait，默认实现 `asterpath::DefaultCompactor` 由宿主经 `AsterpathConfig.compactor` 注入；`None` 表示压缩不可用。摘要调用独立构造请求，不继承 `RequestConfig`（[compaction.md](compaction.md) §4）。
+压缩是**可选能力模块**：引擎的 agent 只依赖本节的 trait，默认实现 `asterpath::DefaultCompactor` 由应用经 `AsterpathConfig.compactor` 注入；`None` 表示压缩不可用。摘要调用独立构造请求，不继承 `RequestConfig`（[compaction.md](compaction.md) §4）。
 
 ```rust
 pub trait Compactor: Send + Sync {
@@ -650,7 +650,7 @@ pub enum ProviderErrorKind {
 - `request_id` 来自响应头或响应 id；`raw` 保存错误 body 的原始文本。
 - `partial_usage` 是 adapter 的 best-effort：只填 provider 已明确给出的部分（例如 Anthropic `message_start` 的输入侧），缺的部分按 0，不估算。loop 原样写入 `ModelCallAborted.usage`（#13）。
 - 流中途失败前已 `ItemCompleted` 的 item 由 loop 组成 `ModelCallAborted.partial`；不写 `AssistantMessage`（#6 I9）。
-- loop 把每次失败的 `kind` / `message` / `request_id` 写入 `ModelCallAborted.error`（`ProviderErrorInfo`，#107）；`raw` 不入日志。取消与崩溃补写为 `None`。发布前加字段，不 bump `LOG_SCHEMA_VERSION`、不写 upcaster（ADR-0002）。脱敏、截断归宿主。
+- loop 把每次失败的 `kind` / `message` / `request_id` 写入 `ModelCallAborted.error`（`ProviderErrorInfo`，#107）；`raw` 不入日志。取消与崩溃补写为 `None`。发布前加字段，不 bump `LOG_SCHEMA_VERSION`、不写 upcaster（ADR-0002）。脱敏、截断归应用。
 
 ## 9. 原始 JSON 保留与回放
 
@@ -672,7 +672,7 @@ pub enum ProviderErrorKind {
 5. **工具集指纹不匹配（仅 Anthropic）**：`Reasoning` 不进入请求；其他 item 不受影响。这是 Anthropic 服务端 prefix 校验的本地近似：Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 上，thinking block 只在顶层 `system`、`tools` 与它之前的消息都不变时有效，否则 400（2026-08-31 后创建的账号默认）或按 `prefix_mismatch_behavior: "drop_block"` 丢弃。近似并不完整：前文改写（除压缩，由 `prefix_epoch` 覆盖）不在其中。追加指令不改顶层 `system`（§3.3），因此不使旧 thinking 失效；只有退回路径（规则 8）改写顶层 `system`。工具变更同理：inline 路径下顶层 `tools` 保持基线，指纹不变；退回路径（规则 9）改写顶层 `tools`，指纹不匹配。OpenAI 不做此检查：文档没有把 reasoning 与工具集绑定，并要求工具调用循环中把 reasoning 传回。依据与会话中途变更配置时的渲染方式见 [#108](https://github.com/zibyn/asterpath/issues/108)。
 6. 丢弃项在 trace 记 `protocol.dropped_items`，附 provider / kind / reason；不影响日志与投影。
 7. `raw.json` 是给同一 adapter 的私有格式；框架不解释其内容，也不保证跨 adapter 版本兼容（版本兼容由 adapter 自己负责；跨版本 raw 的边界见 [plugins.md](plugins.md) §7.3）。
-8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_changes = false`）**：只有官方文档列出支持的模型在内置表中为 `true`；未列出的模型与未识别的 id（`UNRECOGNIZED`，第三方兼容端点如 DeepSeek 会落到这里）为 `false`，宿主确认端点支持时用 `with_inline_changes(true)` 注入。指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
+8. **追加指令的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_changes = false`）**：只有官方文档列出支持的模型在内置表中为 `true`；未列出的模型与未识别的 id（`UNRECOGNIZED`，第三方兼容端点如 DeepSeek 会落到这里）为 `false`，应用确认端点支持时用 `with_inline_changes(true)` 注入。指令并入顶层 `system`，位于最后一条 `Instruction` 之前的 `Reasoning` 不进入请求（它们产出时的 system 不同）；之后的照常回放。基线因压缩变化时由 `prefix_epoch` 覆盖，不另设绑定字段。
 9. **工具变更的退回路径（仅 Anthropic，`AnthropicModelProfile::inline_changes = false`）**：与规则 8 共用同一个标志（文档称工具变更与中途 system 消息支持同一批模型）。顶层 `tools` 渲染生效集合，`ToolsChanged` 条目不渲染，不发 beta header；产出于变更之前的 `Reasoning` 指纹不匹配（规则 5），不进入请求。
 
 `tools_hash` 的定义：把渲染出的顶层工具集（OpenAI 与 Anthropic 退回路径是 `ModelRequest.tools`，Anthropic inline 路径是 `ModelRequest.baseline_tools`）的模型可见字段（`name` / `description` / `schema`）按 `name` 排序，序列化为紧凑 JSON 数组 `[{"name":…,"description":…,"schema":…}, …]`（对象键按字典序递归排序，RFC 8785 可作实现参考），取 SHA-256，小写十六进制。空工具集为 `[]` 的哈希。`strict` 为 `Some` 的工具在对象中加 `strict` 键；本 provider 的 `server_tools` 非空时，数组改为 `{"tools": […], "server_tools": […]}`（服务端工具按声明顺序，各自按键排序）。两者都缺省时与旧定义逐字节相同，已有绑定不失配（ADR-0031）。实现是 `asterpath_protocol::tools_hash`；adapter 在产出 `Reasoning` 时用所服务请求的同一函数计算并写入 `binding`；Anthropic adapter 请求前对每条 `Reasoning` 重算比较。
@@ -822,7 +822,7 @@ pub enum ProviderErrorKind {
 | 同 provider 换模型 | `Reasoning` 不进入请求；其他 item 正常 |
 | `ToolCall` / `ToolResult` 跨 provider | 用规范字段重新渲染；`raw` 忽略 |
 | `Message` / `Compaction` 跨 provider | 正常渲染 |
-| `Part::File` / `Part::Image` 的 `ProviderFile` 指向其他 provider | `Unsupported`；不丢弃、不占位（ADR-0031），宿主改为内联或重新上传 |
+| `Part::File` / `Part::Image` 的 `ProviderFile` 指向其他 provider | `Unsupported`；不丢弃、不占位（ADR-0031），应用改为内联或重新上传 |
 
 - 丢弃是**投影/渲染层**行为，不修改日志；原始 item 仍可扫描，切回原 provider 后仍可回放。
 - 丢弃项在 trace 记 `protocol.dropped_items`；不向模型注入「某段推理被丢弃」的合成文本。
@@ -876,7 +876,7 @@ pub enum ProviderErrorKind {
 ## 14. 出界与非目标
 
 - **typed citations**：v1 只保留在 raw；`Part::Text` 不带 citations 字段。
-- **宿主指定 cache breakpoint**：v1 无规范 API；adapter 可自行设置自动断点。
+- **应用指定 cache breakpoint**：v1 无规范 API；adapter 可自行设置自动断点。
 - **OpenAI 原生 compaction item**：v1 两边都渲染为文本；原生 item 只作为 `ProviderOpaque` 保留。
 - **`allowed_tools` / 更细的 tool_choice**：v1 只有 `Auto / None / Required / Tool`。
 - **OpenAI 服务端状态**：`previous_response_id` / `conversation` 不使用；始终完整历史 + `store:false`。
@@ -884,14 +884,14 @@ pub enum ProviderErrorKind {
 - **非流式 `complete()`**：调用方 drain `stream` 即可。
 - **provider 内建重试**：重试归 loop；adapter 只做错误分类。
 - **供应商特定请求字段的透传**：只经 `provider_options`（R11）与 `server_tools`（R12）；不开放整体 raw request override。
-- **供应商文件上传 / 删除**：归宿主；框架只引用 `ProviderFileId`。
+- **供应商文件上传 / 删除**：归应用；框架只引用 `ProviderFileId`。
 - **客户端执行的供应商工具**：不支持；同类能力用 `asterpath-tools`。
 
 ## 15. 留给下游
 
 - **#12**：`StreamEvent`、`ResponseStarted` / `ResponseEnded`、`protocol.dropped_items` 到 trace span 的命名与属性。
 - **#13**：已定。`Usage` 的聚合、桶、partial usage 与 session 树 rollup 见 [usage.md](usage.md)；`ProviderError.partial_usage` 与三个事件上的 `model` 字段已回写本文件与 #3。
-- **#15**：已定。`ProviderId` / `ModelId` / `ToolName` / `JsonString` / `ModelAlias` 是 opaque newtype；alias 集合由宿主配置（[packaging.md](packaging.md) §3.2）。#26 已定 `Provider::id()` + `ProviderCatalog` 与 `RequestConfig`。
+- **#15**：已定。`ProviderId` / `ModelId` / `ToolName` / `JsonString` / `ModelAlias` 是 opaque newtype；alias 集合由应用配置（[packaging.md](packaging.md) §3.2）。#26 已定 `Provider::id()` + `ProviderCatalog` 与 `RequestConfig`。
 - **#16**：已定。Provider 只有进程内路径，无清单、无动态加载，兼容性由合约 crate semver 保证；model alias 归 #15；`RawProviderData.kind` 原样持久化、跨版本不翻译，不可回放时按本文件规则丢弃并记 trace。见 [plugins.md](plugins.md) §7。
 - **#19**：流中断、错误路径与跨 provider 切换的确定性测试。
 - **#4**：`Item` / `Part` / `Usage` 持久化后的 schema 版本与 upcast 规则（首次定义，暂无 upcast）。

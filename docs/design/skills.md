@@ -1,17 +1,17 @@
-# 技能：宿主解析的指令包
+# 技能：应用解析的指令包
 
 > 来源：[#63](https://github.com/zibyn/asterpath/issues/63)（2026-10-23 设计）。本文件定义技能包格式、发现与优先级、会话集成、`load_skill` 工具语义、安全边界与验收。
 >
 > 对齐：[#2 模块契约](./module-contracts.md)、[#3 事件日志](./event-log-recovery.md)、[#6 agent loop](./agent-loop.md)、[#7 工具契约](./tools.md)、[#9 压缩](./compaction.md)、[#15 打包](./packaging.md)、[#16 插件边界](./plugins.md)。
 >
-> 相关 ADR：[0021 技能是宿主解析的指令包](../adr/0021-skills-are-host-resolved-instruction-packages.md)。
+> 相关 ADR：[0021 技能是应用解析的指令包](../adr/0021-skills-are-host-resolved-instruction-packages.md)。
 >
 > 参考实现（2026-10-23 核对）：Claude Code、Codex、OpenCode、Pi、DeepSeek Harness 都把技能实现为目录 + `SKILL.md` + YAML frontmatter，先列元数据、正文按需加载。本设计取五家的交集，不引入任何一家的私有执行语义。
 
 ## 1. 决策摘要
 
 - **技能是指令包，不是能力**。它是一个目录下的 `SKILL.md`；对模型只表现为“可选加载的指令文本”，不注册工具、不改变审批或沙箱、不参与能力发现。
-- **宿主拥有策略，crate 拥有机制**。宿主决定扫描根、启用与诊断；`asterpath-skills` 只提供解析、索引渲染与 `load_skill` 工具。内核没有新 seam。
+- **应用拥有策略，crate 拥有机制**。应用决定扫描根、启用与诊断；`asterpath-skills` 只提供解析、索引渲染与 `load_skill` 工具。内核没有新 seam。
 - **渐进披露**。system prompt 只放索引（名称 + 描述）；正文由模型调用 `load_skill(name)` 读取。工具结果照常入日志，恢复按日志重放。
 - **索引冻结、正文实时**。索引随 `SessionCreated.config.system` 冻结；正文每次调用读当前磁盘。文件变化不影响已有会话的索引；已加载的内容以日志为准。
 - **技能不授予权限**。`allowed-tools`、`model`、`hooks` 等字段不执行；技能内容不能改 system、审批、沙箱或工具集。
@@ -25,14 +25,14 @@
 | 技能（Skill） | 一段按需加载给模型的指令文本，带名称与描述用于发现和选择；不构成能力，也不授予权限。 |
 | 技能包（Skill Package） | 一个可被发现的技能单元：一个目录，包含 `SKILL.md` 与可选资源文件。 |
 | 技能索引（Skill Index） | 会话开始时写入 system 的技能名称与描述清单；会话期间固定。 |
-| 技能根（Skill Root） | 宿主配置的、包含若干技能包的搜索位置；优先级由宿主决定。 |
+| 技能根（Skill Root） | 应用配置的、包含若干技能包的搜索位置；优先级由应用决定。 |
 
 边界：
 
 - **不是插件**。插件是外部能力来源，M5 只有 `Tools` 能力；技能是本地指令文本，不贡献能力，也不进入插件清单。
 - **不是工具**。工具是可执行副作用入口；技能只影响模型看到什么文本。
 - **不是 command**。M6 没有命令 seam；用户只能在 prompt 里点名，由模型决定是否加载。
-- **不是 system prompt 的替代**。宿主自己的 system 仍然先写；技能索引追加在后。
+- **不是 system prompt 的替代**。应用自己的 system 仍然先写；技能索引追加在后。
 - **不是子智能体的配置单位**。技能随会话的 system 与工具集继承，不为子会话单独解析。
 
 ## 3. 技能包格式
@@ -89,13 +89,13 @@ description: 一句话说明这个技能何时有用。  # 必填
 - **每个新 session 创建时扫描一次**。没有热加载：新技能对下一个新 session 生效；已有 session 的索引不变，但 `load_skill` 读当前磁盘。
 - **开关**：`[skills] enabled = false`（或 `-c skills.enabled=false`）只影响新 session（不扫描、不渲染索引、不注册工具）。续会话总是注册 `load_skill`，索引来自 `SessionCreated.config.system`（见 §5）。
 - **`.claude/skills` 不自动扫描**。需要时写进 `[skills] paths`；格式兼容不等于替别的产品做发现。
-- **项目信任**：M6 不提供信任提示；项目技能默认加载，宿主用 `enabled = false`（参考 CLI 也可 `-c skills.enabled=false`）退出。需要信任门的宿主应在组装 `system` 之前自行拦截。
+- **项目信任**：M6 不提供信任提示；项目技能默认加载，应用用 `enabled = false`（参考 CLI 也可 `-c skills.enabled=false`）退出。需要信任门的应用应在组装 `system` 之前自行拦截。
 
 ## 5. 会话集成
 
 ### 5.1 索引
 
-会话创建时，宿主把索引作为一个文本块追加到自己的 system parts 之后：
+会话创建时，应用把索引作为一个文本块追加到自己的 system parts 之后：
 
 ```text
 ## Skills
@@ -108,14 +108,14 @@ Call `load_skill` with a skill name when the task matches its description.
 
 - 顺序确定：按根优先级，层内按 name 升序。
 - 总量预算 8,000 字符。按优先级顺序填充；放不下的条目及所有更低优先级条目整条省略，并产生诊断。单条 `description` 仍受 1024 字符上限约束，不做二次截断。
-- 没有技能时不追加任何块；宿主自己的 system 原样保留。
+- 没有技能时不追加任何块；应用自己的 system 原样保留。
 - 索引是普通 `Part::Text`，进入 `ConfigSnapshot.system`；不新增字段，也不改变日志 schema。
 - `ConfigSnapshot.tools` 同时包含 `load_skill` 的 `ToolDescriptor`。
 
 ### 5.2 恢复与子会话
 
 - **恢复**：续会话不重新扫描索引，使用日志里的 `ConfigSnapshot.system`；`load_skill` 仍按当前根解析。技能文件消失 → 工具返回 `NotFound`；文件变化 → 返回新内容并作为新的工具结果入日志。已加载过的正文以日志为准。
-- **子会话**：fresh 子继承父的 system 与工具集，因此索引与 `load_skill` 一起继承。模型通过 spawn 参数收窄工具集时可能留下索引却没有 `load_skill`；这是宿主选择收窄的后果，M6 不做特殊处理。
+- **子会话**：fresh 子继承父的 system 与工具集，因此索引与 `load_skill` 一起继承。模型通过 spawn 参数收窄工具集时可能留下索引却没有 `load_skill`；这是应用选择收窄的后果，M6 不做特殊处理。
 - **compaction**：索引在 system，不参与压缩；技能正文是普通工具结果，可能被摘要替换，模型需要时可以再次 `load_skill`。
 
 ## 6. `load_skill` 工具
@@ -150,22 +150,22 @@ pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 ## 7. 安全边界
 
 - **技能是不可信的仓库内容**。加载技能等于让模型读一段仓库里的文本；提示注入是固有风险。缓解手段是：技能没有任何权限，只能影响模型看到什么。
-- **宿主仍是唯一权威**：工具集、审批、沙箱、system 只能由宿主改变。技能不能提权、不能绕过审批、不能放宽沙箱。
+- **应用仍是唯一权威**：工具集、审批、沙箱、system 只能由应用改变。技能不能提权、不能绕过审批、不能放宽沙箱。
 - **`allowed-tools` 等字段不执行**。不要把它们当作限制或预批准；Claude Code 的同类字段是“预批准”而非限制，已有越权问题（anthropics/claude-code#89195）。`doctor` 提示这些字段被忽略。
-- **资源与脚本不执行**：M6 不读 `references/`、不跑 `scripts/`。技能可以提到它们，但模型没有对应工具（除非宿主另外提供）。
+- **资源与脚本不执行**：M6 不读 `references/`、不跑 `scripts/`。技能可以提到它们，但模型没有对应工具（除非应用另外提供）。
 - **路径**：名称正则排除了 `/` 与 `.`，只读 `<root>/<name>/SKILL.md`；根在发现时规范化。不存在任意路径读取。
 - **YAML 解析是信任边界**：frontmatter 先限 16 KiB 再交给 `saphyr`；只读取顶层 `name` / `description` 标量；不执行标签、锚点或自定义构造。解析失败即跳过该技能。
-- **没有签名、registry 或信任提示**；项目技能默认加载，`enabled = false`（或 `-c skills.enabled=false`）是退出开关。需要更强信任模型的宿主应在组装前自行判断。
+- **没有签名、registry 或信任提示**；项目技能默认加载，`enabled = false`（或 `-c skills.enabled=false`）是退出开关。需要更强信任模型的应用应在组装前自行判断。
 - **诊断不包含正文**：只报路径、技能名与原因，避免把技能内容里的秘密带进 stderr 或日志。
 
-## 8. 宿主接口
+## 8. 应用接口
 
 ### 8.1 crate
 
 `asterpath-skills`（M6，Tier 2 module）：
 
 - workspace 依赖只有 `asterpath-protocol`；外部依赖 `saphyr`（YAML）、`futures-core`（`Tool::invoke` 的 `BoxFuture`）、`serde` / `serde_json`（参数与工具 schema）。
-- 不实现 `Module`，也不注册服务：宿主在组装期调用它，把工具放进 `AsterpathConfig.tools`。
+- 不实现 `Module`，也不注册服务：应用在组装期调用它，把工具放进 `AsterpathConfig.tools`。
 
 形状（实现可按需调整，公开面保持最小）：
 
@@ -277,6 +277,6 @@ paths = []          # 显式根；相对路径按进程 cwd 解析
 - 插件打包技能、远程 registry、安装/更新。
 - per-skill 工具限制、预批准、审批策略、模型覆盖、`context: fork`、hooks。
 - 把正文冻结进日志；M6 依赖工具结果作为持久记录。
-- 技能级版本字段；版本随宿主或包管理。
+- 技能级版本字段；版本随应用或包管理。
 - 递归发现、自动扫描 `.claude/skills`。
 - 可配置的索引预算或单条描述上限之外的调参。

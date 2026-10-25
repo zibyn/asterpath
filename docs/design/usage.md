@@ -8,7 +8,7 @@
 
 ## 1. 决策摘要
 
-- **只有 provider 返回值进账**。`Usage` 只来自协议响应；本地 tokenizer、`bytes/3` 估算与宿主猜测永不进入 `Usage` 或总量。`#9` 的 `estimated_input` 只活在压缩模块内部，仅用于窗口判断。
+- **只有 provider 返回值进账**。`Usage` 只来自协议响应；本地 tokenizer、`bytes/3` 估算与应用猜测永不进入 `Usage` 或总量。`#9` 的 `estimated_input` 只活在压缩模块内部，仅用于窗口判断。
 - **归一化沿用 #11 的 exclusive 口径**：`input_total = uncached + cache_read + cache_write`；`output.total` 含推理，`reasoning` 是子集、不叠加；供应商 `total_tokens` 忽略；缺失字段按 0；原始 usage 留在 `raw`。
 - **三个桶**：`model_calls`（成功的 `AssistantMessage`）、`compaction`（成功的 `CompactionApplied`）、`partial`（失败/中断 attempt 已确认的用量，只作诊断）。`total = model_calls + compaction`；`partial` 不进总量。
 - **用量不是独立日志事件**：它是 `AssistantMessage` / `CompactionApplied` / `ModelCallAborted` 上的字段；聚合是事件日志的确定性投影，恢复与重放天然幂等。
@@ -127,7 +127,7 @@ pub enum UsageError {
 | session | 该 session 日志中的全部桶 | 否（`Session` scope） |
 | session 树 | 自身 + 全部后代 | 是（`SessionSubtree` scope） |
 
-- **Turn / Step 只算本人日志**；子会话用量只通过 `SessionSubtree` 进入汇总。想按 spawn 归因的宿主可用 `ChildSessionSpawned.caused_by` 自行关联。
+- **Turn / Step 只算本人日志**；子会话用量只通过 `SessionSubtree` 进入汇总。想按 spawn 归因的应用可用 `ChildSessionSpawned.caused_by` 自行关联。
 - 子会话用量只写子流；父日志不复制（#8）。`own + descendants` 不会重复计数。
 - `fork` 只物化投影条目，不复制日志，因此子会话**不继承**父用量；用量归实际发起模型调用的会话。
 - 没有独立的 subagent 用量桶：子会话本身就是一级 session，子树汇总即父子归因。
@@ -171,7 +171,7 @@ pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option
 - 时间分桶（按小时/天）由调用方对 `records()` 自行分组；v1 没有 `group_by` API。
 - 任一目标 session 的日志损坏 → `UsageError::Corrupt`，整个查询失败，不跳过坏 session（与 #5 的硬错误一致）。
 - v1 不建 usage 派生表、不维护计数器；日志是唯一真相。查询成本与日志长度线性，可流式提前终止。
-- 没有 `UsageScope::All`：全局报表由宿主自己的会话注册表遍历根会话完成；会话目录不提供 `roots()`。
+- 没有 `UsageScope::All`：全局报表由应用自己的会话注册表遍历根会话完成；会话目录不提供 `roots()`。
 
 ## 6. 实时事件与成本接缝
 
@@ -184,10 +184,10 @@ pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option
 
 ### 成本/预算扩展
 
-- 价格表、币种、告警阈值、预算策略全部在宿主钩子，内核不提供相关类型。
+- 价格表、币种、告警阈值、预算策略全部在应用钩子，内核不提供相关类型。
 - 执行点是 `Hooks::before_step`：用 `StepCtx::usage()`（本会话 `own` 与子树 `descendants`）判定，超预算返回 `Gate::EndTurn { reason }` → `Stopped { reason }`。gate 只在 step 之间运行，**最多超支一个 step**；不在模型流中间打断。这是明确接受的语义。
 - 跨会话累计（例如按 root session）由钩子在 `on_record` 里用 `SessionStore::parent` 归并；进程重启后用 `usage(scope)` 重建。
-- 是否把 `Partial` 计入预算由宿主决定。
+- 是否把 `Partial` 计入预算由应用决定。
 
 ## 7. 重放与幂等
 
@@ -197,13 +197,13 @@ pub fn usage_of(event: &SessionEvent, compaction_turn: Option<TurnId>) -> Option
   - `ResponseEnded` 后、`AssistantMessage` append 前崩溃 → 该次调用的 usage 永久丢失；恢复后重调模型，只记新调用。接受低估，不用估算补齐。
   - `AssistantMessage` append 后、`StepCommitted` 前崩溃 → usage 保留，恢复不重调模型（#6）。
   - 压缩在 `CompactionApplied` 前崩溃 → 重做摘要；被丢弃的那次调用不计，只计最终 append 的 `CompactionApplied`。
-- 宿主/扩展若持久化累计值，必须按 `(session, log_id)` 记忆并能从日志重建；不得使用无键的加法计数器。
+- 应用/扩展若持久化累计值，必须按 `(session, log_id)` 记忆并能从日志重建；不得使用无键的加法计数器。
 
 ## 8. 边界与非目标
 
 - 本地 tokenizer / 估算用量进账：不做；估算只属于压缩模块的窗口判断。
 - 全局跨 session 聚合、会话目录的 `roots()`：v1 不做。
-- 价格、币种、预算、告警、成本归因到工具/用户：扩展模块或宿主。
+- 价格、币种、预算、告警、成本归因到工具/用户：扩展模块或应用。
 - 把 `partial` 混入总量、或对丢失的用量做估算补偿：不做。
 - turn / step 级子树汇总：不做；子会话只进 session 树。
 - usage 派生表 / 物化视图 / 独立 usage 日志事件：v1 不做。

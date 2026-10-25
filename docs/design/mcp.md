@@ -11,9 +11,9 @@
 - **只支持 MCP `2026-07-28` 无状态修订**。没有 `initialize`、没有会话、没有服务端反向请求；`2025-11-25` 及更早的 server 加载失败。
 - **传输只有 stdio 与 Streamable HTTP**（POST-only，JSON 或请求级 SSE）。不做旧 HTTP+SSE、WebSocket、GET 监听流、`Last-Event-ID` 续传、OAuth。
 - **启动期一次性发现**：`server/discover` 协商版本与能力，`tools/list`（跟随 cursor）发现工具，原子注册为 `Provenance::External`。运行期不增删工具。
-- **不自动重连/重启**：stdio server 死亡后该服务在本进程内不可用；HTTP 每次调用独立。恢复靠重启宿主。
+- **不自动重连/重启**：stdio server 死亡后该服务在本进程内不可用；HTTP 每次调用独立。恢复靠重启应用。
 - **结果与错误映射不新增事件类型**：`Part` 与 `ToolErrorKind` 保持 #7/#11 的形状；只为运行期 `NotFound` 增加一个 `ToolError` 变体。
-- **ACP 不在工具层**：它是宿主/会话接口，不实现；MCP 配置没有协议字段（ADR-0027）。
+- **ACP 不在工具层**：它是应用/会话接口，不实现；MCP 配置没有协议字段（ADR-0027）。
 - **adapter 是 `asterpath-mcp` 的 crate 私有类型**；`Provenance` 只携带 `TransportKind::{Stdio, Http}`，不含端点或凭据。
 
 ## 2. 范围与术语
@@ -124,7 +124,7 @@ pub enum AdapterError {
 | `nextCursor` | 分页 | 跟随到缺失；重复 cursor 或超过 100 页 = `Failed{Discovery}` |
 
 - `inputSchema` 根不是 object → 该服务 `Failed{Discovery}`，不注册任何工具。
-- 注解是 server 的未验证声明；来源仍是 `External`，审批策略不变。宿主不信任某个 server 时，用包装工具或自定义 `ApprovalPolicy` 覆盖。
+- 注解是 server 的未验证声明；来源仍是 `External`，审批策略不变。应用不信任某个 server 时，用包装工具或自定义 `ApprovalPolicy` 覆盖。
 - `readOnlyHint = true` 推出的 `Safe` 是重放承诺：恢复时可能重跑该调用。server 谎报会导致重复副作用，这是 v1 的信任边界。
 
 ## 6. 调用与结果映射
@@ -175,7 +175,7 @@ pub enum AdapterError {
 | 宽限内 server 自行取消 | `Failed{Cancelled}`；宽限到期由管线写 `Interrupted` |
 | 响应 `content` 过大 | 按 §6.2 截断；完整输出不落日志 |
 
-- 协议错误不自动重试（与 #7“工具失败不重试”一致）；MCP 规范建议的无状态重发由模型/宿主决定。
+- 协议错误不自动重试（与 #7“工具失败不重试”一致）；MCP 规范建议的无状态重发由模型/应用决定。
 - 错误 `message` 只含 JSON-RPC 消息与状态码，不含 URL、headers 或 env。
 
 ### 7.2 加载与连接
@@ -193,7 +193,7 @@ pub enum AdapterError {
 
 ### 7.3 连接死亡
 
-- **stdio**：进程退出、EOF、协议错误 → 该 adapter 在本进程内标记 dead；所有在途调用 `Failed{Transport}`，后续调用立即 `Transport`，不再 I/O。恢复 = 重启宿主。
+- **stdio**：进程退出、EOF、协议错误 → 该 adapter 在本进程内标记 dead；所有在途调用 `Failed{Transport}`，后续调用立即 `Transport`，不再 I/O。恢复 = 重启应用。
 - **HTTP**：每次调用独立；网络错误、5xx、流中断只失败该调用，下一次调用重新 POST。收到 `-32022` / `-32021` 说明协商漂移，标记 adapter dead。
 - 取消/超时导致 stdio server 被杀（#7）同样按 dead 处理；这是 v1 的明确代价。
 
@@ -221,8 +221,8 @@ pub enum AdapterError {
 | 生态 | Zed external agents；Rust SDK 支持 client / agent / proxy | `session/new.mcpServers` 交给 agent 自己连 |
 
 - ACP 规范没有工具调用方法；`tool_call` 是 agent 上报给客户端的活动。MCP-over-ACP 只是 MCP 的传输。
-- v1 **不实现** ACP：它要么是宿主侧客户端，要么是包在 `SessionHandle` 外的 ACP agent 前端，不是 MCP adapter。
-- MCP 配置没有协议字段；ACP 若将来实现，是宿主 / 会话接口，不复用 `asterpath-mcp`（ADR-0027）。
+- v1 **不实现** ACP：它要么是应用侧客户端，要么是包在 `SessionHandle` 外的 ACP agent 前端，不是 MCP adapter。
+- MCP 配置没有协议字段；ACP 若将来实现，是应用 / 会话接口，不复用 `asterpath-mcp`（ADR-0027）。
 
 ## 10. 默认值
 
