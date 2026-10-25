@@ -20,8 +20,10 @@ mod scheduler;
 mod tools;
 mod views;
 mod waits;
+mod watch;
 
 pub use compaction::DefaultCompactor;
+pub use watch::WatchEvent;
 
 /// The contract crate: adapter traits, hooks and value types.
 pub use asterpath_protocol as protocol;
@@ -42,6 +44,7 @@ use crate::tools::ToolTable;
 use crate::views::trace::TracingQuery;
 use crate::views::usage::UsageService;
 use crate::waits::Waits;
+use crate::watch::Watchers;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
@@ -75,6 +78,7 @@ pub struct Asterpath {
     cancellations: Arc<CancellationRegistry>,
     clock: Arc<dyn Clock>,
     trace: TracingQuery,
+    watchers: Arc<Watchers>,
 }
 
 impl std::fmt::Debug for Asterpath {
@@ -149,8 +153,12 @@ impl Asterpath {
         // append entry so hooks see it.
         let trace = TracingQuery::new(Arc::clone(&backend));
         let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
-        let store: Arc<dyn SessionStore> =
-            Arc::new(commit::CommitLog::new(backend, config.hooks.clone()));
+        let watchers = Arc::new(Watchers::default());
+        let store: Arc<dyn SessionStore> = Arc::new(commit::CommitLog::new(
+            backend,
+            config.hooks.clone(),
+            Arc::clone(&watchers),
+        ));
 
         let waits = Arc::new(Waits::new(Arc::clone(&store)));
         let cancellations = Arc::new(CancellationRegistry::new());
@@ -200,7 +208,8 @@ impl Asterpath {
             .with_hooks(config.hooks, Some(usage_lookup))
             .with_compactor(config.compactor.clone())
             .with_cancellations(Arc::clone(&cancellations))
-            .with_scheduler(scheduler),
+            .with_scheduler(scheduler)
+            .with_watchers(Arc::clone(&watchers)),
         );
 
         Ok(Self {
@@ -214,6 +223,7 @@ impl Asterpath {
             cancellations,
             clock,
             trace,
+            watchers,
         })
     }
 
@@ -343,6 +353,7 @@ impl Asterpath {
             agent: Arc::clone(&self.agent),
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
+            watchers: Arc::clone(&self.watchers),
         }
     }
 
@@ -512,6 +523,7 @@ pub struct SessionHandle {
     agent: Arc<Agent>,
     waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
+    watchers: Arc<Watchers>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -698,6 +710,22 @@ impl SessionHandle {
         })
     }
 
+    /// Observe the session without driving it (ADR-0038): every committed
+    /// record after `after` (the whole log for `None`), then
+    /// [`WatchEvent::Synced`], then each new commit as it lands. A drive in
+    /// this process, of this session or of it as a child, also yields its
+    /// live events ([`WatchEvent::Live`]: text deltas and the like), which
+    /// are never replayed. No claim is needed; from another process only
+    /// records arrive, within the store poll interval. The stream never
+    /// ends; drop it to stop watching. Resume after the last record's
+    /// `log_id` to neither miss nor repeat one.
+    pub fn watch(
+        &self,
+        after: Option<LogId>,
+    ) -> BoxStream<'static, Result<WatchEvent, AsterError>> {
+        watch::watch(Arc::clone(&self.store), &self.watchers, self.session, after)
+    }
+
     /// State is the log-derived classification, not driver memory.
     pub async fn state(&self) -> Result<SessionState, AsterError> {
         Ok(self.facts().await?.state())
@@ -749,17 +777,17 @@ impl OwnedSession {
     ///   client disconnects the stream is dropped, and the turn stops until
     ///   someone drives again.
     /// - **Drive from a spawned task.** `tokio::spawn` a task that owns a
-    ///   cloned `OwnedSession` (so the process keeps the tree), reads every
-    ///   `drive()` stream to the end, and
-    ///   fans `AgentEvent`s out over `tokio::sync::broadcast`. Subscribers
-    ///   come and go without affecting the turn.
+    ///   cloned `OwnedSession` (so the process keeps the tree) and reads
+    ///   every `drive()` stream to the end. Views
+    ///   [`watch`](SessionHandle::watch) the session instead: they see the
+    ///   same live events and come and go without affecting the turn.
     /// - **Queue through the log, not by retrying `Busy`.** Keep at most one
     ///   driver task per session. New input only needs
     ///   [`submit_input`](Self::submit_input) plus a wake-up; after each
     ///   drive the task drives again while
     ///   [`SessionFacts::has_pending_input`] holds.
-    /// - **Reconnect by resubscribing.** A new client calls
-    ///   `broadcast::Sender::subscribe`. An `ApprovalRequested` it missed is
+    /// - **Reconnect by watching again** after the last record it saw. An
+    ///   `ApprovalRequested` it missed is
     ///   still listed by [`ApprovalGate::pending`] (via
     ///   [`Asterpath::approval_gate`]), and a re-drive after a dropped stream
     ///   emits it again.
@@ -768,28 +796,19 @@ impl OwnedSession {
     /// use std::sync::Arc;
     ///
     /// use asterpath::{OwnedSession, SessionHandle};
-    /// use asterpath::protocol::AgentEvent;
     /// use futures_util::StreamExt;
-    /// use tokio::sync::{Notify, broadcast};
+    /// use tokio::sync::Notify;
     ///
     /// /// One per session. `wake` is notified after every `submit_input`.
-    /// fn spawn_driver(
-    ///     handle: OwnedSession,
-    ///     wake: Arc<Notify>,
-    /// ) -> broadcast::Sender<AgentEvent> {
-    ///     let (events, _) = broadcast::channel(256);
-    ///     let fan_out = events.clone();
+    /// fn spawn_driver(handle: OwnedSession, wake: Arc<Notify>) {
     ///     tokio::spawn(async move {
     ///         loop {
     ///             let mut stream = handle.drive();
     ///             while let Some(event) = stream.next().await {
-    ///                 match event {
-    ///                     // No subscribers is fine: the turn keeps going.
-    ///                     Ok(event) => drop(fan_out.send(event)),
-    ///                     Err(error) => {
-    ///                         eprintln!("drive failed: {error}");
-    ///                         return;
-    ///                     }
+    ///                 // Watchers get the events; the driver only checks errors.
+    ///                 if let Err(error) = event {
+    ///                     eprintln!("drive failed: {error}");
+    ///                     return;
     ///                 }
     ///             }
     ///             let pending = handle
@@ -804,7 +823,6 @@ impl OwnedSession {
     ///             }
     ///         }
     ///     });
-    ///     events
     /// }
     ///
     /// async fn on_user_message(

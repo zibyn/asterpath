@@ -44,6 +44,7 @@ use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
 use crate::views::usage;
 use crate::waits::Waits;
+use crate::watch::Watchers;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt, stream};
@@ -65,6 +66,9 @@ pub(crate) struct Agent {
     cancellations: Arc<CancellationRegistry>,
     /// Runs `spawn_agent` calls; children are driven by this agent.
     scheduler: Option<Arc<Scheduler>>,
+    /// Every drive's events, children's included, reach this process's
+    /// watchers (ADR-0038).
+    watchers: Arc<Watchers>,
 }
 
 impl Agent {
@@ -100,6 +104,7 @@ impl Agent {
             busy: Arc::new(Mutex::new(HashSet::new())),
             cancellations: Arc::new(CancellationRegistry::new()),
             scheduler: None,
+            watchers: Arc::default(),
         }
     }
 
@@ -137,6 +142,13 @@ impl Agent {
     #[must_use]
     pub(crate) fn with_scheduler(mut self, scheduler: Arc<Scheduler>) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// Share the facade's watchers. Without this the agent keeps private ones.
+    #[must_use]
+    pub(crate) fn with_watchers(mut self, watchers: Arc<Watchers>) -> Self {
+        self.watchers = watchers;
         self
     }
 
@@ -1198,6 +1210,7 @@ impl Agent {
             // Dropping the stream releases single-flight; it does not cancel.
             _guard: guard,
             owner,
+            watchers: Arc::clone(&self.watchers),
             done: false,
         })
     }
@@ -1525,7 +1538,19 @@ struct DriveStream<'a> {
     sink: Arc<EventSink>,
     _guard: BusyGuard,
     owner: Option<OwnerToken>,
+    watchers: Arc<Watchers>,
     done: bool,
+}
+
+impl DriveStream<'_> {
+    /// The next queued event, shown to this process's watchers too.
+    fn pop(&self) -> Option<Result<AgentEvent, AgentError>> {
+        let event = self.sink.pop()?;
+        if let Ok(event) = &event {
+            self.watchers.publish(self._guard.session, event);
+        }
+        Some(event)
+    }
 }
 
 impl Stream for DriveStream<'_> {
@@ -1534,7 +1559,7 @@ impl Stream for DriveStream<'_> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            if let Some(event) = this.sink.pop() {
+            if let Some(event) = this.pop() {
                 return Poll::Ready(Some(event));
             }
             if this.done {
@@ -1545,7 +1570,7 @@ impl Stream for DriveStream<'_> {
                 // The loop already ran and queued events before parking; they
                 // must be yielded now, not on some later wake.
                 Poll::Pending => {
-                    if let Some(event) = this.sink.pop() {
+                    if let Some(event) = this.pop() {
                         return Poll::Ready(Some(event));
                     }
                     return Poll::Pending;
