@@ -171,6 +171,10 @@ _Avoid_: token 数、消耗
 随条目保存的供应商原始 JSON 文本；只能原样回放，不得重新序列化。
 _Avoid_: 原始响应、provider payload
 
+**推理摘要（Reasoning Summary）**：
+供应商公开给人看的推理文本，可能是摘要，也可能是推理原文；只用于显示，回放靠原始供应商数据。
+_Avoid_: thinking、reasoning text（作为与之并列的另一类概念）
+
 **推理绑定（Reasoning Binding）**：
 推理条目与其产出供应商、模型、前缀代次及工具集指纹的关联；回放时由 adapter 按其协议的规则比较，不匹配即不可回放。
 _Avoid_: 签名、reasoning key
