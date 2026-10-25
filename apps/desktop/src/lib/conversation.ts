@@ -4,7 +4,17 @@ import type { Part, TurnEndReason, ViewEvent } from "@/lib/commands";
 export type Entry =
   | { kind: "user" | "assistant" | "reasoning"; text: string }
   /** A turn that ended other than `Completed`. */
-  | { kind: "ended"; reason: string };
+  | { kind: "ended"; reason: string }
+  | { kind: "tool"; call: ToolCall };
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** JSON string. */
+  args: string;
+  /** Absent while it waits or runs. */
+  result?: { status: string; output: string; error?: string };
+}
 
 /** A block still streaming; replaced by the step's record. */
 export interface Draft {
@@ -51,6 +61,18 @@ export function reduce(state: Conversation, view: ViewEvent): Conversation {
     return { ...state, entries: [...state.entries, { kind: "user", text: text(event.InputRecorded.input) }] };
   }
   if (event.TurnStarted) return { ...state, running: true };
+  if (event.ToolCallRequested) {
+    const { tool_call_id: id, name, raw_args: args } = event.ToolCallRequested;
+    return { ...state, entries: [...state.entries, { kind: "tool", call: { id, name, args } }] };
+  }
+  if (event.ToolResult) {
+    const { tool_call_id, status, output, error } = event.ToolResult;
+    const result = { status, output: text(output ?? []), error: error?.message };
+    const entries = state.entries.map((entry) =>
+      entry.kind === "tool" && entry.call.id === tool_call_id ? { ...entry, call: { ...entry.call, result } } : entry,
+    );
+    return { ...state, entries };
+  }
   if (event.AssistantMessage) {
     const { step_id, items } = event.AssistantMessage;
     const entries = items.flatMap((item): Entry[] => {

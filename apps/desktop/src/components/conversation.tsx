@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Send, Square } from "lucide-react";
 import { useEffect, useReducer, useRef, useState } from "react";
 
+import { ApprovalCard, type Detail, ToolCallView } from "@/components/tools";
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
 import { empty, reduce } from "@/lib/conversation";
@@ -38,6 +39,26 @@ export function Conversation({ session }: { session: string }) {
   });
   const readOnly = access.data === "elsewhere";
 
+  // shortcut: pending approvals are polled; subagents' requests never reach the view stream
+  const approvals = useQuery({
+    queryKey: ["approvals", session],
+    queryFn: () => commands.approvals(session),
+    enabled: access.data === "here",
+    refetchInterval: 500,
+  });
+  const approve = useMutation({
+    mutationFn: ({ request, answer }: { request: commands.ApprovalRequest; answer: commands.Answer }) =>
+      commands.approve(request, answer),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["approvals", session] }),
+  });
+
+  const mode = useQuery({ queryKey: ["permission-mode", session], queryFn: () => commands.permissionMode(session) });
+  const setMode = useMutation({
+    mutationFn: (next: commands.PermissionMode) => commands.setPermissionMode(session, next),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["permission-mode", session] }),
+  });
+  const [detail, setDetail] = useState<Detail>("normal");
+
   const send = useMutation({
     mutationFn: (message: string) => commands.send(session, message),
     onSuccess: () => {
@@ -58,7 +79,9 @@ export function Conversation({ session }: { session: string }) {
         <div className="mx-auto flex max-w-3xl flex-col gap-3">
           {watchError && <p className="text-sm text-destructive">{watchError}</p>}
           {state.entries.map((entry, index) =>
-            entry.kind === "ended" ? (
+            entry.kind === "tool" ? (
+              <ToolCallView key={index} call={entry.call} detail={detail} />
+            ) : entry.kind === "ended" ? (
               <p key={index} className="text-center text-xs text-muted-foreground">
                 Turn ended: {entry.reason}
               </p>
@@ -69,6 +92,15 @@ export function Conversation({ session }: { session: string }) {
           {state.drafts.map((draft) => (
             <Block key={draft.key} kind={draft.kind} text={draft.text} />
           ))}
+          {access.data === "here" &&
+            approvals.data?.map((request) => (
+              <ApprovalCard
+                key={`${request.session}/${request.tool_call_id}`}
+                request={request}
+                pending={approve.isPending}
+                onAnswer={(answer) => approve.mutate({ request, answer })}
+              />
+            ))}
           {state.running && <p className="text-xs text-muted-foreground">Working…</p>}
           <div ref={bottom} />
         </div>
@@ -81,8 +113,10 @@ export function Conversation({ session }: { session: string }) {
               Another process is driving this session; it is read-only here.
             </p>
           )}
-          {(send.error || cancel.error) && (
-            <p className="mb-2 text-sm text-destructive">{String(send.error ?? cancel.error)}</p>
+          {(send.error || cancel.error || approve.error || setMode.error) && (
+            <p className="mb-2 text-sm text-destructive">
+              {String(send.error ?? cancel.error ?? approve.error ?? setMode.error)}
+            </p>
           )}
           <div className="flex items-end gap-2">
             <textarea
@@ -108,6 +142,27 @@ export function Conversation({ session }: { session: string }) {
             <Button size="icon" aria-label="Send" disabled={readOnly || !draft.trim() || send.isPending} onClick={submit}>
               <Send />
             </Button>
+          </div>
+          <div className="mt-2 flex items-center gap-3 text-xs text-muted-foreground">
+            <select
+              aria-label="Permission mode"
+              className="h-7 rounded-md border bg-background px-1 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
+              value={mode.data ?? ""}
+              disabled={readOnly || !mode.data}
+              onChange={(event) => setMode.mutate(event.target.value as commands.PermissionMode)}
+            >
+              <option value="read_only">Read only</option>
+              <option value="workspace_write">Workspace write (ask)</option>
+              <option value="full_trust">Full trust</option>
+            </select>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={detail === "detailed"}
+                onChange={(event) => setDetail(event.target.checked ? "detailed" : "normal")}
+              />
+              Detailed tool calls
+            </label>
           </div>
         </div>
       </div>

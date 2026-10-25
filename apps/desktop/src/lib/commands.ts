@@ -37,6 +37,33 @@ export const send = (session: string, message: string) => invoke<void>("send", {
 /** Stop the turn this app drives. */
 export const cancel = (session: string) => invoke<void>("cancel", { session });
 
+/** A tool call waiting for the user. `session` is the asking one (a subagent's, possibly). */
+export interface ApprovalRequest {
+  session: string;
+  tool_call_id: string;
+  tool: string;
+  /** The arguments as a JSON string. */
+  args: string;
+  side_effect: "ReadOnly" | "Mutating";
+}
+
+/** The waiting requests of a session's tree. */
+export const approvals = (session: string) => invoke<ApprovalRequest[]>("approvals", { session });
+
+/** A deny's reason is sent to the model. */
+export type Answer = { kind: "allow_once" } | { kind: "allow_for_session" } | { kind: "deny"; reason: string | null };
+
+export const approve = (request: ApprovalRequest, answer: Answer) =>
+  invoke<void>("approve", { session: request.session, call: request.tool_call_id, answer });
+
+/** What tool calls may do without asking; in memory, applies from the next call. */
+export type PermissionMode = "read_only" | "workspace_write" | "full_trust";
+
+export const permissionMode = (session: string) => invoke<PermissionMode>("permission_mode", { session });
+
+export const setPermissionMode = (session: string, mode: PermissionMode) =>
+  invoke<void>("set_permission_mode", { session, mode });
+
 /** Replay the session's records, then follow it. Resolves to the function that stops watching. */
 export async function watch(session: string, onEvent: (event: ViewEvent) => void): Promise<() => void> {
   const channel = new Channel<ViewEvent>();
@@ -72,6 +99,13 @@ export type SessionEvent = {
   AssistantMessage?: { turn_id: string; step_id: string; items: Item[] };
   ModelCallAborted?: { turn_id: string; step_id: string };
   TurnCommitted?: { turn_id: string; reason: TurnEndReason };
+  ToolCallRequested?: { tool_call_id: string; name: string; raw_args: string };
+  ToolResult?: {
+    tool_call_id: string;
+    status: "Completed" | "Failed" | "Interrupted";
+    output: Part[] | null;
+    error: { kind: unknown; message: string } | null;
+  };
 };
 
 export type PartDelta =
