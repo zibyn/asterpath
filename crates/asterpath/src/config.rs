@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use asterpath_protocol::{ApprovalGate, Clock, SessionStore, SystemClock};
 use asterpath_protocol::{
@@ -41,6 +42,10 @@ pub struct AsterpathConfig {
     /// (ADR-0037). `None`: builder tools only, and spawned processes still
     /// get only the minimal inherited environment.
     pub environment: Option<Arc<dyn EnvironmentAdapter>>,
+    /// How often the process lease is renewed (ADR-0036); keep it well
+    /// within the store's lease TTL (`DEFAULT_LEASE_TTL` unless the store is
+    /// configured otherwise). Defaults to 10 s.
+    pub lease_renew_interval: Duration,
 }
 
 impl Default for AsterpathConfig {
@@ -61,6 +66,7 @@ impl Default for AsterpathConfig {
             hooks: Vec::new(),
             spawn_tool: true,
             environment: None,
+            lease_renew_interval: Duration::from_secs(10),
         }
     }
 }
@@ -159,6 +165,14 @@ impl AsterpathBuilder {
     #[must_use]
     pub fn environment(mut self, environment: Arc<dyn EnvironmentAdapter>) -> Self {
         self.config.environment = Some(environment);
+        self
+    }
+
+    /// How often the process lease is renewed; see
+    /// [`AsterpathConfig::lease_renew_interval`].
+    #[must_use]
+    pub fn lease_renew_interval(mut self, every: Duration) -> Self {
+        self.config.lease_renew_interval = every;
         self
     }
 

@@ -1687,6 +1687,10 @@ impl SessionStore for CorruptParentLog {
     ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
         self.inner.owner(root)
     }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.renew()
+    }
 }
 
 /// Crash after a refused step's `AssistantMessage`, with the step open or

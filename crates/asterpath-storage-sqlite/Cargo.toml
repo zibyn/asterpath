@@ -9,11 +9,11 @@ asterpath-protocol = { path = "../asterpath-protocol" }
 futures-channel = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
-libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1"
 
 [dev-dependencies]
 asterpath-testing = { path = "../asterpath-testing" }
 futures-executor = "0.3"
+libc = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

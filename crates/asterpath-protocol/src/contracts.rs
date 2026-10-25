@@ -38,12 +38,17 @@ pub struct NewEntry {
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
     /// Set on owner writes (agent loop, compaction, child scheduling): the
-    /// store rejects the entry with `OwnedElsewhere` unless `epoch` is still
-    /// the latest claim of `root`. External writes (input, approval
+    /// store rejects the entry with `OwnedElsewhere` unless `epoch` is the
+    /// claim of `root` this handle still holds, checked in the write's own
+    /// transaction. External writes (input, approval
     /// decisions, config changes) leave it `None` (ADR-0036).
     pub owner: Option<OwnerToken>,
     pub payload: serde_json::Value,
 }
+
+/// How long a process lease lasts unless a backend is configured otherwise:
+/// a process killed while holding trees keeps them this long (ADR-0036).
+pub const DEFAULT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The credential of one claim of a session tree: the root session id and
 /// the epoch the claim was granted, which every new claim of the root
@@ -178,8 +183,11 @@ impl CatalogEntry {
 /// whole-session retirement. Retired sessions are invisible to every read.
 ///
 /// Ownership is per session tree, keyed by the root session id (ADR-0036):
-/// at most one process holds a root at a time, and the backend releases it
-/// natively when the holder dies. A store handle stands for one process.
+/// at most one process holds a root at a time. A store handle stands for one
+/// process and keeps a process lease in the store; its claims live while the
+/// lease does, judged by the reader's clock. Everything is plain reads and
+/// conditional writes, no backend-native lock. Dropping the handle (a normal
+/// exit) clears its lease and frees its trees.
 pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
@@ -195,13 +203,20 @@ pub trait SessionStore: Send + Sync {
     /// session.
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
 
-    /// Take ownership of the tree rooted at `root`. Held through this handle
-    /// already: the same epoch, shared. Held through another handle or
-    /// process: `OwnedElsewhere`. Otherwise a new, higher epoch.
+    /// Take ownership of the tree rooted at `root`, renewing this handle's
+    /// lease. Held through this handle already: the same epoch, shared.
+    /// Held through another handle whose lease is live: `OwnedElsewhere`.
+    /// Otherwise a new, higher epoch. Dropping the last claim of the epoch
+    /// releases the tree.
     fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>>;
     /// The live claim of `root` through any handle or process; `None` when
-    /// nobody holds it.
+    /// nobody holds it or its holder's lease has expired.
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>>;
+    /// Extend this handle's lease to `DEFAULT_LEASE_TTL` (or the backend's
+    /// configured TTL) from now. Returns the claims through this handle that
+    /// another process has taken over since, each once; they no longer
+    /// share with a new claim.
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>>;
 
     /// Write the tombstone and delete the session's log and catalog row.
     /// `expected_frontier` must equal the current last log id. Backends

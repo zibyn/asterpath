@@ -186,6 +186,10 @@ impl SessionStore for FailpointEventLog {
         self.inner.owner(root)
     }
 
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        self.inner.renew()
+    }
+
     fn retire(
         &self,
         session: SessionId,

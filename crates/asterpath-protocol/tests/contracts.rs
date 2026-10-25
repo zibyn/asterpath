@@ -43,6 +43,10 @@ impl SessionStore for DummyStore {
     fn owner(&self, _root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
         Box::pin(async { Ok(None) })
     }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 #[test]

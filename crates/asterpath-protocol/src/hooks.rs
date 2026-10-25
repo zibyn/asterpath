@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::{LogId, SessionId, StepId, Timestamp, ToolCallId, TurnId};
+use crate::{LogId, OwnerToken, SessionId, StepId, Timestamp, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 
 use crate::config::{Provenance, ReplaySafety};
@@ -48,6 +48,12 @@ pub trait Hooks: Send + Sync {
     /// After every committed record of every session (children included), in
     /// per-session order. Cannot fail or affect the loop; a panic is logged.
     fn on_record(&self, _record: &CommittedRecord) {}
+
+    /// This process lost `owner`'s tree: its lease could not be renewed, or
+    /// another process took the tree over (ADR-0036). The tree's drives
+    /// here have stopped and the claim is released; owner operations on its
+    /// `OwnedSession`s fail with `OwnedElsewhere`. Called once per claim.
+    fn on_ownership_lost(&self, _owner: OwnerToken) {}
 }
 
 /// `before_step` decision.

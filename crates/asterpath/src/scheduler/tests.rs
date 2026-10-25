@@ -1052,6 +1052,10 @@ impl SessionStore for PoisonLog {
     ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
         self.inner.owner(root)
     }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.renew()
+    }
 }
 
 // --- #49: fork materialization and replay --------------------------------
@@ -2181,6 +2185,10 @@ impl SessionStore for CompletesInGrace {
         root: SessionId,
     ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
         self.inner.owner(root)
+    }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.renew()
     }
 }
 

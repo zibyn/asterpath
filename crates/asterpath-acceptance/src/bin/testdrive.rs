@@ -22,7 +22,9 @@ use asterpath_protocol::{
     ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig, TurnEndReason,
     UserInput, decode_entry,
 };
-use asterpath_protocol::{InputId, SessionId, SessionStore};
+use asterpath_protocol::{
+    Clock, DEFAULT_LEASE_TTL, InputId, SessionId, SessionStore, SystemClock, Timestamp,
+};
 use asterpath_protocol::{SandboxPolicy, SandboxProvider};
 use asterpath_sandbox_linux::LinuxSandbox;
 use asterpath_testing::{
@@ -480,18 +482,38 @@ async fn assemble(
         // in this driver, so the M5 scenarios allow them explicitly.
         builder = builder.approval(Arc::new(AllowExternal));
     }
-    if !args.failpoints.is_empty() {
-        let backend =
-            asterpath_storage_sqlite::open(&args.db).map_err(|error| error.to_string())?;
-        let mut log: Arc<dyn SessionStore> = backend;
-        for failpoint in args.failpoints.iter().filter(|fp| fp.point.is_append()) {
-            log = Arc::new(FailpointEventLog::new(log, failpoint.clone()));
-        }
-        builder = builder.store(log);
-    } else {
-        builder = builder.database(&args.db);
+    let mut log: Arc<dyn SessionStore> = open_store(args)?;
+    for failpoint in args.failpoints.iter().filter(|fp| fp.point.is_append()) {
+        log = Arc::new(FailpointEventLog::new(log, failpoint.clone()));
     }
+    builder = builder.store(log);
     builder.build().await.map_err(|error| error.to_string())
+}
+
+/// Every command but `run` comes after a crashed run: its store reads time
+/// one lease past the wall clock, as if the dead run's process lease had
+/// expired (ADR-0036), so it can take the run's trees without waiting.
+fn open_store(args: &Args) -> Result<Arc<dyn SessionStore>, String> {
+    let clock: Arc<dyn Clock> = if args.command == "run" {
+        Arc::new(SystemClock)
+    } else {
+        Arc::new(AfterLease)
+    };
+    let store = asterpath_storage_sqlite::open_with_clock(
+        &args.db,
+        asterpath_storage_sqlite::OpenOptions::default(),
+        clock,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(store)
+}
+
+struct AfterLease;
+
+impl Clock for AfterLease {
+    fn now(&self) -> Timestamp {
+        SystemClock.now() + DEFAULT_LEASE_TTL.as_millis() as Timestamp + 1
+    }
 }
 
 /// Loads the M5 MCP server configs and returns their tools.
@@ -759,9 +781,8 @@ fn reason_name(reason: &TurnEndReason) -> String {
 }
 
 async fn inspect(args: &Args) -> Result<i32, String> {
-    let backend = asterpath_storage_sqlite::open(&args.db).map_err(|error| error.to_string())?;
     let asterpath = Asterpath::builder()
-        .store(backend)
+        .store(open_store(args)?)
         .build()
         .await
         .map_err(|error| error.to_string())?;

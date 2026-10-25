@@ -16,6 +16,7 @@ use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::lock::Mutex as AsyncMutex;
 
+use crate::owner::Ownership;
 use crate::watch::Watchers;
 
 /// Last record shown to `on_record` for one session.
@@ -36,6 +37,9 @@ pub(crate) struct CommitLog {
     cursors: Mutex<HashMap<SessionId, Arc<AsyncMutex<Cursor>>>>,
     /// Told of every commit, so this process's watchers need not poll.
     watchers: Arc<Watchers>,
+    /// Refuses owner writes of a lost claim and learns of claims another
+    /// process took over.
+    ownership: Arc<Ownership>,
 }
 
 impl CommitLog {
@@ -43,12 +47,14 @@ impl CommitLog {
         inner: Arc<dyn SessionStore>,
         hooks: Vec<Arc<dyn Hooks>>,
         watchers: Arc<Watchers>,
+        ownership: Arc<Ownership>,
     ) -> Self {
         Self {
             inner,
             hooks,
             cursors: Mutex::new(HashMap::new()),
             watchers,
+            ownership,
         }
     }
 
@@ -131,13 +137,23 @@ impl SessionStore for CommitLog {
         // write: it carries that claim (ADR-0036).
         entry.owner = entry.owner.or(crate::owner::current());
         let session = entry.session;
+        let owner = entry.owner;
         Box::pin(async move {
+            if let Some(owner) = owner
+                && self.ownership.revoked(owner)
+            {
+                return Err(StorageError::OwnedElsewhere { root: owner.root });
+            }
             // No hooks, no observation work (#74).
-            let log_id = if self.hooks.is_empty() {
-                self.inner.append(entry).await?
+            let appended = if self.hooks.is_empty() {
+                self.inner.append(entry).await
             } else {
-                self.append_observed(entry).await?
+                self.append_observed(entry).await
             };
+            if let (Some(owner), Err(StorageError::OwnedElsewhere { .. })) = (owner, &appended) {
+                self.ownership.lose(owner);
+            }
+            let log_id = appended?;
             self.watchers.committed(session);
             Ok(log_id)
         })
@@ -168,6 +184,10 @@ impl SessionStore for CommitLog {
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
         self.inner.owner(root)
+    }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        self.inner.renew()
     }
 
     fn retire(

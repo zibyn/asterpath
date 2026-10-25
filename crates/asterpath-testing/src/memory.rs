@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, Clock, LogEntry, LogId, LogQuery, NewEntry, OwnerToken, ParentFilter,
-    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
+    CatalogEntry, Claim, Clock, DEFAULT_LEASE_TTL, LogEntry, LogId, LogQuery, NewEntry, OwnerToken,
+    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
+    SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
@@ -34,14 +35,35 @@ struct State {
     sessions: BTreeMap<SessionId, SessionRow>,
     /// Retired sessions and their last log id.
     retired: HashMap<SessionId, LogId>,
-    /// Per root: the latest claim epoch and, while held, the holding handle
-    /// and its number of live claims.
-    owners: HashMap<SessionId, (u64, Option<(u64, usize)>)>,
+    /// Per root: the latest claim epoch and, until released, the holding
+    /// handle, like SQLite's `tree_owners`.
+    owners: HashMap<SessionId, (u64, Option<u64>)>,
+    /// Per handle: when its process lease expires.
+    leases: HashMap<u64, Timestamp>,
+    /// Per handle and root: the epoch it holds and its number of live claims.
+    held: HashMap<(u64, SessionId), (u64, usize)>,
     /// Handles opened on this state, each standing for one process.
     handles: u64,
 }
 
 impl State {
+    /// The handle holding `root` while its lease is live at `now`; the
+    /// asking handle always sees its own claim.
+    fn holder(&self, root: SessionId, asking: u64, now: Timestamp) -> Option<OwnerToken> {
+        let (epoch, process) = self.owners.get(&root)?;
+        let process = (*process)?;
+        let live = process == asking || self.leases.get(&process).is_some_and(|until| now < *until);
+        live.then_some(OwnerToken {
+            root,
+            epoch: *epoch,
+        })
+    }
+
+    /// Whether `handle` holds `owner`'s epoch in the owner row.
+    fn holds(&self, handle: u64, owner: OwnerToken) -> bool {
+        self.owners.get(&owner.root) == Some(&(owner.epoch, Some(handle)))
+    }
+
     fn log_of(&self, session: SessionId) -> Vec<LogEntry> {
         if self.retired.contains_key(&session) {
             return Vec::new();
@@ -144,6 +166,21 @@ pub struct InMemoryEventLog {
     handle: u64,
 }
 
+/// A normal exit: the lease goes and every tree this handle holds is freed.
+impl Drop for InMemoryEventLog {
+    fn drop(&mut self) {
+        let handle = self.handle;
+        let mut state = self.state();
+        state.leases.remove(&handle);
+        state.held.retain(|(holder, _), _| *holder != handle);
+        for (_, process) in state.owners.values_mut() {
+            if *process == Some(handle) {
+                *process = None;
+            }
+        }
+    }
+}
+
 impl Default for InMemoryEventLog {
     fn default() -> Self {
         Self::new()
@@ -183,24 +220,36 @@ impl InMemoryEventLog {
         lock(&self.state)
     }
 
+    fn lease_until(&self) -> Timestamp {
+        self.clock.now() + DEFAULT_LEASE_TTL.as_millis() as Timestamp
+    }
+
     fn claim_sync(&self, root: SessionId) -> Result<Claim, StorageError> {
+        let now = self.clock.now();
         let mut state = self.state();
-        let (epoch, held) = state.owners.entry(root).or_default();
-        match held {
-            Some((handle, claims)) if *handle == self.handle => *claims += 1,
-            Some(_) => return Err(StorageError::OwnedElsewhere { root }),
-            None => {
-                *epoch += 1;
-                *held = Some((self.handle, 1));
+        state.leases.insert(self.handle, self.lease_until());
+        let epoch = match state.held.get_mut(&(self.handle, root)) {
+            Some((epoch, claims)) => {
+                *claims += 1;
+                *epoch
             }
-        }
-        let token = OwnerToken {
-            root,
-            epoch: *epoch,
+            None => {
+                if state.holder(root, self.handle, now).is_some() {
+                    return Err(StorageError::OwnedElsewhere { root });
+                }
+                let row = state.owners.entry(root).or_default();
+                row.0 += 1;
+                row.1 = Some(self.handle);
+                let epoch = row.0;
+                state.held.insert((self.handle, root), (epoch, 1));
+                epoch
+            }
         };
+        let token = OwnerToken { root, epoch };
         let release = Release {
             state: Arc::clone(&self.state),
-            root,
+            handle: self.handle,
+            token,
         };
         Ok(Claim::new(token, release))
     }
@@ -219,7 +268,7 @@ impl InMemoryEventLog {
             });
         }
         if let Some(owner) = entry.owner
-            && state.owners.get(&owner.root).map(|(epoch, _)| *epoch) != Some(owner.epoch)
+            && !state.holds(self.handle, owner)
         {
             return Err(StorageError::OwnedElsewhere { root: owner.root });
         }
@@ -321,14 +370,28 @@ impl SessionStore for InMemoryEventLog {
     }
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
-        let owner = match self.state().owners.get(&root) {
-            Some((epoch, Some(_))) => Some(OwnerToken {
-                root,
-                epoch: *epoch,
-            }),
-            _ => None,
-        };
+        let owner = self.state().holder(root, self.handle, self.clock.now());
         Box::pin(async move { Ok(owner) })
+    }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        let mut state = self.state();
+        state.leases.insert(self.handle, self.lease_until());
+        let lost: Vec<OwnerToken> = state
+            .held
+            .iter()
+            .filter(|((handle, _), _)| *handle == self.handle)
+            .map(|((_, root), (epoch, _))| OwnerToken {
+                root: *root,
+                epoch: *epoch,
+            })
+            .filter(|token| !state.holds(self.handle, *token))
+            .collect();
+        for token in &lost {
+            state.held.remove(&(self.handle, token.root));
+        }
+        drop(state);
+        Box::pin(async move { Ok(lost) })
     }
 
     /// Idle check, frontier CAS, delete and tombstone under one lock.
@@ -346,22 +409,33 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Drops one claim; the last one releases the root.
+/// Drops one claim; the last one of its epoch releases the root, unless
+/// another process has taken it over since.
 struct Release {
     state: Arc<Mutex<State>>,
-    root: SessionId,
+    handle: u64,
+    token: OwnerToken,
 }
 
 impl Drop for Release {
     fn drop(&mut self) {
         let mut state = lock(&self.state);
-        if let Some((_, held)) = state.owners.get_mut(&self.root)
-            && let Some((_, claims)) = held
+        let key = (self.handle, self.token.root);
+        let Some((epoch, claims)) = state.held.get_mut(&key) else {
+            return;
+        };
+        if *epoch != self.token.epoch {
+            return;
+        }
+        *claims -= 1;
+        if *claims > 0 {
+            return;
+        }
+        state.held.remove(&key);
+        if state.holds(self.handle, self.token)
+            && let Some((_, process)) = state.owners.get_mut(&self.token.root)
         {
-            *claims -= 1;
-            if *claims == 0 {
-                *held = None;
-            }
+            *process = None;
         }
     }
 }
@@ -387,7 +461,9 @@ impl StoreFactory for MemoryBackend {
         Arc::new(InMemoryEventLog::with_clock(clock))
     }
 
-    fn open_other_process(&self) -> Arc<dyn SessionStore> {
-        Arc::new(self.store.other_process())
+    fn open_processes(&self, clock: Arc<dyn Clock>) -> [Arc<dyn SessionStore>; 2] {
+        let first = InMemoryEventLog::with_clock(clock);
+        let second = first.other_process();
+        [Arc::new(first), Arc::new(second)]
     }
 }

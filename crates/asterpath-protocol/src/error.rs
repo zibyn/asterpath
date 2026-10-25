@@ -19,8 +19,20 @@ pub enum StorageError {
     },
     #[error("session {session:?} is retired")]
     Retired { session: SessionId },
+    /// A write conflict, busy database or serialization failure: the
+    /// operation did not take effect and may succeed if retried whole,
+    /// outside its transaction.
+    #[error("storage conflict: {0}")]
+    Conflict(String),
     #[error("storage backend error: {0}")]
     Backend(String),
+}
+
+impl StorageError {
+    /// Only `Conflict` is retried; every other error is a real failure.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
 }
 
 /// Failures of the durable executor seam.

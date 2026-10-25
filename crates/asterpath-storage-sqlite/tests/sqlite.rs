@@ -8,18 +8,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asterpath_protocol::{
-    ConfigSnapshot, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef, ProviderId, SessionEvent,
-    dedup,
+    ConfigSnapshot, DEFAULT_LEASE_TTL, LOG_SCHEMA_VERSION, ModelId, ModelSpec, ParentRef,
+    ProviderId, SessionEvent, dedup,
 };
 use asterpath_protocol::{
     DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter, SessionId, SessionQuery,
     SessionStore, StorageError, ToolCallId, TurnId,
 };
-use asterpath_storage_sqlite::open;
+use asterpath_storage_sqlite::{OpenOptions, open, open_with_clock};
+use asterpath_testing::ManualClock;
 use common::TempDir;
 use futures_util::StreamExt;
 
@@ -232,12 +233,20 @@ fn another_process_drives_other_trees_but_not_a_held_one() {
 }
 
 #[test]
-fn a_killed_owner_releases_its_tree_and_its_epoch_is_fenced() {
+fn a_killed_owners_tree_is_taken_over_once_its_lease_expires() {
     let dir = TempDir::new("killed-owner");
     let db = dir.db();
-    let storage = open(&db).expect("open");
+    // This process reads time from a clock the test moves.
+    let clock = Arc::new(ManualClock::new());
+    let storage = open_with_clock(&db, OpenOptions::default(), clock.clone()).expect("open");
     let mut child = spawn_helper("claim", &db);
     let line = wait_for_marker(&mut child, "\"event\":\"claimed\"");
+    // The helper stamped its lease from its wall clock, before this.
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock")
+        .as_millis() as i64;
+    clock.advance(wall - ManualClock::BASE);
     let epoch: u64 = line
         .rsplit(':')
         .next()
@@ -258,13 +267,21 @@ fn a_killed_owner_releases_its_tree_and_its_epoch_is_fenced() {
     );
 
     sigkill(child);
+    assert!(
+        matches!(
+            block_on(storage.claim(helper_session())),
+            Err(StorageError::OwnedElsewhere { .. })
+        ),
+        "a dead process keeps its trees until its lease expires"
+    );
+    clock.advance(DEFAULT_LEASE_TTL.as_millis() as i64 + 1);
     assert_eq!(
         block_on(storage.owner(helper_session())).expect("owner"),
         None,
-        "the OS released the dead process's lock"
+        "the dead process's lease has expired"
     );
     let claim = block_on(storage.claim(helper_session())).expect("take over");
-    assert!(claim.token().epoch > epoch);
+    assert_eq!(claim.token().epoch, epoch + 1);
 
     let mut stale = entry(helper_session(), &input_recorded(), None);
     stale.owner = Some(dead);
@@ -533,10 +550,11 @@ fn a_new_database_has_only_the_current_tables() {
         tables(&conn),
         vec![
             "log",
-            "owners",
+            "process_leases",
             "retired_sessions",
             "sessions",
-            "sqlite_sequence"
+            "sqlite_sequence",
+            "tree_owners"
         ]
     );
 }

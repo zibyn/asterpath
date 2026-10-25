@@ -10,24 +10,23 @@
 //! tombstone and deletes the log and catalog row. Reads run on the caller
 //! over a separate read-only connection, so they never queue behind a fsync.
 //!
-//! Several processes may open one database (ADR-0036). Each session tree is
-//! owned through a byte-range lock on `<db>.owners`, one byte per root, held
-//! by this handle's open file description; the OS drops it with the process.
-//! Claims bump the root's epoch in the `owners` table, and an owner write is
-//! checked against it inside its write transaction.
+//! Several processes may open one database (ADR-0036). Each handle is one
+//! process with a random id and a lease row in `process_leases`, renewed by
+//! claims and `renew`; each claimed tree has a row in `tree_owners` naming
+//! its process and epoch. Claims, releases and the epoch check of an owner
+//! write are ordinary statements in write transactions; no file lock.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions as FsOpenOptions;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, OwnerToken,
-    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
-    SystemClock,
+    CatalogEntry, Claim, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
+    OwnerToken, ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
+    SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_channel::oneshot;
@@ -37,7 +36,6 @@ use futures_util::{StreamExt, stream};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 /// Physical schema version tracked in `PRAGMA user_version`.
@@ -53,9 +51,21 @@ pub enum Synchronous {
     Normal,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenOptions {
     pub synchronous: Synchronous,
+    /// How long a renewal of this process's lease lasts; a killed process
+    /// keeps its trees this long. Renew well within it (ADR-0036).
+    pub lease_ttl: Duration,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            synchronous: Synchronous::default(),
+            lease_ttl: DEFAULT_LEASE_TTL,
+        }
+    }
 }
 
 const SCHEMA: &str = "
@@ -83,9 +93,14 @@ CREATE TABLE IF NOT EXISTS retired_sessions (
     last_log_id  INTEGER NOT NULL,
     retired_at   INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS owners (
-    root   BLOB    PRIMARY KEY,
-    epoch  INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS tree_owners (
+    root     BLOB    PRIMARY KEY,
+    epoch    INTEGER NOT NULL,
+    process  BLOB
+);
+CREATE TABLE IF NOT EXISTS process_leases (
+    process     BLOB    PRIMARY KEY,
+    expires_at  INTEGER NOT NULL
 );
 ";
 
@@ -112,8 +127,16 @@ pub fn open_with_clock(
     let path = path.as_ref();
     create_private_file(path)?;
     let conn = Connection::open(path).map_err(backend)?;
-    let owners = Arc::new(Owners::open(path)?);
     prepare(&conn, options.synchronous)?;
+    let process: Vec<u8> = conn
+        .query_row("SELECT randomblob(16)", [], |row| row.get(0))
+        .map_err(backend)?;
+    let lease = Lease {
+        process: process
+            .try_into()
+            .map_err(|_| backend("randomblob(16) is not 16 bytes"))?,
+        ttl: i64::try_from(options.lease_ttl.as_millis()).unwrap_or(i64::MAX),
+    };
     let reader = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -125,26 +148,42 @@ pub fn open_with_clock(
     let thread = std::thread::Builder::new()
         .name("asterpath-sqlite-writer".to_owned())
         .spawn({
-            let owners = Arc::clone(&owners);
-            move || run_writer(conn, queue, clock, &owners)
+            let clock = Arc::clone(&clock);
+            move || run_writer(conn, queue, clock.as_ref(), lease)
         })
         .map_err(backend)?;
-    Ok(Arc::new(SqliteStorage {
+    Ok(Arc::new_cyclic(|me| SqliteStorage {
         writer: Writer {
             commands: Some(commands),
             thread: Some(thread),
         },
         reader: Mutex::new(reader),
-        owners,
+        me: me.clone(),
+        lease,
+        clock,
+        held: Mutex::default(),
     }))
 }
 
-/// Field order is drop order: the writer drains and joins before the reader
-/// closes.
+/// Field order is drop order: the writer drains, frees this process's trees
+/// and joins before the reader closes.
 pub struct SqliteStorage {
     writer: Writer,
     reader: Mutex<Connection>,
-    owners: Arc<Owners>,
+    /// For claims, which release through the store if it is still open.
+    me: Weak<SqliteStorage>,
+    lease: Lease,
+    clock: Arc<dyn Clock>,
+    /// Root -> (epoch, live claims) of the trees held through this handle.
+    held: Mutex<HashMap<SessionId, (u64, usize)>>,
+}
+
+/// This handle's process: its id in `process_leases` and how long, in
+/// milliseconds, a renewal lasts.
+#[derive(Clone, Copy)]
+struct Lease {
+    process: [u8; 16],
+    ttl: i64,
 }
 
 /// Most writes group-committed in one transaction.
@@ -156,9 +195,22 @@ type WriterJob = Box<dyn FnOnce(&Connection) + Send>;
 enum Command {
     Write(Write),
     /// Runs alone, in its own transaction, between batches.
+    Alone(Alone),
+}
+
+enum Alone {
     Claim {
         root: SessionId,
-        reply: oneshot::Sender<Result<u64, StorageError>>,
+        reply: oneshot::Sender<Result<(u64, bool), StorageError>>,
+    },
+    /// `done` drops once the release is committed.
+    Release {
+        token: OwnerToken,
+        done: mpsc::Sender<()>,
+    },
+    Renew {
+        held: Vec<OwnerToken>,
+        reply: oneshot::Sender<Result<Vec<OwnerToken>, StorageError>>,
     },
     #[cfg(test)]
     Run(WriterJob),
@@ -228,27 +280,13 @@ fn writer_stopped() -> StorageError {
     StorageError::Backend("sqlite writer stopped".to_owned())
 }
 
-fn run_writer(
-    conn: Connection,
-    queue: mpsc::Receiver<Command>,
-    clock: Arc<dyn Clock>,
-    owners: &Owners,
-) {
+fn run_writer(conn: Connection, queue: mpsc::Receiver<Command>, clock: &dyn Clock, lease: Lease) {
     let mut next = queue.recv().ok();
     while let Some(command) = next.take() {
         let mut batch = match command {
             Command::Write(write) => vec![write],
-            Command::Claim { root, reply } => {
-                // A caller that gave up does not keep the tree.
-                if let Err(Ok(_)) = reply.send(owners.claim(&conn, root)) {
-                    owners.release(root);
-                }
-                next = queue.recv().ok();
-                continue;
-            }
-            #[cfg(test)]
-            Command::Run(job) => {
-                job(&conn);
+            Command::Alone(alone) => {
+                run_alone(&conn, alone, clock, lease);
                 next = queue.recv().ok();
                 continue;
             }
@@ -264,23 +302,57 @@ fn run_writer(
                 Err(_) => break,
             }
         }
-        commit_batch(&conn, batch, clock.as_ref());
+        commit_batch(&conn, batch, clock, lease);
         if next.is_none() {
             next = queue.recv().ok();
         }
     }
+    // The queue closed: a normal exit frees this process's trees at once.
+    if let Err(error) = exit_in(&conn, lease) {
+        eprintln!("asterpath-sqlite: clearing the process lease on exit failed: {error}");
+    }
 }
 
-/// `busy_timeout` waits out other processes' write transactions; on top of
-/// it, a `BUSY` that skips the busy handler is retried here, outside any
-/// transaction.
-fn retry_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+fn run_alone(conn: &Connection, alone: Alone, clock: &dyn Clock, lease: Lease) {
+    match alone {
+        Alone::Claim { root, reply } => {
+            // A caller that gave up does not keep a tree it just took.
+            if let Err(Ok((epoch, true))) = reply.send(claim_in(conn, root, lease, clock.now())) {
+                let _ = release_in(conn, OwnerToken { root, epoch }, lease);
+            }
+        }
+        Alone::Release { token, done } => {
+            // A failed release leaves the tree to the lease's expiry.
+            let _ = release_in(conn, token, lease);
+            drop(done);
+        }
+        Alone::Renew { held, reply } => {
+            let _ = reply.send(renew_in(conn, &held, lease, clock.now()));
+        }
+        #[cfg(test)]
+        Alone::Run(job) => job(conn),
+    }
+}
+
+/// `SQLITE_BUSY` / `SQLITE_LOCKED` are conflicts worth retrying; anything
+/// else is a real failure.
+fn sql(error: rusqlite::Error) -> StorageError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            StorageError::Conflict(error.to_string())
+        }
+        _ => backend(error),
+    }
+}
+
+/// `busy_timeout` waits out other processes' write transactions; a
+/// conflict that still surfaces (a `BUSY` that skips the busy handler) is
+/// retried here, outside any transaction, 1 ms apart. Nothing else is.
+fn retry<T>(mut op: impl FnMut() -> Result<T, StorageError>) -> Result<T, StorageError> {
     let mut attempts = 0;
     loop {
         match op() {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < BUSY_RETRIES =>
-            {
+            Err(error) if error.is_retryable() && attempts < BUSY_RETRIES => {
                 attempts += 1;
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -289,33 +361,33 @@ fn retry_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Resul
     }
 }
 
-/// Retries of a `BUSY` the busy handler did not absorb, 1 ms apart.
+/// Retries of a conflict the busy handler did not absorb.
 const BUSY_RETRIES: usize = 5_000;
 
 /// How long a statement waits for another process's write transaction.
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 
-fn commit_batch(conn: &Connection, batch: Vec<Write>, clock: &dyn Clock) {
-    let (done, commit): (Vec<_>, _) =
-        match retry_busy(|| Transaction::new_unchecked(conn, TransactionBehavior::Immediate)) {
-            Ok(mut tx) => {
-                let done = batch
-                    .into_iter()
-                    .map(|write| execute(&mut tx, write, clock))
-                    .collect();
-                (done, tx.commit().map_err(backend))
-            }
-            Err(error) => (
-                batch.into_iter().map(Done::skipped).collect(),
-                Err(backend(error)),
-            ),
-        };
+fn begin(conn: &Connection) -> Result<Transaction<'_>, StorageError> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(sql)
+}
+
+fn commit_batch(conn: &Connection, batch: Vec<Write>, clock: &dyn Clock, lease: Lease) {
+    let (done, commit): (Vec<_>, _) = match retry(|| begin(conn)) {
+        Ok(mut tx) => {
+            let done = batch
+                .into_iter()
+                .map(|write| execute(&mut tx, write, clock, lease))
+                .collect();
+            (done, tx.commit().map_err(sql))
+        }
+        Err(error) => (batch.into_iter().map(Done::skipped).collect(), Err(error)),
+    };
     for done in done {
         done.reply(&commit);
     }
 }
 
-fn execute(tx: &mut Transaction<'_>, write: Write, clock: &dyn Clock) -> Done {
+fn execute(tx: &mut Transaction<'_>, write: Write, clock: &dyn Clock, lease: Lease) -> Done {
     match write {
         Write::Append {
             entry,
@@ -323,7 +395,7 @@ fn execute(tx: &mut Transaction<'_>, write: Write, clock: &dyn Clock) -> Done {
             reply,
         } => Done::Append(
             reply,
-            in_savepoint(tx, |conn| append_in(conn, &entry, payload, clock)),
+            in_savepoint(tx, |conn| append_in(conn, &entry, payload, clock, lease)),
         ),
         Write::Retire {
             session,
@@ -354,6 +426,7 @@ fn append_in(
     entry: &NewEntry,
     payload: String,
     clock: &dyn Clock,
+    lease: Lease,
 ) -> Result<LogId, StorageError> {
     // Decode inside the transaction and before dedup: a bad payload is a
     // hard error, and the decoded event yields the `event_kind`
@@ -376,19 +449,12 @@ fn append_in(
         });
     }
 
-    // The fence: an owner write lands only under the root's latest claim.
-    if let Some(owner) = entry.owner {
-        let epoch: Option<i64> = tx
-            .query_row(
-                "SELECT epoch FROM owners WHERE root = ?1",
-                [owner.root.as_bytes()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        if epoch != Some(owner.epoch as i64) {
-            return Err(StorageError::OwnedElsewhere { root: owner.root });
-        }
+    // The fence: an owner write lands only under the claim this process
+    // still holds.
+    if let Some(owner) = entry.owner
+        && !holds(tx, owner, lease)?
+    {
+        return Err(StorageError::OwnedElsewhere { root: owner.root });
     }
 
     if let Some(key) = &entry.dedup_key {
@@ -573,7 +639,7 @@ impl SqliteStorage {
         &self,
         job: impl FnOnce(&Connection) + Send + 'static,
     ) -> Result<(), StorageError> {
-        self.send(Command::Run(Box::new(job)))
+        self.send(Command::Alone(Alone::Run(Box::new(job))))
     }
 
     fn scan_sync(&self, query: LogQuery) -> Vec<Result<LogEntry, StorageError>> {
@@ -695,32 +761,31 @@ impl SqliteStorage {
         .collect()
     }
 
-    /// Held here, or locked by another handle or process; the epoch is the
-    /// latest committed claim.
+    /// The owner row of `root` while its process is this one or its lease
+    /// is live.
     fn owner_sync(&self, root: SessionId) -> Result<Option<OwnerToken>, StorageError> {
-        if let Some((epoch, _)) = self.owners.held().get(&root) {
-            return Ok(Some(OwnerToken {
-                root,
-                epoch: *epoch,
-            }));
-        }
-        if !self.owners.locked_elsewhere(root)? {
-            return Ok(None);
-        }
-        let epoch: Option<i64> = self
-            .reader()
-            .query_row(
-                "SELECT epoch FROM owners WHERE root = ?1",
-                [root.as_bytes()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        // A claim between its lock and its epoch commit still owns the tree.
-        Ok(Some(OwnerToken {
-            root,
-            epoch: epoch.unwrap_or(0) as u64,
-        }))
+        let row = owner_row(&self.reader(), root)?;
+        let now = self.clock.now();
+        Ok(match row {
+            Some((epoch, Some(process), until))
+                if process == self.lease.process || until.is_some_and(|until| now < until) =>
+            {
+                Some(OwnerToken { root, epoch })
+            }
+            _ => None,
+        })
+    }
+
+    fn held(&self) -> MutexGuard<'_, HashMap<SessionId, (u64, usize)>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn claim_of(&self, token: OwnerToken) -> Claim {
+        let release = Release {
+            store: self.me.clone(),
+            token,
+        };
+        Claim::new(token, release)
     }
 
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
@@ -776,19 +841,59 @@ impl SessionStore for SqliteStorage {
 
     fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
         Box::pin(async move {
-            let (reply, response) = oneshot::channel();
-            self.send(Command::Claim { root, reply })?;
-            let epoch = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
-            let release = Release {
-                owners: Arc::clone(&self.owners),
-                root,
+            let response = {
+                let mut held = self.held();
+                if let Some((epoch, claims)) = held.get_mut(&root) {
+                    *claims += 1;
+                    let epoch = *epoch;
+                    return Ok(self.claim_of(OwnerToken { root, epoch }));
+                }
+                let (reply, response) = oneshot::channel();
+                // Sent under the lock, so a release of this root queued
+                // before it commits first.
+                self.send(Command::Alone(Alone::Claim { root, reply }))?;
+                response
             };
-            Ok(Claim::new(OwnerToken { root, epoch }, release))
+            let (epoch, _) = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
+            let mut held = self.held();
+            let entry = held.entry(root).or_insert((epoch, 0));
+            if entry.0 != epoch {
+                *entry = (epoch, 0);
+            }
+            entry.1 += 1;
+            drop(held);
+            Ok(self.claim_of(OwnerToken { root, epoch }))
         })
     }
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
         Box::pin(async move { self.owner_sync(root) })
+    }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        Box::pin(async move {
+            let held = self
+                .held()
+                .iter()
+                .map(|(root, (epoch, _))| OwnerToken {
+                    root: *root,
+                    epoch: *epoch,
+                })
+                .collect();
+            let (reply, response) = oneshot::channel();
+            self.send(Command::Alone(Alone::Renew { held, reply }))?;
+            let lost = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
+            let mut held = self.held();
+            for token in &lost {
+                if held
+                    .get(&token.root)
+                    .is_some_and(|(epoch, _)| *epoch == token.epoch)
+                {
+                    held.remove(&token.root);
+                }
+            }
+            Ok(lost)
+        })
     }
 
     fn retire(
@@ -822,163 +927,176 @@ fn create_private_file(path: &Path) -> Result<(), StorageError> {
         .map_err(backend)
 }
 
-// Linux open-file-description locks belong to this handle's descriptor, so
-// another handle (or process) conflicts and only process death or an unlock
-// releases them.
-#[cfg(target_os = "linux")]
-const SET_LOCK: libc::c_int = libc::F_OFD_SETLK;
-#[cfg(target_os = "linux")]
-const GET_LOCK: libc::c_int = libc::F_OFD_GETLK;
-// shortcut: elsewhere POSIX locks are per process, so two handles in one
-// process share them and closing either descriptor drops both; ownership
-// is only guaranteed on Linux until macOS gets a per-process lock table.
-#[cfg(not(target_os = "linux"))]
-const SET_LOCK: libc::c_int = libc::F_SETLK;
-#[cfg(not(target_os = "linux"))]
-const GET_LOCK: libc::c_int = libc::F_GETLK;
-
-/// Session-tree claims held through this handle: one write lock on byte
-/// `lock_offset(root)` of `<db>.owners` per root, shared by every claim of
-/// that root through this handle and counted here.
-struct Owners {
-    file: std::fs::File,
-    /// Root -> (epoch, live claims).
-    held: Mutex<HashMap<SessionId, (u64, usize)>>,
-}
-
-impl Owners {
-    fn open(db: &Path) -> Result<Self, StorageError> {
-        let mut path = db.as_os_str().to_os_string();
-        path.push(".owners");
-        let file = FsOpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(PathBuf::from(path))
-            .map_err(backend)?;
-        Ok(Self {
-            file,
-            held: Mutex::default(),
-        })
-    }
-
-    fn held(&self) -> MutexGuard<'_, HashMap<SessionId, (u64, usize)>> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// `fcntl` on the root's byte.
-    fn fcntl(
-        &self,
-        command: libc::c_int,
-        kind: libc::c_short,
-        root: SessionId,
-    ) -> io::Result<libc::flock> {
-        // SAFETY: `flock` is plain data; all-zero is a valid value.
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = kind;
-        lock.l_whence = libc::SEEK_SET as libc::c_short;
-        lock.l_start = lock_offset(root);
-        lock.l_len = 1;
-        // SAFETY: the descriptor is open for the call and `lock` outlives it.
-        if unsafe { libc::fcntl(self.file.as_raw_fd(), command, &mut lock) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(lock)
-    }
-
-    fn lock(&self, root: SessionId) -> Result<(), StorageError> {
-        match self.fcntl(SET_LOCK, libc::F_WRLCK as libc::c_short, root) {
-            Ok(_) => Ok(()),
-            Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EACCES) => {
-                Err(StorageError::OwnedElsewhere { root })
-            }
-            Err(error) => Err(backend(error)),
-        }
-    }
-
-    fn unlock(&self, root: SessionId) {
-        // Unlocking a held range cannot conflict; a failure leaves the lock
-        // to process exit.
-        let _ = self.fcntl(SET_LOCK, libc::F_UNLCK as libc::c_short, root);
-    }
-
-    fn locked_elsewhere(&self, root: SessionId) -> Result<bool, StorageError> {
-        let probe = self
-            .fcntl(GET_LOCK, libc::F_WRLCK as libc::c_short, root)
-            .map_err(backend)?;
-        Ok(probe.l_type != libc::F_UNLCK as libc::c_short)
-    }
-
-    /// On the writer thread: lock the root, then bump its epoch in its own
-    /// transaction. Claims through this handle share the lock and epoch.
-    fn claim(&self, conn: &Connection, root: SessionId) -> Result<u64, StorageError> {
-        let mut held = self.held();
-        if let Some((epoch, claims)) = held.get_mut(&root) {
-            *claims += 1;
-            return Ok(*epoch);
-        }
-        self.lock(root)?;
-        let bumped = retry_busy(|| {
-            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-            let epoch: i64 = tx.query_row(
-                "INSERT INTO owners (root, epoch) VALUES (?1, 1) \
-                 ON CONFLICT (root) DO UPDATE SET epoch = epoch + 1 RETURNING epoch",
-                [root.as_bytes()],
-                |row| row.get(0),
-            )?;
-            tx.commit()?;
-            Ok(epoch)
-        });
-        match bumped {
-            Ok(epoch) => {
-                let epoch = epoch as u64;
-                held.insert(root, (epoch, 1));
-                Ok(epoch)
-            }
-            Err(error) => {
-                self.unlock(root);
-                Err(backend(error))
-            }
-        }
-    }
-
-    fn release(&self, root: SessionId) {
-        let mut held = self.held();
-        if let Some((_, claims)) = held.get_mut(&root) {
-            *claims -= 1;
-            if *claims == 0 {
-                held.remove(&root);
-                self.unlock(root);
-            }
-        }
-    }
-}
-
-/// Drops one claim; see `Owners::release`.
+/// Drops one claim; the last one of its epoch releases the tree, committed
+/// before `drop` returns so another process may claim it at once. A store
+/// already closed has freed the tree on exit.
 struct Release {
-    owners: Arc<Owners>,
-    root: SessionId,
+    store: Weak<SqliteStorage>,
+    token: OwnerToken,
 }
 
 impl Drop for Release {
     fn drop(&mut self) {
-        self.owners.release(self.root);
+        let Some(store) = self.store.upgrade() else {
+            return;
+        };
+        let committed = {
+            let mut held = store.held();
+            match held.get_mut(&self.token.root) {
+                Some((epoch, claims)) if *epoch == self.token.epoch => {
+                    *claims -= 1;
+                    if *claims > 0 {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            held.remove(&self.token.root);
+            let (done, committed) = mpsc::channel();
+            let release = Alone::Release {
+                token: self.token,
+                done,
+            };
+            if store.send(Command::Alone(release)).is_err() {
+                return;
+            }
+            committed
+        };
+        let _ = committed.recv();
     }
 }
 
-/// A stable byte per root, the same in every build and process: FNV-1a of
-/// the id, kept within the positive `off_t` range. A collision only makes
-/// two trees contend, never share.
-fn lock_offset(root: SessionId) -> libc::off_t {
-    let hash = root
-        .as_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    (hash >> 2) as libc::off_t
+/// `(epoch, process, its lease expiry)` of `root`'s owner row.
+type OwnerRow = (u64, Option<Vec<u8>>, Option<Timestamp>);
+
+fn owner_row(conn: &Connection, root: SessionId) -> Result<Option<OwnerRow>, StorageError> {
+    conn.query_row(
+        "SELECT o.epoch, o.process, l.expires_at FROM tree_owners o \
+         LEFT JOIN process_leases l ON l.process = o.process WHERE o.root = ?1",
+        [root.as_bytes()],
+        |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(sql)
+}
+
+/// Whether this process still holds `owner`'s epoch.
+fn holds(conn: &Connection, owner: OwnerToken, lease: Lease) -> Result<bool, StorageError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tree_owners WHERE root = ?1 AND epoch = ?2 AND process = ?3)",
+        params![
+            owner.root.as_bytes(),
+            owner.epoch as i64,
+            &lease.process[..]
+        ],
+        |row| row.get(0),
+    )
+    .map_err(sql)
+}
+
+fn renew_lease(conn: &Connection, lease: Lease, now: Timestamp) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO process_leases (process, expires_at) VALUES (?1, ?2) \
+         ON CONFLICT (process) DO UPDATE SET expires_at = excluded.expires_at",
+        params![&lease.process[..], now.saturating_add(lease.ttl)],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// Renew the lease and take `root` unless another process with a live
+/// lease holds it: the epoch, and whether this claim took the tree rather
+/// than sharing this process's claim.
+fn claim_in(
+    conn: &Connection,
+    root: SessionId,
+    lease: Lease,
+    now: Timestamp,
+) -> Result<(u64, bool), StorageError> {
+    retry(|| {
+        let tx = begin(conn)?;
+        renew_lease(&tx, lease, now)?;
+        let claimed = match owner_row(&tx, root)? {
+            Some((epoch, Some(process), _)) if process == lease.process => (epoch, false),
+            Some((_, Some(_), Some(until))) if now < until => {
+                return Err(StorageError::OwnedElsewhere { root });
+            }
+            _ => {
+                let epoch: i64 = tx
+                    .query_row(
+                        "INSERT INTO tree_owners (root, epoch, process) VALUES (?1, 1, ?2) \
+                         ON CONFLICT (root) DO UPDATE SET epoch = epoch + 1, \
+                         process = excluded.process RETURNING epoch",
+                        params![root.as_bytes(), &lease.process[..]],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                (epoch as u64, true)
+            }
+        };
+        tx.commit().map_err(sql)?;
+        Ok(claimed)
+    })
+}
+
+/// Free `token`'s tree unless another process has taken it since.
+fn release_in(conn: &Connection, token: OwnerToken, lease: Lease) -> Result<(), StorageError> {
+    retry(|| {
+        conn.execute(
+            "UPDATE tree_owners SET process = NULL \
+             WHERE root = ?1 AND epoch = ?2 AND process = ?3",
+            params![
+                token.root.as_bytes(),
+                token.epoch as i64,
+                &lease.process[..]
+            ],
+        )
+        .map_err(sql)
+    })?;
+    Ok(())
+}
+
+/// Renew the lease; the claims in `held` this process no longer holds.
+fn renew_in(
+    conn: &Connection,
+    held: &[OwnerToken],
+    lease: Lease,
+    now: Timestamp,
+) -> Result<Vec<OwnerToken>, StorageError> {
+    retry(|| {
+        let tx = begin(conn)?;
+        renew_lease(&tx, lease, now)?;
+        // Leases of killed processes would otherwise stay forever; an
+        // expired lease already owns nothing.
+        tx.execute("DELETE FROM process_leases WHERE expires_at <= ?1", [now])
+            .map_err(sql)?;
+        let mut lost = Vec::new();
+        for token in held {
+            if !holds(&tx, *token, lease)? {
+                lost.push(*token);
+            }
+        }
+        tx.commit().map_err(sql)?;
+        Ok(lost)
+    })
+}
+
+/// A normal exit: drop the lease and free every tree this process holds.
+fn exit_in(conn: &Connection, lease: Lease) -> Result<(), StorageError> {
+    retry(|| {
+        let tx = begin(conn)?;
+        tx.execute(
+            "DELETE FROM process_leases WHERE process = ?1",
+            [&lease.process[..]],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "UPDATE tree_owners SET process = NULL WHERE process = ?1",
+            [&lease.process[..]],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    })
 }
 
 /// Connection setup and schema migration every opener runs before serving.
@@ -992,9 +1110,10 @@ fn prepare(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageErr
 fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageError> {
     // Switching a fresh file to WAL can return BUSY without consulting the busy
     // handler (lock-upgrade deadlock between concurrent first openers), so retry.
-    let mode: String =
-        retry_busy(|| conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)))
-            .map_err(backend)?;
+    let mode: String = retry(|| {
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(sql)
+    })?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(StorageError::Backend(format!(
             "could not enable WAL (journal_mode={mode})"
@@ -1023,8 +1142,8 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
         });
     }
     // Pre-release: no DDL migrations; a database from an older layout is rebuilt.
-    // Every table is `IF NOT EXISTS`, so a version-1 file from before `owners`
-    // gains it here.
+    // Every table is `IF NOT EXISTS`, so a version-1 file from before
+    // `tree_owners` and `process_leases` gains them here.
     tx.execute_batch(SCHEMA).map_err(backend)?;
     if version == 0 {
         tx.pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
@@ -1114,6 +1233,7 @@ fn backend(error: impl std::fmt::Display) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn open_applies_wal_full_and_waits_for_other_writers() {
@@ -1122,6 +1242,7 @@ mod tests {
             (
                 OpenOptions {
                     synchronous: Synchronous::Normal,
+                    ..OpenOptions::default()
                 },
                 1,
             ),
@@ -1194,6 +1315,7 @@ mod tests {
                             &path,
                             OpenOptions {
                                 synchronous: Synchronous::Normal,
+                                ..OpenOptions::default()
                             },
                         )?;
                         let conn = storage.reader();
@@ -1379,5 +1501,38 @@ mod tests {
                 .expect_err("writer is gone");
             assert!(matches!(error, StorageError::Backend(_)), "{error:?}");
         }
+    }
+
+    #[test]
+    fn busy_is_a_conflict_and_only_conflicts_are_retried() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(matches!(sql(busy), StorageError::Conflict(_)));
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(matches!(sql(full), StorageError::Backend(_)));
+
+        let mut attempts = 0;
+        let retried = retry(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(StorageError::Conflict("busy".to_owned()))
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(retried.expect("a conflict is retried"), 3);
+
+        let mut attempts = 0;
+        let failed: Result<(), _> = retry(|| {
+            attempts += 1;
+            Err(backend("disk full"))
+        });
+        assert!(matches!(failed, Err(StorageError::Backend(_))));
+        assert_eq!(attempts, 1, "a real failure is not retried");
     }
 }

@@ -57,8 +57,14 @@ fn concurrency_bench() {
 
 fn run(synchronous: Synchronous, n: usize) {
     let dir = TempDir::new("bench");
-    let store: Arc<dyn SessionStore> =
-        open_with(dir.db(), OpenOptions { synchronous }).expect("open store");
+    let store: Arc<dyn SessionStore> = open_with(
+        dir.db(),
+        OpenOptions {
+            synchronous,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("open store");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .enable_all()
@@ -182,7 +188,16 @@ fn multi_process_bench() {
 fn run_processes(synchronous: Synchronous, processes: usize) {
     let dir = TempDir::new("bench-processes");
     // Create the schema once, outside the timed part.
-    drop(open_with(dir.db(), OpenOptions { synchronous }).expect("open store"));
+    drop(
+        open_with(
+            dir.db(),
+            OpenOptions {
+                synchronous,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open store"),
+    );
     let started = Instant::now();
     let children: Vec<_> = (0..processes)
         .map(|index| {
@@ -237,8 +252,14 @@ fn bench_child() {
         Ok("Normal") => Synchronous::Normal,
         _ => Synchronous::Full,
     };
-    let store: Arc<dyn SessionStore> =
-        open_with(db, OpenOptions { synchronous }).expect("open store");
+    let store: Arc<dyn SessionStore> = open_with(
+        db,
+        OpenOptions {
+            synchronous,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("open store");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .enable_all()

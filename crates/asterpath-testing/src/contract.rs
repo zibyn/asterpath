@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use crate::ManualClock;
 use asterpath_protocol::{
-    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, OwnerToken,
-    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StepId, StorageError,
-    ToolCallId, TurnId,
+    CatalogEntry, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry, LogId, LogIdRange, LogQuery,
+    NewEntry, OwnerToken, ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore,
+    StepId, StorageError, ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -29,10 +29,11 @@ pub trait StoreFactory {
     fn open(&self) -> Arc<dyn SessionStore>;
     /// A fresh, empty store that stamps `recorded_at` from `clock`.
     fn open_with_clock(&self, clock: Arc<dyn Clock>) -> Arc<dyn SessionStore>;
-    /// A second handle on the store under test, as another process sharing
-    /// it would open it: claims made through one handle conflict with the
+    /// Two handles on one fresh, empty store, as two processes sharing it
+    /// would open it, both reading time from `clock` and leasing for
+    /// `DEFAULT_LEASE_TTL`: claims made through one conflict with the
     /// other's (ADR-0036).
-    fn open_other_process(&self) -> Arc<dyn SessionStore>;
+    fn open_processes(&self, clock: Arc<dyn Clock>) -> [Arc<dyn SessionStore>; 2];
 }
 
 /// Run the shared store contract against a backend. Retirement cases are
@@ -51,7 +52,12 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     catalog(&*factory.open_with_clock(clock.clone()), &clock).await;
     metadata_filter(store).await;
     retirement(store).await;
-    ownership(store, &*factory.open_other_process()).await;
+    let clock = Arc::new(ManualClock::new());
+    let [here, elsewhere] = factory.open_processes(clock.clone());
+    ownership(&*here, &*elsewhere).await;
+    let [here, elsewhere] = factory.open_processes(clock.clone());
+    process_leases(&*here, &*elsewhere, &clock).await;
+    exit_and_kill(|| factory.open_processes(clock.clone()), &clock).await;
 }
 
 fn session(byte: u8) -> SessionId {
@@ -1079,4 +1085,119 @@ async fn ownership(here: &dyn SessionStore, elsewhere: &dyn SessionStore) {
         "the stale write left nothing"
     );
     drop((taken, other));
+}
+
+/// Past a lease written now: `DEFAULT_LEASE_TTL` and one millisecond.
+fn lease_expiry() -> i64 {
+    DEFAULT_LEASE_TTL.as_millis() as i64 + 1
+}
+
+fn owned_elsewhere(error: &StorageError, of: SessionId) -> bool {
+    matches!(error, StorageError::OwnedElsewhere { root } if *root == of)
+}
+
+/// Liveness is a process lease renewed through the handle; a process that
+/// stops renewing loses its trees to the next claimer once the lease
+/// expires by the claimer's clock (ADR-0036).
+async fn process_leases(
+    here: &dyn SessionStore,
+    elsewhere: &dyn SessionStore,
+    clock: &ManualClock,
+) {
+    let (kept, released) = (session(0xB1), session(0xB2));
+    for root in [kept, released] {
+        create(elsewhere, root, None).await;
+    }
+
+    // Renewing keeps a holder alive past its first lease.
+    let held = here.claim(kept).await.expect("claim");
+    clock.advance(lease_expiry() / 2);
+    assert_eq!(
+        here.renew().await.expect("renew"),
+        vec![],
+        "nothing was taken"
+    );
+    clock.advance(lease_expiry() / 2 + 1);
+    let refused = elsewhere
+        .claim(kept)
+        .await
+        .expect_err("a renewed lease holds");
+    assert!(owned_elsewhere(&refused, kept), "{refused:?}");
+    assert_eq!(
+        elsewhere.owner(kept).await.expect("owner"),
+        Some(held.token())
+    );
+
+    // A holder that stops renewing is taken over once its lease expires.
+    clock.advance(lease_expiry());
+    assert_eq!(
+        elsewhere.owner(kept).await.expect("owner"),
+        None,
+        "an expired lease owns nothing"
+    );
+    let taken = elsewhere
+        .claim(kept)
+        .await
+        .expect("take over an expired lease");
+    assert_eq!(taken.token().epoch, held.token().epoch + 1);
+    let stale = owned_append(here, kept, held.token())
+        .await
+        .expect_err("the old holder's epoch is fenced");
+    assert!(owned_elsewhere(&stale, kept), "{stale:?}");
+    // Its next renewal reports the loss, and its claims are refused while
+    // the new holder lives.
+    assert_eq!(here.renew().await.expect("renew"), vec![held.token()]);
+    assert_eq!(here.renew().await.expect("renew"), vec![], "reported once");
+    let refused = here.claim(kept).await.expect_err("held by the new owner");
+    assert!(owned_elsewhere(&refused, kept), "{refused:?}");
+    drop(held);
+    assert_eq!(
+        elsewhere.owner(kept).await.expect("owner"),
+        Some(taken.token())
+    );
+    owned_append(elsewhere, kept, taken.token())
+        .await
+        .expect("dropping the superseded claim released nothing");
+
+    // A released epoch is fenced even before anyone claims again.
+    let claim = elsewhere.claim(released).await.expect("claim");
+    let token = claim.token();
+    drop(claim);
+    let stale = owned_append(elsewhere, released, token)
+        .await
+        .expect_err("a released claim no longer writes");
+    assert!(owned_elsewhere(&stale, released), "{stale:?}");
+
+    drop(taken);
+}
+
+/// A process that exits normally frees its trees at once, even with a claim
+/// still alive; a killed one holds them until its lease expires.
+async fn exit_and_kill(processes: impl Fn() -> [Arc<dyn SessionStore>; 2], clock: &ManualClock) {
+    let root = session(0xC1);
+
+    let [exiting, elsewhere] = processes();
+    create(&*elsewhere, root, None).await;
+    let claim = exiting.claim(root).await.expect("claim");
+    drop(exiting);
+    let after_exit = elsewhere
+        .claim(root)
+        .await
+        .expect("claim after a normal exit");
+    drop((claim, after_exit));
+
+    let [killed, elsewhere] = processes();
+    create(&*elsewhere, root, None).await;
+    let claim = killed.claim(root).await.expect("claim");
+    let token = claim.token();
+    // Killed: no exit path runs and nothing renews.
+    std::mem::forget((claim, killed));
+    let refused = elsewhere.claim(root).await.expect_err("the lease is live");
+    assert!(owned_elsewhere(&refused, root), "{refused:?}");
+    clock.advance(lease_expiry());
+    let taken = elsewhere
+        .claim(root)
+        .await
+        .expect("claim after the lease expires");
+    assert_eq!(taken.token().epoch, token.epoch + 1);
 }

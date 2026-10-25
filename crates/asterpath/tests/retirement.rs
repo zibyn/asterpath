@@ -202,6 +202,15 @@ impl SessionStore for NoRetirement {
     > {
         self.0.owner(root)
     }
+
+    fn renew(
+        &self,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Vec<asterpath::protocol::OwnerToken>, asterpath::protocol::StorageError>,
+    > {
+        self.0.renew()
+    }
 }
 
 #[tokio::test]

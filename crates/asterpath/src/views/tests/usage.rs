@@ -260,6 +260,10 @@ impl SessionStore for TestLog {
     ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
         Box::pin(async { Ok(None) })
     }
+
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<asterpath_protocol::OwnerToken>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 fn service(log: Arc<TestLog>) -> UsageService {

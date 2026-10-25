@@ -54,7 +54,7 @@ use asterpath_protocol::{
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Claim, Clock, EnvironmentAdapter, LogQuery, OwnerToken,
+    ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken,
     SessionEnvironment, SessionQuery, SessionStore, Tool, root_of, unique_bytes,
 };
 use futures_core::stream::BoxStream;
@@ -82,6 +82,7 @@ pub struct Asterpath {
     trace: TracingQuery,
     environment: Option<Arc<dyn EnvironmentAdapter>>,
     watchers: Arc<Watchers>,
+    ownership: Arc<owner::Ownership>,
 }
 
 impl std::fmt::Debug for Asterpath {
@@ -139,10 +140,16 @@ impl Asterpath {
         let trace = TracingQuery::new(Arc::clone(&backend));
         let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
         let watchers = Arc::new(Watchers::default());
+        let ownership = Arc::new(owner::Ownership::new(
+            Arc::clone(&backend),
+            config.hooks.clone(),
+        ));
+        owner::Ownership::keep_renewed(&ownership, config.lease_renew_interval);
         let store: Arc<dyn SessionStore> = Arc::new(commit::CommitLog::new(
             backend,
             config.hooks.clone(),
             Arc::clone(&watchers),
+            Arc::clone(&ownership),
         ));
 
         let waits = Arc::new(Waits::new(Arc::clone(&store)));
@@ -210,6 +217,7 @@ impl Asterpath {
             trace,
             environment: config.environment,
             watchers,
+            ownership,
         })
     }
 
@@ -342,6 +350,7 @@ impl Asterpath {
             waits: Arc::clone(&self.waits),
             cancellations: Arc::clone(&self.cancellations),
             watchers: Arc::clone(&self.watchers),
+            ownership: Arc::clone(&self.ownership),
         }
     }
 
@@ -383,8 +392,9 @@ impl Asterpath {
         Ok(Some(Arc::new(env)))
     }
 
-    /// Release the engine. Nothing runs in the background, so there is
-    /// nothing to await.
+    /// Release the engine. The only background work is the process lease
+    /// renewal, which stops once the engine and its handles are dropped;
+    /// the store then clears the lease and frees this process's trees.
     pub async fn shutdown(self) -> Result<(), AsterError> {
         Ok(())
     }
@@ -571,6 +581,7 @@ pub struct SessionHandle {
     waits: Arc<Waits>,
     cancellations: Arc<CancellationRegistry>,
     watchers: Arc<Watchers>,
+    ownership: Arc<owner::Ownership>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -590,13 +601,15 @@ impl SessionHandle {
     /// Claims from this `Asterpath` share the tree; another process holding
     /// it is
     /// [`StorageError::OwnedElsewhere`](asterpath_protocol::StorageError::OwnedElsewhere). Dropping the last
-    /// [`OwnedSession`] releases the tree.
+    /// [`OwnedSession`] releases the tree. The claim lives while this
+    /// process renews its lease; if it is lost, `Hooks::on_ownership_lost`
+    /// is told and owner operations fail with `OwnedElsewhere`.
     pub async fn claim(&self) -> Result<OwnedSession, AsterError> {
         let root = root_of(&*self.store, self.session).await?;
-        let claim = self.store.claim(root).await?;
+        let held = self.ownership.claim(root).await?;
         let owned = OwnedSession {
             handle: self.clone(),
-            claim: Arc::new(claim),
+            held,
         };
         owned.follow_environment().await?;
         Ok(owned)
@@ -792,14 +805,14 @@ impl SessionHandle {
 #[derive(Clone)]
 pub struct OwnedSession {
     handle: SessionHandle,
-    claim: Arc<Claim>,
+    held: Arc<owner::Held>,
 }
 
 impl std::fmt::Debug for OwnedSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnedSession")
             .field("session", &self.handle.session)
-            .field("owner", &self.claim.token())
+            .field("owner", &self.held.token())
             .finish()
     }
 }
@@ -857,7 +870,7 @@ impl OwnedSession {
 
     /// The claim this handle holds: the tree's root and its epoch.
     pub fn owner(&self) -> OwnerToken {
-        self.claim.token()
+        self.held.token()
     }
 
     /// Stream live `AgentEvent`s until `TurnCommitted` or `Idle`.
@@ -865,7 +878,9 @@ impl OwnedSession {
     /// The turn advances only while this stream is polled. Dropping it does
     /// not cancel anything: the next `drive` resumes from the log (ADR-0006).
     /// A second `drive` on a session that is already being driven yields
-    /// [`AgentError::Busy`].
+    /// [`AgentError::Busy`]. If this process loses the tree (ADR-0036) the
+    /// stream stops at once and ends with
+    /// [`StorageError::OwnedElsewhere`](asterpath_protocol::StorageError::OwnedElsewhere).
     ///
     /// # Host driver pattern
     ///
@@ -944,7 +959,34 @@ impl OwnedSession {
             Some(self.owner()),
             self.env.clone(),
         );
-        run.map(|event| event.map_err(AsterError::from)).boxed()
+        let mut run = Some(run.map(|event| event.map_err(AsterError::from)));
+        let mut lost = Box::pin(self.held.lost());
+        let root = self.owner().root;
+        // Dropping the run stops its turn, waits and child drives.
+        futures_util::stream::poll_fn(move |cx| {
+            let Some(active) = run.as_mut() else {
+                return std::task::Poll::Ready(None);
+            };
+            if lost.as_mut().poll(cx).is_ready() {
+                run = None;
+                return std::task::Poll::Ready(Some(Err(AsterError::Storage(
+                    asterpath_protocol::StorageError::OwnedElsewhere { root },
+                ))));
+            }
+            let next = active.poll_next_unpin(cx);
+            if matches!(
+                next,
+                std::task::Poll::Ready(
+                    None | Some(Err(AsterError::Storage(
+                        asterpath_protocol::StorageError::OwnedElsewhere { .. }
+                    )))
+                )
+            ) {
+                run = None;
+            }
+            next
+        })
+        .boxed()
     }
 
     /// Cancel the active turn. Idempotent; a no-op while idle.
