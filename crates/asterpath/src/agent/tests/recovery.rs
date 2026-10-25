@@ -1399,6 +1399,31 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         ),
         "the orphan turn closes as cancelled"
     );
+    // The closed intent is announced, then finished, like any interrupted call.
+    let tool_events: Vec<_> = agent_events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolStarted {
+                call, tool, args, ..
+            } => Some((
+                *call,
+                Some((tool.as_str().to_owned(), args.as_str().to_owned())),
+            )),
+            AgentEvent::ToolFinished {
+                call,
+                status: ToolResultStatus::Interrupted,
+                ..
+            } => Some((*call, None)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_events,
+        [
+            (CALL, Some(("echo".to_owned(), "{}".to_owned()))),
+            (CALL, None)
+        ]
+    );
 
     let entries = scan(&log).await;
     assert_eq!(

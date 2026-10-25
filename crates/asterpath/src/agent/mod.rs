@@ -26,11 +26,11 @@ use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalPolicy, CancelReason, CancelRegistration,
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
-    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, OpenStep,
-    ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorInfo,
+    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, ModelRequest, OpenStep,
+    OpenTool, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorInfo,
     ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx,
-    StopReason, StorageError, StreamEvent, ToolConfig, ToolName, ToolResultStatus, TurnConfig,
-    TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup, decode_entry, dedup,
+    StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName, ToolResultStatus,
+    TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup, decode_entry, dedup,
     effective_config,
 };
 use asterpath_protocol::{
@@ -191,7 +191,7 @@ impl Agent {
         // R4: a child whose parent already stopped waiting is an orphan; close
         // its open intents as cancelled and never open another turn.
         if self.parent_recorded_completion(session, &facts).await? {
-            return self.close_orphan(session, &facts, events).await;
+            return self.close_orphan(session, &decoded, &facts, events).await;
         }
 
         // A dangling compaction intent is redone only when a compactor is
@@ -362,6 +362,7 @@ impl Agent {
     async fn close_orphan(
         &self,
         session: SessionId,
+        decoded: &[(LogEntry, SessionEvent)],
         facts: &SessionFacts,
         events: &EventSink,
     ) -> Result<(), AgentError> {
@@ -379,7 +380,18 @@ impl Agent {
         )
         .await?;
 
-        for (tool_call_id, _) in facts.open_tools() {
+        for (tool_call_id, tool) in facts.open_tools() {
+            // Never run in this process: announced, then closed, like any
+            // call interrupted before it started.
+            let (output_index, args) = recorded_call(decoded, tool, tool_call_id);
+            events.push(Ok(AgentEvent::ToolStarted {
+                turn: tool.turn,
+                step: tool.step,
+                output_index,
+                call: tool_call_id,
+                tool: tool.name.clone(),
+                args,
+            }));
             self.append(
                 session,
                 SessionEvent::ToolResult {
@@ -392,6 +404,14 @@ impl Agent {
                 Some(dedup::tool_result(tool_call_id)),
             )
             .await?;
+            events.push(Ok(AgentEvent::ToolFinished {
+                turn: tool.turn,
+                step: tool.step,
+                call: tool_call_id,
+                status: ToolResultStatus::Interrupted,
+                output: None,
+                error: None,
+            }));
         }
         for (child, _) in facts.open_children() {
             self.append(
@@ -1550,6 +1570,35 @@ struct OpenAttempt {
     watermark: u64,
     history: Attempts,
     next: Next,
+}
+
+/// A recorded call's `ToolStarted` fields: its position in the step's
+/// `AssistantMessage` (as a resumed step reports it; 0 when none was
+/// committed) and its recorded arguments.
+fn recorded_call(
+    decoded: &[(LogEntry, SessionEvent)],
+    tool: &OpenTool,
+    tool_call_id: ToolCallId,
+) -> (u32, JsonString) {
+    let Some((provider_call_id, args)) = decoded.iter().find_map(|(_, event)| match event {
+        SessionEvent::ToolCallRequested {
+            tool_call_id: id,
+            provider_call_id,
+            raw_args,
+            ..
+        } if *id == tool_call_id => Some((provider_call_id, raw_args.clone())),
+        _ => None,
+    }) else {
+        return (0, JsonString::new("{}"));
+    };
+    let output_index = assistant_message(decoded, tool.turn, tool.step)
+        .and_then(|(items, _)| {
+            items.iter().position(
+                |item| matches!(item, Item::ToolCall { call_id, .. } if call_id == provider_call_id),
+            )
+        })
+        .map_or(0, |index| index as u32);
+    (output_index, args)
 }
 
 /// The step's committed `AssistantMessage`: its items and stop reason.
