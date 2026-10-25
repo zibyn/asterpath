@@ -308,9 +308,9 @@ fn run_writer(conn: Connection, queue: mpsc::Receiver<Command>, clock: &dyn Cloc
         }
     }
     // The queue closed: a normal exit frees this process's trees at once.
-    if let Err(error) = exit_in(&conn, lease) {
-        eprintln!("asterpath-sqlite: clearing the process lease on exit failed: {error}");
-    }
+    // Nobody is left to report a failure to (the handle is dropping); the
+    // lease then expires after one TTL, as for a killed process.
+    let _ = exit_in(&conn, lease);
 }
 
 fn run_alone(conn: &Connection, alone: Alone, clock: &dyn Clock, lease: Lease) {
