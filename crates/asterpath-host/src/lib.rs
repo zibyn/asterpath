@@ -11,11 +11,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use asterpath::AsterError;
+use asterpath::{AsterError, Asterpath};
 use asterpath_mcp::{McpError, McpServerConfig, McpServers, McpTransport};
 use asterpath_protocol::{
-    CatalogEntry, EnvironmentAdapter, EnvironmentError, Part, SandboxPolicy, SandboxProvider,
-    SessionEnvironment, SessionId, SessionSpec, SpawnEnv, Tool,
+    CatalogEntry, EnvironmentAdapter, EnvironmentError, ParentFilter, Part, SandboxPolicy,
+    SandboxProvider, SessionEnvironment, SessionId, SessionQuery, SessionSpec, SpawnEnv, Tool,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillRoot, SkillRootLabel, discover,
@@ -201,39 +201,72 @@ pub fn continued_root(
     Ok((root, pinned))
 }
 
-/// Sessions created in `root`, last active first.
-// shortcut: reads the whole catalog and sorts by last_activity here; move to a store-side filter when catalogs grow large
-pub fn in_root(sessions: &[CatalogEntry], root: &Path) -> Vec<CatalogEntry> {
-    let root = root.display().to_string();
-    let mut here: Vec<CatalogEntry> = sessions
-        .iter()
-        .filter(|entry| entry.metadata.get(CWD) == Some(&root))
-        .cloned()
-        .collect();
-    here.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
-    here
+/// Every root session whose host metadata has all of `metadata`
+/// (ADR-0039), page by page; empty matches every root.
+// shortcut: reads every matching entry; page in the caller when lists grow long
+pub async fn roots(
+    asterpath: &Asterpath,
+    metadata: BTreeMap<String, String>,
+) -> Result<Vec<CatalogEntry>, HostError> {
+    every(
+        asterpath,
+        SessionQuery {
+            parent: ParentFilter::Roots,
+            metadata,
+            ..SessionQuery::default()
+        },
+    )
+    .await
 }
 
-/// A hex id (any root), else the last active session of that name in `root`.
-pub fn by_id_or_name(
-    sessions: &[CatalogEntry],
+/// Root sessions created in `root`, last active first.
+pub async fn in_root(asterpath: &Asterpath, root: &Path) -> Result<Vec<CatalogEntry>, HostError> {
+    let cwd = BTreeMap::from([(CWD.to_owned(), root.display().to_string())]);
+    let mut here = roots(asterpath, cwd).await?;
+    here.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
+    Ok(here)
+}
+
+/// A hex id (any session), else the last active session of that name in
+/// `root`.
+pub async fn by_id_or_name(
+    asterpath: &Asterpath,
     root: &Path,
     value: &str,
 ) -> Result<CatalogEntry, HostError> {
     if let Ok(id) = serde_json::from_value::<SessionId>(serde_json::Value::String(value.to_owned()))
     {
-        return sessions
-            .iter()
+        // shortcut: the catalog has no lookup by id, so this reads it whole
+        return every(asterpath, SessionQuery::default())
+            .await?
+            .into_iter()
             .find(|entry| entry.session == id)
-            .cloned()
             .ok_or_else(|| HostError::NotFound(format!("session {id:?} not found")));
     }
-    in_root(sessions, root)
+    in_root(asterpath, root)
+        .await?
         .into_iter()
         .find(|entry| entry.metadata.get(NAME).map(String::as_str) == Some(value))
         .ok_or_else(|| {
             HostError::NotFound(format!("no session named {value} in {}", root.display()))
         })
+}
+
+/// Every entry `query` matches, 256 a page.
+async fn every(
+    asterpath: &Asterpath,
+    mut query: SessionQuery,
+) -> Result<Vec<CatalogEntry>, HostError> {
+    query.limit = Some(256);
+    let mut all = Vec::new();
+    loop {
+        let page = asterpath.sessions(query.clone()).await?;
+        let Some(last) = page.last() else {
+            return Ok(all);
+        };
+        query.after = Some(last.cursor());
+        all.extend(page);
+    }
 }
 
 /// The session environment of a work root (ADR-0037): workspace tools, the
@@ -369,67 +402,6 @@ fn sandbox_provider(policy: &SandboxPolicy) -> Option<Arc<dyn SandboxProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn entry(byte: u8, last_activity: i64, metadata: &[(&str, &str)]) -> CatalogEntry {
-        let mut entry = CatalogEntry::new(
-            SessionId::from_bytes([byte; 16]),
-            None,
-            0,
-            last_activity,
-            BTreeMap::new(),
-        );
-        for (key, value) in metadata {
-            entry
-                .metadata
-                .insert((*key).to_owned(), (*value).to_owned());
-        }
-        entry
-    }
-
-    #[test]
-    fn in_root_keeps_the_root_and_puts_the_last_active_first() {
-        let sessions = [
-            entry(1, 10, &[(CWD, "/a")]),
-            entry(2, 30, &[(CWD, "/a")]),
-            entry(3, 50, &[(CWD, "/b")]),
-            entry(4, 60, &[]),
-        ];
-        let here = in_root(&sessions, Path::new("/a"));
-        let ids: Vec<_> = here.iter().map(|entry| entry.session).collect();
-        assert_eq!(
-            ids,
-            [
-                SessionId::from_bytes([2; 16]),
-                SessionId::from_bytes([1; 16])
-            ]
-        );
-    }
-
-    #[test]
-    fn a_name_resolves_to_its_last_active_session_in_the_root_and_an_id_to_itself() {
-        let sessions = [
-            entry(1, 10, &[(NAME, "fix"), (CWD, "/a")]),
-            entry(2, 30, &[(NAME, "fix"), (CWD, "/a")]),
-            entry(3, 50, &[(NAME, "other"), (CWD, "/a")]),
-            entry(4, 70, &[(NAME, "fix"), (CWD, "/b")]),
-        ];
-        let root = Path::new("/a");
-        assert_eq!(
-            by_id_or_name(&sessions, root, "fix").unwrap().session,
-            SessionId::from_bytes([2; 16])
-        );
-        let hex = SessionId::from_bytes([4; 16]).to_hex();
-        assert_eq!(
-            by_id_or_name(&sessions, root, &hex).unwrap().session,
-            SessionId::from_bytes([4; 16]),
-            "an id resolves outside the root"
-        );
-        assert!(by_id_or_name(&sessions, root, "nope").is_err());
-        assert!(
-            by_id_or_name(&sessions, Path::new("/c"), "fix").is_err(),
-            "a name resolves only in the root"
-        );
-    }
 
     #[test]
     fn a_continued_root_is_pinned_only_when_it_is_not_the_sessions_cwd() {

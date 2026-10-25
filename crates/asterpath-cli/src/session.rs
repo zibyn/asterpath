@@ -13,8 +13,8 @@ use asterpath_host::{
 };
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
-    CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, SessionId, SessionQuery,
-    StorageError, decode_entry,
+    CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, SessionId, StorageError,
+    decode_entry,
 };
 use asterpath_skills::SkillDiagnosticKind;
 use clap::{Args, ValueEnum};
@@ -316,8 +316,7 @@ async fn find(
     }
     let asterpath = bare(settings).await?;
     let found = async {
-        let sessions = catalog(&asterpath).await?;
-        let mut here = in_root(&sessions, root);
+        let mut here = in_root(&asterpath, root).await.map_err(CliError::run)?;
         let target = match args.resume.as_deref() {
             None => here.into_iter().next().ok_or_else(|| {
                 CliError::run(format!("no session to continue in {}", root.display()))
@@ -326,7 +325,9 @@ async fn find(
                 here.truncate(PICKER_SIZE);
                 pick(&here, io::stdin().lock(), io::stderr())?
             }
-            Some(value) => by_id_or_name(&sessions, root, value).map_err(CliError::run)?,
+            Some(value) => by_id_or_name(&asterpath, root, value)
+                .await
+                .map_err(CliError::run)?,
         };
         let snapshot = snapshot(&asterpath, target.session).await?;
         Ok((target, snapshot))
@@ -336,26 +337,6 @@ async fn find(
     let found = found?;
     shutdown?;
     Ok(found)
-}
-
-/// Every catalog entry.
-async fn catalog(asterpath: &Asterpath) -> CliResult<Vec<CatalogEntry>> {
-    let mut all = Vec::new();
-    let mut query = SessionQuery {
-        limit: Some(256),
-        ..SessionQuery::default()
-    };
-    loop {
-        let page = asterpath
-            .sessions(query.clone())
-            .await
-            .map_err(aster_error)?;
-        let Some(last) = page.last() else {
-            return Ok(all);
-        };
-        query.after = Some(last.cursor());
-        all.extend(page);
-    }
 }
 
 /// List the candidates and read a number.

@@ -9,13 +9,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_host::config::{self, Settings};
-use asterpath_host::{CWD, NAME, WorkRoot, Workspace, new_session_spec, work_root};
+use asterpath_host::{CWD, NAME, WorkRoot, Workspace, in_root, new_session_spec, roots, work_root};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
-    CatalogEntry, Clock, ConfigPatch, EnvironmentAdapter, InputId, ModelSpec, ParentFilter, Part,
-    SessionEvent, SessionQuery, SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId,
-    ToolName, ToolSelection, UsageScope, UserInput, decode_entry, effective_config, root_of,
-    scan_all, unique_bytes,
+    CatalogEntry, Clock, ConfigPatch, EnvironmentAdapter, InputId, ModelSpec, Part, SessionEvent,
+    SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId, ToolName, ToolSelection,
+    UsageScope, UserInput, decode_entry, effective_config, root_of, scan_all, unique_bytes,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -289,14 +288,15 @@ impl Desktop {
 
     /// Added roots and every root a session was created in, by path.
     pub async fn projects(&self) -> Result<Vec<Project>, String> {
-        let mut roots: BTreeSet<String> = self.added()?.into_iter().collect();
-        roots.extend(
-            self.roots(BTreeMap::new())
-                .await?
+        let mut paths: BTreeSet<String> = self.added()?.into_iter().collect();
+        paths.extend(
+            roots(&self.asterpath, BTreeMap::new())
+                .await
+                .map_err(text)?
                 .into_iter()
                 .filter_map(|entry| entry.metadata.get(CWD).cloned()),
         );
-        Ok(roots.into_iter().map(Project::new).collect())
+        Ok(paths.into_iter().map(Project::new).collect())
     }
 
     /// Remember `dir` (canonical) as a project.
@@ -318,9 +318,7 @@ impl Desktop {
 
     /// The root sessions created in `root`, last active first.
     pub async fn sessions(&self, root: &Path) -> Result<Vec<SessionSummary>, String> {
-        let query = BTreeMap::from([(CWD.to_owned(), root.display().to_string())]);
-        let mut entries = self.roots(query).await?;
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
+        let entries = in_root(&self.asterpath, root).await.map_err(text)?;
         let mut sessions = Vec::with_capacity(entries.len());
         for entry in entries {
             let status = self.status(entry.session).await?;
@@ -353,18 +351,26 @@ impl Desktop {
                 .map(|tool| tool.descriptor().name.clone())
                 .collect(),
         );
-        let session = self
+        let name = spec.metadata.get(NAME).cloned();
+        let id = self
             .asterpath
             .create_session(spec)
             .await
             .map_err(text)?
             .id();
-        let mut created = self.roots(BTreeMap::new()).await?;
-        created.retain(|entry| entry.session == session);
-        created
-            .pop()
-            .map(|entry| SessionSummary::new(entry, Status::Idle))
-            .ok_or_else(|| "the new session is not in the catalog".to_owned())
+        // Its only record so far is `SessionCreated`, whose time the catalog shows.
+        let created = scan_all(&*self.asterpath.store(), id)
+            .await
+            .map_err(text)?
+            .first()
+            .map_or(0, |entry| entry.recorded_at);
+        Ok(SessionSummary {
+            id,
+            name,
+            created_at: created,
+            last_activity: created,
+            status: Status::Idle,
+        })
     }
 
     /// Who may drive `session` now.
@@ -577,26 +583,6 @@ impl Desktop {
                 "cannot read {}: {error}",
                 self.projects_file.display()
             )),
-        }
-    }
-
-    /// Every root session whose metadata has `metadata`, page by page.
-    // shortcut: reads every matching catalog entry per call; page in the UI when lists grow long
-    async fn roots(&self, metadata: BTreeMap<String, String>) -> Result<Vec<CatalogEntry>, String> {
-        let mut query = SessionQuery {
-            parent: ParentFilter::Roots,
-            metadata,
-            limit: Some(256),
-            ..SessionQuery::default()
-        };
-        let mut all = Vec::new();
-        loop {
-            let page = self.asterpath.sessions(query.clone()).await.map_err(text)?;
-            let Some(last) = page.last() else {
-                return Ok(all);
-            };
-            query.after = Some(last.cursor());
-            all.extend(page);
         }
     }
 }
