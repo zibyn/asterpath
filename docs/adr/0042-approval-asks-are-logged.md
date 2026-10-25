@@ -1,6 +1,6 @@
 # 询问落日志，待审批从日志折叠；宿主可声明持久审批端点
 
-**Status**: proposed (2026-10-25)
+**Status**: rejected (2026-10-25) by [ADR-0047](0047-multi-user-and-multi-node-belong-to-the-platform.md)：多机部署归集成平台
 **部分取代**: [ADR-0007](0007-approval-and-sandbox-layers.md) 的「询问不是持久事实」与「没有审批端就 fail closed」
 **来源**: [#159](https://github.com/zibyn/asterpath/issues/159)（拆自 [#155](https://github.com/zibyn/asterpath/issues/155)）
 

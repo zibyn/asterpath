@@ -1,6 +1,6 @@
 # 唤醒发现以唤醒缓存保存折叠结果，判定仍只来自折叠
 
-**Status**: proposed (2026-10-25)
+**Status**: rejected (2026-10-25) by [ADR-0047](0047-multi-user-and-multi-node-belong-to-the-platform.md)：多机部署归集成平台
 **部分修订**: [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md) 的「存储契约不物化派生状态」
 **来源**: [#148](https://github.com/zibyn/asterpath/issues/148)
 **调研**: [multi-process-storage-audit.md](../research/multi-process-storage-audit.md)（E9）

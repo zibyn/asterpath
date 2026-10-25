@@ -25,6 +25,8 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 
 ## 现行 ADR
 
+0048 之前的 ADR 里「宿主」按「应用」读，「宿主元数据」即会话元数据。
+
 | ADR | 决定 |
 | --- | --- |
 | [0002](0002-log-topology-and-commit-semantics.md) | 每个会话一条 append-only 日志，只提交终态，不做工作流引擎 |
@@ -46,15 +48,14 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0033](0033-session-fork-reuses-context-fork-snapshot.md) | 会话分叉是宿主创建的独立会话，复用上下文分叉的快照 |
 | [0034](0034-structured-output-modes-and-output-tool.md) | 结构化输出有显式选择的输出模式，工具模式由引擎以输出工具实现 |
 | [0035](0035-desktop-reference-host.md) | 桌面参考宿主一个进程托管所有项目，与 CLI 共用配置与数据库 |
-| [0036](0036-per-session-tree-ownership.md) | 写者独占缩小到会话树：显式认领、进程租约与属主纪元，多进程共用存储 |
+| [0036](0036-per-session-tree-ownership.md) | 写者独占缩小到会话树：显式认领、进程租约与属主纪元，多进程共用存储（跨进程送达由 0047 取代） |
 | [0037](0037-session-environment.md) | 会话环境由宿主适配器按会话解析，子进程默认不继承进程环境 |
 | [0038](0038-watch-separates-observing-from-driving.md) | 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出 |
-| [0039](0039-multi-user-embedding-mechanisms.md) | 多用户内嵌：用户是宿主元数据，内核只补按会话的机制 |
-| [0040](0040-host-kit-shared-by-reference-hosts.md) | 宿主共用层：组装约定从 CLI 下沉为 `asterpath-host` |
-| [0041](0041-wake-discovery-caches-folds.md) | 唤醒发现以唤醒缓存保存折叠结果，判定仍只来自折叠（proposed） |
-| [0042](0042-approval-asks-are-logged.md) | 询问落日志，待审批从日志折叠；宿主可声明持久审批端点（proposed） |
-| [0043](0043-change-notification-is-a-framework-hint.md) | 变更通知是框架提供的提示：每进程一个轮询器，宿主可接入变更总线（proposed） |
+| [0039](0039-multi-user-embedding-mechanisms.md) | 多用户内嵌：用户是宿主元数据，内核只补按会话的机制（前提由 0047 修正） |
 | [0044](0044-host-metadata-is-patchable.md) | 宿主元数据可按键修改：外部写入的 patch，目录行同事务合并（proposed） |
 | [0045](0045-fork-at-any-committed-turn.md) | 会话分叉可指定任一已提交回合为水位（proposed） |
+| [0046](0046-local-hosts-and-web-sdk-do-not-share.md) | 本地应用与 web 集成分开，互不共享数据（`asterpath-host` 部分由 0048 取代） |
+| [0047](0047-multi-user-and-multi-node-belong-to-the-platform.md) | 多用户与多机部署归集成平台；内核只保证会话树单写者与 SQLite、Postgres 两种后端 |
+| [0048](0048-no-host-tier-workspace-and-config-are-facade-features.md) | 没有宿主这一层：工作根组装与配置加载是门面的可选 feature；「宿主」改称「应用」 |
 
-其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩。
+其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。

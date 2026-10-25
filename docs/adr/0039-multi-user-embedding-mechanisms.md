@@ -1,6 +1,6 @@
 # 多用户内嵌：用户是宿主元数据，内核只补按会话的机制
 
-**Status**: accepted (2026-10-25)
+**Status**: accepted (2026-10-25)；Context 前提（单进程上千用户是平台的形态，不是内核目标） 部分取代 by [ADR-0047](0047-multi-user-and-multi-node-belong-to-the-platform.md)
 **调研**: [design-audit-2026-10-25.md](../research/design-audit-2026-10-25.md)、[kernel-host-boundary-audit.md](../research/kernel-host-boundary-audit.md)
 
 ## Context

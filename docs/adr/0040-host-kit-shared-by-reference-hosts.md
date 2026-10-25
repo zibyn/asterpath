@@ -1,6 +1,6 @@
 # 宿主共用层：组装约定从 CLI 下沉为 `asterpath-host`
 
-**Status**: accepted (2026-10-25)
+**Status**: superseded by [ADR-0048](0048-no-host-tier-workspace-and-config-are-facade-features.md)（2026-10-25）；此前「web 可以直接用组装部分」与「配置加载是可选 feature」已由 [ADR-0046](0046-local-hosts-and-web-sdk-do-not-share.md) 部分取代
 **调研**: [kernel-host-boundary-audit.md](../research/kernel-host-boundary-audit.md)
 
 ## Context

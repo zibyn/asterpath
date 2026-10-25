@@ -1,6 +1,6 @@
 # 引擎是一个 crate，只有适配器 trait 与钩子公开，宿主显式驱动
 
-**Status**: accepted (2026-10-23)；2026-10-24 整理：并入 ADR-0015 仍有效的打包原则
+**Status**: accepted (2026-10-23)；2026-10-24 整理：并入 ADR-0015 仍有效的打包原则；依赖角色去掉 host 见 [ADR-0048](0048-no-host-tier-workspace-and-config-are-facade-features.md)
 **来源**: [#15](https://github.com/zibyn/asterpath/issues/15)、[#79](https://github.com/zibyn/asterpath/issues/79)
 **取代**: [ADR-0001](0001-dependency-direction.md)、[ADR-0015](0015-packaging-and-stability.md)
 **规范**: [packaging.md](../design/packaging.md)、`deps-allowlist.toml`

@@ -1,6 +1,6 @@
 # 变更通知是框架提供的提示：每进程一个轮询器，宿主可接入变更总线
 
-**Status**: proposed (2026-10-25)
+**Status**: rejected (2026-10-25) by [ADR-0047](0047-multi-user-and-multi-node-belong-to-the-platform.md)：多机部署归集成平台
 **来源**: [#160](https://github.com/zibyn/asterpath/issues/160)（拆自 [#155](https://github.com/zibyn/asterpath/issues/155)）
 **相关**: [ADR-0036](0036-per-session-tree-ownership.md)、[ADR-0038](0038-watch-separates-observing-from-driving.md)、[ADR-0042](0042-approval-asks-are-logged.md)
 
