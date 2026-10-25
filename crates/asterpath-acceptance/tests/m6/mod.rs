@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
     AgentEvent, ConfigSnapshot, Item, JsonString, ModelId, ModelSpec, Part, Provider, ProviderId,
     RequestConfig, Role, SessionEvent, SessionSpec, SideEffect, StopReason, SubagentConfig,
@@ -107,7 +107,7 @@ async fn build(
         .expect("build")
 }
 
-async fn drive(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     let mut stream = handle.drive();
     while let Some(event) = stream.next().await {
@@ -179,7 +179,7 @@ fn tool_results(
         .collect()
 }
 
-async fn finish(asterpath: Asterpath, handle: SessionHandle) -> SessionId {
+async fn finish(asterpath: Asterpath, handle: OwnedSession) -> SessionId {
     let session = handle.id();
     drop(handle);
     asterpath.shutdown().await.expect("shutdown");
@@ -210,7 +210,10 @@ async fn s3_the_index_is_frozen_in_the_snapshot_and_the_tool_set() {
     let handle = asterpath
         .create_session(spec(system.clone()))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([1; 16]),
@@ -278,7 +281,10 @@ async fn s4_load_skill_returns_the_body_and_needs_no_approval() {
     let handle = asterpath
         .create_session(spec(system))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([2; 16]),
@@ -366,7 +372,10 @@ async fn s5_a_logged_body_is_authoritative_after_the_file_changes() {
     let handle = asterpath
         .create_session(spec(system.clone()))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([3; 16]),
@@ -390,7 +399,13 @@ async fn s5_a_logged_body_is_authoritative_after_the_file_changes() {
         Arc::new(LoadSkillTool::new(roots)),
     )
     .await;
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([4; 16]),
@@ -447,7 +462,10 @@ async fn s5_an_unclosed_safe_call_is_rerun_after_resume() {
     let handle = asterpath
         .create_session(spec(system))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([5; 16]),
@@ -470,7 +488,13 @@ async fn s5_an_unclosed_safe_call_is_rerun_after_resume() {
         Arc::new(LoadSkillTool::new(roots)),
     )
     .await;
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     assert_eq!(reasons(&events), vec![TurnEndReason::Completed]);
     finish(asterpath, handle).await;
@@ -511,7 +535,10 @@ async fn s6_a_deleted_skill_is_not_found_and_the_session_continues() {
     let handle = asterpath
         .create_session(spec(system))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let session = finish(asterpath, handle).await;
 
     std::fs::remove_dir_all(skills.join("demo")).expect("remove skill");
@@ -531,7 +558,13 @@ async fn s6_a_deleted_skill_is_not_found_and_the_session_continues() {
         Arc::new(LoadSkillTool::new(roots)),
     )
     .await;
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([6; 16]),
@@ -591,7 +624,10 @@ async fn s8_fresh_children_inherit_the_index_and_loader_and_can_narrow_them_away
     let handle = asterpath
         .create_session(spec(system.clone()))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([8; 16]),
@@ -666,7 +702,10 @@ async fn s8_fresh_children_inherit_the_index_and_loader_and_can_narrow_them_away
     let handle = asterpath
         .create_session(spec(system))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([9; 16]),

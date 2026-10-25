@@ -682,6 +682,7 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
             .await
             .map_err(|error| error.to_string())?
     };
+    let session = session.claim().await.map_err(|error| error.to_string())?;
 
     let mut stream = session.drive();
     let mut cancelled = false;

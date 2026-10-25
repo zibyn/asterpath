@@ -21,7 +21,7 @@ use asterpath::protocol::{
 use asterpath::protocol::{
     ApprovalGate, InputId, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId,
 };
-use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, SessionHandle};
+use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, OwnedSession};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -183,7 +183,7 @@ fn decoded(entries: &[LogEntry]) -> Vec<SessionEvent> {
         .collect()
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -288,7 +288,13 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     parent_spec
         .metadata
         .insert("cwd".to_owned(), "/work".to_owned());
-    let handle = asterpath.create_session(parent_spec).await.unwrap();
+    let handle = asterpath
+        .create_session(parent_spec)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
@@ -447,7 +453,13 @@ async fn child_max_steps_is_a_failed_outcome_in_a_completed_tool_result() {
     ))
     .await;
     // The parent needs two steps (spawn + answer); the child exceeds two.
-    let handle = asterpath.create_session(spec(Some(2))).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(Some(2)))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
@@ -534,7 +546,13 @@ async fn child_approval_is_scoped_to_the_child_session() {
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register();
     let asterpath = approval_fixture(&db, Arc::new(approval_script()), Arc::clone(&gate)).await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
 
@@ -602,7 +620,13 @@ async fn child_approval_wait_survives_a_restart() {
     let _endpoint = gate.register();
     let provider = Arc::new(approval_script());
     let asterpath = approval_fixture(&db, provider.clone(), gate.clone()).await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
 
@@ -621,7 +645,13 @@ async fn child_approval_wait_survives_a_restart() {
 
     // The same logs, a new process.
     let reopened = approval_fixture(&db, provider, gate).await;
-    let handle = reopened.open_session(parent).await.unwrap();
+    let handle = reopened
+        .open_session(parent)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let driver = tokio::spawn({
         let handle = handle.clone();
         async move { drive_all(&handle).await }
@@ -905,7 +935,13 @@ async fn fan_out_partial_failure_keeps_siblings_independent() {
         Vec::new(),
     ))
     .await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
@@ -991,7 +1027,13 @@ async fn the_ninth_spawn_queues_until_a_slot_is_released() {
         ..simple_config(&db, vec![provider as Arc<dyn Provider>], Vec::new())
     };
     let asterpath = open(config).await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
     let driver = tokio::spawn({
@@ -1085,6 +1127,9 @@ async fn parent_cancel_cancels_the_child_and_drops_the_queued_spawn() {
             config.cancel_grace = Duration::from_millis(300);
             config
         }))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     let parent = handle.id();
@@ -1198,6 +1243,9 @@ async fn cancel_with_zero_grace_closes_the_open_child_wait() {
             config
         }))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
@@ -1274,6 +1322,9 @@ async fn spawn_timeout_fires_and_reports_failed_timeout() {
     .await;
     let handle = asterpath
         .create_session(spec_with(subagents, TurnConfig::default()))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     let parent = handle.id();
@@ -1352,7 +1403,13 @@ async fn a_child_completing_before_its_deadline_wins() {
         Vec::new(),
     ))
     .await;
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
@@ -1406,7 +1463,13 @@ async fn the_facade_global_live_child_limit_queues_spawns() {
     .build()
     .await
     .expect("facade builds");
-    let handle = asterpath.create_session(spec(None)).await.unwrap();
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let parent = handle.id();
     handle.submit_input(input("go")).await.unwrap();
     let driver = tokio::spawn({

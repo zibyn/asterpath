@@ -6,10 +6,10 @@
 
 use std::io::{self, BufRead, Write};
 
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession, SessionHandle};
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, InputId, Part, PartDelta, SystemClock,
-    UsageScope, UserInput, unique_bytes,
+    AgentEvent, ApprovalDecision, ApprovalRequest, InputId, Item, LogEntry, Part, PartDelta, Role,
+    SystemClock, UsageScope, UserInput, project, unique_bytes,
 };
 use asterpath_protocol::{Clock, CompactResult};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -51,11 +51,19 @@ pub async fn interactive(
     let mut lines = stdin_lines();
     let mut interrupts = interrupts();
     loop {
+        let Some(owned) = &opened.owned else {
+            // Another process drives it: show the conversation, change nothing.
+            let entries = scan(opened.asterpath.store(), opened.handle.id())
+                .await
+                .map_err(CliError::run)?;
+            transcript(&mut io::stdout(), &entries);
+            return opened.shutdown().await;
+        };
         // The TTY prompt is this mode's approval channel (§4.4).
         let endpoint = opened.asterpath.approval_gate().register();
         let next = repl(
             &opened.asterpath,
-            &opened.handle,
+            owned,
             std::mem::take(&mut first),
             &mut lines,
             &mut interrupts,
@@ -127,7 +135,7 @@ fn interrupts() -> UnboundedReceiver<()> {
 /// An open turn or pending input is driven first (crash recovery), then `first`.
 pub async fn repl<W: Write>(
     asterpath: &Asterpath,
-    handle: &SessionHandle,
+    handle: &OwnedSession,
     first: Vec<Part>,
     lines: &mut UnboundedReceiver<String>,
     interrupts: &mut UnboundedReceiver<()>,
@@ -171,7 +179,7 @@ pub async fn repl<W: Write>(
 /// A turn that does not complete is reported, not fatal.
 async fn turn<W: Write>(
     asterpath: &Asterpath,
-    handle: &SessionHandle,
+    handle: &OwnedSession,
     parts: Option<Vec<Part>>,
     lines: &mut UnboundedReceiver<String>,
     interrupts: &mut UnboundedReceiver<()>,
@@ -208,7 +216,7 @@ async fn turn<W: Write>(
 /// A slash command; `Some` ends the REPL.
 async fn command<W: Write>(
     asterpath: &Asterpath,
-    handle: &SessionHandle,
+    handle: &OwnedSession,
     line: &str,
     out: &mut W,
 ) -> Option<Next> {
@@ -273,6 +281,29 @@ async fn status(asterpath: &Asterpath, handle: &SessionHandle) -> CliResult<Stri
 
 /// Show a live event: text deltas as they stream, tool calls and their
 /// truncated results. Display redaction would go here (host policy).
+/// The conversation's text as the model sees it: `> ` before user lines.
+fn transcript<W: Write>(out: &mut W, entries: &[LogEntry]) {
+    let Ok(projection) = project(entries) else {
+        return;
+    };
+    for item in projection.into_iter().flat_map(|projected| projected.items) {
+        let Item::Message { role, parts, .. } = item else {
+            continue;
+        };
+        let text: String = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let _ = match role {
+            Role::User => writeln!(out, "> {text}"),
+            Role::Assistant => writeln!(out, "{text}"),
+        };
+    }
+}
+
 pub fn render<W: Write>(out: &mut W, event: &AgentEvent) {
     let _ = match event {
         AgentEvent::ModelDelta {
@@ -445,7 +476,13 @@ mod tests {
     async fn ctrl_c_cancels_the_turn_then_exits_while_idle() {
         let dir = tempfile::tempdir().unwrap();
         let asterpath = setup(dir.path(), false).await;
-        let handle = asterpath.create_session(spec()).await.unwrap();
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         let (line_tx, mut lines) = unbounded_channel::<String>();
         let (interrupt_tx, mut interrupts) = unbounded_channel();
         line_tx.send("go".into()).unwrap();
@@ -490,7 +527,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let asterpath = setup(dir.path(), true).await;
         let _endpoint = asterpath.approval_gate().register();
-        let handle = asterpath.create_session(spec()).await.unwrap();
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         let (line_tx, mut lines) = unbounded_channel::<String>();
         let (interrupt_tx, mut interrupts) = unbounded_channel();
         line_tx.send("go".into()).unwrap();

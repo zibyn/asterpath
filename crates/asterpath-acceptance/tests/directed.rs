@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CompactionConfig, Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provenance,
@@ -206,7 +206,7 @@ async fn scan_session(asterpath: &Asterpath, session: SessionId) -> Vec<LogEntry
     entries
 }
 
-async fn drive(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -275,7 +275,13 @@ fn abort_kinds(entries: &[LogEntry]) -> Vec<asterpath_protocol::AbortKind> {
 async fn inspect_prints_the_committed_log_from_sqlite() {
     let (_dir, db) = temp_db("inspect");
     let asterpath = build(&db, Arc::new(ScriptedProvider::new("p")), Vec::new(), None).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     asterpath.shutdown().await.expect("shutdown");
     drop(handle);
@@ -352,7 +358,13 @@ async fn s18_input_submitted_before_a_crash_is_projected_exactly_once() {
         Usage::default(),
     ));
     let asterpath = build(&db, provider, Vec::new(), None).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     handle.submit_input(input("go")).await.expect("submit");
     asterpath.shutdown().await.expect("shutdown");
@@ -368,7 +380,13 @@ async fn s18_input_submitted_before_a_crash_is_projected_exactly_once() {
     let wakeable = asterpath.wakeable().await.expect("wakeable");
     assert_eq!(wakeable, vec![session], "pending input wakes the session");
 
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     assert!(
         events
@@ -412,7 +430,13 @@ async fn s18_input_submitted_before_a_crash_is_projected_exactly_once() {
 async fn unclosed_compaction_stays_open_without_making_the_session_busy() {
     let (_dir, db) = temp_db("compaction");
     let asterpath = build(&db, Arc::new(ScriptedProvider::new("p")), Vec::new(), None).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     let frontier = asterpath
         .store()
@@ -456,7 +480,13 @@ async fn unclosed_compaction_stays_open_without_making_the_session_busy() {
 
     // The intent is still open after a restart, and the session is still Idle.
     let asterpath = build(&db, Arc::new(ScriptedProvider::new("p")), Vec::new(), None).await;
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     assert_eq!(
         handle.state().await.expect("state"),
         asterpath_protocol::SessionState::Idle
@@ -572,7 +602,13 @@ async fn t3_recorded_allow_survives_the_restart_and_executes_without_reprompting
     )
     .await;
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     assert!(
         !events
@@ -634,7 +670,13 @@ async fn t4_undecided_ask_resuspends_after_a_restart_and_waits_for_the_answer() 
     )
     .await;
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
 
     let mut stream = handle.drive();
     let request = loop {
@@ -706,7 +748,13 @@ async fn t4_undecided_ask_with_no_endpoint_after_restart_fails_closed() {
     );
     let asterpath = build(&db, provider, vec![tool], Some(Arc::new(AlwaysAsk))).await;
     // No endpoint registered after the restart.
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     assert!(
         !events
@@ -743,7 +791,13 @@ async fn s11_cancelled_tool_result_is_not_retried_after_a_restart() {
     let asterpath = build(&db, provider, vec![blocking], None).await;
     let mut zero_grace = spec();
     zero_grace.turn.cancel_grace = Duration::ZERO;
-    let handle = asterpath.create_session(zero_grace).await.expect("create");
+    let handle = asterpath
+        .create_session(zero_grace)
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     handle.submit_input(input("go")).await.expect("submit");
 
@@ -767,7 +821,13 @@ async fn s11_cancelled_tool_result_is_not_retried_after_a_restart() {
     // Restart: a completed cancellation is not retried.
     let provider = Arc::new(ScriptedProvider::new("p"));
     let asterpath = build(&db, Arc::clone(&provider), Vec::new(), None).await;
-    let handle = asterpath.open_session(session).await.expect("open");
+    let handle = asterpath
+        .open_session(session)
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     assert!(matches!(events.as_slice(), [AgentEvent::Idle { .. }]));
     assert!(provider.requests().is_empty());

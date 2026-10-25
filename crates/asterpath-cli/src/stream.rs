@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 
-use asterpath::SessionHandle;
+use asterpath::OwnedSession;
 use asterpath_protocol::{AgentEvent, ApprovalDecision, Part, ToolCallId};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -34,7 +34,7 @@ enum Command {
 /// command or unreadable stdin cancels the turn and stops serving; the error
 /// comes back in [`DriveOutcome::error`] so the caller still prints the result.
 pub async fn run<R: AsyncBufRead + Unpin, W: Write>(
-    handle: &SessionHandle,
+    handle: &OwnedSession,
     start: bool,
     commands: Option<R>,
     out: &mut W,

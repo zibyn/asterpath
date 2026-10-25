@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use asterpath::SessionHandle;
+use asterpath::OwnedSession;
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin,
     Provenance, ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason,
@@ -68,10 +68,7 @@ impl Operator for Headless {}
 
 /// Drive to `TurnCommitted` or `Idle`; an interrupt cancels the turn and
 /// the drive runs on to its end. There is no exit code for "stopped at a wait".
-pub async fn drive(
-    handle: &SessionHandle,
-    operator: &mut impl Operator,
-) -> CliResult<DriveOutcome> {
+pub async fn drive(handle: &OwnedSession, operator: &mut impl Operator) -> CliResult<DriveOutcome> {
     let mut outcome = DriveOutcome {
         ran: true,
         ..DriveOutcome::default()
@@ -427,7 +424,13 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
         let _endpoint = asterpath.approval_gate().register();
-        let handle = asterpath.create_session(spec()).await.unwrap();
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -463,7 +466,13 @@ mod tests {
         let asterpath = build(&db, provider, echo_tool(Arc::new(AtomicUsize::new(0)))).await;
         let mut spec = spec();
         spec.turn.max_steps_per_turn = Some(1);
-        let handle = asterpath.create_session(spec).await.unwrap();
+        let handle = asterpath
+            .create_session(spec)
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         for (byte, text) in [(1, "first"), (2, "second")] {
             handle
                 .submit_input(UserInput {
@@ -500,7 +509,13 @@ mod tests {
         ));
         let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
         let _endpoint = asterpath.approval_gate().register();
-        let handle = asterpath.create_session(spec()).await.unwrap();
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -533,7 +548,13 @@ mod tests {
         // Phase 1: reach the approval, record Allow, then drop the drive.
         let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
         let _endpoint = asterpath.approval_gate().register();
-        let handle = asterpath.create_session(spec()).await.unwrap();
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -570,7 +591,13 @@ mod tests {
         ));
         let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
         let _endpoint = asterpath.approval_gate().register();
-        let handle = asterpath.open_session(session).await.unwrap();
+        let handle = asterpath
+            .open_session(session)
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
 
         let mut io = PromptIo {
             reader: Cursor::new(b"n\n"),
@@ -634,7 +661,13 @@ mod tests {
             let db = dir.path().join("ask.db");
             let asterpath = ask_bash(&db, dir.path()).await;
             let _endpoint = open.then(|| asterpath.approval_gate().register());
-            let handle = asterpath.create_session(spec()).await.unwrap();
+            let handle = asterpath
+                .create_session(spec())
+                .await
+                .unwrap()
+                .claim()
+                .await
+                .unwrap();
             handle
                 .submit_input(UserInput {
                     id: InputId::from_bytes([1; 16]),

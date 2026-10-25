@@ -1951,6 +1951,58 @@ async fn recovery_counts_admitted_children_and_requeues_only_open_spawns() {
 }
 
 #[tokio::test]
+async fn a_tree_that_changed_owner_rebuilds_admission_from_the_log() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let calls = [
+        ToolCallId::from_bytes([0x61; 16]),
+        ToolCallId::from_bytes([0x62; 16]),
+    ];
+    let subagents = limit(1);
+    let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
+    let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
+    let as_owner = |epoch, future| crate::owner::Owned {
+        owner: asterpath_protocol::OwnerToken {
+            root: reference.session,
+            epoch,
+        },
+        future,
+    };
+
+    // Epoch 1: call A takes the only slot.
+    let a = as_owner(
+        1,
+        scheduler.spawn(request_for(&reference, calls[0], caused_by[0])),
+    )
+    .await
+    .expect("spawn A");
+    // The tree moves to another process, which closes A, then comes back.
+    append(
+        &*log,
+        reference.session,
+        SessionEvent::ChildSessionCompleted {
+            child: a.child,
+            outcome: ChildOutcome::Cancelled {
+                reason: CancelReason::Parent,
+            },
+        },
+    )
+    .await;
+
+    // Epoch 2: the slot A held here is not counted from stale memory.
+    let b = tokio::time::timeout(
+        Duration::from_secs(1),
+        as_owner(
+            2,
+            scheduler.spawn(request_for(&reference, calls[1], caused_by[1])),
+        ),
+    )
+    .await
+    .expect("admitted from the log, not the stale count")
+    .expect("spawn B");
+    assert_eq!(b.parent.tool_call, calls[1]);
+}
+
+#[tokio::test]
 async fn cancel_after_a_child_terminal_still_records_cancelled_parent() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;

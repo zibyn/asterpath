@@ -2,7 +2,8 @@
 //!
 //! The facade constructs the engine components directly; hosts extend it only
 //! through adapter traits and [`protocol::Hooks`] (ADR-0025). There is no
-//! background driver: the host calls [`SessionHandle::drive`].
+//! background driver: the host claims a session tree and calls
+//! [`OwnedSession::drive`].
 
 // The public error enum is fixed by packaging.md §3.5.
 #![allow(clippy::result_large_err)]
@@ -13,6 +14,7 @@ mod compaction;
 pub mod config;
 pub mod error;
 mod fork;
+mod owner;
 mod scan;
 mod scheduler;
 mod tools;
@@ -48,7 +50,7 @@ use asterpath_protocol::{
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Clock, SessionQuery, SessionStore, unique_bytes,
+    ApprovalGate, CatalogEntry, Claim, Clock, OwnerToken, SessionQuery, SessionStore, unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -344,6 +346,7 @@ impl Asterpath {
         }
     }
 
+    /// A read-only handle; [`SessionHandle::claim`] makes it drivable.
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError> {
         // Unknown and retired sessions are indistinguishable: both have no
         // committed frontier (retention.md §9).
@@ -373,17 +376,46 @@ impl Asterpath {
         Ok(self.store.sessions(query).await?)
     }
 
-    /// Sessions with unfinished work (ADR-0023): a non-compaction intent is
-    /// open or an input waits for its step. Retired sessions are never
-    /// listed. The host decides when to drive them.
+    /// The live claim of `session`'s tree, held by this or another process;
+    /// `None` when nobody owns it (ADR-0036). Hosts route cancellation and
+    /// other owner operations by it.
+    pub async fn owner(&self, session: SessionId) -> Result<Option<OwnerToken>, AsterError> {
+        let root = root_of(&*self.store, session).await?;
+        Ok(self.store.owner(root).await?)
+    }
+
+    /// Unowned sessions with unfinished work (ADR-0023, ADR-0036): a
+    /// non-compaction intent is open or an input waits for its step, and no
+    /// process, this one included, holds the session's tree. Retired
+    /// sessions are never listed. The host decides which to claim and drive.
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
         // shortcut: folds every session on each call; index inside the sqlite module once session counts grow
         let mut wakeable = Vec::new();
         let catalog = self.store.sessions(SessionQuery::default()).await?;
+        let parents: BTreeMap<SessionId, Option<SessionId>> = catalog
+            .iter()
+            .map(|entry| (entry.session, entry.parent))
+            .collect();
         // Id order, as before the catalog listed newest first.
-        let mut sessions: Vec<SessionId> = catalog.iter().map(|entry| entry.session).collect();
+        let mut sessions: Vec<SessionId> = parents.keys().copied().collect();
         sessions.sort();
+        let mut owned = BTreeMap::new();
         for session in sessions {
+            let mut root = session;
+            while let Some(Some(parent)) = parents.get(&root) {
+                root = *parent;
+            }
+            let held = match owned.get(&root) {
+                Some(held) => *held,
+                None => {
+                    let held = self.store.owner(root).await?.is_some();
+                    owned.insert(root, held);
+                    held
+                }
+            };
+            if held {
+                continue;
+            }
             let entries = scan_all(&*self.store, session).await?;
             let facts = SessionFacts::fold(&entries).map_err(|error| {
                 AsterError::Agent(AgentError::Corrupt {
@@ -422,6 +454,24 @@ impl Asterpath {
     }
 }
 
+/// Longest parent chain followed to a root; the scheduler caps nesting lower.
+const MAX_PARENT_CHAIN: usize = 64;
+
+/// The root of `session`'s tree: the key it is owned by (ADR-0036).
+async fn root_of(store: &dyn SessionStore, session: SessionId) -> Result<SessionId, AsterError> {
+    let mut root = session;
+    for _ in 0..MAX_PARENT_CHAIN {
+        match store.parent(root).await? {
+            Some(parent) => root = parent,
+            None => return Ok(root),
+        }
+    }
+    Err(AsterError::Agent(AgentError::Corrupt {
+        session,
+        detail: "session parent chain is cyclic".to_owned(),
+    }))
+}
+
 /// Host metadata limits (storage.md §5).
 fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
     if metadata.len() > 64
@@ -450,7 +500,9 @@ fn totals_filter(scope: UsageScope) -> UsageFilter {
     }
 }
 
-/// One session: submit inputs, then drive explicitly.
+/// One session, read-only (ADR-0036): its log-derived views plus the
+/// external writes any process may make (input, approval decisions, config
+/// changes). [`claim`](Self::claim) its tree to drive it.
 #[derive(Clone)]
 pub struct SessionHandle {
     session: SessionId,
@@ -473,6 +525,20 @@ impl std::fmt::Debug for SessionHandle {
 impl SessionHandle {
     pub fn id(&self) -> SessionId {
         self.session
+    }
+
+    /// Take ownership of this session's tree (its root and every child).
+    /// Claims from this `Asterpath` share the tree; another process holding
+    /// it is
+    /// [`StorageError::OwnedElsewhere`](asterpath_protocol::StorageError::OwnedElsewhere). Dropping the last
+    /// [`OwnedSession`] releases the tree.
+    pub async fn claim(&self) -> Result<OwnedSession, AsterError> {
+        let root = root_of(&*self.store, self.session).await?;
+        let claim = self.store.claim(root).await?;
+        Ok(OwnedSession {
+            handle: self.clone(),
+            claim: Arc::new(claim),
+        })
     }
 
     /// Append `InputRecorded` only. Never starts a turn.
@@ -596,6 +662,80 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Answer a pending `Ask` as the approval endpoint. The decision is a
+    /// recorded `ApprovalDecided`, so it survives a crash and is reused.
+    pub async fn approve(
+        &self,
+        call: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<(), AsterError> {
+        self.waits
+            .record_approval(self.session, call, decision)
+            .await?;
+        Ok(())
+    }
+
+    /// The session facts folded from the log, not driver memory.
+    pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
+        let entries = scan_all(&*self.store, self.session).await?;
+        SessionFacts::fold(&entries).map_err(|error| {
+            AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
+                session: self.session,
+                detail: error.to_string(),
+            })
+        })
+    }
+
+    /// The model-visible projection folded from the log, not driver memory.
+    /// Each entry keeps its origin so hosts can map items back to log ids.
+    pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
+        let entries = scan_all(&*self.store, self.session).await?;
+        asterpath_protocol::project(&entries).map_err(|error| {
+            AsterError::Agent(AgentError::Corrupt {
+                session: self.session,
+                detail: error.to_string(),
+            })
+        })
+    }
+
+    /// State is the log-derived classification, not driver memory.
+    pub async fn state(&self) -> Result<SessionState, AsterError> {
+        Ok(self.facts().await?.state())
+    }
+}
+
+/// A claimed session: ownership of its tree for as long as any clone lives
+/// (ADR-0036). Driving, manual compaction, cancellation and child scheduling
+/// happen only here; everything a [`SessionHandle`] does is available too.
+#[derive(Clone)]
+pub struct OwnedSession {
+    handle: SessionHandle,
+    claim: Arc<Claim>,
+}
+
+impl std::fmt::Debug for OwnedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedSession")
+            .field("session", &self.handle.session)
+            .field("owner", &self.claim.token())
+            .finish()
+    }
+}
+
+impl std::ops::Deref for OwnedSession {
+    type Target = SessionHandle;
+
+    fn deref(&self) -> &SessionHandle {
+        &self.handle
+    }
+}
+
+impl OwnedSession {
+    /// The claim this handle holds: the tree's root and its epoch.
+    pub fn owner(&self) -> OwnerToken {
+        self.claim.token()
+    }
+
     /// Stream live `AgentEvent`s until `TurnCommitted` or `Idle`.
     ///
     /// The turn advances only while this stream is polled. Dropping it does
@@ -609,7 +749,8 @@ impl SessionHandle {
     ///   client disconnects the stream is dropped, and the turn stops until
     ///   someone drives again.
     /// - **Drive from a spawned task.** `tokio::spawn` a task that owns a
-    ///   cloned `SessionHandle`, reads every `drive()` stream to the end, and
+    ///   cloned `OwnedSession` (so the process keeps the tree), reads every
+    ///   `drive()` stream to the end, and
     ///   fans `AgentEvent`s out over `tokio::sync::broadcast`. Subscribers
     ///   come and go without affecting the turn.
     /// - **Queue through the log, not by retrying `Busy`.** Keep at most one
@@ -626,14 +767,14 @@ impl SessionHandle {
     /// ```no_run
     /// use std::sync::Arc;
     ///
-    /// use asterpath::SessionHandle;
+    /// use asterpath::{OwnedSession, SessionHandle};
     /// use asterpath::protocol::AgentEvent;
     /// use futures_util::StreamExt;
     /// use tokio::sync::{Notify, broadcast};
     ///
     /// /// One per session. `wake` is notified after every `submit_input`.
     /// fn spawn_driver(
-    ///     handle: SessionHandle,
+    ///     handle: OwnedSession,
     ///     wake: Arc<Notify>,
     /// ) -> broadcast::Sender<AgentEvent> {
     ///     let (events, _) = broadcast::channel(256);
@@ -681,10 +822,13 @@ impl SessionHandle {
     /// [`SessionFacts::has_pending_input`]: asterpath_protocol::SessionFacts::has_pending_input
     /// [`ApprovalGate::pending`]: asterpath_protocol::ApprovalGate::pending
     pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>> {
-        let run = self.agent.run(RunRequest {
-            session: self.session,
-            trigger: RunTrigger::Resume,
-        });
+        let run = self.agent.run_as(
+            RunRequest {
+                session: self.session,
+                trigger: RunTrigger::Resume,
+            },
+            Some(self.owner()),
+        );
         run.map(|event| event.map_err(AsterError::from)).boxed()
     }
 
@@ -694,49 +838,12 @@ impl SessionHandle {
         Ok(())
     }
 
-    /// Answer a pending `Ask` as the approval endpoint. The decision is a
-    /// recorded `ApprovalDecided`, so it survives a crash and is reused.
-    pub async fn approve(
-        &self,
-        call: ToolCallId,
-        decision: ApprovalDecision,
-    ) -> Result<(), AsterError> {
-        self.waits
-            .record_approval(self.session, call, decision)
-            .await?;
-        Ok(())
-    }
-
-    /// The session facts folded from the log, not driver memory.
-    pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
-        SessionFacts::fold(&entries).map_err(|error| {
-            AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
-                session: self.session,
-                detail: error.to_string(),
-            })
-        })
-    }
-
-    /// The model-visible projection folded from the log, not driver memory.
-    /// Each entry keeps its origin so hosts can map items back to log ids.
-    pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
-        asterpath_protocol::project(&entries).map_err(|error| {
-            AsterError::Agent(AgentError::Corrupt {
-                session: self.session,
-                detail: error.to_string(),
-            })
-        })
-    }
-
-    /// State is the log-derived classification, not driver memory.
-    pub async fn state(&self) -> Result<SessionState, AsterError> {
-        Ok(self.facts().await?.state())
-    }
-
     /// Run one manual compaction. Only allowed while idle and undriven.
     pub async fn compact_now(&self) -> Result<CompactResult, AsterError> {
-        Ok(self.agent.compact_now(self.session).await?)
+        let compaction = owner::Owned {
+            owner: self.owner(),
+            future: self.agent.compact_now(self.session),
+        };
+        Ok(compaction.await?)
     }
 }

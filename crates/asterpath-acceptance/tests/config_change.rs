@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use asterpath::anthropic::{AnthropicModelProfile, AnthropicProvider};
 use asterpath::openai::OpenAiProvider;
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
     CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Part, Provider, ProviderId,
     ReplaySafety, RequestConfig, SessionSpec, SideEffect, SubagentConfig, Tool, ToolArgs,
@@ -40,7 +40,7 @@ fn model(name: &str) -> ModelSpec {
 /// its second.
 struct Switch {
     descriptor: ToolDescriptor,
-    handle: OnceLock<SessionHandle>,
+    handle: OnceLock<OwnedSession>,
     calls: AtomicUsize,
 }
 
@@ -153,7 +153,10 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
             metadata: Default::default(),
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     switch.handle.set(handle.clone()).expect("set once");
     handle
         .submit_input(UserInput {
@@ -194,7 +197,7 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
 /// Appends a system instruction to the session on every call.
 struct Append {
     descriptor: ToolDescriptor,
-    handle: OnceLock<SessionHandle>,
+    handle: OnceLock<OwnedSession>,
 }
 
 impl Tool for Append {
@@ -263,7 +266,10 @@ async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
             metadata: Default::default(),
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     append.handle.set(handle.clone()).expect("set once");
     handle
         .submit_input(UserInput {
@@ -405,7 +411,7 @@ fn plain_tool(name: &str) -> ToolDescriptor {
 /// Adds `lookup` and removes itself.
 struct Equip {
     descriptor: ToolDescriptor,
-    handle: OnceLock<SessionHandle>,
+    handle: OnceLock<OwnedSession>,
 }
 
 impl Tool for Equip {
@@ -493,7 +499,10 @@ async fn run_equip_turn(
             metadata: Default::default(),
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     equip.handle.set(handle.clone()).expect("set once");
     handle
         .submit_input(UserInput {

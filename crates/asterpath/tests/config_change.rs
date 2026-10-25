@@ -19,7 +19,7 @@ use asterpath::protocol::{
     Parallelism, ReplaySafety, SideEffect, Tool, ToolArgs, ToolContext, ToolDescriptor, ToolError,
     ToolErrorKind, ToolOutput, ToolResultStatus,
 };
-use asterpath::{AsterError, Asterpath, DefaultCompactor, SessionHandle};
+use asterpath::{AsterError, Asterpath, DefaultCompactor, OwnedSession};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -83,7 +83,7 @@ fn input(id: u8) -> UserInput {
 /// update to `handle`, so the change lands inside a step that is running.
 struct Switching {
     inner: ScriptedProvider,
-    handle: OnceLock<SessionHandle>,
+    handle: OnceLock<OwnedSession>,
     updates: Mutex<VecDeque<Option<ConfigPatch>>>,
 }
 
@@ -127,7 +127,7 @@ impl Provider for Switching {
     }
 }
 
-async fn events(asterpath: &Asterpath, handle: &SessionHandle) -> Vec<SessionEvent> {
+async fn events(asterpath: &Asterpath, handle: &OwnedSession) -> Vec<SessionEvent> {
     scan_all(&*asterpath.store(), handle.id())
         .await
         .expect("scan")
@@ -136,7 +136,7 @@ async fn events(asterpath: &Asterpath, handle: &SessionHandle) -> Vec<SessionEve
         .collect()
 }
 
-async fn drive(handle: &SessionHandle) {
+async fn drive(handle: &OwnedSession) {
     let mut stream = handle.drive();
     while let Some(event) = stream.next().await {
         event.expect("drive");
@@ -158,7 +158,13 @@ async fn an_unregistered_provider_is_rejected_and_nothing_is_logged() {
         .build()
         .await
         .expect("build");
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let before = events(&asterpath, &handle).await;
 
     let mut update = ConfigPatch::default();
@@ -187,7 +193,13 @@ async fn a_mid_turn_change_applies_from_the_next_step_only() {
         .build()
         .await
         .expect("build");
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
 
@@ -257,7 +269,7 @@ async fn assemble(store: Arc<dyn SessionStore>, provider: Arc<dyn Provider>) -> 
 
 async fn kinds(
     store: &dyn SessionStore,
-    handle: &SessionHandle,
+    handle: &OwnedSession,
 ) -> Result<Vec<&'static str>, StorageError> {
     Ok(scan_all(store, handle.id())
         .await?
@@ -270,7 +282,13 @@ async fn kinds(
 async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
     let live = pausing_switcher();
     let asterpath = assemble(Arc::new(InMemoryEventLog::new()), live.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -289,7 +307,13 @@ async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
             .with_occurrence(NonZeroUsize::new(8).expect("non-zero")),
     ));
     let asterpath = assemble(failing, crashing.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     crashing.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     let driven = handle.clone();
@@ -305,7 +329,13 @@ async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
         Usage::default(),
     ));
     let asterpath = assemble(shared.clone(), recovered.clone()).await;
-    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    let handle = asterpath
+        .open_session(handle.id())
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     drive(&handle).await;
 
     assert_eq!(recovered.requests(), [live_step_2]);
@@ -340,7 +370,10 @@ async fn a_child_inherits_the_config_of_its_spawn_step() {
             ..spec()
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -395,7 +428,13 @@ fn pausing_appender() -> Arc<Switching> {
 async fn an_appended_instruction_reaches_the_next_step_in_place() {
     let provider = pausing_appender();
     let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -422,7 +461,13 @@ async fn invalid_appends_are_rejected_and_nothing_is_logged() {
         Arc::new(ScriptedProvider::new("p")),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let before = events(&asterpath, &handle).await;
 
     let mut without_id = append(1, "rule");
@@ -448,7 +493,13 @@ async fn a_retried_append_is_recorded_once() {
         Arc::new(ScriptedProvider::new("p")),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle
         .update_config(append(1, "rule"))
         .await
@@ -473,7 +524,13 @@ async fn a_retried_append_is_recorded_once() {
 async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
     let live = pausing_appender();
     let asterpath = assemble(Arc::new(InMemoryEventLog::new()), live.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -488,7 +545,13 @@ async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
             .with_occurrence(NonZeroUsize::new(8).expect("non-zero")),
     ));
     let asterpath = assemble(failing, crashing.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     crashing.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     let driven = handle.clone();
@@ -503,7 +566,13 @@ async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
         Usage::default(),
     ));
     let asterpath = assemble(shared.clone(), recovered.clone()).await;
-    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    let handle = asterpath
+        .open_session(handle.id())
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     drive(&handle).await;
 
     assert_eq!(recovered.requests(), [live_step_2]);
@@ -544,7 +613,10 @@ async fn a_forked_child_sees_an_appended_instruction_once() {
             ..spec()
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -584,7 +656,13 @@ async fn compaction_rebases_replaced_instructions_into_the_system() {
         .expect("build");
     let mut session = spec();
     session.model.context_window = Some(100_000);
-    let handle = asterpath.create_session(session).await.expect("create");
+    let handle = asterpath
+        .create_session(session)
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -622,7 +700,13 @@ async fn trace_attributes_each_model_call_to_the_model_it_used() {
         vec![Some(switch_to("model-2"))],
     );
     let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -751,7 +835,13 @@ async fn an_added_tool_is_callable_next_step_and_a_removed_one_is_not_found() {
         tool.clone(),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -817,7 +907,10 @@ async fn invalid_tool_changes_are_rejected_and_nothing_is_logged() {
             ..spec()
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let before = events(&asterpath, &handle).await;
 
     let mut unregistered = add_lookup(1);
@@ -845,7 +938,13 @@ async fn an_added_descriptor_must_match_the_registry() {
         lookup_tool(),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let mut changed = add_lookup(1);
     changed.add_tools[0].description = "something else".to_owned();
     let error = handle.update_config(changed).await.unwrap_err();
@@ -860,7 +959,13 @@ async fn a_retried_tool_change_is_recorded_once() {
         lookup_tool(),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle.update_config(add_lookup(1)).await.expect("first");
     handle.update_config(add_lookup(1)).await.expect("retry");
     let changes = events(&asterpath, &handle)
@@ -890,7 +995,13 @@ async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
         lookup_tool(),
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -906,7 +1017,13 @@ async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
             .with_occurrence(NonZeroUsize::new(8).expect("non-zero")),
     ));
     let asterpath = assemble_with_lookup(failing, crashing.clone(), lookup_tool()).await;
-    let handle = asterpath.create_session(spec()).await.expect("create");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     crashing.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     let driven = handle.clone();
@@ -921,7 +1038,13 @@ async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
         Usage::default(),
     ));
     let asterpath = assemble_with_lookup(shared.clone(), recovered.clone(), lookup_tool()).await;
-    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    let handle = asterpath
+        .open_session(handle.id())
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     drive(&handle).await;
 
     assert_eq!(recovered.requests(), [live_step_2]);
@@ -949,7 +1072,13 @@ async fn compaction_rebases_replaced_tool_changes_into_the_baseline_tools() {
         .expect("build");
     let mut session = spec();
     session.model.context_window = Some(100_000);
-    let handle = asterpath.create_session(session).await.expect("create");
+    let handle = asterpath
+        .create_session(session)
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -1006,7 +1135,10 @@ async fn a_forked_child_starts_from_the_effective_tools_without_change_items() {
             ..spec()
         })
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -1057,7 +1189,10 @@ async fn trace_describes_a_call_by_the_tools_of_its_step() {
     let handle = asterpath
         .create_session(with_lookup())
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     provider.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -1087,7 +1222,10 @@ async fn a_resumed_step_runs_its_calls_under_the_config_it_started_with() {
     let handle = asterpath
         .create_session(with_lookup())
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
@@ -1109,7 +1247,10 @@ async fn a_resumed_step_runs_its_calls_under_the_config_it_started_with() {
     let handle = asterpath
         .create_session(with_lookup())
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     crashing.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     let driven = handle.clone();
@@ -1125,7 +1266,13 @@ async fn a_resumed_step_runs_its_calls_under_the_config_it_started_with() {
     ));
     let tool = lookup_tool();
     let asterpath = assemble_with_lookup(shared.clone(), recovered, tool.clone()).await;
-    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    let handle = asterpath
+        .open_session(handle.id())
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     drive(&handle).await;
 
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);

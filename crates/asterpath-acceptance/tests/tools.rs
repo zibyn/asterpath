@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
     CompactionConfig, Item, JsonString, LogEntry, ModelId, ModelSpec, Part, Provider, ProviderId,
     RequestConfig, Role, SandboxPolicy, SessionEvent, SessionSpec, StopReason, SubagentConfig,
@@ -112,8 +112,14 @@ fn script(steps: Vec<Vec<Item>>) -> Arc<ScriptedProvider> {
     Arc::new(provider)
 }
 
-async fn start(asterpath: &Asterpath, input: u8) -> SessionHandle {
-    let handle = asterpath.create_session(spec()).await.expect("session");
+async fn start(asterpath: &Asterpath, input: u8) -> OwnedSession {
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(UserInput {
             id: InputId::from_bytes([input; 16]),
@@ -126,7 +132,7 @@ async fn start(asterpath: &Asterpath, input: u8) -> SessionHandle {
     handle
 }
 
-async fn drive_all(handle: &SessionHandle) {
+async fn drive_all(handle: &OwnedSession) {
     let mut stream = handle.drive();
     while let Some(event) = stream.next().await {
         event.expect("drive");
@@ -343,7 +349,13 @@ async fn an_unsafe_tool_interrupted_by_a_crash_is_not_rerun() {
 
     // Second process: the provider can only answer the follow-up step.
     let reopened = project.open(script(vec![done()]), project.tools()).await;
-    let handle = reopened.open_session(session).await.unwrap();
+    let handle = reopened
+        .open_session(session)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     drive_all(&handle).await;
 
     assert_eq!(read(&project.root, "count.txt").as_deref(), Some("ab"));

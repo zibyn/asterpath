@@ -12,7 +12,7 @@ use asterpath::protocol::{
     ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage,
     UserInput, decode_entry, scan_all,
 };
-use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath::{AsterError, Asterpath, OwnedSession};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -130,7 +130,7 @@ async fn build(
         .expect("build")
 }
 
-async fn drive(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -183,7 +183,13 @@ async fn run(
 ) -> Run {
     let store: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let asterpath = build(store.clone(), provider.clone(), tools).await;
-    let handle = asterpath.create_session(spec).await.expect("create");
+    let handle = asterpath
+        .create_session(spec)
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input()).await.expect("input");
     let events = drive(&handle).await;
     Run {
@@ -192,7 +198,7 @@ async fn run(
     }
 }
 
-async fn logged(store: &dyn SessionStore, handle: &SessionHandle) -> Vec<SessionEvent> {
+async fn logged(store: &dyn SessionStore, handle: &OwnedSession) -> Vec<SessionEvent> {
     scan_all(store, handle.id())
         .await
         .expect("scan")
@@ -416,7 +422,10 @@ async fn recovery_closes_a_recorded_output_intent_without_a_model_call() {
     let handle = asterpath
         .create_session(spec(OutputMode::Auto, ToolChoice::Auto))
         .await
-        .expect("create");
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input()).await.expect("input");
     let driven = handle.clone();
     let crashed = tokio::spawn(async move { drive(&driven).await }).await;
@@ -425,7 +434,13 @@ async fn recovery_closes_a_recorded_output_intent_without_a_model_call() {
     // Auto now resolves to native: only the recorded intent marks the call.
     let recovered = Arc::new(provider(true, true));
     let asterpath = build(shared.clone(), recovered.clone(), vec![Echo::new()]).await;
-    let handle = asterpath.open_session(handle.id()).await.expect("open");
+    let handle = asterpath
+        .open_session(handle.id())
+        .await
+        .expect("open")
+        .claim()
+        .await
+        .unwrap();
     let events = drive(&handle).await;
     let run = Run {
         log: logged(&*shared, &handle).await,

@@ -13,7 +13,7 @@ use asterpath_protocol::{
     CompactionConfig, ModelId, ModelSpec, Part, ProviderId, RequestConfig, SessionEvent,
     SessionSpec, SubagentConfig, ToolSelection, TurnConfig, UserInput, encode_entry,
 };
-use asterpath_protocol::{InputId, TurnId};
+use asterpath_protocol::{InputId, SessionStore, TurnId};
 use common::{MockServer, Reply, bin};
 
 struct TestDir {
@@ -958,6 +958,35 @@ fn resume_without_a_prompt_prints_idle_for_a_finished_session() {
     let (stdout, _) = ok(dir.exec(&dir.path).args(["-r", &session]));
     assert_eq!(stdout, "idle");
     assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_of_a_session_driven_elsewhere_falls_back_to_a_read_only_view() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("Hello"))]);
+    let dir = TestDir::new("resume-held");
+    dir.config(&config_body(&server, &dir.db()));
+    let (_, session) = ok(dir.exec(&dir.path).arg("hi"));
+    // Another process (this test) owns the session's tree (ADR-0036).
+    let store = asterpath_storage_sqlite::open(dir.db()).expect("open the database");
+    let id: asterpath_protocol::SessionId =
+        serde_json::from_value(serde_json::json!(session)).expect("session id");
+    let _claim = store.claim(id).await.expect("claim");
+
+    let output = dir.exec(&dir.path).args(["-r", &session]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("read-only"), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Hello");
+
+    assert_eq!(
+        code(dir.exec(&dir.path).args(["-r", &session, "more"])),
+        Some(1)
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "nothing ran in the second process"
+    );
 }
 
 #[test]

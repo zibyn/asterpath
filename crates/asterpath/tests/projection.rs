@@ -11,7 +11,7 @@ use asterpath::protocol::{
     Role, SessionEvent, SessionSpec, SessionStore, StopReason, SubagentConfig, ToolResultStatus,
     ToolSelection, TurnConfig, Usage, UserInput, encode_entry, history, scan_all,
 };
-use asterpath::{AsterError, Asterpath, AsterpathBuilder, InputId, SessionHandle, ToolCallId};
+use asterpath::{AsterError, Asterpath, AsterpathBuilder, InputId, OwnedSession, ToolCallId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
 
@@ -88,7 +88,7 @@ async fn facade(builder: AsterpathBuilder, provider: Arc<ScriptedProvider>) -> A
         .expect("facade builds")
 }
 
-async fn turn(handle: &SessionHandle, id: u8) {
+async fn turn(handle: &OwnedSession, id: u8) {
     handle
         .submit_input(input(id, &format!("message {id}")))
         .await
@@ -101,7 +101,7 @@ async fn turn(handle: &SessionHandle, id: u8) {
 
 async fn assert_matches_history(
     asterpath: &Asterpath,
-    handle: &SessionHandle,
+    handle: &OwnedSession,
 ) -> Vec<ProjectedOrigin> {
     let projection = handle.projection().await.expect("projection");
     let entries = scan_all(&*asterpath.store(), handle.id())
@@ -124,7 +124,13 @@ async fn projection_follows_the_log(builder: AsterpathBuilder) {
             .respond(vec![assistant("three")], StopReason::EndTurn, usage()),
     );
     let asterpath = facade(builder, provider).await;
-    let handle = asterpath.create_session(spec()).await.expect("session");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     turn(&handle, 1).await;
     turn(&handle, 2).await;
 
@@ -175,7 +181,13 @@ async fn a_corrupt_log_is_reported_as_corrupt() {
         provider,
     )
     .await;
-    let handle = asterpath.create_session(spec()).await.expect("session");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     // Decodable, but the result refers to a tool call the log never requested.
     let orphan = SessionEvent::ToolResult {
         tool_call_id: ToolCallId::from_bytes([7; 16]),

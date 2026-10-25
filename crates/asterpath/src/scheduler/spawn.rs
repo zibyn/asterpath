@@ -42,7 +42,7 @@ pub(crate) struct Scheduler {
     /// Shared with the agent so child drives see cancellation.
     cancellations: Arc<CancellationRegistry>,
     /// Admission state is memory only; `recovered` marks parents whose open
-    /// spawns have been rebuilt from the log.
+    /// spawns have been rebuilt from the log, and under which owner epoch.
     admission: Mutex<Admission>,
     notify: tokio::sync::Notify,
 }
@@ -51,7 +51,7 @@ pub(crate) struct Scheduler {
 struct Admission {
     live: usize,
     parents: HashMap<SessionId, ParentAdmission>,
-    recovered: HashSet<SessionId>,
+    recovered: HashMap<SessionId, Option<u64>>,
 }
 
 #[derive(Default)]
@@ -439,20 +439,24 @@ impl Scheduler {
         })
     }
 
-    /// Rebuild this parent's queue and Running count from the log. A child
-    /// with `ChildSessionSpawned` and no completion is Running and is never
-    /// re-queued; open spawns wait in `seq` order.
+    /// Rebuild this parent's queue and Running count from the log, once per
+    /// claim of its tree: under a new owner epoch the tree may have been
+    /// driven elsewhere, so the memory of an earlier claim is dropped
+    /// (ADR-0036). A child with `ChildSessionSpawned` and no completion is
+    /// Running and is never re-queued; open spawns wait in `seq` order.
     async fn recover_parent(
         &self,
         parent: SessionId,
         facts: &SessionFacts,
     ) -> Result<(), ExecutionError> {
+        let epoch = crate::owner::current().map(|owner| owner.epoch);
         if self
             .admission
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .recovered
-            .contains(&parent)
+            .get(&parent)
+            == Some(&epoch)
         {
             return Ok(());
         }
@@ -472,8 +476,11 @@ impl Scheduler {
             .admission
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !state.recovered.insert(parent) {
+        if state.recovered.insert(parent, epoch) == Some(epoch) {
             return Ok(());
+        }
+        if let Some(stale) = state.parents.remove(&parent) {
+            state.live = state.live.saturating_sub(stale.running);
         }
         let mut started = 0usize;
         {

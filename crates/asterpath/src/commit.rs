@@ -117,7 +117,10 @@ impl CommitLog {
 }
 
 impl SessionStore for CommitLog {
-    fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
+    fn append(&self, mut entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
+        // A write made while a drive or compaction is polled is an owner
+        // write: it carries that claim (ADR-0036).
+        entry.owner = entry.owner.or(crate::owner::current());
         // No hooks, no observation work (#74).
         if self.hooks.is_empty() {
             return self.inner.append(entry);

@@ -15,7 +15,7 @@ use asterpath::protocol::{
     TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
-use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath::{AsterError, Asterpath, OwnedSession};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -137,7 +137,7 @@ fn kinds(entries: &[LogEntry]) -> Vec<&'static str> {
         .collect()
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -183,6 +183,9 @@ async fn two_step_turn_with_a_tool_call_matches_l1_and_projects_the_result() {
         .expect("facade builds");
     let handle = asterpath
         .create_session(spec(ToolSelection::Names(vec![ToolName::new("echo")])))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input("go")).await.unwrap();
@@ -312,6 +315,9 @@ async fn live_events_carry_tool_args_tool_output_and_turn_usage() {
     let handle = asterpath
         .create_session(spec(ToolSelection::All))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input("go")).await.unwrap();
     let live = drive_all(&handle).await;
@@ -364,6 +370,9 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
     let handle = asterpath
         .create_session(spec(ToolSelection::Names(vec![ToolName::new("beta")])))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     let entries = scan(asterpath.store(), handle.id()).await;
     let snapshot = entries
@@ -378,6 +387,9 @@ async fn tool_selection_resolves_names_and_rejects_unknown_tools() {
 
     let all = asterpath
         .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     let entries = scan(asterpath.store(), all.id()).await;
@@ -426,6 +438,9 @@ async fn disabling_the_spawn_tool_removes_it_from_selection() {
 
     let all = asterpath
         .create_session(spec(ToolSelection::All))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     let entries = scan(asterpath.store(), all.id()).await;
@@ -495,7 +510,13 @@ async fn a_snapshotted_spawn_call_fails_after_the_tool_is_disabled() {
         .build()
         .await
         .expect("facade rebuilds");
-    let handle = asterpath.open_session(id).await.unwrap();
+    let handle = asterpath
+        .open_session(id)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input("go")).await.unwrap();
     drive_all(&handle).await;
 
@@ -601,6 +622,9 @@ async fn interleaved_json_args_fragments_reassemble_by_step_and_output_index() {
         .expect("facade builds");
     let handle = asterpath
         .create_session(spec(ToolSelection::Names(vec![ToolName::new("echo")])))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input("go")).await.unwrap();

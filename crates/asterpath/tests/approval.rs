@@ -16,7 +16,7 @@ use asterpath::protocol::{
     ToolSelection, TurnConfig, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
 use asterpath::protocol::{DedupKey, LogEntry, LogQuery, SessionId, SessionStore, ToolCallId};
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_testing::{ScriptedProvider, TestTool};
 use futures_util::StreamExt;
 
@@ -145,7 +145,7 @@ fn text_input(id: u8) -> UserInput {
     }
 }
 
-async fn drive_events(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_events(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -184,7 +184,13 @@ async fn dropped_stream_redrive_requests_the_same_approval_again() {
         .await
         .expect("build");
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -263,7 +269,13 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .await
         .expect("build");
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -342,7 +354,13 @@ async fn dropping_the_drive_stream_removes_the_pending_request() {
         .await
         .expect("build");
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -386,7 +404,13 @@ async fn ask_with_open_gate_deny_records_denied_with_reason() {
         .await
         .expect("build");
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -443,7 +467,13 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
         .expect("build");
     // RAII endpoint registered and dropped: the gate is closed again.
     drop(asterpath.approval_gate().register());
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     let events = drive_events(&handle).await;
@@ -491,7 +521,13 @@ async fn recorded_decision_is_reused_without_reprompting() {
         .build()
         .await
         .expect("build");
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
 
     let turn = asterpath::protocol::TurnId::from_bytes([1; 16]);
@@ -598,7 +634,13 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
         .await
         .expect("build");
     let _endpoint = asterpath.approval_gate().register();
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
 
     let turn = asterpath::protocol::TurnId::from_bytes([1; 16]);
@@ -734,7 +776,13 @@ async fn cancel_before_deadline_wins_over_timeout() {
         .build()
         .await
         .expect("build");
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     drive_events(&handle).await;
@@ -786,7 +834,13 @@ async fn real_result_within_grace_beats_cancellation() {
         .build()
         .await
         .expect("build");
-    let handle = asterpath.create_session(spec()).await.unwrap();
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(text_input(1)).await.unwrap();
 
     drive_events(&handle).await;
@@ -845,7 +899,13 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
         .expect("build");
 
     // No endpoint: default policy denies without a prompt or a wait.
-    let denied = asterpath.create_session(spec()).await.unwrap();
+    let denied = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     denied.submit_input(text_input(1)).await.unwrap();
     let events = drive_events(&denied).await;
     assert!(
@@ -860,7 +920,13 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
 
     // With an endpoint the same tool asks and, once allowed, executes.
     let _endpoint = asterpath.approval_gate().register();
-    let allowed = asterpath.create_session(spec()).await.unwrap();
+    let allowed = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     allowed.submit_input(text_input(2)).await.unwrap();
     let mut stream = allowed.drive();
     let request = loop {

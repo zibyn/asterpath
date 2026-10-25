@@ -4,6 +4,7 @@
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
+use asterpath::OwnedSession;
 use asterpath_protocol::{Clock, SystemClock, UserInput, unique_bytes};
 use asterpath_protocol::{
     FileSource, ImageSource, InputId, OutputFormat as SchemaFormat, OutputMode, Part,
@@ -109,10 +110,68 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     }
 
     let opened = session::open(global, &args.session, schema).await?;
-    let handle = &opened.handle;
+    let outcome = match &opened.owned {
+        // Viewing only: the latest result as it stands, nothing driven.
+        None if parts.is_empty() && !commands => drive::DriveOutcome {
+            ran: true,
+            ..drive::DriveOutcome::default()
+        },
+        None => {
+            opened.shutdown().await?;
+            return Err(CliError::run(
+                "the session is driven by another process; give it input there, \
+                 or fork it with --fork-session",
+            ));
+        }
+        Some(handle) => drive_owned(&opened, handle, parts, commands, &args).await?,
+    };
+    let ran = outcome.ran;
+
+    let entries = scan(opened.asterpath.store(), opened.handle.id())
+        .await
+        .map_err(CliError::run)?;
+    let delivered = ran.then(|| output_result(&entries)).flatten();
+    let undelivered = ran && delivered.is_none() && mode == OutputMode::Tool;
+    let text = delivered.or_else(|| ran.then(|| final_assistant_text(&entries)).flatten());
+    match args.output_format {
+        OutputFormat::Text if !ran => println!("idle"),
+        OutputFormat::Text => {
+            if let Some(text) = &text {
+                println!("{text}");
+            }
+        }
+        OutputFormat::Json | OutputFormat::StreamJson => println!(
+            "{}",
+            serde_json::json!({
+                "session": opened.handle.id().to_hex(),
+                "result": text,
+                "reason": outcome.reason,
+                "usage": outcome.usage,
+            })
+        ),
+    }
+    opened.shutdown().await?;
+    if let Some(error) = outcome.error {
+        return Err(error);
+    }
+    turn_result(outcome.reason.as_ref(), &entries)?;
+    if undelivered {
+        return Err(CliError::run("the model did not call the output tool"));
+    }
+    Ok(())
+}
+
+/// Recover what the continued session left open, then run `parts`.
+async fn drive_owned(
+    opened: &session::Opened,
+    handle: &OwnedSession,
+    parts: Vec<Part>,
+    commands: bool,
+    args: &ExecArgs,
+) -> CliResult<drive::DriveOutcome> {
     // A continued session first finishes what it had open (crash recovery).
     let recover = opened.continued && handle.facts().await.map_err(aster_error)?.is_wakeable();
-    let outcome = if let OutputFormat::StreamJson = args.output_format {
+    Ok(if let OutputFormat::StreamJson = args.output_format {
         let start = recover || !parts.is_empty();
         if !parts.is_empty() {
             submit(handle, parts).await?;
@@ -132,41 +191,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
             outcome = drive::drive(handle, &mut drive::Headless).await?;
         }
         outcome
-    };
-    let ran = outcome.ran;
-
-    let entries = scan(opened.asterpath.store(), handle.id())
-        .await
-        .map_err(CliError::run)?;
-    let delivered = ran.then(|| output_result(&entries)).flatten();
-    let undelivered = ran && delivered.is_none() && mode == OutputMode::Tool;
-    let text = delivered.or_else(|| ran.then(|| final_assistant_text(&entries)).flatten());
-    match args.output_format {
-        OutputFormat::Text if !ran => println!("idle"),
-        OutputFormat::Text => {
-            if let Some(text) = &text {
-                println!("{text}");
-            }
-        }
-        OutputFormat::Json | OutputFormat::StreamJson => println!(
-            "{}",
-            serde_json::json!({
-                "session": handle.id().to_hex(),
-                "result": text,
-                "reason": outcome.reason,
-                "usage": outcome.usage,
-            })
-        ),
-    }
-    opened.shutdown().await?;
-    if let Some(error) = outcome.error {
-        return Err(error);
-    }
-    turn_result(outcome.reason.as_ref(), &entries)?;
-    if undelivered {
-        return Err(CliError::run("the model did not call the output tool"));
-    }
-    Ok(())
+    })
 }
 
 pub async fn submit(handle: &asterpath::SessionHandle, parts: Vec<Part>) -> CliResult<()> {

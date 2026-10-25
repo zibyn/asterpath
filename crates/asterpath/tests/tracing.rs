@@ -92,7 +92,13 @@ async fn trace_folds_the_session_without_touching_the_log() {
         .await
         .expect("facade builds");
 
-    let handle = framework.create_session(spec()).await.expect("session");
+    let handle = framework
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     handle
         .submit_input(UserInput {
@@ -148,7 +154,13 @@ async fn retired_sessions_disappear_from_the_trace() {
         .await
         .expect("facade builds");
 
-    let handle = framework.create_session(spec()).await.expect("session");
+    let handle = framework
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     handle
         .submit_input(UserInput {

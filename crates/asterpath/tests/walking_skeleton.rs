@@ -18,7 +18,7 @@ use asterpath::protocol::{
 use asterpath::protocol::{
     Clock, InputId, LogEntry, LogQuery, ParentFilter, SessionId, SessionQuery, SessionStore,
 };
-use asterpath::{AsterError, Asterpath, SessionHandle};
+use asterpath::{AsterError, Asterpath, OwnedSession};
 use asterpath_testing::{ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
@@ -132,7 +132,7 @@ fn decoded(entries: &[LogEntry]) -> Vec<SessionEvent> {
         .collect()
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -157,7 +157,13 @@ async fn one_turn_without_tools_commits_the_expected_sequence() {
         usage(7, 3),
     ));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle
         .submit_input(input(1, "hi"))
         .await
@@ -257,7 +263,13 @@ async fn reopening_the_same_database_finds_an_idle_session() {
         usage(1, 1),
     ));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     let session = handle.id();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
@@ -266,7 +278,13 @@ async fn reopening_the_same_database_finds_an_idle_session() {
 
     let idle_provider = Arc::new(ScriptedProvider::new("p"));
     let reopened = open(&db, vec![idle_provider.clone()]).await;
-    let handle = reopened.open_session(session).await.unwrap();
+    let handle = reopened
+        .open_session(session)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     assert!(matches!(handle.state().await.unwrap(), SessionState::Idle));
     let events = drive_all(&handle).await;
     assert_eq!(events, vec![AgentEvent::Idle { session }]);
@@ -284,7 +302,13 @@ async fn drive_is_single_flight_across_handles() {
         usage(1, 1),
     ));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
 
     let mut first = handle.drive();
@@ -322,7 +346,13 @@ async fn dropping_the_stream_does_not_cancel_or_close_the_session() {
         usage(1, 1),
     ));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
 
     let mut stream = handle.drive();
@@ -387,7 +417,13 @@ async fn retryable_failures_retry_the_same_step_with_partial_usage_kept_diagnost
             ),
     );
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
@@ -467,7 +503,13 @@ async fn non_retryable_rejection_ends_the_turn_failed() {
         "bad request",
     )));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
@@ -519,7 +561,13 @@ async fn refusal_empty_and_max_tokens_end_with_stop_reason_preserved() {
         let provider =
             Arc::new(ScriptedProvider::new("p").respond(items, stop_reason.clone(), usage(1, 1)));
         let asterpath = open(&db, vec![provider.clone()]).await;
-        let handle = asterpath.create_session(spec("p")).await.unwrap();
+        let handle = asterpath
+            .create_session(spec("p"))
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
         handle.submit_input(input(1, "hi")).await.unwrap();
         drive_all(&handle).await;
 
@@ -567,7 +615,13 @@ async fn a_refused_step_is_logged_but_not_projected_or_executed() {
             .respond(assistant_items("ok"), StopReason::EndTurn, usage(1, 1)),
     );
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "first")).await.unwrap();
     let first = drive_all(&handle).await;
     assert!(matches!(
@@ -625,7 +679,13 @@ async fn pause_turn_continues_the_turn_and_other_stop_reasons_complete() {
             .respond(assistant_items("second"), StopReason::EndTurn, usage(1, 1)),
     );
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
@@ -664,7 +724,13 @@ async fn pause_turn_continues_the_turn_and_other_stop_reasons_complete() {
         usage(1, 1),
     ));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
     let entries = scan(asterpath.store(), handle.id()).await;
@@ -703,7 +769,13 @@ async fn pause_turn_continuation_keeps_the_declared_server_tools() {
         .request
         .server_tools
         .insert(ProviderId::new("p"), declared.clone());
-    let handle = asterpath.create_session(session_spec).await.unwrap();
+    let handle = asterpath
+        .create_session(session_spec)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
@@ -851,7 +923,13 @@ async fn capability_mismatch_is_rejected_before_the_response_is_used() {
     let mut sampling = SamplingParams::default();
     sampling.temperature = Some(0.4);
     session_spec.request.sampling = Some(sampling);
-    let handle = asterpath.create_session(session_spec).await.unwrap();
+    let handle = asterpath
+        .create_session(session_spec)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "hi")).await.unwrap();
     drive_all(&handle).await;
 
@@ -896,7 +974,13 @@ async fn submit_input_records_but_never_starts_a_turn() {
     let db = temp_db("submit");
     let provider = Arc::new(ScriptedProvider::new("p"));
     let asterpath = open(&db, vec![provider.clone()]).await;
-    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    let handle = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
 
     let first = handle.submit_input(input(7, "hi")).await.unwrap();
     let duplicate = handle.submit_input(input(7, "hi")).await.unwrap();
@@ -926,8 +1010,20 @@ async fn manual_clock_ids_are_deterministic_and_unique() {
         .build()
         .await
         .expect("facade builds");
-    let first = asterpath.create_session(spec("p")).await.unwrap();
-    let second = asterpath.create_session(spec("p")).await.unwrap();
+    let first = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
+    let second = asterpath
+        .create_session(spec("p"))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
     first
         .submit_input(input(1, "hi"))
         .await

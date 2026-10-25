@@ -34,8 +34,8 @@ use asterpath_protocol::{
     decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
-    ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
-    TurnId, unique_bytes,
+    ApprovalGate, Clock, DedupKey, LogEntry, LogId, OwnerToken, SessionId, SessionStore, StepId,
+    Timestamp, TurnId, unique_bytes,
 };
 use futures_core::Stream;
 
@@ -1165,6 +1165,17 @@ impl Agent {
 
 impl Agent {
     pub(crate) fn run(&self, req: RunRequest) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
+        self.run_as(req, None)
+    }
+
+    /// Drive under `owner`, a held claim of the session's tree; every append
+    /// the drive makes carries it (ADR-0036). `None` keeps the claim of the
+    /// drive this one is polled in: a child drive inside its parent's.
+    pub(crate) fn run_as(
+        &self,
+        req: RunRequest,
+        owner: Option<OwnerToken>,
+    ) -> BoxStream<'_, Result<AgentEvent, AgentError>> {
         let session = req.session;
         if !self.acquire(session) {
             return stream::once(async move { Err(AgentError::Busy { session }) }).boxed();
@@ -1186,6 +1197,7 @@ impl Agent {
             sink,
             // Dropping the stream releases single-flight; it does not cancel.
             _guard: guard,
+            owner,
             done: false,
         })
     }
@@ -1512,6 +1524,7 @@ struct DriveStream<'a> {
     future: BoxFuture<'a, ()>,
     sink: Arc<EventSink>,
     _guard: BusyGuard,
+    owner: Option<OwnerToken>,
     done: bool,
 }
 
@@ -1527,7 +1540,7 @@ impl Stream for DriveStream<'_> {
             if this.done {
                 return Poll::Ready(None);
             }
-            match this.future.as_mut().poll(cx) {
+            match crate::owner::within(this.owner, || this.future.as_mut().poll(cx)) {
                 Poll::Ready(()) => this.done = true,
                 // The loop already ran and queued events before parking; they
                 // must be yielded now, not on some later wake.

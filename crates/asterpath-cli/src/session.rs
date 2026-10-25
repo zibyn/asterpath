@@ -6,11 +6,14 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor, SessionHandle};
+use asterpath::{
+    AsterError, Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor, OwnedSession,
+    SessionHandle,
+};
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
     CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, Part, ProviderCatalog,
-    SandboxPolicy, SandboxProvider, SessionId, SessionQuery, Tool, decode_entry,
+    SandboxPolicy, SandboxProvider, SessionId, SessionQuery, StorageError, Tool, decode_entry,
 };
 use asterpath_skills::{
     DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillDiagnosticKind, SkillRoot,
@@ -84,6 +87,9 @@ pub struct Opened {
     pub asterpath: Asterpath,
     pub mcp: McpServers,
     pub handle: SessionHandle,
+    /// The claim of the session's tree; `None` when another process drives
+    /// the continued session, which is then only viewed (ADR-0036).
+    pub owned: Option<OwnedSession>,
     /// Whether the session existed before (continued, not created or forked):
     /// only then can it have work to recover.
     pub continued: bool,
@@ -92,7 +98,7 @@ pub struct Opened {
 impl Opened {
     /// Engine first, then the MCP servers its tools call (ADR-0027).
     pub async fn shutdown(self) -> CliResult<()> {
-        drop(self.handle);
+        drop((self.owned, self.handle));
         let shutdown = self.asterpath.shutdown().await;
         self.mcp.shutdown().await;
         shutdown.map_err(aster_error)
@@ -164,6 +170,14 @@ pub async fn open(
         (handle, true)
     };
     eprintln!("session: {}", handle.id().to_hex());
+    let owned = match handle.claim().await {
+        Ok(owned) => Some(owned),
+        Err(AsterError::Storage(StorageError::OwnedElsewhere { .. })) if continued => {
+            eprintln!("another process is driving this session; it is read-only here");
+            None
+        }
+        Err(error) => return Err(aster_error(error)),
+    };
 
     let mut patch = match &args.model {
         Some(model) => model_patch(&snapshot, model),
@@ -174,13 +188,15 @@ pub async fn open(
         request.output_format = Some(format);
         patch.request = Some(request);
     }
-    if patch != ConfigPatch::default() {
+    // A viewer leaves the owner's config alone.
+    if patch != ConfigPatch::default() && owned.is_some() {
         handle.update_config(patch).await.map_err(aster_error)?;
     }
     Ok(Opened {
         asterpath,
         mcp,
         handle,
+        owned,
         continued,
     })
 }
@@ -227,10 +243,12 @@ async fn create(
     let asterpath = assemble(settings, tools).await?;
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
+    let owned = Some(handle.claim().await.map_err(aster_error)?);
     Ok(Opened {
         asterpath,
         mcp,
         handle,
+        owned,
         continued: false,
     })
 }

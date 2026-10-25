@@ -16,7 +16,7 @@ use asterpath::protocol::{
     ToolOutput, ToolResultStatus, ToolResultView, ToolSelection, TurnConfig, TurnEndReason, Usage,
     UserInput,
 };
-use asterpath::{Asterpath, InputId, SessionHandle, SessionId};
+use asterpath::{Asterpath, InputId, OwnedSession, SessionId};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -145,7 +145,7 @@ fn input(message: &str) -> UserInput {
     }
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -206,7 +206,13 @@ async fn run(
         builder = builder.hooks(hook);
     }
     let asterpath = builder.build().await.expect("facade builds");
-    let handle = asterpath.create_session(spec()).await.expect("session");
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input("go")).await.expect("input");
     let events = drive_all(&handle).await;
     asterpath.shutdown().await.expect("shutdown");

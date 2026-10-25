@@ -17,7 +17,7 @@ use asterpath::protocol::{
     ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
 };
 use asterpath::protocol::{InputId, LogEntry, LogQuery, SessionId, SessionStore};
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_testing::ScriptedProvider;
 use asterpath_testing::{TestTool, ToolCalls};
 use futures_core::future::BoxFuture;
@@ -262,7 +262,7 @@ fn abort_kinds(entries: &[LogEntry]) -> Vec<(u32, AbortKind)> {
         .collect()
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -296,6 +296,9 @@ async fn cancel_during_model_stream_aborts_without_retry_and_allows_a_new_turn()
     let asterpath = build(&db, provider.clone(), Vec::new(), None).await;
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
@@ -387,6 +390,9 @@ async fn cancel_with_zero_grace_interrupts_a_blocked_tool() {
             config
         }))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
 
@@ -449,6 +455,9 @@ async fn cancel_with_grace_keeps_a_tool_result_that_returns_in_time() {
             config
         }))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
 
@@ -490,6 +499,9 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
     let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
@@ -546,6 +558,9 @@ async fn idempotent_cancel_during_a_tool_and_idle_cancel_is_a_no_op() {
             config.cancel_grace = Duration::ZERO;
             config
         }))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
 
@@ -608,6 +623,9 @@ async fn steering_enters_the_next_step_projection_in_seq_order() {
     let asterpath = build(&db, provider.clone(), vec![tool], None).await;
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
@@ -697,6 +715,9 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
 
@@ -764,6 +785,9 @@ async fn max_steps_per_turn_ends_with_max_steps_exceeded() {
             config
         }))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
     drive_all(&handle).await;
@@ -798,6 +822,9 @@ async fn context_window_stop_reason_and_provider_error_map_to_context_exhausted(
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
         .await
+        .unwrap()
+        .claim()
+        .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
     drive_all(&handle).await;
@@ -822,6 +849,9 @@ async fn context_window_stop_reason_and_provider_error_map_to_context_exhausted(
     let asterpath = build(&db, provider.clone(), Vec::new(), None).await;
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();
@@ -855,6 +885,9 @@ async fn cancel_interrupts_the_retry_backoff_sleep() {
             config.max_backoff = Duration::from_secs(30);
             config
         }))
+        .await
+        .unwrap()
+        .claim()
         .await
         .unwrap();
     handle.submit_input(input(1, "go")).await.unwrap();

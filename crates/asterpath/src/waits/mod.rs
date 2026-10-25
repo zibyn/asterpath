@@ -18,6 +18,9 @@ use futures_core::future::BoxFuture;
 use crate::scan::{backend, scan_decoded};
 use tokio::sync::Notify;
 
+/// Longest a wait goes without re-reading the log.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Process-local wait identities. Not persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WaitKey {
@@ -111,8 +114,10 @@ impl Waits {
         Ok(completed.then_some(()))
     }
 
-    /// Re-check `ready` on every wake of `key`. The notifier is armed before
-    /// each check, so a wake between check and wait is not lost.
+    /// Re-check `ready` on every wake of `key`, and at least every
+    /// `POLL_INTERVAL`: another process may write the record, and its wake
+    /// never reaches this one (ADR-0036). The notifier is armed before each
+    /// check, so a wake between check and wait is not lost.
     async fn wait_until<T, F>(
         &self,
         key: WaitKey,
@@ -129,7 +134,7 @@ impl Waits {
             if let Some(value) = ready().await? {
                 return Ok(value);
             }
-            notified.await;
+            let _ = tokio::time::timeout(POLL_INTERVAL, notified).await;
         }
     }
 }

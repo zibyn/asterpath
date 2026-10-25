@@ -11,7 +11,7 @@ use asterpath::protocol::{
     ToolOutput, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
     encode_entry, scan_all,
 };
-use asterpath::{Asterpath, DefaultCompactor, SessionHandle};
+use asterpath::{Asterpath, DefaultCompactor, OwnedSession};
 use asterpath::{StepId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider, TestTool, ToolCalls};
 use futures_util::StreamExt;
@@ -97,7 +97,7 @@ async fn build_with(provider: &Arc<ScriptedProvider>, tool: Arc<TestTool>) -> As
         .expect("build")
 }
 
-async fn turn(handle: &SessionHandle, id: u8, value: &str) {
+async fn turn(handle: &OwnedSession, id: u8, value: &str) {
     handle.submit_input(input(id, value)).await.expect("input");
     let mut stream = handle.drive();
     while let Some(event) = stream.next().await {
@@ -105,7 +105,7 @@ async fn turn(handle: &SessionHandle, id: u8, value: &str) {
     }
 }
 
-async fn history(handle: &SessionHandle) -> Vec<Item> {
+async fn history(handle: &OwnedSession) -> Vec<Item> {
     handle
         .projection()
         .await
@@ -115,7 +115,7 @@ async fn history(handle: &SessionHandle) -> Vec<Item> {
         .collect()
 }
 
-async fn events(asterpath: &Asterpath, handle: &SessionHandle) -> Vec<SessionEvent> {
+async fn events(asterpath: &Asterpath, handle: &OwnedSession) -> Vec<SessionEvent> {
     scan_all(&*asterpath.store(), handle.id())
         .await
         .expect("scan")
@@ -133,13 +133,22 @@ async fn forked_sessions_continue_independently() {
             .respond(vec![assistant("c")], StopReason::EndTurn, Usage::default()),
     );
     let asterpath = build(&provider).await;
-    let source = asterpath.create_session(spec()).await.expect("create");
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     turn(&source, 1, "one").await;
 
     let fork = asterpath
         .fork_session(source.id(), metadata("copy"))
         .await
-        .expect("fork");
+        .expect("fork")
+        .claim()
+        .await
+        .unwrap();
     assert_ne!(fork.id(), source.id());
     turn(&source, 2, "two").await;
     turn(&fork, 3, "three").await;
@@ -194,13 +203,22 @@ async fn compacting_the_source_after_a_fork_leaves_the_fork_unchanged() {
             ),
     );
     let asterpath = build(&provider).await;
-    let source = asterpath.create_session(spec()).await.expect("create");
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     turn(&source, 1, "one").await;
     turn(&source, 2, "two").await;
     let fork = asterpath
         .fork_session(source.id(), BTreeMap::new())
         .await
-        .expect("fork");
+        .expect("fork")
+        .claim()
+        .await
+        .unwrap();
     let before = history(&fork).await;
     assert_eq!(
         before,
@@ -246,7 +264,13 @@ async fn a_turn_in_progress_is_not_copied() {
         }
     });
     let asterpath = build_with(&provider, tool).await;
-    let source = asterpath.create_session(spec()).await.expect("create");
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     turn(&source, 1, "one").await;
 
     let driven = source.clone();
@@ -255,7 +279,10 @@ async fn a_turn_in_progress_is_not_copied() {
     let fork = asterpath
         .fork_session(source.id(), BTreeMap::new())
         .await
-        .expect("fork while driven");
+        .expect("fork while driven")
+        .claim()
+        .await
+        .unwrap();
     release.notify_one();
     driver.await.expect("source turn");
 
@@ -267,7 +294,13 @@ async fn a_turn_in_progress_is_not_copied() {
 async fn an_input_waiting_for_the_next_turn_is_not_copied() {
     let provider = Arc::new(ScriptedProvider::new("p"));
     let asterpath = build(&provider).await;
-    let source = asterpath.create_session(spec()).await.expect("create");
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     let turn_id = TurnId::from_bytes([1; 16]);
     source.submit_input(input(1, "one")).await.expect("input");
     for event in [
@@ -292,7 +325,10 @@ async fn an_input_waiting_for_the_next_turn_is_not_copied() {
     let fork = asterpath
         .fork_session(source.id(), BTreeMap::new())
         .await
-        .expect("fork");
+        .expect("fork")
+        .claim()
+        .await
+        .unwrap();
 
     assert_eq!(history(&fork).await, [user("one")]);
 }
@@ -305,7 +341,13 @@ async fn a_compaction_inside_the_turn_in_progress_is_not_copied() {
         Usage::default(),
     ));
     let asterpath = build(&provider).await;
-    let source = asterpath.create_session(spec()).await.expect("create");
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
     turn(&source, 1, "one").await;
 
     // A second turn starts and compacts everything so far, then is still
@@ -342,7 +384,10 @@ async fn a_compaction_inside_the_turn_in_progress_is_not_copied() {
     let fork = asterpath
         .fork_session(source.id(), BTreeMap::new())
         .await
-        .expect("fork");
+        .expect("fork")
+        .claim()
+        .await
+        .unwrap();
 
     assert_eq!(history(&fork).await, [user("one"), assistant("a")]);
 }

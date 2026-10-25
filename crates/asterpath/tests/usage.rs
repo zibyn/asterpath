@@ -11,7 +11,7 @@ use asterpath::protocol::{
     RequestConfig, SessionSpec, StopReason, SubagentConfig, ToolSelection, TurnConfig, Usage,
     UsageError, UsageScope, UserInput,
 };
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_testing::ScriptedProvider;
 use futures_util::StreamExt;
 
@@ -79,7 +79,7 @@ fn spec() -> SessionSpec {
     }
 }
 
-async fn drive(session: &SessionHandle) {
+async fn drive(session: &OwnedSession) {
     let mut stream = session.drive();
     while let Some(event) = stream.next().await {
         let event = event.expect("drive");
@@ -109,7 +109,10 @@ async fn facade_usage_query_folds_live_turns() {
     let session = asterpath
         .create_session(spec())
         .await
-        .expect("create session");
+        .expect("create session")
+        .claim()
+        .await
+        .unwrap();
 
     session
         .submit_input(UserInput {

@@ -17,7 +17,7 @@ use asterpath::protocol::{
     TurnEndReason, Usage, UserInput, decode_entry, dedup, encode_entry,
 };
 use asterpath::protocol::{InputId, LogEntry, LogId, LogQuery, SessionId, SessionStore};
-use asterpath::{Asterpath, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_testing::ScriptedProvider;
 use futures_core::future::BoxFuture;
 use futures_util::StreamExt;
@@ -198,7 +198,7 @@ fn count(entries: &[LogEntry], kind: &str) -> usize {
         .count()
 }
 
-async fn drive_all(handle: &SessionHandle) -> Vec<AgentEvent> {
+async fn drive_all(handle: &OwnedSession) -> Vec<AgentEvent> {
     let mut stream = handle.drive();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
@@ -297,7 +297,10 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(1)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -372,7 +375,10 @@ async fn c2_forced_compaction_with_one_complete_step_has_nothing_to_do() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -418,7 +424,10 @@ async fn c5_forced_compaction_retries_the_same_step_once() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -499,7 +508,10 @@ async fn c5_second_context_exhaustion_ends_the_turn() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -528,7 +540,10 @@ async fn c6_stop_reason_exhaustion_does_not_compress() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(1)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -558,7 +573,10 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     let before = scan(asterpath.store(), handle.id()).await;
@@ -630,7 +648,10 @@ async fn c9_at_most_one_automatic_compaction_per_turn() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(1)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     let entries = scan(asterpath.store(), handle.id()).await;
@@ -663,7 +684,10 @@ async fn c13_missing_window_disables_every_path() {
     let handle = asterpath
         .create_session(spec(None, compaction_config(1)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -710,7 +734,10 @@ async fn c15_forced_summary_failure_maps_to_compaction_failed() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -762,7 +789,10 @@ async fn c15_forced_insufficient_maps_to_context_exhausted() {
     let handle = asterpath
         .create_session(spec(Some(90), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -804,7 +834,10 @@ async fn c16_without_a_compactor_nothing_is_written() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(1)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let events = drive_all(&handle).await;
     assert!(events.iter().any(|event| matches!(
@@ -858,7 +891,10 @@ async fn c3_open_compaction_is_redone_on_recovery() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     seed_open_compaction(&asterpath, handle.id(), CompactionTrigger::Manual).await;
@@ -892,7 +928,10 @@ async fn c3_failed_redo_closes_with_an_abort() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     seed_open_compaction(&asterpath, handle.id(), CompactionTrigger::Manual).await;
@@ -920,7 +959,10 @@ async fn c3_without_a_compactor_the_intent_stays_open_and_idle() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     seed_open_compaction(&asterpath, handle.id(), CompactionTrigger::Manual).await;
@@ -954,7 +996,10 @@ async fn c4_committed_compaction_is_not_repeated() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     handle.compact_now().await.expect("manual compaction");
@@ -983,7 +1028,10 @@ async fn c10_same_frontier_append_is_idempotent() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     let entries = scan(asterpath.store(), handle.id()).await;
     let frontier = entries.last().expect("frontier").log_id;
@@ -1024,7 +1072,10 @@ async fn c11_summary_usage_is_recorded_on_the_applied_event_only() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "go")).await.expect("input");
     drive_all(&handle).await;
     handle.compact_now().await.expect("manual");
@@ -1055,7 +1106,10 @@ async fn manual_states_are_results_not_errors() {
     let handle = asterpath
         .create_session(spec(Some(1000), compaction_config(0)))
         .await
-        .expect("session");
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     assert_eq!(
         handle.compact_now().await.expect("nothing to do"),
         asterpath::protocol::CompactResult::NotConfigured
@@ -1135,7 +1189,13 @@ async fn anthropic_thinking_never_reaches_the_summary_request() {
     spec.model.provider = ProviderId::new("anthropic");
     spec.model.model = ModelId::new("claude-test");
     spec.tools = ToolSelection::Names(Vec::new());
-    let handle = asterpath.create_session(spec).await.expect("session");
+    let handle = asterpath
+        .create_session(spec)
+        .await
+        .expect("session")
+        .claim()
+        .await
+        .unwrap();
     handle.submit_input(input(1, "first")).await.expect("input");
     drive_all(&handle).await;
     handle
