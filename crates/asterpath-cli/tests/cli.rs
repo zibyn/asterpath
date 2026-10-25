@@ -1110,6 +1110,13 @@ fn config_flag_beats_the_environment_which_beats_the_default_path() {
         .args(["--config", valid.to_str().unwrap()])
         .assert()
         .success();
+    // A named file must exist; only the default path may be missing.
+    let missing = dir.path.join("missing.toml");
+    doctor()
+        .args(["--config", missing.to_str().unwrap()])
+        .assert()
+        .code(2);
+    doctor().env("ASTERPATH_CONFIG", &missing).assert().code(2);
 }
 
 #[test]

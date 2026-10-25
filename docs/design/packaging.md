@@ -373,7 +373,7 @@ pub enum AsterError {
 
 ### 4.7 配置
 
-默认读 `$XDG_CONFIG_HOME/asterpath/config.toml`（`--config` 或 `ASTERPATH_CONFIG` 可换文件）；不存在时使用默认值。只有用户级一层，没有项目级配置。优先级：专用 flag > `-c key=value` > 文件。
+默认读 `$XDG_CONFIG_HOME/asterpath/config.toml`（`--config` 或 `ASTERPATH_CONFIG` 可换文件）；默认路径不存在时使用默认值，`--config` 或 `ASTERPATH_CONFIG` 指定的文件不存在是配置错误（退出 2）。只有用户级一层，没有项目级配置。优先级：专用 flag > `-c key=value` > 文件。
 
 ```toml
 [model]

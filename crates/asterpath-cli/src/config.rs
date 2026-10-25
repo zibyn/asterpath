@@ -51,14 +51,15 @@ pub struct Settings {
 }
 
 /// Load the configuration file (`--config`, else `ASTERPATH_CONFIG`, else
-/// `$XDG_CONFIG_HOME/asterpath/config.toml`; missing means defaults) and merge
+/// `$XDG_CONFIG_HOME/asterpath/config.toml`; only that default may be missing) and merge
 /// each `-c key=value` over it.
 pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, String> {
-    let path = config
-        .or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from))
-        .or_else(|| config_home().map(|home| home.join("asterpath/config.toml")));
+    let explicit = config.or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from));
+    // Only the default file may be missing; a named one that is not there is a typo.
+    let named = explicit.is_some();
+    let path = explicit.or_else(|| config_home().map(|home| home.join("asterpath/config.toml")));
     let mut table = match path {
-        Some(path) if path.exists() => {
+        Some(path) if named || path.exists() => {
             let contents = std::fs::read_to_string(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
             toml::from_str(&contents).map_err(|error| format!("invalid config: {error}"))?
