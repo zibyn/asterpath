@@ -1,6 +1,6 @@
 # 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-25)
 **调研**: [design-audit-2026-10-25.md](../research/design-audit-2026-10-25.md)、[opencode.md](../research/opencode.md)、[pi-and-pi-durable.md](../research/pi-and-pi-durable.md)
 
 ## Context
