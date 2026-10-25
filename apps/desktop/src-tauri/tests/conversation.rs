@@ -42,7 +42,7 @@ async fn engine(db: &Path, provider: Arc<dyn Provider>) -> Asterpath {
         .providers(vec![provider])
         .environment(Arc::new(WorkRoot {
             workspace: workspace(),
-            new: false,
+            new_session: false,
             pinned: None,
         }))
         .build()
@@ -482,7 +482,7 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
         .approval(Arc::new(AlwaysAsk))
         .environment(Arc::new(WorkRoot {
             workspace: workspace(),
-            new: false,
+            new_session: false,
             pinned: None,
         }))
         .build()
@@ -666,7 +666,7 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
         .providers(vec![provider.clone() as Arc<dyn Provider>])
         .environment(Arc::new(WorkRoot {
             workspace: workspace(),
-            new: false,
+            new_session: false,
             pinned: None,
         }))
         .build()

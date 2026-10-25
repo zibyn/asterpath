@@ -239,7 +239,7 @@ pub struct Desktop {
 
 impl Desktop {
     /// `asterpath`'s environment adapter treats every session as continued
-    /// (`WorkRoot { new: false }`); a new session gets `workspace`'s
+    /// (`WorkRoot { new_session: false }`); a new session gets `workspace`'s
     /// new-session tools as its explicit selection instead. `asterpath`'s
     /// approval policy must be `modes`.
     pub fn new(
@@ -269,7 +269,7 @@ impl Desktop {
         let template = config::session_spec(&settings).map_err(text)?;
         let environment = WorkRoot {
             workspace: workspace.clone(),
-            new: false,
+            new_session: false,
             pinned: None,
         };
         // shortcut: no MCP servers yet; they are loaded per work root, which a multi-project process does not have
@@ -340,7 +340,7 @@ impl Desktop {
         new_session_spec(&self.workspace, &root, name, &mut spec).map_err(text)?;
         let fresh = WorkRoot {
             workspace: self.workspace.clone(),
-            new: true,
+            new_session: true,
             pinned: None,
         };
         let environment = fresh.resolve(&spec.metadata).await.map_err(text)?;

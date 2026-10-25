@@ -97,7 +97,7 @@ async fn a_new_session_reads_files_of_its_work_root_through_the_facade() {
         .provider(Arc::new(provider) as Arc<dyn Provider>)
         .environment(Arc::new(WorkRoot {
             workspace: workspace(),
-            new: true,
+            new_session: true,
             pinned: None,
         }))
         .build()
@@ -149,7 +149,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
 
     let new = WorkRoot {
         workspace: selected.clone(),
-        new: true,
+        new_session: true,
         pinned: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&new, &metadata)
@@ -159,7 +159,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
 
     let continued = WorkRoot {
         workspace: selected,
-        new: false,
+        new_session: false,
         pinned: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&continued, &metadata)
@@ -175,7 +175,7 @@ async fn a_session_without_cwd_resolves_only_when_pinned() {
     let dir = tempfile::tempdir().unwrap();
     let unpinned = WorkRoot {
         workspace: workspace(),
-        new: false,
+        new_session: false,
         pinned: None,
     };
     assert!(

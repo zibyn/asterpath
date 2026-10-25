@@ -45,7 +45,7 @@ async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
         .providers(vec![provider.clone() as Arc<dyn Provider>])
         .environment(Arc::new(WorkRoot {
             workspace: workspace.clone(),
-            new: false,
+            new_session: false,
             pinned: None,
         }))
         .approval(modes.clone())

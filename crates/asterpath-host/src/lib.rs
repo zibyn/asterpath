@@ -277,20 +277,20 @@ pub struct WorkRoot {
     /// New sessions get the tool selection and the skill switch; continued
     /// ones every workspace tool and the skill loader, so whatever their
     /// effective config names still resolves.
-    pub new: bool,
+    pub new_session: bool,
     /// Overrides the `cwd` metadata.
     pub pinned: Option<PathBuf>,
 }
 
 impl WorkRoot {
     fn tools(&self, root: &Path) -> Result<Vec<Arc<dyn Tool>>, HostError> {
-        let selection = if self.new {
+        let selection = if self.new_session {
             self.workspace.tools.as_deref()
         } else {
             None
         };
         let mut tools = workspace_tools(&self.workspace, root, selection)?;
-        if !self.new || self.workspace.skills_enabled {
+        if !self.new_session || self.workspace.skills_enabled {
             tools.push(Arc::new(LoadSkillTool::new(skill_roots(
                 &self.workspace,
                 root,

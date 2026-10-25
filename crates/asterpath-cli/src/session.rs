@@ -180,7 +180,7 @@ pub async fn open(
     report_mcp_failures(&workspace, &mcp);
     let environment = WorkRoot {
         workspace,
-        new: false,
+        new_session: false,
         pinned,
     };
     let asterpath = config::assemble(
@@ -270,7 +270,7 @@ async fn create(
     spec.request.output_format = output_format;
     let environment = WorkRoot {
         workspace,
-        new: true,
+        new_session: true,
         pinned: None,
     };
     let asterpath = config::assemble(
