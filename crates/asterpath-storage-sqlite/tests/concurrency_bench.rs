@@ -12,6 +12,12 @@
 //! on the same runtime sleeps 1ms and records how late it wakes (worker stall
 //! proxy). Repeated for `Synchronous::Full` and `Synchronous::Normal` to split
 //! fsync cost from lock contention.
+//!
+//! `multi_process_bench` (same command) spreads the sessions over P
+//! processes sharing the file (ADR-0036): each claims its own trees and
+//! appends as their owner, so writers contend for the WAL lock across
+//! processes without a shared group commit. It prints throughput and the
+//! append latency tail.
 
 mod common;
 
@@ -146,4 +152,144 @@ fn percentile(samples: &mut [Duration], p: f64) -> Duration {
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+// --- several processes on one file (ADR-0036) --------------------------------
+
+const PROCESS_COUNTS: [usize; 3] = [1, 2, 4];
+const SESSIONS_PER_PROCESS: usize = 8;
+const CHILD_DB: &str = "ASTERPATH_BENCH_DB";
+const CHILD_INDEX: &str = "ASTERPATH_BENCH_PROCESS";
+const CHILD_SYNC: &str = "ASTERPATH_BENCH_SYNC";
+
+#[test]
+#[ignore = "benchmark; run explicitly in release mode (see file header)"]
+fn multi_process_bench() {
+    println!(
+        "sessions/process={SESSIONS_PER_PROCESS} appends/session={APPENDS_PER_SESSION}, owner writes"
+    );
+    println!(
+        "| synchronous | processes | appends | appends/s | append p50 (ms) | append p99 (ms) | append max (ms) | wall (s) |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for synchronous in [Synchronous::Full, Synchronous::Normal] {
+        for processes in PROCESS_COUNTS {
+            run_processes(synchronous, processes);
+        }
+    }
+}
+
+fn run_processes(synchronous: Synchronous, processes: usize) {
+    let dir = TempDir::new("bench-processes");
+    // Create the schema once, outside the timed part.
+    drop(open_with(dir.db(), OpenOptions { synchronous }).expect("open store"));
+    let started = Instant::now();
+    let children: Vec<_> = (0..processes)
+        .map(|index| {
+            std::process::Command::new(std::env::current_exe().expect("bench binary"))
+                .args(["--exact", "bench_child", "--nocapture", "--ignored"])
+                .env(CHILD_DB, dir.db())
+                .env(CHILD_INDEX, index.to_string())
+                .env(CHILD_SYNC, format!("{synchronous:?}"))
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn bench process")
+        })
+        .collect();
+    let mut appends: Vec<Duration> = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().expect("bench process");
+        assert!(output.status.success(), "bench process failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("latencies_us:"))
+            .expect("latency line");
+        appends.extend(
+            line.split_whitespace()
+                .map(|us| Duration::from_micros(us.parse().expect("micros"))),
+        );
+    }
+    let wall = started.elapsed();
+    println!(
+        "| {synchronous:?} | {processes} | {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} |",
+        appends.len(),
+        appends.len() as f64 / wall.as_secs_f64(),
+        ms(percentile(&mut appends, 0.50)),
+        ms(percentile(&mut appends, 0.99)),
+        ms(percentile(&mut appends, 1.0)),
+        wall.as_secs_f64(),
+    );
+}
+
+/// One bench process: claims its sessions and appends as their owner.
+#[test]
+#[ignore = "re-entered by multi_process_bench"]
+fn bench_child() {
+    let Ok(db) = std::env::var(CHILD_DB) else {
+        return;
+    };
+    let index: usize = std::env::var(CHILD_INDEX)
+        .expect("process index")
+        .parse()
+        .expect("index");
+    let synchronous = match std::env::var(CHILD_SYNC).as_deref() {
+        Ok("Normal") => Synchronous::Normal,
+        _ => Synchronous::Full,
+    };
+    let store: Arc<dyn SessionStore> =
+        open_with(db, OpenOptions { synchronous }).expect("open store");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let latencies = runtime.block_on(async {
+        let sessions: Vec<_> = (0..SESSIONS_PER_PROCESS)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let session = session(index * SESSIONS_PER_PROCESS + i);
+                    let claim = store.claim(session).await.expect("claim");
+                    owner_appends(&*store, session, claim.token()).await
+                })
+            })
+            .collect();
+        let mut latencies = Vec::new();
+        for handle in sessions {
+            latencies.extend(handle.await.expect("session task"));
+        }
+        latencies
+    });
+    let micros: Vec<String> = latencies
+        .iter()
+        .map(|latency| latency.as_micros().to_string())
+        .collect();
+    println!("latencies_us:{}", micros.join(" "));
+}
+
+async fn owner_appends(
+    store: &dyn SessionStore,
+    session: SessionId,
+    owner: asterpath_protocol::OwnerToken,
+) -> Vec<Duration> {
+    let payload = serde_json::to_value(SessionEvent::InputRecorded { input: vec![] })
+        .expect("serialize event");
+    let mut latencies = Vec::with_capacity(APPENDS_PER_SESSION);
+    for _ in 0..APPENDS_PER_SESSION {
+        let start = Instant::now();
+        store
+            .append(NewEntry {
+                session,
+                schema_version: LOG_SCHEMA_VERSION,
+                dedup_key: None,
+                owner: Some(owner),
+                payload: payload.clone(),
+            })
+            .await
+            .expect("append");
+        latencies.push(start.elapsed());
+        tokio::task::yield_now().await;
+    }
+    latencies
 }
