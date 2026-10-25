@@ -48,7 +48,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0035](0035-desktop-reference-host.md) | 桌面参考宿主一个进程托管所有项目，与 CLI 共用配置与数据库 |
 | [0036](0036-per-session-tree-ownership.md) | 写者独占缩小到会话树：显式认领、进程租约与属主纪元，多进程共用存储（proposed） |
 | [0037](0037-session-environment.md) | 会话环境由宿主适配器按会话解析，子进程默认不继承进程环境 |
-| [0038](0038-watch-separates-observing-from-driving.md) | 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出（proposed） |
+| [0038](0038-watch-separates-observing-from-driving.md) | 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出 |
 | [0039](0039-multi-user-embedding-mechanisms.md) | 多用户内嵌：用户是宿主元数据，内核只补按会话的机制 |
 | [0040](0040-host-kit-shared-by-reference-hosts.md) | 宿主共用层：组装约定从 CLI 下沉为 `asterpath-host` |
 | [0041](0041-wake-discovery-caches-folds.md) | 唤醒发现以唤醒缓存保存折叠结果，判定仍只来自折叠（proposed） |
