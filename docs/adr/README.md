@@ -54,5 +54,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0041](0041-wake-discovery-caches-folds.md) | 唤醒发现以唤醒缓存保存折叠结果，判定仍只来自折叠（proposed） |
 | [0042](0042-approval-asks-are-logged.md) | 询问落日志，待审批从日志折叠；宿主可声明持久审批端点（proposed） |
 | [0043](0043-change-notification-is-a-framework-hint.md) | 变更通知是框架提供的提示：每进程一个轮询器，宿主可接入变更总线（proposed） |
+| [0044](0044-host-metadata-is-patchable.md) | 宿主元数据可按键修改：外部写入的 patch，目录行同事务合并（proposed） |
+| [0045](0045-fork-at-any-committed-turn.md) | 会话分叉可指定任一已提交回合为水位（proposed） |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩。
