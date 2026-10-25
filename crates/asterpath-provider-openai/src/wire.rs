@@ -494,23 +494,23 @@ impl Normalizer {
                 })
             }
             "reasoning" => {
-                let texts = |parts: Option<Vec<&RawValue>>| {
+                let texts = |parts: Option<Vec<&RawValue>>, kind: &str| {
                     let mut texts = Vec::new();
                     for content in parts.unwrap_or_default() {
                         let part: WirePart<'_> =
                             serde_json::from_str(content.get()).map_err(|error| {
                                 protocol(format!("invalid reasoning part: {error}"))
                             })?;
-                        if let Some(text) = part.text {
+                        if let Some(text) = part.text.filter(|_| part.kind == kind) {
                             texts.push(Part::Text { text });
                         }
                     }
                     Ok::<_, ProviderError>(texts)
                 };
                 let summary = match self.reasoning_source.get(&index) {
-                    Some(ReasoningSource::Text) => texts(item.content)?,
-                    _ => match texts(item.summary)? {
-                        summary if summary.is_empty() => texts(item.content)?,
+                    Some(ReasoningSource::Text) => texts(item.content, "reasoning_text")?,
+                    _ => match texts(item.summary, "summary_text")? {
+                        summary if summary.is_empty() => texts(item.content, "reasoning_text")?,
                         summary => summary,
                     },
                 };

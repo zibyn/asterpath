@@ -997,7 +997,11 @@ async fn the_first_reasoning_delta_kind_locks_each_item_independently() {
 
 #[tokio::test]
 async fn reasoning_without_deltas_prefers_summary_then_falls_back_to_content() {
-    let content_only = reasoning_wire_item("rs_a", &[], &["from content"]);
+    let mut content_only = reasoning_wire_item("rs_a", &[], &["from content"]);
+    content_only["content"]
+        .as_array_mut()
+        .expect("content")
+        .push(json!({"type": "other_text", "text": "not reasoning"}));
     let both = reasoning_wire_item("rs_b", &["from summary"], &["from content"]);
     let neither = reasoning_wire_item("rs_c", &[], &[]);
     let server = MockServer::start(vec![MockResponse::sse(sse(&[
