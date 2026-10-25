@@ -614,19 +614,22 @@ async fn drive(drivers: Drivers, errors: Errors, gate: Arc<ApprovalGate>, owned:
     let _endpoint = gate.register(owned.owner().root);
     loop {
         let mut stream = owned.drive();
+        let mut failed = false;
         while let Some(event) = stream.next().await {
             if let Err(error) = event {
                 lock(&errors).insert(session, error.to_string());
-                lock(&drivers).remove(&session);
-                return;
+                failed = true;
+                break;
             }
         }
         drop(stream);
-        let pending = owned
-            .facts()
-            .await
-            .is_ok_and(|facts| facts.has_pending_input());
-        if pending {
+        // After an error only new input retries; old pending input would fail again.
+        if !failed
+            && owned
+                .facts()
+                .await
+                .is_ok_and(|facts| facts.has_pending_input())
+        {
             continue;
         }
         let mut drivers = lock(&drivers);

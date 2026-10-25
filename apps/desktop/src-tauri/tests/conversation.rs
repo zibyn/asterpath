@@ -4,6 +4,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use asterpath::Asterpath;
@@ -15,8 +16,13 @@ use asterpath_protocol::{
     ProviderCapabilities, ProviderError, ProviderId, Role, SessionEvent, SessionId, StepId,
     StopReason, StreamEvent, ToolName, TurnEndReason, TurnId, Usage, UserInput,
 };
-use asterpath_testing::ScriptedProvider;
+use asterpath_protocol::{
+    CatalogEntry, Claim, LogEntry, LogQuery, NewEntry, OwnerToken, RetirementError, SessionQuery,
+    SessionStore, StorageError,
+};
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use common::template;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::Semaphore;
@@ -569,4 +575,103 @@ async fn a_drive_error_reaches_the_status_bar() {
     .expect("the error is kept");
     assert!(error.contains('q'), "{error}");
     assert_eq!(desktop.access(id).await.unwrap(), Access::Free);
+}
+
+/// A store whose next append fails once `fail_next` is set.
+struct Flaky {
+    inner: Arc<dyn SessionStore>,
+    fail_next: AtomicBool,
+}
+
+impl SessionStore for Flaky {
+    fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>> {
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            return Box::pin(async { Err(StorageError::Backend("disk full".to_owned())) });
+        }
+        self.inner.append(entry)
+    }
+    fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {
+        self.inner.scan(query)
+    }
+    fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>> {
+        self.inner.frontier(session)
+    }
+    fn sessions(
+        &self,
+        query: SessionQuery,
+    ) -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>> {
+        self.inner.sessions(query)
+    }
+    fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        self.inner.parent(session)
+    }
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
+        self.inner.claim(root)
+    }
+    fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
+        self.inner.owner(root)
+    }
+    fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
+        self.inner.renew()
+    }
+    fn retire(
+        &self,
+        session: SessionId,
+        expected_frontier: LogId,
+    ) -> BoxFuture<'_, Result<(), RetirementError>> {
+        self.inner.retire(session, expected_frontier)
+    }
+}
+
+#[tokio::test]
+async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
+    let fixture = fixture();
+    let (provider, permits) = gated(
+        ScriptedProvider::new("p")
+            .respond(reply("lost"), StopReason::EndTurn, Usage::default())
+            .respond(reply("recovered"), StopReason::EndTurn, Usage::default())
+            .respond(reply("more done"), StopReason::EndTurn, Usage::default()),
+    );
+    let store = Arc::new(Flaky {
+        inner: Arc::new(InMemoryEventLog::new()),
+        fail_next: AtomicBool::new(false),
+    });
+    let asterpath = Asterpath::builder()
+        .store(store.clone())
+        .providers(vec![provider.clone() as Arc<dyn Provider>])
+        .environment(Arc::new(WorkRoot {
+            workspace: workspace(),
+            new: false,
+            pinned: None,
+        }))
+        .build()
+        .await
+        .expect("build");
+    let desktop = Desktop::new(
+        asterpath,
+        Arc::new(ApprovalModes::new(ApprovalMode::default())),
+        workspace(),
+        template(),
+        fixture.root.join("projects.json"),
+    );
+    let id = desktop
+        .create_session(&fixture.root, None)
+        .await
+        .unwrap()
+        .id;
+    let mut view = desktop.watch(id, None).await.unwrap();
+
+    desktop.send(id, "go".to_owned()).await.unwrap();
+    until(&mut view, turn_started).await;
+    desktop.send(id, "more".to_owned()).await.unwrap();
+    // The step's answer cannot be logged: the drive fails with "more" waiting.
+    store.fail_next.store(true, Ordering::SeqCst);
+    permits.add_permits(3);
+
+    until(&mut view, |event| {
+        turn_committed(event) == Some(&TurnEndReason::Completed)
+    })
+    .await;
+    let last = provider.inner.requests().pop().unwrap();
+    assert_eq!(user_texts(&last), ["go", "more"]);
 }
