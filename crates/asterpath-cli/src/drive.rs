@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use asterpath::SessionHandle;
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, Provenance,
-    ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason, Usage,
-    decode_entry, history, scan_all,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin,
+    Provenance, ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason,
+    Usage, decode_entry, project, scan_all,
 };
 use futures_util::StreamExt;
 
@@ -164,10 +164,22 @@ pub async fn scan(
         .map_err(|error| error.to_string())
 }
 
-/// The last assistant message in the model-visible projection.
+/// The latest turn's last assistant message in the model-visible projection;
+/// `None` when that turn wrote no text.
 pub fn final_assistant_text(entries: &[LogEntry]) -> Option<String> {
-    let items = history(entries).ok()?;
-    for item in items.iter().rev() {
+    let turn_start = entries
+        .iter()
+        .rev()
+        .find(|entry| matches!(decode_entry(entry), Ok(SessionEvent::TurnStarted { .. })))?
+        .log_id;
+    // shortcut: text compacted away within the same turn reads as `None`; read
+    // the raw step events if hosts need it.
+    let items = project(entries)
+        .ok()?
+        .into_iter()
+        .filter(|projected| matches!(projected.origin, ProjectedOrigin::Log(id) if id > turn_start))
+        .flat_map(|projected| projected.items);
+    for item in items.rev() {
         if let Item::Message {
             role: Role::Assistant,
             parts,
@@ -435,6 +447,43 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(String::from_utf8(io.writer).unwrap().contains("tool: echo"));
         assert_eq!(signal_count(&asterpath, handle.id()).await, 1);
+
+        asterpath.shutdown().await.unwrap();
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn final_text_is_none_when_the_latest_turn_wrote_no_text() {
+        let db = temp_db("final-text");
+        let provider = Arc::new(
+            ScriptedProvider::new("p")
+                .respond(vec![final_message()], StopReason::EndTurn, Usage::default())
+                .respond(vec![tool_call()], StopReason::ToolUse, Usage::default()),
+        );
+        let asterpath = build(&db, provider, echo_tool(Arc::new(AtomicUsize::new(0)))).await;
+        let mut spec = spec();
+        spec.turn.max_steps_per_turn = Some(1);
+        let handle = asterpath.create_session(spec).await.unwrap();
+        for (byte, text) in [(1, "first"), (2, "second")] {
+            handle
+                .submit_input(UserInput {
+                    id: InputId::from_bytes([byte; 16]),
+                    parts: vec![Part::Text { text: text.into() }],
+                })
+                .await
+                .unwrap();
+            let outcome = drive(&handle, &mut Headless).await.expect("drive");
+            let entries = scan(asterpath.store(), handle.id()).await.unwrap();
+            if byte == 1 {
+                assert_eq!(final_assistant_text(&entries).as_deref(), Some("done"));
+            } else {
+                assert!(matches!(
+                    outcome.reason,
+                    Some(TurnEndReason::MaxStepsExceeded)
+                ));
+                assert_eq!(final_assistant_text(&entries), None);
+            }
+        }
 
         asterpath.shutdown().await.unwrap();
         cleanup(&db);
