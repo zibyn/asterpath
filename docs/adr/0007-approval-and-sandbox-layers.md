@@ -1,6 +1,6 @@
 # 审批是框架管线，隔离与内容安全是扩展责任
 
-**Status**: accepted (2026-10-22)；2026-10-24 整理：并入 ADR-0028 的待审批决定
+**Status**: accepted (2026-10-22)；2026-10-24 整理：并入 ADR-0028 的待审批决定；「询问不是持久事实」「没有审批端就 fail closed」部分取代 by [ADR-0042](0042-approval-asks-are-logged.md)（proposed）
 **来源**: [#7](https://github.com/zibyn/asterpath/issues/7)、[#26](https://github.com/zibyn/asterpath/issues/26)、[#28](https://github.com/zibyn/asterpath/issues/28)、[#84](https://github.com/zibyn/asterpath/issues/84)
 **规范**: [tools.md](../design/tools.md)
 

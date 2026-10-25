@@ -1,6 +1,6 @@
 # 会话携带不透明的宿主元数据
 
-**Status**: accepted (2026-10-24)
+**Status**: accepted (2026-10-24)；「之后不可变」部分取代 by [ADR-0044](0044-host-metadata-is-patchable.md)（proposed）
 **来源**: CLI 重设计（[packaging.md](../design/packaging.md) §4，[对比研究](../research/cli-codex-vs-claude-code.md)）
 
 ## Context
