@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
-use asterpath_desktop::{Access, Desktop, Project, SessionSummary, ViewEvent};
+use asterpath_desktop::{Access, Desktop, Project, SessionInfo, SessionSummary, ViewEvent};
 use futures_util::StreamExt;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
@@ -113,6 +114,28 @@ async fn cancel(backend: State<'_, Backend>, session: SessionId) -> Result<(), S
     backend.get()?.cancel(session).await
 }
 
+#[tauri::command]
+fn models(backend: State<'_, Backend>) -> Result<Vec<ModelSpec>, String> {
+    Ok(backend.get()?.models())
+}
+
+#[tauri::command]
+async fn session_info(
+    backend: State<'_, Backend>,
+    session: SessionId,
+) -> Result<SessionInfo, String> {
+    backend.get()?.session_info(session).await
+}
+
+#[tauri::command]
+async fn set_model(
+    backend: State<'_, Backend>,
+    session: SessionId,
+    model: ModelSpec,
+) -> Result<(), String> {
+    backend.get()?.set_model(session, model).await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -132,7 +155,10 @@ fn main() {
             watch,
             unwatch,
             send,
-            cancel
+            cancel,
+            models,
+            session_info,
+            set_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop app");
