@@ -72,8 +72,9 @@ pub trait SessionStore: Send + Sync {
     fn frontier(&self, session: SessionId)
         -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 
-    /// 有 `SessionCreated` 且未退役的会话的目录项，按父会话过滤，
-    /// 按 `(created_at, session)` 降序，游标分页（ADR-0023）。
+    /// 有 `SessionCreated` 且未退役的会话的目录项，按父会话与元数据
+    /// 键值等值过滤（ADR-0039），按 `(created_at, session)` 降序，
+    /// 游标分页（ADR-0023）；分页只数匹配的项。
     fn sessions(&self, query: SessionQuery)
         -> BoxFuture<'_, Result<Vec<CatalogEntry>, StorageError>>;
     /// `SessionCreated` 记录的父会话；根或未知会话为 `None`。
@@ -190,6 +191,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0002 的硬错误一致）。
 - 唯一的派生动作：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`，`metadata` 取 `SessionCreated.metadata`）。其余事件只写日志。
 - **宿主元数据上限**（ADR-0032）：至多 64 个键；键至多 128 字节，值至多 4096 字节（UTF-8）。超限由 `create_session` 报 `AsterError::Config`，不落日志；存储适配器原样保存，不再校验。子会话的元数据为空。
+- **元数据过滤**（ADR-0039）：`SessionQuery.metadata` 的每个键值都要与目录项相等（AND，等值，区分大小写，不做前缀或范围）。SQLite 用 `json_each` 在查询里比对，没有索引，按目录大小线性扫描；需要时再按常用键加表达式索引。
 - 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。`ApprovalDecided` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。
 - **`idle` = 没有非 compaction 的未闭合意图。** compaction 意图只供恢复重做（#24/#27），不影响退役与唤醒发现。
 
@@ -231,7 +233,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G2 幂等**：`(session, event_kind, dedup_key)` 只有一条记录；重复 append 返回原 `LogId`，不写目录行；同 key 不同事件类型互不抑制。
 - **G3 全序**：`seq` 在 session 内严格单调、无洞，只由存储分配。
 - **G4 游标扫描**：`scan(after)` 只返回 `log_id > after` 的已提交记录，按 `seq` 升序，`limit` 有界。扫描结果在读取期间构成稳定前缀：append 只会分配更大的 `log_id`，不会改变已返回的条目。
-- **G5 会话目录完备**：`sessions(query)` 列出每个有 `SessionCreated` 且未退役的会话（含子会话）一次，按 `(created_at, session)` 降序；父会话过滤、`parent` 与 `SessionCreated.parent` 一致；游标翻页不重不漏；`last_activity` 是最后一条日志的 `recorded_at`（ADR-0023）；`metadata` 与 `SessionCreated.metadata` 一致（ADR-0032）。唤醒发现建立在它之上（§7），不是后端契约。
+- **G5 会话目录完备**：`sessions(query)` 列出每个有 `SessionCreated` 且未退役的会话（含子会话）一次，按 `(created_at, session)` 降序；父会话过滤、元数据等值过滤（与父会话过滤、分页组合）、`parent` 与 `SessionCreated.parent` 一致；游标翻页不重不漏；`last_activity` 是最后一条日志的 `recorded_at`（ADR-0023）；`metadata` 与 `SessionCreated.metadata` 一致（ADR-0032）。唤醒发现建立在它之上（§7），不是后端契约。
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
 - **G7 索引可重建**：`sessions` 可完全由日志重建，不是真相源。
 - **G8 退役原子性（可选能力）**：`SessionStore::retire` 在同一事务里折叠会话事实判定空闲、写墓碑、删日志与 `sessions` 行；要么全部生效，要么全部不生效；退役后的会话对 `SessionStore` 的全部读取不可见。契约见 [retention.md](retention.md)。

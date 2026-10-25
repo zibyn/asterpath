@@ -154,7 +154,7 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 ```
 
 - 策略在 `ToolCallRequested` 之后、执行之前运行；输入是 effective args 与来源/副作用声明。
-- `Ask` 时先查 `ApprovalGate::is_open()`（是否注册了审批端点）；关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后经引擎持久等待该调用的 `ApprovalDecided`。
+- `Ask` 时先沿父会话找到调用所在会话树的根，查 `ApprovalGate::is_open(root)`（是否有端点在照看这棵树，ADR-0039）；同进程里其他会话树的端点不算数。关闭则直接写 `ToolResult{Failed, Denied}`（固定 reason），**不**发 `ApprovalRequested`、不挂起。门打开时管线发一条 `ApprovalRequested` typed event（观察者可见，**不落日志**），然后经引擎持久等待该调用的 `ApprovalDecided`。
 - 决定由 host 的审批端经 `SessionHandle::approve(tool_call_id, decision)` 写为 `ApprovalDecided { tool_call_id, decision: ApprovalDecision }`，dedup key 为 `tool_call_id`。
 - `ApprovalVerdict` 是策略的输出，`ApprovalDecision` 是宿主的回答；两者不合并，`Ask` 只在策略侧存在。
 - 已记录的 Allow 让调用继续执行；Deny 写 `ToolResult{Failed, Denied}`。两者都不重新提示。
@@ -162,19 +162,21 @@ pub struct ApprovalRequest {        // #[non_exhaustive]
 - **恢复**：open `ToolCallRequested` + 无 `ApprovalDecided` + 策略为 `Ask` → 先查审批门；门打开则重新挂起并重新发 `ApprovalRequested`，门关闭则按 Deny 收尾。有 `ApprovalDecided` 则按记录执行，**不再看当前策略**。
 - 策略必须对同一 `ApprovalRequest` + session config 稳定；恢复用同一策略重跑，结果必须与崩溃前一致。host 不得在调用 open 期间热换策略（v1 无热替换，#2）。
 - 审批粒度是单次调用；session 级「本次全部允许」是 host 的缓存策略，不落日志、不改变已记录的决定。
-- 不引入独立的 `Approver` trait：host 在能够应答时用 `Asterpath::approval_gate().register()` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并调用 `approve` 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
+- 不引入独立的 `Approver` trait：host 在能够应答某会话树时用 `Asterpath::approval_gate().register(root)` 注册审批端点（RAII，drop 注销），通过订阅 `ApprovalRequested` 并调用 `approve` 来回答；等待由引擎的持久等待（`Waits`）承担（#17）。门只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
 - 一个调用最多一条 `ApprovalDecided`：重复回答被 dedup 吸收，先写入者生效。等待按 session 作用域。
 - 等待不写意图记录：open 的 `ToolCallRequested` 已承担意图。
-- 未注册审批端点时，`Ask` 按 `Deny` 处理（fail closed），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
-- **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序），宿主按 `ApprovalRequest::session` 过滤，供新连上的客户端找回待审批项。等待因任何原因结束（决定、取消、宿主丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
+- 会话树没有注册审批端点时，`Ask` 按 `Deny` 处理（fail closed，reason 为 `NO_APPROVAL_ENDPOINT`），且不产生等待；与“已注册但尚未回答”不同，后者持久挂起、可跨崩溃。
+- **待审批列表只在进程内**：`ApprovalGate::pending()` 返回全部会话中仍在等待决定的 `ApprovalRequest`（按请求顺序）；`pending_in(root)` 只返回一棵会话树的（含子会话），供新连上的客户端找回待审批项。子会话的请求不进父会话的 drive 流，宿主轮询 `pending_in(root)` 发现它们，按 `ApprovalRequest::session` 打开该会话再 `approve`。等待因任何原因结束（决定、取消、宿主丢弃 drive 流）即移除。不持久化：进程重启后由恢复重新发出 `ApprovalRequested`（[#84](https://github.com/zibyn/asterpath/issues/84)，参考 Codex app-server 的 resume 重发与 opencode 的进程内列表）。
 
 默认策略（未安装自定义 `ApprovalPolicy` 时）：
 
-| provenance | 审批端点 | 默认 |
+| provenance | 会话树的审批端点 | 默认 |
 | --- | --- | --- |
 | `InProcess` | 任意 | `Allow` |
 | `External` | 打开 | `Ask` |
 | `External` | 关闭 | `Deny` |
+
+- `DefaultApprovalPolicy` 本身对 `External` 一律给 `Ask`，「关闭则 `Deny`」由管线按会话树执行，所以策略不持有审批门。
 
 - `side_effect` 只作为自定义策略的输入；默认策略不看它。
 - `Provenance::Unknown` 不进入审批：工具不存在，管线直接写 `NotFound`，不会发 `ApprovalRequested`。

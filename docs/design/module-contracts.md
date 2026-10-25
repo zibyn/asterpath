@@ -111,19 +111,22 @@ pub trait Clock: Send + Sync {
 
 pub struct SystemClock;
 
-// 审批端点的存活声明：机制，不是决策者（#26）。
+// 审批端点的存活声明，按会话树（根会话 id）登记：机制，不是决策者（#26、ADR-0039）。
 pub struct ApprovalGate;
 impl ApprovalGate {
-    pub fn register(&self) -> ApprovalEndpoint;   // RAII；drop 注销
-    pub fn is_open(&self) -> bool;
-    pub fn pending(&self) -> Vec<ApprovalRequest>; // 进程内待审批列表（tools.md §4）
+    pub fn register(&self, root: SessionId) -> ApprovalEndpoint; // RAII；drop 注销
+    pub fn is_open(&self, root: SessionId) -> bool;
+    pub fn pending(&self) -> Vec<ApprovalRequest>;                 // 进程内全部待审批（tools.md §4）
+    pub fn pending_in(&self, root: SessionId) -> Vec<ApprovalRequest>; // 某会话树的待审批，含子会话
 }
 pub struct ApprovalEndpoint;
+
+pub async fn root_of(log: &dyn SessionStore, session: SessionId) -> Result<SessionId, StorageError>;
 ```
 
-- `ApprovalGate` 由宿主经 facade 的 `Asterpath::approval_gate()` 取得；宿主在能够应答审批时 `register()`，句柄 drop 即失效。
-- agent 管线在 `Ask` 前查 `is_open()`；关闭时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4）。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
-- 门是进程级的，因此子会话的审批请求同样受它保护；按会话路由到具体 UI 是宿主的事。
+- `ApprovalGate` 由宿主经 facade 的 `Asterpath::approval_gate()` 取得；宿主在能够应答某会话树的审批时 `register(root)`，句柄 drop 即失效。根 id 可由 `OwnedSession::owner().root` 或 `root_of` 得到。
+- agent 管线在 `Ask` 前按调用所在会话找到根，查 `is_open(root)`；该树没有端点时直接 `Deny`，不发 `ApprovalRequested`、不挂起（[tools.md](tools.md) §4），其他会话树的端点不算数。它只声明“有人在听”，不参与 `Allow | Ask | Deny` 的判定。
+- 子会话的请求登记在根会话的树下；`pending_in(root)` 列出整棵树的待审批项，按会话路由到具体 UI 是宿主的事。
 - `Clock` 是时间来源接缝：引擎（agent / scheduler）注入 `Arc<dyn Clock>` 取 `now`；存储不读时间（`recorded_at` 只供诊断）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - 唤醒发现不在存储：facade 的 `Asterpath::wakeable()` 对 `sessions()` 逐个折叠会话事实（[storage.md](storage.md) §7）。
 - 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），宿主经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。

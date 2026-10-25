@@ -150,7 +150,7 @@ impl Asterpath {
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 无主会话的唤醒发现（storage.md §7）
     pub async fn owner(&self, session: SessionId)
         -> Result<Option<OwnerToken>, AsterError>;      // 会话树当前的认领（ADR-0036）
-    pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
+    pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主按会话树注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
     pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError>;
 }
@@ -174,7 +174,8 @@ impl Asterpath {
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、宿主元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
 - `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由宿主重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
-- `sessions(query)` 是存储目录查询的原样转发：按父会话过滤，按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序或过滤由宿主在结果上完成（ADR-0032）。
+- `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带宿主元数据。按元数据排序、前缀或范围匹配由宿主在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
+- 多用户内嵌（ADR-0039）：用户是宿主写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, metadata }>`，`metadata` 是根会话的元数据，宿主包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
 ### 3.3 Session 驱动
 
@@ -368,7 +369,7 @@ pub enum AsterError {
 ### 4.4 审批
 
 - `-a untrusted`（默认）：进程内只读工具放行；`SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）与外部工具（MCP，`<id>__<tool>`）执行前问人。`-a never`：从不问人，靠沙箱兜底。优先级 `-a` > `[approval] default` > `untrusted`。
-- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`；`exec` 只有 `--input-format stream-json` 时经流交给宿主。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
+- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给宿主。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
 - "由策略决定"：问不问人由宿主 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 

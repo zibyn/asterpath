@@ -1,6 +1,6 @@
 # 多用户内嵌：用户是宿主元数据，内核只补按会话的机制
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-25)
 **调研**: [design-audit-2026-10-25.md](../research/design-audit-2026-10-25.md)、[kernel-host-boundary-audit.md](../research/kernel-host-boundary-audit.md)
 
 ## Context

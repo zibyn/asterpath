@@ -97,7 +97,7 @@ pub enum CompactResult {
   - 摘要请求不挂工具，不启用 reasoning / thinking。
 - 摘要模型：默认 = 当前会话的 provider + 模型；可配 `compaction.summary_model` 单独指定；**不做跨 provider 自动回退**。
 - 摘要调用的 attempt / 退避 / `request_timeout` 取 `CompactionInput.turn`（`TurnConfig`），与模型调用一致。
-- 调用由 compactor 独立构造请求，**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）；输出达到上限按截断文本接受，不重试。
+- 调用由 compactor 独立构造请求，**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（宿主包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
 - 提示词是 compactor 内的固定模板，v1 不开放给宿主；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
 - 产出是单条 `Item::Compaction { parts: Vec<Part> }`（类型归 #11）；v1 两边都渲染为文本——Anthropic 为用户文本块，OpenAI 为普通 input 文本消息；原生 compaction item 出界。
 

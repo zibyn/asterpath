@@ -247,6 +247,13 @@ pub struct ModelRequest {
     pub provider_options: BTreeMap<ProviderId, JsonString>,
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
     pub output_format: Option<OutputFormat>,
+    pub session: Option<SessionContext>, // 请求为谁而发（ADR-0039）；会话外构造为 None，适配器不读
+}
+
+pub struct SessionContext {
+    pub session: SessionId,
+    pub root: SessionId,                    // 会话树的根；根会话即自身
+    pub metadata: BTreeMap<String, String>, // 根会话的宿主元数据：子会话不继承，租户键在根上
 }
 
 pub enum ToolChoice {
@@ -501,6 +508,7 @@ pub struct CompactionJob {
     pub max_summary_tokens: u32,
     pub usable_window: u32,               // 由会话模型算出，不是摘要模型
     pub retained_tokens: u64,             // first_kept 之后的估算
+    pub session: Option<SessionContext>,  // plan 填 None，agent 在 compact 前填入；摘要请求原样带上（ADR-0039）
 }
 
 #[non_exhaustive]
