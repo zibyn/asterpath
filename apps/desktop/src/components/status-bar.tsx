@@ -14,11 +14,6 @@ export function StatusBar({ session }: { session: string }) {
     queryFn: () => commands.sessionInfo(session),
     refetchInterval: 1000,
   });
-  const access = useQuery({
-    queryKey: ["access", session],
-    queryFn: () => commands.access(session),
-    refetchInterval: 1000,
-  });
   const setModel = useMutation({
     mutationFn: (model: commands.ModelSpec) => commands.setModel(session, model),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["session-info", session] }),
@@ -36,7 +31,7 @@ export function StatusBar({ session }: { session: string }) {
         aria-label="Model"
         className="rounded border bg-background px-1 py-0.5"
         value={current ? key(current) : ""}
-        disabled={!current || access.data === "elsewhere" || setModel.isPending}
+        disabled={!current || setModel.isPending}
         onChange={(event) => {
           const model = options.find((option) => key(option) === event.target.value);
           if (model) setModel.mutate(model);

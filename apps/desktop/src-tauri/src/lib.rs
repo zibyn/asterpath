@@ -430,12 +430,13 @@ impl Desktop {
         })
     }
 
-    /// Use `model` from the session's next step on (ADR-0030).
+    /// Use `model` from the session's next step on (ADR-0030). An external
+    /// write: no claim, so it also works while another process drives.
     pub async fn set_model(&self, session: SessionId, model: ModelSpec) -> Result<(), String> {
-        let owned = self.claim(session).await?;
+        let handle = self.asterpath.open_session(session).await.map_err(text)?;
         let mut patch = ConfigPatch::default();
         patch.model = Some(model);
-        owned.update_config(patch).await.map_err(text)
+        handle.update_config(patch).await.map_err(text)
     }
 
     /// The session's records after `after`, then everything new. Never

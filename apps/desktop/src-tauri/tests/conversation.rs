@@ -551,6 +551,31 @@ async fn the_status_bar_shows_the_model_and_tokens_and_switches_the_model() {
     assert_eq!(desktop.session_info(id).await.unwrap().tokens, 34);
 }
 
+/// A model switch is an external write (ADR-0030): it needs no claim, so it
+/// works while another process drives the session.
+#[tokio::test]
+async fn the_model_switches_while_another_process_drives() {
+    let fixture = fixture();
+    let cli = engine(&fixture.db, Arc::new(ScriptedProvider::new("p"))).await;
+    let mut spec = template();
+    spec.metadata = asterpath_host::metadata(&fixture.root, None);
+    let owned = cli
+        .create_session(spec)
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
+    let id = owned.id();
+
+    let desktop = desktop(&fixture, Arc::new(ScriptedProvider::new("p"))).await;
+    let mut other = template().model;
+    other.model = ModelId::new("model-2");
+    desktop.set_model(id, other.clone()).await.unwrap();
+    assert_eq!(desktop.session_info(id).await.unwrap().model, other);
+    assert_eq!(desktop.access(id).await.unwrap(), Access::Elsewhere);
+}
+
 #[tokio::test]
 async fn a_drive_error_reaches_the_status_bar() {
     let fixture = fixture();
