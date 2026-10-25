@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
 use asterpath_desktop::{
-    Access, Answer, Desktop, PermissionMode, Project, SessionSummary, ViewEvent,
+    Access, Answer, Desktop, PermissionMode, Project, SessionInfo, SessionSummary, ViewEvent,
 };
 use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
@@ -152,6 +153,28 @@ fn set_permission_mode(
     Ok(())
 }
 
+#[tauri::command]
+fn models(backend: State<'_, Backend>) -> Result<Vec<ModelSpec>, String> {
+    Ok(backend.get()?.models())
+}
+
+#[tauri::command]
+async fn session_info(
+    backend: State<'_, Backend>,
+    session: SessionId,
+) -> Result<SessionInfo, String> {
+    backend.get()?.session_info(session).await
+}
+
+#[tauri::command]
+async fn set_model(
+    backend: State<'_, Backend>,
+    session: SessionId,
+    model: ModelSpec,
+) -> Result<(), String> {
+    backend.get()?.set_model(session, model).await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -175,7 +198,10 @@ fn main() {
             approvals,
             approve,
             permission_mode,
-            set_permission_mode
+            set_permission_mode,
+            models,
+            session_info,
+            set_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop app");

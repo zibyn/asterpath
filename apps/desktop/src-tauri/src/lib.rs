@@ -12,13 +12,38 @@ use asterpath_host::config::{self, ApprovalMode, Settings};
 use asterpath_host::{CWD, NAME, WorkRoot, Workspace, new_session_spec, work_root};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
-    CatalogEntry, Clock, EnvironmentAdapter, InputId, ParentFilter, Part, SessionEvent,
-    SessionQuery, SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId, ToolName,
-    ToolSelection, UserInput, unique_bytes,
+    CatalogEntry, Clock, ConfigPatch, EnvironmentAdapter, InputId, ModelSpec, ParentFilter, Part,
+    SessionEvent, SessionQuery, SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId,
+    ToolName, ToolSelection, UsageScope, UserInput, decode_entry, effective_config, scan_all,
+    unique_bytes,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+
+/// A session's badge in the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// This process drives it.
+    Running,
+    /// A tool call in its tree waits for a decision here (ADR-0039).
+    AwaitingApproval,
+    Idle,
+    /// Another process drives it; read-only here.
+    Elsewhere,
+}
+
+/// The status bar of a session.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionInfo {
+    /// The model its next step uses.
+    pub model: ModelSpec,
+    /// Committed tokens of the session and its subagents.
+    pub tokens: u64,
+    /// Why this process last stopped driving it, until the next send.
+    pub error: Option<String>,
+}
 
 /// A work root in the sidebar.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -44,15 +69,17 @@ pub struct SessionSummary {
     pub name: Option<String>,
     pub created_at: i64,
     pub last_activity: i64,
+    pub status: Status,
 }
 
-impl From<CatalogEntry> for SessionSummary {
-    fn from(entry: CatalogEntry) -> Self {
+impl SessionSummary {
+    fn new(entry: CatalogEntry, status: Status) -> Self {
         Self {
             id: entry.session,
             name: entry.metadata.get(NAME).cloned(),
             created_at: entry.created_at,
             last_activity: entry.last_activity,
+            status,
         }
     }
 }
@@ -183,6 +210,8 @@ struct Driver {
 }
 
 type Drivers = Arc<Mutex<HashMap<SessionId, Driver>>>;
+/// The last drive error per session.
+type Errors = Arc<Mutex<HashMap<SessionId, String>>>;
 
 pub struct Desktop {
     asterpath: Asterpath,
@@ -193,7 +222,10 @@ pub struct Desktop {
     template: SessionSpec,
     /// The roots added with the folder picker, a JSON array of paths.
     projects_file: PathBuf,
+    /// The model picker: the configured model, then the aliases' models.
+    models: Vec<ModelSpec>,
     drivers: Drivers,
+    errors: Errors,
 }
 
 impl Desktop {
@@ -212,9 +244,11 @@ impl Desktop {
             asterpath,
             permissions,
             workspace,
+            models: vec![template.model.clone()],
             template,
             projects_file,
             drivers: Drivers::default(),
+            errors: Errors::default(),
         }
     }
 
@@ -234,13 +268,13 @@ impl Desktop {
         let asterpath = config::assemble(&settings, Vec::new(), environment, permissions.clone())
             .await
             .map_err(text)?;
-        Ok(Self::new(
-            asterpath,
-            permissions,
-            workspace,
-            template,
-            projects_file,
-        ))
+        let mut desktop = Self::new(asterpath, permissions, workspace, template, projects_file);
+        for model in config::model_aliases(&settings).into_values() {
+            if !desktop.models.contains(&model) {
+                desktop.models.push(model);
+            }
+        }
+        Ok(desktop)
     }
 
     /// Added roots and every root a session was created in, by path.
@@ -275,9 +309,14 @@ impl Desktop {
     /// The root sessions created in `root`, last active first.
     pub async fn sessions(&self, root: &Path) -> Result<Vec<SessionSummary>, String> {
         let query = BTreeMap::from([(CWD.to_owned(), root.display().to_string())]);
-        let mut sessions = self.roots(query).await?;
-        sessions.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
-        Ok(sessions.into_iter().map(SessionSummary::from).collect())
+        let mut entries = self.roots(query).await?;
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
+        let mut sessions = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let status = self.status(entry.session).await?;
+            sessions.push(SessionSummary::new(entry, status));
+        }
+        Ok(sessions)
     }
 
     /// A session in `root` as the CLI creates one: `AGENTS.md`, the skill
@@ -317,7 +356,7 @@ impl Desktop {
         created.retain(|entry| entry.session == session);
         created
             .pop()
-            .map(SessionSummary::from)
+            .map(|entry| SessionSummary::new(entry, Status::Idle))
             .ok_or_else(|| "the new session is not in the catalog".to_owned())
     }
 
@@ -330,6 +369,63 @@ impl Desktop {
             Some(_) => Access::Elsewhere,
             None => Access::Free,
         })
+    }
+
+    /// The sidebar badge of root session `session`.
+    async fn status(&self, session: SessionId) -> Result<Status, String> {
+        if !self
+            .asterpath
+            .approval_gate()
+            .pending_in(session)
+            .is_empty()
+        {
+            return Ok(Status::AwaitingApproval);
+        }
+        Ok(match self.access(session).await? {
+            Access::Here => Status::Running,
+            Access::Free => Status::Idle,
+            Access::Elsewhere => Status::Elsewhere,
+        })
+    }
+
+    /// The models the picker offers.
+    pub fn models(&self) -> Vec<ModelSpec> {
+        self.models.clone()
+    }
+
+    pub async fn session_info(&self, session: SessionId) -> Result<SessionInfo, String> {
+        let store = self.asterpath.store();
+        let entries = scan_all(&*store, session)
+            .await
+            .map_err(|e| e.to_string())?;
+        let records = entries
+            .into_iter()
+            .map(|entry| {
+                let event = decode_entry(&entry).map_err(|e| e.to_string())?;
+                Ok((entry, event))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let model = effective_config(&records, u64::MAX)
+            .ok_or_else(|| format!("session {} does not exist", session.to_hex()))?
+            .model;
+        let usage = self
+            .asterpath
+            .usage(UsageScope::SessionSubtree(session))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(SessionInfo {
+            model,
+            tokens: usage.own.total() + usage.descendants.total(),
+            error: lock(&self.errors).get(&session).cloned(),
+        })
+    }
+
+    /// Use `model` from the session's next step on (ADR-0030).
+    pub async fn set_model(&self, session: SessionId, model: ModelSpec) -> Result<(), String> {
+        let owned = self.claim(session).await?;
+        let mut patch = ConfigPatch::default();
+        patch.model = Some(model);
+        owned.update_config(patch).await.map_err(text)
     }
 
     /// The session's records after `after`, then everything new. Never
@@ -361,13 +457,8 @@ impl Desktop {
     /// background; during a turn it steers the next step. A session another
     /// process drives is read-only: nothing is logged.
     pub async fn send(&self, session: SessionId, message: String) -> Result<(), String> {
-        let handle = self.asterpath.open_session(session).await.map_err(text)?;
-        let owned = handle.claim().await.map_err(|error| match error {
-            AsterError::Storage(StorageError::OwnedElsewhere { .. }) => {
-                "another process is driving this session".to_owned()
-            }
-            error => error.to_string(),
-        })?;
+        let owned = self.claim(session).await?;
+        lock(&self.errors).remove(&session);
         owned
             .submit_input(UserInput {
                 id: InputId::from_bytes(unique_bytes(SystemClock.now())),
@@ -388,6 +479,7 @@ impl Desktop {
             );
             tokio::spawn(drive(
                 Arc::clone(&self.drivers),
+                Arc::clone(&self.errors),
                 self.asterpath.approval_gate(),
                 owned,
             ));
@@ -452,6 +544,17 @@ impl Desktop {
         self.permissions.sessions().entry(session).or_default().mode = Some(mode);
     }
 
+    /// Writer access to `session`; refused while another process drives it.
+    async fn claim(&self, session: SessionId) -> Result<OwnedSession, String> {
+        let handle = self.asterpath.open_session(session).await.map_err(text)?;
+        handle.claim().await.map_err(|error| match error {
+            AsterError::Storage(StorageError::OwnedElsewhere { .. }) => {
+                "another process is driving this session".to_owned()
+            }
+            error => error.to_string(),
+        })
+    }
+
     fn added(&self) -> Result<Vec<String>, String> {
         match std::fs::read_to_string(&self.projects_file) {
             Ok(json) => serde_json::from_str(&json)
@@ -489,15 +592,14 @@ impl Desktop {
 /// `again` and removing the driver happen under the lock `send` takes, so
 /// input sent while the task stops always gets a drive. The tree's approval
 /// endpoint is open meanwhile; the view answers through `approve`.
-async fn drive(drivers: Drivers, gate: Arc<ApprovalGate>, owned: OwnedSession) {
+async fn drive(drivers: Drivers, errors: Errors, gate: Arc<ApprovalGate>, owned: OwnedSession) {
     let session = owned.id();
     let _endpoint = gate.register(owned.owner().root);
     loop {
         let mut stream = owned.drive();
         while let Some(event) = stream.next().await {
             if let Err(error) = event {
-                // shortcut: drive errors only reach stderr; the status bar (#153) should show them
-                eprintln!("session {}: {error}", session.to_hex());
+                lock(&errors).insert(session, error.to_string());
                 lock(&drivers).remove(&session);
                 return;
             }
@@ -521,8 +623,8 @@ async fn drive(drivers: Drivers, gate: Arc<ApprovalGate>, owned: OwnedSession) {
     }
 }
 
-fn lock(drivers: &Drivers) -> MutexGuard<'_, HashMap<SessionId, Driver>> {
-    drivers.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(map: &Mutex<T>) -> MutexGuard<'_, T> {
+    map.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn text(error: AsterError) -> String {

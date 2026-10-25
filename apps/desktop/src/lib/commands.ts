@@ -14,7 +14,11 @@ export interface SessionSummary {
   name: string | null;
   created_at: number;
   last_activity: number;
+  status: Status;
 }
+
+/** A session's sidebar badge; `elsewhere` = another process drives it. */
+export type Status = "running" | "awaiting_approval" | "idle" | "elsewhere";
 
 export const projects = () => invoke<Project[]>("projects");
 
@@ -63,6 +67,27 @@ export const permissionMode = (session: string) => invoke<PermissionMode>("permi
 
 export const setPermissionMode = (session: string, mode: PermissionMode) =>
   invoke<void>("set_permission_mode", { session, mode });
+
+export interface ModelSpec {
+  provider: string;
+  model: string;
+  context_window: number | null;
+}
+
+/** The status bar: the next step's model, committed tokens incl. subagents, the last drive error. */
+export interface SessionInfo {
+  model: ModelSpec;
+  tokens: number;
+  error: string | null;
+}
+
+/** The configured model and the model aliases' models. */
+export const models = () => invoke<ModelSpec[]>("models");
+
+export const sessionInfo = (session: string) => invoke<SessionInfo>("session_info", { session });
+
+/** Use `model` from the session's next step on. */
+export const setModel = (session: string, model: ModelSpec) => invoke<void>("set_model", { session, model });
 
 /** Replay the session's records, then follow it. Resolves to the function that stops watching. */
 export async function watch(session: string, onEvent: (event: ViewEvent) => void): Promise<() => void> {

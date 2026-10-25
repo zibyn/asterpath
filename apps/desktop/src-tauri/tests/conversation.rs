@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath::Asterpath;
-use asterpath_desktop::{Access, Desktop, PermissionMode, Permissions, ViewEvent};
+use asterpath_desktop::{Access, Desktop, PermissionMode, Permissions, Status, ViewEvent};
 use asterpath_host::{WorkRoot, Workspace};
 use asterpath_protocol::{
-    AgentEvent, InputId, Item, LogId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
-    ProviderCapabilities, ProviderError, ProviderId, Role, SessionEvent, StepId, StopReason,
-    StreamEvent, TurnEndReason, TurnId, Usage, UserInput,
+    AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, InputId, InputTokens, Item,
+    JsonString, LogId, ModelId, ModelRequest, ModelSpec, OutputTokens, Part, PartDelta, Provider,
+    ProviderCapabilities, ProviderError, ProviderId, Role, SessionEvent, SessionId, StepId,
+    StopReason, StreamEvent, ToolName, TurnEndReason, TurnId, Usage, UserInput,
 };
 use asterpath_testing::ScriptedProvider;
 use common::template;
@@ -319,6 +320,10 @@ async fn a_session_another_process_drives_is_read_only_but_watched() {
 
     let desktop = desktop(&fixture, Arc::new(ScriptedProvider::new("p"))).await;
     assert_eq!(desktop.access(id).await.unwrap(), Access::Elsewhere);
+    assert_eq!(
+        desktop.sessions(&fixture.root).await.unwrap()[0].status,
+        Status::Elsewhere
+    );
     assert!(desktop.send(id, "mine".to_owned()).await.is_err());
     let mut view = desktop.watch(id, None).await.unwrap();
     until(&mut view, |event| *event == ViewEvent::Synced).await;
@@ -402,4 +407,166 @@ fn view_events_serialize_as_the_frontend_types_them() {
             }},
         ])
     );
+}
+
+async fn wait_for_status(desktop: &Desktop, root: &Path, id: SessionId, status: Status) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sessions = desktop.sessions(root).await.unwrap();
+            if sessions.iter().any(|s| s.id == id && s.status == status) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{id:?} never became {status:?}"));
+}
+
+#[tokio::test]
+async fn sessions_run_at_once_in_the_background_and_list_their_status() {
+    let fixture = fixture();
+    let (provider, permits) = gated(
+        ScriptedProvider::new("p")
+            .respond(reply("a"), StopReason::EndTurn, Usage::default())
+            .respond(reply("b"), StopReason::EndTurn, Usage::default()),
+    );
+    let desktop = desktop(&fixture, provider).await;
+    let a = desktop.create_session(&fixture.root, None).await.unwrap();
+    assert_eq!(a.status, Status::Idle);
+    let b = desktop.create_session(&fixture.root, None).await.unwrap();
+
+    // Nobody watches either session: driving does not need a view.
+    desktop.send(a.id, "go a".to_owned()).await.unwrap();
+    desktop.send(b.id, "go b".to_owned()).await.unwrap();
+    wait_for_status(&desktop, &fixture.root, a.id, Status::Running).await;
+    wait_for_status(&desktop, &fixture.root, b.id, Status::Running).await;
+
+    permits.add_permits(2);
+    wait_for_status(&desktop, &fixture.root, a.id, Status::Idle).await;
+    wait_for_status(&desktop, &fixture.root, b.id, Status::Idle).await;
+}
+
+/// Classifies every call as `Ask`.
+struct AlwaysAsk;
+
+impl ApprovalPolicy for AlwaysAsk {
+    fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
+        ApprovalVerdict::Ask
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval() {
+    let fixture = fixture();
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![Item::ToolCall {
+            call_id: "call-1".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("read_file"),
+            raw_args: JsonString::new(r#"{"path":"x"}"#),
+            raw: None,
+        }],
+        StopReason::ToolUse,
+        Usage::default(),
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&fixture.db)
+        .providers(vec![provider])
+        .approval(Arc::new(AlwaysAsk))
+        .environment(Arc::new(WorkRoot {
+            workspace: workspace(),
+            new: false,
+            pinned: None,
+        }))
+        .build()
+        .await
+        .unwrap();
+    let desktop = Desktop::new(
+        asterpath,
+        Arc::new(Permissions::new(PermissionMode::default())),
+        workspace(),
+        template(),
+        fixture.root.join("projects.json"),
+    );
+    let id = desktop
+        .create_session(&fixture.root, None)
+        .await
+        .unwrap()
+        .id;
+
+    desktop.send(id, "read".to_owned()).await.unwrap();
+    wait_for_status(&desktop, &fixture.root, id, Status::AwaitingApproval).await;
+    desktop.cancel(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_status_bar_shows_the_model_and_tokens_and_switches_the_model() {
+    let fixture = fixture();
+    let usage = Usage {
+        input: InputTokens {
+            uncached: 10,
+            cache_read: 2,
+            cache_write: 0,
+        },
+        output: OutputTokens {
+            total: 5,
+            reasoning: 0,
+        },
+    };
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(reply("one"), StopReason::EndTurn, usage)
+            .respond(reply("two"), StopReason::EndTurn, usage),
+    );
+    let desktop = desktop(&fixture, provider.clone()).await;
+    assert_eq!(desktop.models(), [template().model]);
+    let id = desktop
+        .create_session(&fixture.root, None)
+        .await
+        .unwrap()
+        .id;
+    let mut view = desktop.watch(id, None).await.unwrap();
+
+    desktop.send(id, "one".to_owned()).await.unwrap();
+    until(&mut view, |event| turn_committed(event).is_some()).await;
+    let info = desktop.session_info(id).await.unwrap();
+    assert_eq!(info.model, template().model);
+    assert_eq!(info.tokens, 17);
+    assert_eq!(info.error, None);
+
+    let mut other = template().model;
+    other.model = ModelId::new("model-2");
+    desktop.set_model(id, other.clone()).await.unwrap();
+    assert_eq!(desktop.session_info(id).await.unwrap().model, other);
+    desktop.send(id, "two".to_owned()).await.unwrap();
+    until(&mut view, |event| turn_committed(event).is_some()).await;
+    assert_eq!(provider.requests()[1].spec, other);
+    assert_eq!(desktop.session_info(id).await.unwrap().tokens, 34);
+}
+
+#[tokio::test]
+async fn a_drive_error_reaches_the_status_bar() {
+    let fixture = fixture();
+    // The CLI's config has a provider this app does not.
+    let cli = engine(&fixture.db, Arc::new(ScriptedProvider::new("q"))).await;
+    let mut spec = template();
+    spec.model.provider = ProviderId::new("q");
+    spec.metadata = asterpath_host::metadata(&fixture.root, None);
+    let id = cli.create_session(spec).await.unwrap().id();
+
+    let desktop = desktop(&fixture, Arc::new(ScriptedProvider::new("p"))).await;
+    desktop.send(id, "hi".to_owned()).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(error) = desktop.session_info(id).await.unwrap().error {
+                return error;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the error is kept");
+    assert!(error.contains('q'), "{error}");
+    assert_eq!(desktop.access(id).await.unwrap(), Access::Free);
 }
