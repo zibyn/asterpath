@@ -20,6 +20,7 @@
 
 - 桌面参考宿主 `asterpath-desktop`（`apps/desktop`，ADR-0035）骨架：侧栏按项目（工作根）列出会话，读 CLI 的 `config.toml` 与数据库，CLI 建的会话出现在对应项目下。窗口在非默认 feature `tauri` 之后。
 - 桌面端对话：在项目下新建会话（工具与技能按 CLI 新会话的规则），发送后由后台任务认领并驱动到空闲、空闲后释放认领；对话流显示流式文本与可折叠的推理；运行中继续输入即引导，可停止当前回合；被其他进程（如 CLI）驱动的会话只读显示。
+- 桌面端多会话：多个会话同时在后台驱动，切换视图不中断；侧栏标出运行中 / 等待审批 / 空闲 / 被其他进程占用；状态栏可切换模型（配置的模型与模型别名），显示会话及其子代理的累计 token 与最近一次驱动错误。
 - `asterpath-host`（ADR-0040）：参考宿主共用的按工作根组装、宿主元数据键与续会话规则；可选 `config` feature 解析 `config.toml`。参考 CLI 改用它，行为不变。
 - 会话环境适配器 `EnvironmentAdapter`（`AsterpathBuilder::environment`）：按会话的宿主元数据解析该会话的工具、沙箱策略与子进程变量，子会话用根会话的；`ToolContext::spawn` 把策略与变量交给工具。
 - 会话目录按元数据等值过滤：`SessionQuery.metadata`（`SessionQuery` 不再是 `Copy`）。

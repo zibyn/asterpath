@@ -2,6 +2,7 @@ import { createRootRoute, createRoute, createRouter, Outlet } from "@tanstack/re
 
 import { Conversation } from "@/components/conversation";
 import { Sidebar } from "@/components/sidebar";
+import { StatusBar } from "@/components/status-bar";
 
 const rootRoute = createRootRoute({
   component: () => (
@@ -25,7 +26,14 @@ const sessionRoute = createRoute({
   path: "/sessions/$sessionId",
   component: function Session() {
     const { sessionId } = sessionRoute.useParams();
-    return <Conversation key={sessionId} session={sessionId} />;
+    return (
+      <div className="flex h-full flex-col">
+        <div className="min-h-0 flex-1">
+          <Conversation key={sessionId} session={sessionId} />
+        </div>
+        <StatusBar session={sessionId} />
+      </div>
+    );
   },
 });
 

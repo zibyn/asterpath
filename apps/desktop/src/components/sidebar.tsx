@@ -4,6 +4,7 @@ import { FolderPlus, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
+import { cn } from "@/lib/utils";
 
 /** Projects (work roots), each with its root sessions, last active first. */
 export function Sidebar() {
@@ -37,6 +38,8 @@ function ProjectItem({ project }: { project: commands.Project }) {
   const sessions = useQuery({
     queryKey: ["sessions", project.root],
     queryFn: () => commands.sessions(project.root),
+    // shortcut: statuses are polled; switch to a change notification (ADR-0043) once the facade has one
+    refetchInterval: 1000,
   });
   const create = useMutation({
     mutationFn: () => commands.createSession(project.root),
@@ -71,13 +74,26 @@ function ProjectItem({ project }: { project: commands.Project }) {
             <Link
               to="/sessions/$sessionId"
               params={{ sessionId: session.id }}
-              className="block truncate rounded-md px-2 py-1 text-sm hover:bg-accent [&.active]:bg-accent"
+              className="flex items-center gap-2 rounded-md px-2 py-1 text-sm hover:bg-accent [&.active]:bg-accent"
             >
-              {session.name ?? session.id.slice(0, 8)}
+              <span className="flex-1 truncate">{session.name ?? session.id.slice(0, 8)}</span>
+              <StatusBadge status={session.status} />
             </Link>
           </li>
         ))}
       </ul>
     </section>
   );
+}
+
+const badges: Record<commands.Status, { label: string; className: string }> = {
+  running: { label: "Running", className: "bg-blue-500 animate-pulse" },
+  awaiting_approval: { label: "Awaiting approval", className: "bg-amber-500" },
+  idle: { label: "Idle", className: "bg-muted-foreground/30" },
+  elsewhere: { label: "Driven by another process", className: "bg-violet-500" },
+};
+
+function StatusBadge({ status }: { status: commands.Status }) {
+  const { label, className } = badges[status];
+  return <span role="img" aria-label={label} title={label} className={cn("size-2 shrink-0 rounded-full", className)} />;
 }
