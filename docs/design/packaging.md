@@ -161,7 +161,7 @@ impl Asterpath {
 - 存储只有一个注入点 `store`：提供则直接使用（不需要 `database`），未提供时由 `sqlite` feature 按 `database` 打开；没有“部分注入”。注入的存储可以不实现退役（`retire` 返回 `Unsupported`）。
 - `AsterpathBuilder` 是常见配置的糖；字段与 `AsterpathConfig` 一一对应（`hooks(Arc<dyn Hooks>)` 可多次调用、逐个追加），`build().await` 按固定顺序直接构造内部组件。
 - `spawn_tool(false)`（= `AsterpathConfig.spawn_tool = false`）不注册 `spawn_agent`：`ToolSelection::All` 快照不含它，`Names` 点名它是 `AsterError::Config`；调度器与子会话恢复不受影响。
-- 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
+- 扩展点只有 `Hooks`（`before_step` / `before_tool` / `after_tool` / `on_record` / `on_ownership_lost`，形状与语义见 [module-contracts.md](module-contracts.md) §3.1、[ADR-0025](../adr/0025-extension-points-are-typed-hooks.md)）。facade 没有服务清单、模块宿主或事件总线。
 - 查询是 facade 方法、直接返回值（ADR-0026）：`usage(scope)` 是 scope 所指会话的 `own`（`SessionSubtree` 另含 `descendants`）合计；`trace(session)` 是该会话日志折叠出的全部 span。没有 span 实时推送：实时导出由宿主在 `Hooks::on_record` 上自行增量折叠。
 - 再导出：`asterpath::protocol`（= `asterpath-protocol`）、id 类型（`SessionId`、`TurnId`、`StepId`、`InputId`、`ToolCallId`、`LogId`、`Timestamp`）与 `DefaultCompactor`，嵌入者编写钩子与工具只需依赖 `asterpath`。
 - 会话配置（`turn` / `compaction` / `subagents`）只有 `SessionSpec` 一个来源，进 `ConfigSnapshot`；`AsterpathConfig` 只放部署级字段（如全局 `max_live_children`）。
@@ -235,6 +235,8 @@ impl OwnedSession {
 
 - `create_session` / `open_session` / `fork_session` 都返回只读句柄；驱动、手动压缩、取消（子会话调度在驱动内）只在 `claim()` 得到的 `OwnedSession` 上。认领的是会话所在树的根：同一个 `Asterpath` 内重复认领共享同一纪元，另一个进程持有时得到 `AsterError::Storage(StorageError::OwnedElsewhere)`。非属主进程要取消，先用 `Asterpath::owner` 找到属主，由宿主路由过去。
 - 驱动与手动压缩期间的每条 append 都携带认领的 `OwnerToken`，存储拒绝过期纪元；输入、审批决定与配置变更不携带，任何进程都可以写。
+- 认领随本进程的进程租约有效：`Asterpath` 在构建时所在的 tokio runtime 上每 `lease_renew_interval`（builder，默认 10 s）续约一次，TTL 是存储的参数（SQLite `OpenOptions::lease_ttl`，默认 30 s；见 [storage.md](storage.md) §6）。`Asterpath` 与它的句柄全部 drop 即正常退出，租约清除、树立即可被别的进程认领；进程被 kill 则别人要等一个 TTL。
+- 失去属主（续约失败，或树已被别的进程接管）时，该树在本进程内的 `drive` 流立刻结束并以 `OwnedElsewhere` 收尾，之后这个 `OwnedSession` 上的属主操作都得到 `OwnedElsewhere`，认领被释放，`Hooks::on_ownership_lost(owner)` 通知宿主；宿主丢掉这个 `OwnedSession`，需要时重新 `claim()`。
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
 - `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。

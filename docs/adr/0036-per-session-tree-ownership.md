@@ -1,6 +1,6 @@
 # 写者独占缩小到会话树：显式认领、进程租约与属主纪元，多进程共用一个存储
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-25)
 **部分取代**: [ADR-0023](0023-storage-holds-log-and-catalog-wake-by-fold.md) 的「单进程独占写者」
 **调研**: [multi-process-storage-audit.md](../research/multi-process-storage-audit.md)、[design-audit-2026-10-25.md](../research/design-audit-2026-10-25.md)
 

@@ -61,6 +61,7 @@ pub trait Hooks: Send + Sync {
     fn after_tool<'a>(&'a self, ctx: &'a ToolCallCtx, result: &'a mut ToolResultView)
         -> BoxFuture<'a, Result<(), HookError>>;
     fn on_record(&self, record: &CommittedRecord);   // 同步、不可失败
+    fn on_ownership_lost(&self, owner: OwnerToken);  // 同步；本进程失去一棵会话树（ADR-0036）
 }
 ```
 
@@ -69,6 +70,7 @@ pub trait Hooks: Send + Sync {
 - 组合：按注册顺序调用；首个 `Gate::EndTurn` / `ToolGate::Deny` 短路，参数与结果改写逐个传递；没有环绕式 `next`。
 - 拦截式钩子（`before_*` / `after_tool`）的错误或 panic 按该钩子的错误处理：`before_step` → 回合 `Failed`；`before_tool` / `after_tool` → 该调用 `Failed`（`Internal`）。
 - `on_record` 在每条提交记录（所有会话，含子会话）提交后按会话内顺序调用一次；panic 被捕获、`tracing::warn!` 后继续，不影响循环。「一次」是每个进程内：多个进程共用一个存储时，同一条记录可能在两个进程各出现一次，宿主按 `(session, log_id)` 去重（ADR-0036）。
+- `on_ownership_lost` 在本进程失去一个认领时（续约失败，或树被别的进程接管）每个认领调用一次；此时该树的驱动已停、认领已释放，宿主丢掉对应的 `OwnedSession`（[storage.md](storage.md) §6）。panic 同样被捕获。
 - 上下文只带数据：`StepCtx { session, turn, step_index }`、`ToolCallCtx { session, turn, step, tool_call_id, provider_call_id, tool, provenance, replay }`；两者的异步 `usage()` 返回本会话自身与子树的用量（`UsageReport`）。没有服务定位器。
 - 调用点：`before_step` 在每个新 step 前（恢复的未完成 step 不再调用）；`before_tool` 在写意图前，已记录意图恢复时不调用（#28）；`after_tool` 在截断后、写结果前，框架补写的 `Interrupted` / 拒绝不经过它。
 

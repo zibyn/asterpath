@@ -10,7 +10,7 @@
 - **终态条目**是提交单位；流式 delta 不落盘。
 - 不变量：**模型可见即已记录**。任何进入下一次请求上下文的内容、任何副作用意图，先于该动作提交。
 - **检查点 = 最后一个完整的 `StepCommitted` 边界**，没有独立的 checkpoint 记录。
-- 日志层**没有 ack**：完成 = 写了终态记录。存储也没有租约或 ack；唤醒是只读发现（[storage.md](storage.md) §7）。
+- 日志层**没有 ack**：完成 = 写了终态记录。存储也没有任务租约或 ack（进程租约只管属主存活，见 [storage.md](storage.md) §6）；唤醒是只读发现（[storage.md](storage.md) §7）。
 - 恢复 = 只读已提交前缀 → 定位检查点 → 重放已提交事件 → 处理**未闭合意图**。
 - **`Idle` 由未闭合意图定义**：存在任一非 compaction 的 open intent 即非 `Idle`。恢复、唤醒发现与退役共用同一份会话事实折叠（`SessionFacts`，§6、[storage.md](storage.md) §7）。
 - **等待是事件**：持久等待只有两种——人工审批（意图是 open `ToolCallRequested`，终态是 `ApprovalDecided`）与子会话完成（`ChildSessionSpawned` → `ChildSessionCompleted`）；崩溃后重新挂起。spawn 超时是 spawn 记录上的截止时间，不是独立 timer（[ADR-0008](../adr/0008-subagent-model.md)）。
