@@ -1,5 +1,6 @@
 import { createRootRoute, createRoute, createRouter, Outlet } from "@tanstack/react-router";
 
+import { Conversation } from "@/components/conversation";
 import { Sidebar } from "@/components/sidebar";
 
 const rootRoute = createRootRoute({
@@ -19,13 +20,12 @@ const indexRoute = createRoute({
   component: () => <p className="p-6 text-sm text-muted-foreground">Pick a session.</p>,
 });
 
-// The conversation view replaces this body (#151).
 const sessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
   component: function Session() {
     const { sessionId } = sessionRoute.useParams();
-    return <p className="p-6 font-mono text-sm">{sessionId}</p>;
+    return <Conversation key={sessionId} session={sessionId} />;
   },
 });
 

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
-import { FolderPlus } from "lucide-react";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { FolderPlus, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
@@ -32,16 +32,38 @@ export function Sidebar() {
 }
 
 function ProjectItem({ project }: { project: commands.Project }) {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const sessions = useQuery({
     queryKey: ["sessions", project.root],
     queryFn: () => commands.sessions(project.root),
   });
+  const create = useMutation({
+    mutationFn: () => commands.createSession(project.root),
+    onSuccess: (session) => {
+      void queryClient.invalidateQueries({ queryKey: ["sessions", project.root] });
+      void navigate({ to: "/sessions/$sessionId", params: { sessionId: session.id } });
+    },
+  });
 
   return (
     <section className="mb-3">
-      <h2 className="truncate px-1 py-1 text-xs font-medium text-muted-foreground" title={project.root}>
-        {project.name}
-      </h2>
+      <div className="flex items-center justify-between">
+        <h2 className="truncate px-1 py-1 text-xs font-medium text-muted-foreground" title={project.root}>
+          {project.name}
+        </h2>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6"
+          aria-label={`New session in ${project.name}`}
+          disabled={create.isPending}
+          onClick={() => create.mutate()}
+        >
+          <Plus />
+        </Button>
+      </div>
+      {create.error && <p className="px-1 text-sm text-destructive">{String(create.error)}</p>}
       {sessions.error && <p className="px-1 text-sm text-destructive">{String(sessions.error)}</p>}
       <ul>
         {sessions.data?.map((session) => (
