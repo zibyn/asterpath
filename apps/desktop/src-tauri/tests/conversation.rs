@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath::Asterpath;
-use asterpath_desktop::{Access, Desktop, Status, ViewEvent};
+use asterpath_desktop::{Access, Desktop, PermissionMode, Permissions, Status, ViewEvent};
 use asterpath_host::{WorkRoot, Workspace};
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, InputId, InputTokens, Item,
@@ -63,6 +63,7 @@ fn fixture() -> Fixture {
 async fn desktop(fixture: &Fixture, provider: Arc<dyn Provider>) -> Desktop {
     Desktop::new(
         engine(&fixture.db, provider).await,
+        Arc::new(Permissions::new(PermissionMode::default())),
         workspace(),
         template(),
         fixture.root.join("projects.json"),
@@ -481,9 +482,9 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
         .build()
         .await
         .unwrap();
-    let gate = asterpath.approval_gate();
     let desktop = Desktop::new(
         asterpath,
+        Arc::new(Permissions::new(PermissionMode::default())),
         workspace(),
         template(),
         fixture.root.join("projects.json"),
@@ -493,8 +494,6 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
         .await
         .unwrap()
         .id;
-    // Stands in for the approval UI attending the tree.
-    let _endpoint = gate.register(id);
 
     desktop.send(id, "read".to_owned()).await.unwrap();
     wait_for_status(&desktop, &fixture.root, id, Status::AwaitingApproval).await;
