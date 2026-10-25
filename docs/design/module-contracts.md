@@ -18,7 +18,7 @@
 
 ```text
 app
-  asterpath-cli, asterpath-acceptance
+  asterpath-app, asterpath-acceptance
         │
         ▼
 engine (one crate; facade + internal modules)
@@ -250,7 +250,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 | protocol | `asterpath-protocol` | 无；且不声明 feature |
 | adapter | provider、sqlite、http、mcp、sandbox-linux、skills、testing | `asterpath-protocol` 与白名单列出的同类适配器 |
 | engine | `asterpath` | `asterpath-protocol` 与它再导出 / 按 feature 装配的适配器 |
-| app | `asterpath-cli`、`asterpath-acceptance` | 任意 workspace 成员 |
+| app | `asterpath-app`、`asterpath-acceptance` | 任意 workspace 成员 |
 | tool | `xtask`、`asterpath-mcp-fixture` | 白名单所列（当前无） |
 
 - 每个 crate 的职责见 [packaging.md](packaging.md) §2。`asterpath-testing` 不依赖引擎；需要真实组装的测试放 facade 的 `tests/` 或 `asterpath-acceptance`。

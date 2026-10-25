@@ -25,7 +25,7 @@ _Avoid_: 公共 crate、基础库
 _Avoid_: 启动器、bootstrap
 
 **应用（Application）**：
-使用框架的一方：CLI、桌面端，或集成 SDK 的 web 平台；负责组装根、策略配置、UX 与运维，框架不替它做决定。框架与应用之间没有中间层（ADR-0048）。
+使用框架的一方：CLI、桌面端，或集成 SDK 的 web 平台；负责组装根、策略配置、UX 与运维，框架不替它做决定。框架与应用之间没有中间层（ADR-0048）；CLI 与桌面端是同一个应用 crate 的两个入口（ADR-0049）。
 _Avoid_: 宿主、客户端、上层应用、宿主共用层
 
 **参考应用（Reference Application）**：

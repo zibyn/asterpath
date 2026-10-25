@@ -1,6 +1,6 @@
 # 桌面参考宿主：一个进程托管所有项目，与 CLI 共用配置与数据库
 
-**Status**: accepted (2026-10-25)
+**Status**: accepted (2026-10-25)；「命令层与窗口分开构建：workspace 成员 `asterpath-desktop`」部分取代 by [ADR-0049](0049-cli-and-desktop-are-one-application-crate.md)（CLI 与桌面端合为一个应用 crate）
 **依赖**: [ADR-0036](0036-per-session-tree-ownership.md)–[ADR-0040](0040-host-kit-shared-by-reference-hosts.md)
 **调研**: [desktop-codex.md](../research/desktop-codex.md)、[desktop-claude-code.md](../research/desktop-claude-code.md)
 **来源**: #140、#150

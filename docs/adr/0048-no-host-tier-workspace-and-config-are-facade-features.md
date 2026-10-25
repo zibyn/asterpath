@@ -1,6 +1,6 @@
 # 没有宿主这一层：工作根组装与配置加载是门面的可选 feature
 
-**Status**: accepted (2026-10-25)
+**Status**: accepted (2026-10-25)；「并入门面，作为 `workspace` / `config` feature」及其稳定面后果取代 by [ADR-0049](0049-cli-and-desktop-are-one-application-crate.md)
 **取代**: [ADR-0040](0040-host-kit-shared-by-reference-hosts.md)；[ADR-0046](0046-local-hosts-and-web-sdk-do-not-share.md) 中「`asterpath-host` 是本地参考宿主的共用层」
 **修订**: [ADR-0026](0026-engine-is-one-crate-only-adapter-traits-public.md) 的依赖角色
 **调研**: [pi-and-pi-durable.md](../research/pi-and-pi-durable.md)、[mastra.md](../research/mastra.md)、[agno.md](../research/agno.md)、[llamaindex.md](../research/llamaindex.md)

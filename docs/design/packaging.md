@@ -21,7 +21,7 @@
 | crate | 角色 | 职责 | 允许的 workspace 依赖 |
 | --- | --- | --- | --- |
 | `asterpath-protocol` | protocol | ID、日志信封与存储契约（`SessionStore`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy` / `SandboxProvider` 及沙箱类型，ADR-0027）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
-| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2）；可选 feature `workspace`（按工作根组装：工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`、`cwd` / `name` 元数据键与续会话规则）与 `config`（`config.toml` 与环境变量解析，依赖 `workspace`），都不在 `default`（ADR-0048） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite`；`workspace` 下 `tools`、`skills`、`mcp`、`sandbox-linux` |
+| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite` |
 | `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；`provider_options` 深合并与同 provider raw 字段提取（#101、#103）；不属于稳定面（ADR-0026 修订） | `protocol` |
 | `asterpath-provider-anthropic` | adapter | Anthropic Messages adapter | `protocol`, `http` |
 | `asterpath-provider-openai` | adapter | OpenAI Responses adapter | `protocol`, `http` |
@@ -31,8 +31,7 @@
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
 | `asterpath-tools` | adapter | 按根目录构造的 `read_file` / `list_dir` / `grep` / `write_file` / `edit_file` / `bash` 工具与 `read_only` / `coding` 预设（#83） | `protocol` |
 | `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件、`FakeSandboxProvider` | `protocol` |
-| `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
-| `asterpath-desktop` | app | Tauri 桌面参考应用（`apps/desktop/src-tauri`）；命令层是库，窗口在非默认 feature `tauri` 后（ADR-0035） | 任意 |
+| `asterpath-app` | app | 本地应用（ADR-0049，`apps/asterpath`）：CLI 二进制 `asterpath`，与桌面窗口二进制 `asterpath-desktop`（非默认 feature `tauri` 之后，ADR-0035）；私有模块含工作根组装（工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`、`cwd` / `name` 元数据键与续会话规则）、`config.toml` 解析与桌面命令层（不依赖 Tauri） | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
 | `asterpath-mcp-fixture` | tool | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） |
 | `xtask` | tool | `check-deps` 与 CI 辅助；`publish = false` | 无 |
@@ -317,7 +316,7 @@ pub enum AsterError {
 | crate | features | 默认 |
 | --- | --- | --- |
 | `asterpath` | `anthropic`, `openai`, `sqlite` | `anthropic`, `openai`, `sqlite` |
-| `asterpath-cli` | 同 facade | 同 facade |
+| `asterpath-app` | 同 facade | 同 facade |
 | 适配器 crate | 无 | — |
 | `protocol` | 无 | — |
 
@@ -327,7 +326,7 @@ pub enum AsterError {
 
 ## 4. 参考 CLI
 
-二进制名 `asterpath`，包名 `asterpath-cli`。命令面对齐 Codex CLI 与 Claude Code 的**共有核心子集**（对比见 [cli-codex-vs-claude-code.md](../research/cli-codex-vs-claude-code.md)）：命令骨架与安全模型取 Codex，无头输出协议与续会话开关取 Claude Code。全屏 TUI、后台会话、守护进程、云端与 IDE 集成不在范围内。
+二进制名 `asterpath`，包名 `asterpath-app`（与桌面入口同一 crate，ADR-0049）。命令面对齐 Codex CLI 与 Claude Code 的**共有核心子集**（对比见 [cli-codex-vs-claude-code.md](../research/cli-codex-vs-claude-code.md)）：命令骨架与安全模型取 Codex，无头输出协议与续会话开关取 Claude Code。全屏 TUI、后台会话、守护进程、云端与 IDE 集成不在范围内。
 
 **flag 准入规则**：只有两者共有核心子集里存在对应物的选项才做专用 flag；其余框架参数一律走配置文件或 `-c key=value`。满足规则是必要条件，不是充分条件。新增 flag 先过这条规则。
 
@@ -395,7 +394,7 @@ pub enum AsterError {
 
 ### 4.6 会话装配
 
-组装规则在门面的 `workspace` / `config` feature（ADR-0048），CLI 只解析 flag、打印与选退出码，用自己的 clap 枚举映射过来；桌面端调用同一份。
+组装规则是本地应用 crate 的私有模块（ADR-0049），CLI 入口只解析 flag、打印与选退出码；桌面入口调用同一份。
 
 - 新会话：会话元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
 - MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。

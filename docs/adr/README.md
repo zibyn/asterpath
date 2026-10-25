@@ -47,7 +47,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0032](0032-sessions-carry-opaque-host-metadata.md) | 会话携带创建时写入、不可变、框架不解释的宿主元数据 |
 | [0033](0033-session-fork-reuses-context-fork-snapshot.md) | 会话分叉是宿主创建的独立会话，复用上下文分叉的快照 |
 | [0034](0034-structured-output-modes-and-output-tool.md) | 结构化输出有显式选择的输出模式，工具模式由引擎以输出工具实现 |
-| [0035](0035-desktop-reference-host.md) | 桌面参考宿主一个进程托管所有项目，与 CLI 共用配置与数据库 |
+| [0035](0035-desktop-reference-host.md) | 桌面参考宿主一个进程托管所有项目，与 CLI 共用配置与数据库（crate 组织由 0049 取代） |
 | [0036](0036-per-session-tree-ownership.md) | 写者独占缩小到会话树：显式认领、进程租约与属主纪元，多进程共用存储（跨进程送达由 0047 取代） |
 | [0037](0037-session-environment.md) | 会话环境由宿主适配器按会话解析，子进程默认不继承进程环境 |
 | [0038](0038-watch-separates-observing-from-driving.md) | 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出 |
@@ -56,6 +56,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0045](0045-fork-at-any-committed-turn.md) | 会话分叉可指定任一已提交回合为水位（proposed） |
 | [0046](0046-local-hosts-and-web-sdk-do-not-share.md) | 本地应用与 web 集成分开，互不共享数据（`asterpath-host` 部分由 0048 取代） |
 | [0047](0047-multi-user-and-multi-node-belong-to-the-platform.md) | 多用户与多机部署归集成平台；内核只保证会话树单写者与 SQLite、Postgres 两种后端 |
-| [0048](0048-no-host-tier-workspace-and-config-are-facade-features.md) | 没有宿主这一层：工作根组装与配置加载是门面的可选 feature；「宿主」改称「应用」 |
+| [0048](0048-no-host-tier-workspace-and-config-are-facade-features.md) | 没有宿主这一层；「宿主」改称「应用」（并入门面 feature 部分由 0049 取代） |
+| [0049](0049-cli-and-desktop-are-one-application-crate.md) | CLI 与桌面端是一个应用 crate 的两个入口；组装与配置是它的私有模块 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。
