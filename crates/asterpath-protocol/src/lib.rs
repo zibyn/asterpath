@@ -81,7 +81,7 @@ pub use projection::{
 };
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,
-    ProviderError, ProviderErrorKind, StreamEvent,
+    ProviderError, ProviderErrorKind, SessionContext, StreamEvent,
 };
 pub use sandbox::{
     ConfinedSpawn, Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider,

@@ -97,6 +97,17 @@ impl Switching {
     }
 }
 
+/// Requests of different sessions compare equal apart from their context.
+fn sessionless(requests: Vec<ModelRequest>) -> Vec<ModelRequest> {
+    requests
+        .into_iter()
+        .map(|mut request| {
+            request.session = None;
+            request
+        })
+        .collect()
+}
+
 impl Provider for Switching {
     fn id(&self) -> ProviderId {
         self.inner.id()
@@ -292,7 +303,7 @@ async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
-    let live_step_2 = live.inner.requests()[1].clone();
+    let live_step_2 = sessionless(live.inner.requests())[1].clone();
     assert_eq!(live_step_2.spec, model("model-2"));
     assert_eq!(live_step_2.max_output_tokens, 512);
 
@@ -338,7 +349,7 @@ async fn recovery_after_a_change_renders_the_request_a_live_run_renders() {
         .unwrap();
     drive(&handle).await;
 
-    assert_eq!(recovered.requests(), [live_step_2]);
+    assert_eq!(sessionless(recovered.requests()), [live_step_2]);
 }
 
 #[tokio::test]
@@ -534,7 +545,7 @@ async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
-    let live_step_2 = live.inner.requests()[1].clone();
+    let live_step_2 = sessionless(live.inner.requests())[1].clone();
 
     // Dies appending step 2's `StepStarted` (see the model-switch case).
     let shared = Arc::new(InMemoryEventLog::new());
@@ -575,7 +586,7 @@ async fn recovery_after_an_append_renders_the_request_a_live_run_renders() {
         .unwrap();
     drive(&handle).await;
 
-    assert_eq!(recovered.requests(), [live_step_2]);
+    assert_eq!(sessionless(recovered.requests()), [live_step_2]);
 }
 
 #[tokio::test]
@@ -1005,7 +1016,7 @@ async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
     live.handle.set(handle.clone()).expect("set once");
     handle.submit_input(input(1)).await.expect("input");
     drive(&handle).await;
-    let live_step_2 = live.inner.requests()[1].clone();
+    let live_step_2 = sessionless(live.inner.requests())[1].clone();
     assert_eq!(names(&live_step_2.tools), ["lookup"]);
 
     // Dies appending step 2's `StepStarted` (see the model-switch case).
@@ -1047,7 +1058,7 @@ async fn recovery_after_a_tool_change_renders_the_request_a_live_run_renders() {
         .unwrap();
     drive(&handle).await;
 
-    assert_eq!(recovered.requests(), [live_step_2]);
+    assert_eq!(sessionless(recovered.requests()), [live_step_2]);
 }
 
 #[tokio::test]

@@ -34,8 +34,8 @@ use asterpath_protocol::{
     decode_entry, dedup, effective_config,
 };
 use asterpath_protocol::{
-    ApprovalGate, Clock, DedupKey, LogEntry, LogId, OwnerToken, SessionId, SessionStore, StepId,
-    Timestamp, TurnId, unique_bytes,
+    ApprovalGate, Clock, DedupKey, LogEntry, LogId, LogQuery, OwnerToken, SessionContext,
+    SessionId, SessionStore, StepId, Timestamp, TurnId, root_of, unique_bytes,
 };
 use futures_core::Stream;
 
@@ -1102,11 +1102,38 @@ impl Agent {
             history.tools,
             &config.request,
         );
+        request.session = Some(self.session_context(session).await?);
         let format = self.output_tool(config);
         if let Some(format) = format {
             output::apply(&mut request, format);
         }
         Ok((request, format.map(|format| ToolName::new(&format.name))))
+    }
+
+    /// Who a model request of `session` is for (ADR-0039): its tree's root
+    /// and the root's metadata.
+    async fn session_context(&self, session: SessionId) -> Result<SessionContext, AgentError> {
+        let root = root_of(&*self.log, session).await?;
+        // `SessionCreated` is the first record of every session.
+        let first = self
+            .log
+            .scan(LogQuery {
+                session: root,
+                after: None,
+                limit: Some(1),
+            })
+            .next()
+            .await
+            .transpose()?;
+        let metadata = match first.as_ref().map(decode_entry) {
+            Some(Ok(SessionEvent::SessionCreated { metadata, .. })) => metadata,
+            _ => BTreeMap::new(),
+        };
+        Ok(SessionContext {
+            session,
+            root,
+            metadata,
+        })
     }
 
     async fn commit_turn(
@@ -1335,7 +1362,7 @@ impl Agent {
         let Some(compactor) = &self.compactor else {
             return Ok(CompactionRun::Done(CompactResult::NotConfigured));
         };
-        let job = match compactor.plan(&input) {
+        let mut job = match compactor.plan(&input) {
             CompactPlan::Summarize(job) => job,
             CompactPlan::NotNeeded => return Ok(CompactionRun::Done(CompactResult::NotNeeded)),
             CompactPlan::NothingToDo => {
@@ -1358,6 +1385,7 @@ impl Agent {
             )
             .await?;
         }
+        job.session = Some(self.session_context(session).await?);
         match compactor.compact(job).await {
             Ok(CompactSummary::Applied(outcome)) => {
                 self.append_applied(session, &outcome, key.clone()).await?;

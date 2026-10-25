@@ -586,6 +586,12 @@ async fn c7_manual_compaction_is_idle_only_and_turn_free() {
         result,
         asterpath::protocol::CompactResult::Applied(_)
     ));
+    let summary = provider.requests().pop().expect("the summary call");
+    assert_eq!(
+        summary.session.map(|context| context.session),
+        Some(handle.id()),
+        "the summary call carries its session (ADR-0039)"
+    );
     let after = scan(asterpath.store(), handle.id()).await;
     assert_eq!(count(&after, "CompactionStarted"), 1);
     assert_eq!(count(&after, "CompactionApplied"), 1);

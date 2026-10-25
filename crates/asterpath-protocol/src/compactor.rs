@@ -5,7 +5,7 @@
 //! `plan` returns `Summarize` and writes the terminal event from `compact`'s
 //! result, so there is exactly one writer and one commit point.
 
-use crate::{LogId, LogIdRange};
+use crate::{LogId, LogIdRange, SessionContext};
 use futures_core::future::BoxFuture;
 
 use crate::agent::{CompactionError, CompactionOutcome};
@@ -40,6 +40,7 @@ pub struct UsageAnchor {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // one plan per compaction, never stored
 #[non_exhaustive]
 pub enum CompactPlan {
     /// Threshold not reached; only the `Threshold` trigger returns this.
@@ -68,6 +69,10 @@ pub struct CompactionJob {
     /// Attempt, backoff and request timeout for the summary call. Carried here
     /// because `compact` receives only the job, not the planning input.
     pub turn: TurnConfig,
+    /// The session compacted, for the summary request's
+    /// [`ModelRequest::session`](crate::ModelRequest::session). `plan` leaves
+    /// it `None`; the agent fills it in before `compact`.
+    pub session: Option<SessionContext>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

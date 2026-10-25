@@ -83,6 +83,7 @@ fn job(usable: u32, retained: u64) -> CompactionJob {
         usable_window: usable,
         retained_tokens: retained,
         turn: turn(),
+        session: None,
     }
 }
 

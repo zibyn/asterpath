@@ -134,6 +134,7 @@ impl Compactor for DefaultCompactor {
                     .unwrap_or(1),
             ),
             turn: input.turn.clone(),
+            session: None,
         })
     }
 
@@ -172,6 +173,7 @@ impl DefaultCompactor {
         );
         request.tool_choice = ToolChoice::None;
         request.max_output_tokens = job.max_summary_tokens;
+        request.session.clone_from(&job.session);
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {
             Ok(result) => result,

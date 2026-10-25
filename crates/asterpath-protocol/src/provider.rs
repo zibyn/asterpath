@@ -11,7 +11,7 @@ use crate::config::{
     ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
     ToolDescriptor,
 };
-use crate::ids::{JsonString, ProviderId};
+use crate::ids::{JsonString, ProviderId, SessionId};
 use crate::item::{FileSource, ImageSource, Item, Part, RawProviderData, Role};
 use crate::usage::Usage;
 
@@ -43,6 +43,22 @@ pub struct ModelRequest {
     pub output_format: Option<OutputFormat>,
     /// See [`RequestConfig::server_tools`].
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
+    /// The session the request is made for; `None` outside one. Adapters
+    /// ignore it; host wrappers pick credentials or endpoints by it
+    /// (ADR-0039).
+    pub session: Option<SessionContext>,
+}
+
+/// Who a model request is made for. The kernel has no users: tenancy is
+/// whatever the host wrote into the root's metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionContext {
+    pub session: SessionId,
+    /// The root of the session's tree; the session itself for a root.
+    pub root: SessionId,
+    /// The root's host metadata (ADR-0032): children have their own, never
+    /// inherited, so a tree's tenancy lives on its root.
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl ModelRequest {
@@ -73,6 +89,7 @@ impl ModelRequest {
             provider_options: request.provider_options.clone(),
             output_format: request.output_format.clone(),
             server_tools: request.server_tools.clone(),
+            session: None,
         }
     }
 }
