@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath::Asterpath;
-use asterpath_desktop::{Access, Desktop, ViewEvent};
+use asterpath_desktop::{Access, Desktop, PermissionMode, Permissions, ViewEvent};
 use asterpath_host::{WorkRoot, Workspace};
 use asterpath_protocol::{
     AgentEvent, InputId, Item, LogId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
@@ -62,6 +62,7 @@ fn fixture() -> Fixture {
 async fn desktop(fixture: &Fixture, provider: Arc<dyn Provider>) -> Desktop {
     Desktop::new(
         engine(&fixture.db, provider).await,
+        Arc::new(Permissions::new(PermissionMode::default())),
         workspace(),
         template(),
         fixture.root.join("projects.json"),
