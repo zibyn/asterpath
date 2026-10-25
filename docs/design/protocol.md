@@ -793,13 +793,15 @@ pub enum ProviderErrorKind {
 | `response.content_part.added` | 不单独暴露；part 起始由 delta 隐含 |
 | `response.output_text.delta` | `PartDelta::Text` |
 | `response.function_call_arguments.delta` | `PartDelta::JsonArgs` |
-| `response.reasoning_summary_text.delta` | `PartDelta::ReasoningSummary` |
-| `response.reasoning_text.delta` / encrypted 片段 | adapter 内部，不暴露 |
+| `response.reasoning_summary_text.delta` | `PartDelta::ReasoningSummary`（`part_index` = `summary_index`） |
+| `response.reasoning_text.delta` | `PartDelta::ReasoningSummary`（`part_index` = `content_index`） |
+| encrypted 片段 | adapter 内部，不暴露 |
 | `response.output_item.done` | `ItemCompleted` |
 | `response.completed` / `response.incomplete` | `ResponseEnded` |
 | `response.failed` | `ProviderError` |
 
 - provider 的 `sequence_number` 只用于 adapter 内部校验；规范 `sequence` 由 adapter 重新分配。
+- 推理增量每个 `output_index` 先到先得：第一条推理增量是 summary 还是 text 就锁定哪种，另一种之后直接丢弃。完成时 `Item::Reasoning.summary` 跟随锁定：锁定 text 取 `item.content` 的 `reasoning_text`；锁定 summary 或没收到推理增量时优先 `item.summary`，为空再取 `item.content`。`raw` 照旧完整保存。
 - OpenAI item 事件可能交错；adapter 按 `output_index` 归一，`ItemCompleted` 可按完成顺序发出，loop 最终按 `output_index` 排序。
 
 ## 11. 跨供应商与失效规则

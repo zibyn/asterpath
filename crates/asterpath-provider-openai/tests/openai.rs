@@ -882,6 +882,144 @@ async fn reasoning_is_replayed_after_the_tool_set_changes() {
     );
 }
 
+fn reasoning_wire_item(id: &str, summary: &[&str], content: &[&str]) -> Value {
+    json!({
+        "id": id,
+        "type": "reasoning",
+        "summary": summary.iter().map(|text| json!({"type": "summary_text", "text": text})).collect::<Vec<_>>(),
+        "content": content.iter().map(|text| json!({"type": "reasoning_text", "text": text})).collect::<Vec<_>>()
+    })
+}
+
+fn reasoning_delta(sequence: u64, index: u32, kind: &str, part: u32, text: &str) -> Value {
+    let (event_type, index_key) = match kind {
+        "summary" => ("response.reasoning_summary_text.delta", "summary_index"),
+        _ => ("response.reasoning_text.delta", "content_index"),
+    };
+    json!({
+        "type": event_type,
+        "sequence_number": sequence,
+        "item_id": "rs",
+        "output_index": index,
+        index_key: part,
+        "delta": text
+    })
+}
+
+/// `(output_index, part_index, text)` for every reasoning delta, in order.
+fn reasoning_deltas(events: &[Result<StreamEvent, ProviderError>]) -> Vec<(u32, u32, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::PartDelta {
+                output_index,
+                part_index,
+                delta: PartDelta::ReasoningSummary { text },
+                ..
+            }) => Some((*output_index, *part_index, text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reasoning_summary(item: &Item) -> Vec<Part> {
+    match item {
+        Item::Reasoning { summary, .. } => summary.clone(),
+        other => panic!("expected reasoning, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reasoning_text_deltas_surface_as_reasoning_summary() {
+    let item = reasoning_wire_item("rs_1", &[], &["think", "ing"]);
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, reasoning_wire_item("rs_1", &[], &[])),
+        reasoning_delta(2, 0, "text", 0, "thi"),
+        reasoning_delta(3, 0, "text", 0, "nk"),
+        reasoning_delta(4, 0, "text", 1, "ing"),
+        done(5, 0, item.clone()),
+        completed(6, vec![item], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let deltas = reasoning_deltas(&events);
+    assert_eq!(
+        deltas,
+        [
+            (0, 0, "thi".to_owned()),
+            (0, 0, "nk".to_owned()),
+            (0, 1, "ing".to_owned())
+        ]
+    );
+    let summary = reasoning_summary(&completed_items(&events)[0].1);
+    let joined: String = deltas.iter().map(|(_, _, text)| text.as_str()).collect();
+    let summary_text: String = summary
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.as_str(),
+            other => panic!("unexpected part {other:?}"),
+        })
+        .collect();
+    assert_eq!(summary_text, joined);
+    assert_eq!(summary, [texts("think"), texts("ing")].concat());
+}
+
+#[tokio::test]
+async fn the_first_reasoning_delta_kind_locks_each_item_independently() {
+    let summary_first = reasoning_wire_item("rs_a", &["from summary"], &["from content"]);
+    let text_first = reasoning_wire_item("rs_b", &["from summary"], &["from content"]);
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, reasoning_wire_item("rs_a", &[], &[])),
+        added(2, 1, reasoning_wire_item("rs_b", &[], &[])),
+        reasoning_delta(3, 0, "summary", 0, "s0"),
+        reasoning_delta(4, 1, "text", 0, "t1"),
+        reasoning_delta(5, 0, "text", 0, "dropped"),
+        reasoning_delta(6, 1, "summary", 0, "dropped"),
+        done(7, 0, summary_first.clone()),
+        done(8, 1, text_first.clone()),
+        completed(9, vec![summary_first, text_first], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    assert_eq!(
+        reasoning_deltas(&events),
+        [(0, 0, "s0".to_owned()), (1, 0, "t1".to_owned())]
+    );
+    let by_index: std::collections::BTreeMap<u32, Item> =
+        completed_items(&events).into_iter().collect();
+    assert_eq!(reasoning_summary(&by_index[&0]), texts("from summary"));
+    assert_eq!(reasoning_summary(&by_index[&1]), texts("from content"));
+}
+
+#[tokio::test]
+async fn reasoning_without_deltas_prefers_summary_then_falls_back_to_content() {
+    let content_only = reasoning_wire_item("rs_a", &[], &["from content"]);
+    let both = reasoning_wire_item("rs_b", &["from summary"], &["from content"]);
+    let neither = reasoning_wire_item("rs_c", &[], &[]);
+    let server = MockServer::start(vec![MockResponse::sse(sse(&[
+        created(0),
+        added(1, 0, content_only.clone()),
+        added(2, 1, both.clone()),
+        added(3, 2, neither.clone()),
+        done(4, 0, content_only.clone()),
+        done(5, 1, both.clone()),
+        done(6, 2, neither.clone()),
+        completed(7, vec![content_only, both, neither], usage_json(10, 0, 2)),
+    ]))]);
+    let events = collect(&provider(&server), request(vec![user_text("go")])).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+
+    let by_index: std::collections::BTreeMap<u32, Item> =
+        completed_items(&events).into_iter().collect();
+    assert_eq!(reasoning_summary(&by_index[&0]), texts("from content"));
+    assert_eq!(reasoning_summary(&by_index[&1]), texts("from summary"));
+    assert_eq!(reasoning_summary(&by_index[&2]), []);
+}
+
 #[tokio::test]
 async fn usage_is_exclusive_and_ignores_total_tokens() {
     let item = message_item("msg_1", "ok");

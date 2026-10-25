@@ -1,6 +1,6 @@
 //! OpenAI Responses SSE decoding and canonical event normalization.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use asterpath_http::{SseDecoder, SseEvent};
 use asterpath_protocol::{
@@ -134,8 +134,16 @@ struct Normalizer {
     seen_completed: HashSet<u32>,
     completed_count: usize,
     has_tool_call: bool,
+    /// Which reasoning delta kind each item locked onto with its first delta.
+    reasoning_source: HashMap<u32, ReasoningSource>,
     terminal: bool,
     poisoned: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ReasoningSource {
+    Summary,
+    Text,
 }
 
 impl Normalizer {
@@ -151,6 +159,7 @@ impl Normalizer {
             seen_completed: HashSet::new(),
             completed_count: 0,
             has_tool_call: false,
+            reasoning_source: HashMap::new(),
             terminal: false,
             poisoned: false,
         }
@@ -249,7 +258,8 @@ impl Normalizer {
             }
             "response.output_text.delta"
             | "response.function_call_arguments.delta"
-            | "response.reasoning_summary_text.delta" => {
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta" => {
                 self.start(&mut out, None);
                 let Some(index) = event.output_index else {
                     return self.poison(protocol("delta event without output_index"));
@@ -260,14 +270,23 @@ impl Normalizer {
                     )));
                 }
                 let fragment = event.delta.unwrap_or_default();
-                let part_index = event
-                    .content_index
-                    .or(event.summary_index)
-                    .unwrap_or_default();
+                let mut part_index = event.content_index.unwrap_or_default();
                 let delta = match event.kind {
                     "response.output_text.delta" => PartDelta::Text { text: fragment },
                     "response.function_call_arguments.delta" => PartDelta::JsonArgs { fragment },
-                    _ => PartDelta::ReasoningSummary { text: fragment },
+                    kind => {
+                        let source = if kind == "response.reasoning_text.delta" {
+                            ReasoningSource::Text
+                        } else {
+                            part_index = event.summary_index.unwrap_or_default();
+                            ReasoningSource::Summary
+                        };
+                        // First kind wins per item so summary and text indices never share a part.
+                        if *self.reasoning_source.entry(index).or_insert(source) != source {
+                            return out;
+                        }
+                        PartDelta::ReasoningSummary { text: fragment }
+                    }
                 };
                 self.emit(&mut out, |sequence| StreamEvent::PartDelta {
                     sequence,
@@ -294,7 +313,7 @@ impl Normalizer {
                 let Some(raw) = event.item else {
                     return self.poison(protocol("output_item.done without item"));
                 };
-                let item = match self.normalize_item(raw) {
+                let item = match self.normalize_item(index, raw) {
                     Ok(item) => item,
                     Err(error) => return self.poison(error),
                 };
@@ -420,7 +439,7 @@ impl Normalizer {
         error
     }
 
-    fn normalize_item(&self, raw: &RawValue) -> Result<Item, ProviderError> {
+    fn normalize_item(&self, index: u32, raw: &RawValue) -> Result<Item, ProviderError> {
         let item: WireItem<'_> = serde_json::from_str(raw.get())
             .map_err(|error| protocol(format!("invalid output item: {error}")))?;
         let kind = item
@@ -475,14 +494,26 @@ impl Normalizer {
                 })
             }
             "reasoning" => {
-                let mut summary = Vec::new();
-                for content in item.summary.unwrap_or_default() {
-                    let part: WirePart<'_> = serde_json::from_str(content.get())
-                        .map_err(|error| protocol(format!("invalid reasoning summary: {error}")))?;
-                    if let Some(text) = part.text {
-                        summary.push(Part::Text { text });
+                let texts = |parts: Option<Vec<&RawValue>>| {
+                    let mut texts = Vec::new();
+                    for content in parts.unwrap_or_default() {
+                        let part: WirePart<'_> =
+                            serde_json::from_str(content.get()).map_err(|error| {
+                                protocol(format!("invalid reasoning part: {error}"))
+                            })?;
+                        if let Some(text) = part.text {
+                            texts.push(Part::Text { text });
+                        }
                     }
-                }
+                    Ok::<_, ProviderError>(texts)
+                };
+                let summary = match self.reasoning_source.get(&index) {
+                    Some(ReasoningSource::Text) => texts(item.content)?,
+                    _ => match texts(item.summary)? {
+                        summary if summary.is_empty() => texts(item.content)?,
+                        summary => summary,
+                    },
+                };
                 Ok(Item::Reasoning {
                     summary,
                     binding: ReasoningBinding {
