@@ -1,6 +1,6 @@
 # 服务端工具按 provider 声明，文件引用绑定 provider，结构化输出是请求约束
 
-**Status**: accepted (2026-10-24)
+**Status**: accepted (2026-10-24)；部分修订 by [ADR-0034](0034-structured-output-modes-and-output-tool.md)（结构化输出的输出模式与输出工具）
 **来源**: [#96](https://github.com/zibyn/asterpath/issues/96)
 **修订**: [ADR-0010](0010-canonical-protocol-model.md) 的请求模型（新增服务端工具声明、结构化输出与文件片段）
 

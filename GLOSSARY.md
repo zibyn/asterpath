@@ -196,8 +196,16 @@ _Avoid_: 转换、适配
 _Avoid_: 内置工具（不分执行方时的泛称）、builtin tool、provider tool
 
 **结构化输出（Structured Output）**：
-请求要求模型的最终文本符合给定 JSON schema；产出仍是普通消息文本，解析与校验归宿主。
+请求要求模型交付的结果符合给定 JSON schema；解析与校验归宿主。
 _Avoid_: JSON 模式、response format
+
+**输出模式（Output Mode）**：
+结构化输出的实现方式，由宿主显式选择：原生（供应商的 schema 约束）、工具（输出工具）或自动（按模型能力在两者间选择）。各模式约束强度相同，不含只要求 JSON 或只写进指令的弱约束。
+_Avoid_: 降级、fallback
+
+**输出工具（Output Tool）**：
+工具输出模式下由框架提供的专用工具；模型调用它即交付结果，不经工具执行管线。
+_Avoid_: final tool、结果工具
 
 **供应商文件引用（Provider File Reference）**：
 指向某供应商文件存储中已上传文件的 ID；只能发给该供应商，换供应商时由宿主改为内联或重新上传。
