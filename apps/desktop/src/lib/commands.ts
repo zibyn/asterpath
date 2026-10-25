@@ -1,5 +1,6 @@
-// Hand-written mirrors of the Tauri commands in `src-tauri/src/main.rs` and
-// the types of `src-tauri/src/lib.rs` (ADR-0035: no generated types).
+// Hand-written mirrors of the Tauri commands in
+// `apps/asterpath/src/bin/asterpath-desktop/main.rs` and the types of
+// `apps/asterpath/src/desktop.rs` (ADR-0035: no generated types).
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 /** A work root in the sidebar. */

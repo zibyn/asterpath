@@ -2,7 +2,7 @@
 //! `write_file`, `edit_file` and `bash`.
 //!
 //! Each tool is built for one absolute root directory; every path argument is
-//! resolved against it and anything that leaves it is `Denied`. A host serving
+//! resolved against it and anything that leaves it is `Denied`. An application serving
 //! several projects builds one tool set per project in its session
 //! environment (ADR-0037). `bash` gets only the minimal inherited environment
 //! plus the session's `ToolContext::spawn` variables, and runs under the
@@ -192,7 +192,7 @@ pub fn bash(
     )
 }
 
-/// A host default for [`bash`]'s `timeout`.
+/// An application default for [`bash`]'s `timeout`.
 pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on what any tool reads into memory or returns; the pipeline
@@ -453,7 +453,7 @@ async fn run_bash(
                     let status = status?;
                     // A background process that inherited the pipes may hold them open forever.
                     // shortcut: such a process outlives a successful bash exit and its output
-                    // after READ_AFTER_EXIT is lost; kill the group on exit if hosts need that.
+                    // after READ_AFTER_EXIT is lost; kill the group on exit if applications need that.
                     match tokio::time::timeout(READ_AFTER_EXIT, &mut reads).await {
                         Ok(read) => {
                             read_done = true;

@@ -44,19 +44,19 @@ pub struct ModelRequest {
     /// See [`RequestConfig::server_tools`].
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
     /// The session the request is made for; `None` outside one. Adapters
-    /// ignore it; host wrappers pick credentials or endpoints by it
+    /// ignore it; application wrappers pick credentials or endpoints by it
     /// (ADR-0039).
     pub session: Option<SessionContext>,
 }
 
 /// Who a model request is made for. The kernel has no users: tenancy is
-/// whatever the host wrote into the root's metadata.
+/// whatever the application wrote into the root's metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionContext {
     pub session: SessionId,
     /// The root of the session's tree; the session itself for a root.
     pub root: SessionId,
-    /// The root's host metadata (ADR-0032): children have their own, never
+    /// The root's session metadata (ADR-0032): children have their own, never
     /// inherited, so a tree's tenancy lives on its root.
     pub metadata: BTreeMap<String, String>,
 }

@@ -1,4 +1,4 @@
-//! Session environment contract (ADR-0037): the host resolves, per session,
+//! Session environment contract (ADR-0037): the application resolves, per session,
 //! the tools it may call and what its spawned processes start with.
 
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use futures_core::future::BoxFuture;
 use crate::sandbox::SpawnEnv;
 use crate::tool::Tool;
 
-/// One session's environment, resolved from its host metadata. Not logged:
+/// One session's environment, resolved from its session metadata. Not logged:
 /// it is resolved again on every open.
 #[non_exhaustive]
 #[derive(Clone, Default)]
@@ -41,10 +41,10 @@ impl std::fmt::Debug for SessionEnvironment {
     }
 }
 
-/// Host adapter that turns a root session's metadata into its environment.
+/// Application adapter that turns a root session's metadata into its environment.
 /// The engine calls it when a session is created, forked or opened; child
 /// sessions use their root's. How metadata maps to an environment, and any
-/// caching of tool instances, is the host's.
+/// caching of tool instances, is the application's.
 pub trait EnvironmentAdapter: Send + Sync + 'static {
     fn resolve<'a>(
         &'a self,
@@ -52,7 +52,7 @@ pub trait EnvironmentAdapter: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<SessionEnvironment, EnvironmentError>>;
 }
 
-/// The host could not resolve a session's environment.
+/// The application could not resolve a session's environment.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("session environment: {message}")]
 pub struct EnvironmentError {

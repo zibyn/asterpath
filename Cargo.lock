@@ -158,14 +158,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "asterpath-cli"
+name = "asterpath-app"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "asterpath",
- "asterpath-host",
  "asterpath-mcp",
  "asterpath-protocol",
+ "asterpath-sandbox-linux",
  "asterpath-skills",
  "asterpath-storage-sqlite",
  "asterpath-testing",
@@ -174,42 +174,9 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-desktop"
-version = "0.1.0"
-dependencies = [
- "asterpath",
- "asterpath-host",
- "asterpath-protocol",
- "asterpath-testing",
- "futures-util",
- "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "asterpath-host"
-version = "0.1.0"
-dependencies = [
- "asterpath",
- "asterpath-mcp",
- "asterpath-protocol",
- "asterpath-sandbox-linux",
- "asterpath-skills",
- "asterpath-testing",
- "asterpath-tools",
- "futures-util",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

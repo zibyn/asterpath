@@ -695,7 +695,7 @@ async fn write_and_edit_replace_the_file_atomically_and_keep_its_mode() {
 }
 
 #[test]
-fn coding_gives_bash_the_host_timeout() {
+fn coding_gives_bash_the_application_timeout() {
     let (_dir, root) = root();
     let bash = tool(&full_access(&root), "bash");
     assert_eq!(

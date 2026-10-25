@@ -1,4 +1,4 @@
-//! Host-resolved instruction packages: `SKILL.md` discovery, the session index
+//! Application-resolved instruction packages: `SKILL.md` discovery, the session index
 //! and the `load_skill` tool.
 //!
 //! A skill grants nothing. Discovery only reads metadata; the body is read by

@@ -1,7 +1,7 @@
 //! Native execution tracing: a deterministic projection of the event log.
 //!
 //! There is no trace sink, no trace table and no push channel: [`TracingQuery`]
-//! folds the injected [`SessionStore`] on demand. Live export is the host's own
+//! folds the injected [`SessionStore`] on demand. Live export is the application's own
 //! incremental fold over `Hooks::on_record`. `recorded_at` only feeds timings
 //! and statuses here, never recovery or projection.
 

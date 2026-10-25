@@ -1,5 +1,5 @@
 //! Session environments (ADR-0037): tools and spawn settings resolved per
-//! session from host metadata; children use their root's.
+//! session from session metadata; children use their root's.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

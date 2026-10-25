@@ -1,4 +1,4 @@
-//! Context-fork snapshots, shared by spawn forks (subagents.md §4.2) and host
+//! Context-fork snapshots, shared by spawn forks (subagents.md §4.2) and application
 //! session forks (ADR-0033): which source records a fork copies, and the
 //! projection it materializes.
 

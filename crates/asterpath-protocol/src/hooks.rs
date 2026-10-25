@@ -1,6 +1,6 @@
 //! Typed extension hooks (ADR-0025): the only in-process extension point.
 //!
-//! Hosts register any number of [`Hooks`]; the engine calls them in
+//! Applications register any number of [`Hooks`]; the engine calls them in
 //! registration order. The first `EndTurn` / `Deny` short-circuits, rewrites
 //! pass from one hook to the next, and there is no `next` wrapping.
 

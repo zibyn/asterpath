@@ -17,7 +17,7 @@ pub(crate) fn tool<'a>(
 ) -> Option<&'a OutputFormat> {
     let format = request.output_format.as_ref()?;
     let tool = match format.mode {
-        // Config checks keep the host's tool choice compatible.
+        // Config checks keep the application's tool choice compatible.
         OutputMode::Tool => true,
         OutputMode::Auto => {
             !capabilities.structured_output

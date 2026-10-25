@@ -40,7 +40,7 @@ fn origin_end(origin: &ProjectedOrigin) -> LogId {
 /// Fixed text substituted for every non-text part.
 const NON_TEXT_PLACEHOLDER: &str = "[non-text content omitted]";
 
-/// Fixed summary prompt; not exposed to hosts in v1.
+/// Fixed summary prompt; not exposed to applications in v1.
 const SUMMARY_PROMPT: &str = "Summarize the conversation segment below for future turns. \
 Keep it compact and factual. Include: the goal, work completed, key facts and files, \
 open questions, and the next steps.";

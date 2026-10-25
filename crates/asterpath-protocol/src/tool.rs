@@ -1,7 +1,7 @@
 //! Tool contract and approval policy.
 //!
 //! The pipeline itself lives in the agent module; this crate owns the frozen
-//! shapes it hands to tools, hosts and extensions.
+//! shapes it hands to tools, applications and extensions.
 
 use std::fmt;
 use std::future::Future;
@@ -42,7 +42,7 @@ pub struct ToolContext {
     pub tool_call_id: ToolCallId,
     pub cancel: CancelToken,
     /// The session environment's spawn settings (ADR-0037); empty when the
-    /// host registered no session environment.
+    /// application registered no session environment.
     pub spawn: SpawnEnv,
 }
 
@@ -242,7 +242,7 @@ impl Future for Cancelled {
     }
 }
 
-/// Host policy for one tool call. `Ask` is only meaningful when an approval
+/// Application policy for one tool call. `Ask` is only meaningful when an approval
 /// endpoint may be available; the pipeline fails closed otherwise.
 pub trait ApprovalPolicy: Send + Sync {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict;
@@ -256,7 +256,7 @@ pub enum ApprovalVerdict {
     Deny { reason: Option<String> },
 }
 
-/// Host answer to an approval request, recorded as `ApprovalDecided`.
+/// Application answer to an approval request, recorded as `ApprovalDecided`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {

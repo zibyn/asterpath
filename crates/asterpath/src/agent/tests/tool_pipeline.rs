@@ -19,7 +19,7 @@ use asterpath_protocol::{ToolCallId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider, TestTool};
 use futures_core::future::BoxFuture;
 
-// --- host hooks -----------------------------------------------------------
+// --- application hooks -----------------------------------------------------------
 
 struct RewriteArgs {
     args: JsonString,

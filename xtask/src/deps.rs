@@ -6,16 +6,14 @@ use serde::Deserialize;
 
 /// Role rules (ADR-0026): the protocol crate depends on no member; adapters
 /// depend only on protocol and other adapters; the engine only on protocol and
-/// the adapters it re-exports or feature-gates; the host kit (ADR-0040) on
-/// anything but apps and other host crates, and only apps depend on it. Apps
-/// and tools are otherwise bounded only by their `allow` list.
+/// the adapters it re-exports or feature-gates. Apps and tools are bounded only
+/// by their `allow` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Protocol,
     Adapter,
     Engine,
-    Host,
     App,
     Tool,
 }
@@ -26,16 +24,13 @@ impl Role {
         match self {
             Role::Protocol => Some(&[]),
             Role::Adapter | Role::Engine => Some(&[Role::Protocol, Role::Adapter]),
-            Role::Host => Some(&[Role::Protocol, Role::Adapter, Role::Engine]),
             Role::App | Role::Tool => None,
         }
     }
 
     fn may_depend_on_role(self, role: Role) -> bool {
-        match self.may_depend_on() {
-            Some(permitted) => permitted.contains(&role),
-            None => role != Role::Host || self == Role::App,
-        }
+        self.may_depend_on()
+            .is_none_or(|permitted| permitted.contains(&role))
     }
 }
 
@@ -239,7 +234,7 @@ mod tests {
                 &["openai"],
                 &["asterpath-protocol", "asterpath-provider-openai"],
             ),
-            package("asterpath-cli", &[], &["asterpath", "asterpath-protocol"]),
+            package("asterpath-app", &[], &["asterpath", "asterpath-protocol"]),
         ];
         let allow = [
             allowed("asterpath-protocol", Role::Protocol, &[]),
@@ -254,7 +249,7 @@ mod tests {
                 Role::Engine,
                 &["asterpath-protocol", "asterpath-provider-openai"],
             ),
-            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath-app", Role::App, &["*"]),
         ];
 
         assert!(check(&packages, &allow).is_empty());
@@ -284,18 +279,18 @@ mod tests {
     #[test]
     fn rejects_an_adapter_depending_on_the_engine_or_an_app() {
         let packages = [
-            package("asterpath-skills", &[], &["asterpath", "asterpath-cli"]),
+            package("asterpath-skills", &[], &["asterpath", "asterpath-app"]),
             package("asterpath", &[], &[]),
-            package("asterpath-cli", &[], &[]),
+            package("asterpath-app", &[], &[]),
         ];
         let allow = [
             allowed(
                 "asterpath-skills",
                 Role::Adapter,
-                &["asterpath", "asterpath-cli"],
+                &["asterpath", "asterpath-app"],
             ),
             allowed("asterpath", Role::Engine, &[]),
-            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath-app", Role::App, &["*"]),
         ];
 
         assert_eq!(
@@ -308,7 +303,7 @@ mod tests {
                 },
                 Violation::RoleDependency {
                     from: "asterpath-skills".to_string(),
-                    to: "asterpath-cli".to_string(),
+                    to: "asterpath-app".to_string(),
                     role: Role::App,
                 },
             ]
@@ -318,60 +313,21 @@ mod tests {
     #[test]
     fn rejects_an_engine_dependency_on_an_app() {
         let packages = [
-            package("asterpath", &[], &["asterpath-cli"]),
-            package("asterpath-cli", &[], &[]),
+            package("asterpath", &[], &["asterpath-app"]),
+            package("asterpath-app", &[], &[]),
         ];
         let allow = [
-            allowed("asterpath", Role::Engine, &["asterpath-cli"]),
-            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath", Role::Engine, &["asterpath-app"]),
+            allowed("asterpath-app", Role::App, &["*"]),
         ];
 
         assert_eq!(
             check(&packages, &allow),
             [Violation::RoleDependency {
                 from: "asterpath".to_string(),
-                to: "asterpath-cli".to_string(),
+                to: "asterpath-app".to_string(),
                 role: Role::App,
             }]
-        );
-    }
-
-    #[test]
-    fn only_apps_may_depend_on_the_host_kit_and_it_not_on_apps() {
-        let packages = [
-            package("asterpath-host", &[], &["asterpath", "asterpath-cli"]),
-            package("asterpath", &[], &[]),
-            package("asterpath-cli", &[], &["asterpath-host"]),
-            package("asterpath-skills", &[], &["asterpath-host"]),
-            package("xtask", &[], &["asterpath-host"]),
-        ];
-        let allow = [
-            allowed("asterpath-host", Role::Host, &["*"]),
-            allowed("asterpath", Role::Engine, &[]),
-            allowed("asterpath-cli", Role::App, &["*"]),
-            allowed("asterpath-skills", Role::Adapter, &["asterpath-host"]),
-            allowed("xtask", Role::Tool, &["asterpath-host"]),
-        ];
-
-        assert_eq!(
-            check(&packages, &allow),
-            [
-                Violation::RoleDependency {
-                    from: "asterpath-host".to_string(),
-                    to: "asterpath-cli".to_string(),
-                    role: Role::App,
-                },
-                Violation::RoleDependency {
-                    from: "asterpath-skills".to_string(),
-                    to: "asterpath-host".to_string(),
-                    role: Role::Host,
-                },
-                Violation::RoleDependency {
-                    from: "xtask".to_string(),
-                    to: "asterpath-host".to_string(),
-                    role: Role::Host,
-                },
-            ]
         );
     }
 
@@ -424,12 +380,12 @@ mod tests {
     #[test]
     fn wildcard_allows_application_crates_to_depend_on_any_workspace_member() {
         let packages = [
-            package("asterpath-cli", &[], &["asterpath", "asterpath-skills"]),
+            package("asterpath-app", &[], &["asterpath", "asterpath-skills"]),
             package("asterpath", &[], &[]),
             package("asterpath-skills", &[], &[]),
         ];
         let allow = [
-            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath-app", Role::App, &["*"]),
             allowed("asterpath", Role::Engine, &[]),
             allowed("asterpath-skills", Role::Adapter, &[]),
         ];
@@ -454,9 +410,7 @@ mod tests {
             ("asterpath-tools", Role::Adapter),
             ("asterpath-testing", Role::Adapter),
             ("asterpath", Role::Engine),
-            ("asterpath-host", Role::Host),
-            ("asterpath-cli", Role::App),
-            ("asterpath-desktop", Role::App),
+            ("asterpath-app", Role::App),
             ("asterpath-acceptance", Role::App),
             ("asterpath-mcp-fixture", Role::Tool),
             ("xtask", Role::Tool),
@@ -471,7 +425,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from allowlist"));
             assert_eq!(entry.role, role, "wrong role for {name}");
             match role {
-                Role::Protocol | Role::Adapter | Role::Engine | Role::Host => assert!(
+                Role::Protocol | Role::Adapter | Role::Engine => assert!(
                     !entry.allow.iter().any(|allowed| allowed == "*"),
                     "{name} must list explicit dependencies"
                 ),

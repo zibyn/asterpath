@@ -129,7 +129,7 @@ pub struct CatalogCursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionQuery {
     pub parent: ParentFilter,
-    /// Host metadata every listed entry carries: each key equals its value
+    /// Session metadata every listed entry carries: each key equals its value
     /// (ADR-0039). Empty matches all.
     pub metadata: BTreeMap<String, String>,
     /// Exclusive cursor: the page starts after this entry.
@@ -148,7 +148,7 @@ pub struct CatalogEntry {
     /// `recorded_at` of the session's last committed record; display only,
     /// recovery and wake never read it.
     pub last_activity: Timestamp,
-    /// The host metadata recorded in `SessionCreated` (ADR-0032).
+    /// The session metadata recorded in `SessionCreated` (ADR-0032).
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -232,7 +232,7 @@ pub trait SessionStore: Send + Sync {
 }
 
 /// Every committed record of `session`, in `seq` order: the one whole-session
-/// read shared by the engine and its hosts.
+/// read shared by the engine and its applications.
 pub async fn scan_all(
     log: &dyn SessionStore,
     session: SessionId,

@@ -1,8 +1,8 @@
 //! Asterpath facade: the composition root and the stable session API.
 //!
-//! The facade constructs the engine components directly; hosts extend it only
+//! The facade constructs the engine components directly; applications extend it only
 //! through adapter traits and [`protocol::Hooks`] (ADR-0025). There is no
-//! background driver: the host claims a session tree and calls
+//! background driver: the application claims a session tree and calls
 //! [`OwnedSession::drive`].
 
 // The public error enum is fixed by packaging.md §3.5.
@@ -33,7 +33,7 @@ pub use asterpath_protocol as protocol;
 pub use asterpath_protocol::{InputId, LogId, SessionId, StepId, Timestamp, ToolCallId, TurnId};
 
 /// Re-export of the Anthropic adapter when the `anthropic` feature is enabled.
-/// Providers stay host-injected: the facade never assembles one itself.
+/// Providers stay application-injected: the facade never assembles one itself.
 #[cfg(feature = "anthropic")]
 pub use asterpath_provider_anthropic as anthropic;
 
@@ -286,7 +286,7 @@ impl Asterpath {
     /// is the source's projection at the end of its last committed turn, so a
     /// turn in progress is not copied and `source` may be driven meanwhile.
     /// The config is the source's effective config there, unnarrowed; the
-    /// copied history drops tool changes. `metadata` is the host's, not
+    /// copied history drops tool changes. `metadata` is the application's, not
     /// inherited. Unknown source = `NotFound`; metadata over the limits =
     /// `Config`.
     pub async fn fork_session(
@@ -314,7 +314,7 @@ impl Asterpath {
         let items = snapshot.items;
 
         let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
-        // shortcut: two appends, so a crash between them leaves an empty fork that, being the newest, a host "continue the last active session" (CLI `--continue`) picks; needs a batch append in SessionStore
+        // shortcut: two appends, so a crash between them leaves an empty fork that, being the newest, an application "continue the last active session" (CLI `--continue`) picks; needs a batch append in SessionStore
         for (key, event) in [
             (
                 dedup::session_created(session),
@@ -407,7 +407,7 @@ impl Asterpath {
         Arc::clone(&self.store)
     }
 
-    /// One page of the session catalog, host metadata included (ADR-0032):
+    /// One page of the session catalog, session metadata included (ADR-0032):
     /// filtered by parent and by metadata equality (ADR-0039), newest
     /// `(created_at, session)` first, resumed after `query.after`.
     pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError> {
@@ -415,7 +415,7 @@ impl Asterpath {
     }
 
     /// The live claim of `session`'s tree, held by this or another process;
-    /// `None` when nobody owns it (ADR-0036). Hosts route cancellation and
+    /// `None` when nobody owns it (ADR-0036). Applications route cancellation and
     /// other owner operations by it.
     pub async fn owner(&self, session: SessionId) -> Result<Option<OwnerToken>, AsterError> {
         let root = root_of(&*self.store, session).await?;
@@ -425,7 +425,7 @@ impl Asterpath {
     /// Unowned sessions with unfinished work (ADR-0023, ADR-0036): a
     /// non-compaction intent is open or an input waits for its step, and no
     /// process, this one included, holds the session's tree. Retired
-    /// sessions are never listed. The host decides which to claim and drive.
+    /// sessions are never listed. The application decides which to claim and drive.
     pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError> {
         // shortcut: folds every session on each call; index inside the sqlite module once session counts grow
         let mut wakeable = Vec::new();
@@ -470,13 +470,13 @@ impl Asterpath {
     }
 
     /// Register an RAII endpoint per session tree (its root id) while the
-    /// host can answer that tree's approvals (ADR-0039).
+    /// application can answer that tree's approvals (ADR-0039).
     pub fn approval_gate(&self) -> Arc<ApprovalGate> {
         Arc::clone(&self.gate)
     }
 
     /// The session's spans: a deterministic fold over its event log. Live
-    /// export is the host's own fold over `Hooks::on_record`.
+    /// export is the application's own fold over `Hooks::on_record`.
     pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError> {
         self.trace
             .spans(SpanFilter {
@@ -534,7 +534,7 @@ fn check_tool_names(tools: &[Arc<dyn Tool>]) -> Result<(), AsterError> {
     Ok(())
 }
 
-/// Host metadata limits (storage.md §5).
+/// Session metadata limits (storage.md §5).
 fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
     if metadata.len() > 64
         || metadata
@@ -757,7 +757,7 @@ impl SessionHandle {
     }
 
     /// The model-visible projection folded from the log, not driver memory.
-    /// Each entry keeps its origin so hosts can map items back to log ids.
+    /// Each entry keeps its origin so applications can map items back to log ids.
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
         let entries = scan_all(&*self.store, self.session).await?;
         Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
@@ -815,7 +815,7 @@ impl OwnedSession {
     /// Bring the effective tool set in line with the resolved environment
     /// (ADR-0037, ADR-0030): a tool whose descriptor changed is replaced,
     /// one that no longer resolves is removed. Tools are never added; that
-    /// stays the host's `update_config`.
+    /// stays the application's `update_config`.
     async fn follow_environment(&self) -> Result<(), AsterError> {
         if self.env.is_none() {
             return Ok(());
@@ -868,7 +868,7 @@ impl OwnedSession {
     /// stream stops at once and ends with
     /// [`StorageError::OwnedElsewhere`](asterpath_protocol::StorageError::OwnedElsewhere).
     ///
-    /// # Host driver pattern
+    /// # Application driver pattern
     ///
     /// - **Do not tie the stream to a web request or connection.** When the
     ///   client disconnects the stream is dropped, and the turn stops until
@@ -880,7 +880,7 @@ impl OwnedSession {
     ///   same live events and come and go without affecting the turn.
     /// - **Queue through the log, not by retrying `Busy`.** Keep at most one
     ///   driver task per session. New input only needs
-    ///   [`submit_input`](Self::submit_input) plus a wake-up; after each
+    ///   [`submit_input`](SessionHandle::submit_input) plus a wake-up; after each
     ///   drive the task drives again while
     ///   [`SessionFacts::has_pending_input`] holds.
     /// - **Reconnect by watching again** after the last record it saw. An

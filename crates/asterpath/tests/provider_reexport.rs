@@ -1,5 +1,5 @@
 //! The facade re-exports the Anthropic adapter under its feature flag but never
-//! assembles one itself: providers remain host-injected.
+//! assembles one itself: providers remain application-injected.
 
 #![cfg(feature = "anthropic")]
 

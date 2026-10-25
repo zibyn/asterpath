@@ -1962,7 +1962,7 @@ async fn an_injected_profile_allows_off_and_sets_capabilities() {
                 .with_efforts(vec![Low])
                 .with_forced_tool_choice(false),
         )
-        // A host entry overrides an official id.
+        // An application entry overrides an official id.
         .with_model_profile(
             "gpt-6.1-sol",
             OpenAiModelProfile::latest().with_efforts(vec![Off]),

@@ -125,7 +125,7 @@ fn resolve(
 ) -> Result<(OwnedFd, Option<OsString>), ToolError> {
     let mut parts = normal_parts(relative)?;
     let last = parts.pop().map(OsStr::to_owned);
-    // The root path is host-supplied and trusted, so following symlinks in it is fine.
+    // The root path is application-supplied and trusted, so following symlinks in it is fine.
     let mut dir =
         rustix::fs::open(root, dir_flags() - OFlags::NOFOLLOW, Mode::empty()).map_err(|error| {
             ToolError::Internal {

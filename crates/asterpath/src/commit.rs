@@ -1,6 +1,6 @@
 //! The single append entry (ADR-0025). Every engine writer (agent, waits,
 //! scheduler, facade) appends through this log: after a successful append it
-//! shows each new record to the hosts' `on_record` hooks, in session order.
+//! shows each new record to the applications' `on_record` hooks, in session order.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -33,7 +33,7 @@ pub(crate) struct CommitLog {
     inner: Arc<dyn SessionStore>,
     hooks: Vec<Arc<dyn Hooks>>,
     // shortcut: one cursor per session touched by this process, never evicted;
-    // evict on retirement if long-lived hosts touch very many sessions.
+    // evict on retirement if long-lived applications touch very many sessions.
     cursors: Mutex<HashMap<SessionId, Arc<AsyncMutex<Cursor>>>>,
     /// Told of every commit, so this process's watchers need not poll.
     watchers: Arc<Watchers>,

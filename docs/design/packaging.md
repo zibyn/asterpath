@@ -316,7 +316,7 @@ pub enum AsterError {
 | crate | features | 默认 |
 | --- | --- | --- |
 | `asterpath` | `anthropic`, `openai`, `sqlite` | `anthropic`, `openai`, `sqlite` |
-| `asterpath-app` | 同 facade | 同 facade |
+| `asterpath-app` | facade 的三个，加 `tauri`（桌面窗口） | `anthropic`, `openai`, `sqlite` |
 | 适配器 crate | 无 | — |
 | `protocol` | 无 | — |
 
@@ -512,7 +512,7 @@ default = "untrusted"         # untrusted | never
 | M1 恢复 | 场景 (a)；引入 `asterpath-acceptance` | `acceptance` 的 A1–A3 通过 |
 | M2 双协议 | 两个 provider crate + adapter 测试 | 场景 (b) 通过 |
 | M3 子智能体 | `runtime` / `scheduler` / 子会话 + tracing / usage；默认 compactor 可选接入 | 场景 (c) 通过 |
-| M4 CLI | `asterpath-cli` 交互模式与 `exec` / `doctor` / `debug`（§4.1）、配置、审批端 | CLI 场景测试通过 |
+| M4 CLI | `asterpath-app` 的 CLI 交互模式与 `exec` / `doctor` / `debug`（§4.1）、配置、审批端 | CLI 场景测试通过 |
 | M5 扩展（已交付） | `asterpath-mcp`（MCP 服务配置、子进程、MCP adapter；#80 前为 `asterpath-plugin-host`）、沙箱合约（#80 起在 protocol）与 Linux 后端 | 不参与 v1 验收；闸门见 tracker 侧 M5 实现 spec（六张子票 + T6 端到端） |
 | M6 技能（已交付） | `asterpath-skills`、CLI `[skills]`（`enabled` 开关）、发现/索引/`load_skill` | 不参与 v1 验收；场景见 [skills.md](skills.md) §11（S1–S10） |
 

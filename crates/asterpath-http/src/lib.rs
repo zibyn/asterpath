@@ -137,7 +137,7 @@ fn protocol(message: String) -> ProviderError {
 }
 
 /// The `provider_options` entry for `request.spec.provider` as top-level body fields,
-/// rejecting any key in `reserved` (keys the adapter never lets a host set,
+/// rejecting any key in `reserved` (keys the adapter never lets an application set,
 /// written or not) as `Unsupported` and a non-object value as `InvalidRequest`.
 /// Merge the result with [`merge_provider_option`].
 pub fn provider_options_for(
@@ -280,7 +280,7 @@ pub fn same_provider_raw_field(
 
 /// Receives an adapter's protocol-level trace marks.
 ///
-/// The tracing module is not wired in v1 yet; hosts inject a sink (or ignore
+/// The tracing module is not wired in v1 yet; applications inject a sink (or ignore
 /// marks) until `protocol.dropped_items` / `protocol.rendered_as_text` have a
 /// real span to land on.
 pub trait TraceSink: Send + Sync {

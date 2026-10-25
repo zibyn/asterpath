@@ -801,7 +801,7 @@ fn named(name: &str) -> SessionSpec {
 }
 
 #[tokio::test]
-async fn sessions_lists_host_metadata_across_a_reopen() {
+async fn sessions_lists_session_metadata_across_a_reopen() {
     let clock = Arc::new(ManualClock::new());
     let db = temp_db("catalog");
     let build = |db: PathBuf| {
@@ -854,7 +854,7 @@ async fn sessions_lists_host_metadata_across_a_reopen() {
 }
 
 #[tokio::test]
-async fn oversized_host_metadata_is_a_configuration_error() {
+async fn oversized_session_metadata_is_a_configuration_error() {
     let db = temp_db("metadata-limits");
     let asterpath = open(&db, vec![Arc::new(ScriptedProvider::new("p"))]).await;
     let too_many = (0..=64).map(|i| (format!("k{i}"), String::new())).collect();

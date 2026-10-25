@@ -7,9 +7,7 @@
 #     `allow` list ("*" = any workspace member, apps only);
 #   - role rules: `protocol` depends on no member and declares no features;
 #     an `adapter` depends only on protocol and other adapters; the `engine`
-#     depends only on protocol and the adapters it re-exports or feature-gates;
-#     the `host` kit (ADR-0040) depends on protocol, adapters and the engine,
-#     and only apps depend on it.
+#     depends only on protocol and the adapters it re-exports or feature-gates.
 #
 # Only normal dependencies are checked. Dev-dependencies are intentionally exempt
 # (crates may dev-depend on `asterpath-testing` for contract suites).
@@ -80,28 +78,10 @@ allow = [
     "asterpath-storage-sqlite",
 ]
 
-# Host kit shared by the reference hosts (ADR-0040): work-root assembly and,
-# behind the `config` feature, `config.toml` parsing.
+# Local application (ADR-0049): the CLI binary and, behind the `tauri`
+# feature, the desktop window (ADR-0035).
 [[package]]
-name = "asterpath-host"
-role = "host"
-allow = [
-    "asterpath",
-    "asterpath-protocol",
-    "asterpath-mcp",
-    "asterpath-skills",
-    "asterpath-tools",
-    "asterpath-sandbox-linux",
-]
-
-[[package]]
-name = "asterpath-cli"
-role = "app"
-allow = ["*"]
-
-# Tauri desktop reference host (ADR-0035); the window is behind the `tauri` feature.
-[[package]]
-name = "asterpath-desktop"
+name = "asterpath-app"
 role = "app"
 allow = ["*"]
 

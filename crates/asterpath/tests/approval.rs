@@ -379,7 +379,7 @@ async fn dropping_the_drive_stream_removes_the_pending_request() {
     drop(stream);
     assert!(
         asterpath.approval_gate().pending().is_empty(),
-        "the host dropped the wait"
+        "the application dropped the wait"
     );
 
     asterpath.shutdown().await.unwrap();

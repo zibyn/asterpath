@@ -76,7 +76,7 @@ pub(crate) struct ToolPipeline {
     gate: Arc<ApprovalGate>,
     waits: Arc<Waits>,
     clock: Arc<dyn Clock>,
-    /// Host hooks, called in registration order (ADR-0025).
+    /// Application hooks, called in registration order (ADR-0025).
     hooks: Vec<Arc<dyn Hooks>>,
     /// Backs `ToolCallCtx::usage`.
     usage: Option<UsageLookup>,
@@ -739,7 +739,7 @@ impl ToolPipeline {
         })
     }
 
-    /// Host `before_tool` hooks in order: rewrites pass along, the first
+    /// Application `before_tool` hooks in order: rewrites pass along, the first
     /// `Deny` short-circuits, and an error or panic fails the call.
     async fn before_tool(&self, ctx: &ToolCallCtx, args: &mut ToolArgs) -> Option<PreFailure> {
         for hook in &self.hooks {
@@ -756,7 +756,7 @@ impl ToolPipeline {
         None
     }
 
-    /// Host `after_tool` hooks in order; the first error or panic wins.
+    /// Application `after_tool` hooks in order; the first error or panic wins.
     async fn after_tool(
         &self,
         ctx: &ToolCallCtx,

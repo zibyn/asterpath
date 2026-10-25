@@ -739,7 +739,7 @@ impl Scheduler {
                     SessionEvent::SessionCreated {
                         config: config.clone(),
                         parent: Some(parent.clone()),
-                        // Children never inherit host metadata (ADR-0032).
+                        // Children never inherit session metadata (ADR-0032).
                         metadata: Default::default(),
                     },
                     Some(dedup::session_created(child)),
@@ -997,7 +997,7 @@ fn child_outcome(events: &[(LogEntry, SessionEvent)]) -> Option<ChildOutcome> {
             reason: ChildFailure::Refused,
             summary: Summary { items: Vec::new() },
         },
-        // The child was stopped by its own host, not by the parent's wait.
+        // The child was stopped by its own application, not by the parent's wait.
         TurnEndReason::Cancelled => ChildOutcome::Cancelled {
             reason: CancelReason::Host,
         },

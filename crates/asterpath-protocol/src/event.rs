@@ -22,7 +22,7 @@ pub enum SessionEvent {
     SessionCreated {
         config: ConfigSnapshot,
         parent: Option<ParentRef>,
-        /// Opaque, immutable host metadata (ADR-0032); empty for children.
+        /// Opaque, immutable session metadata (ADR-0032); empty for children.
         metadata: BTreeMap<String, String>,
     },
     ContextForked {
@@ -126,12 +126,12 @@ pub enum SessionEvent {
         child: SessionId,
         outcome: ChildOutcome,
     },
-    /// The host's answer to an `Ask` for one recorded tool call.
+    /// The application's answer to an `Ask` for one recorded tool call.
     ApprovalDecided {
         tool_call_id: ToolCallId,
         decision: ApprovalDecision,
     },
-    /// A host change to the effective configuration; it takes effect at the
+    /// An application change to the effective configuration; it takes effect at the
     /// next `StepStarted` (ADR-0030).
     ConfigChanged {
         patch: ConfigPatch,
@@ -179,7 +179,7 @@ pub struct ParentRef {
 pub enum ForkSource {
     /// A `spawn_agent` call: the child's parent session, turn and tool call.
     Spawn(ParentRef),
-    /// A host session fork; the new session has no parent.
+    /// An application session fork; the new session has no parent.
     Session { session: SessionId },
 }
 

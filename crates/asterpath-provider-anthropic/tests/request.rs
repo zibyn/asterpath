@@ -1337,7 +1337,7 @@ async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
         .with_default_profile(off())
         .with_model_profile("deepseek-v4-pro", low_only())
         .with_model_profile("deepseek-v4", off())
-        // A host entry overrides an official id.
+        // An application entry overrides an official id.
         .with_model_profile("claude-opus-5-5", off().with_forced_tool_choice(true));
     let server = MockServer::start((0..4).map(|_| Reply::sse(empty_sse())).collect());
     let provider = provider.with_base_url(server.base_url());
@@ -1366,7 +1366,7 @@ async fn profile_lookup_prefers_model_entries_then_default_then_builtin() {
             "deepseek-flash"
         ]
     );
-    // The host entry's capabilities replace the official row's.
+    // The application entry's capabilities replace the official row's.
     let mut spec = model();
     spec.model = ModelId::new("claude-opus-5-5");
     let capabilities = asterpath_protocol::Provider::capabilities(&provider, &spec);

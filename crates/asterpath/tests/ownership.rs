@@ -399,7 +399,7 @@ async fn owner_writes_carry_the_claim_and_external_writes_do_not() {
 /// Past a lease written now.
 const LEASE_EXPIRY: i64 = DEFAULT_LEASE_TTL.as_millis() as i64 + 1;
 
-/// Every owner whose loss a process reported to its host.
+/// Every owner whose loss a process reported to its application.
 #[derive(Default)]
 struct LostOwners(Mutex<Vec<OwnerToken>>);
 
@@ -503,7 +503,7 @@ async fn a_killed_owners_tree_is_recovered_elsewhere_once_its_lease_expires() {
 }
 
 #[tokio::test]
-async fn an_owner_whose_tree_was_taken_over_stops_and_tells_the_host() {
+async fn an_owner_whose_tree_was_taken_over_stops_and_tells_the_application() {
     let db = TempDb::new("taken-over");
     let clock = Arc::new(ManualClock::new());
     let lost = Arc::new(LostOwners::default());
@@ -582,7 +582,7 @@ impl SessionStore for Unrenewable {
 }
 
 #[tokio::test]
-async fn an_owner_that_cannot_renew_stops_and_tells_the_host() {
+async fn an_owner_that_cannot_renew_stops_and_tells_the_application() {
     let store = Arc::new(Unrenewable {
         inner: Arc::new(InMemoryEventLog::new()),
         failing: AtomicBool::new(false),

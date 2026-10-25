@@ -20,7 +20,7 @@
 | `testdrive` 二进制 | `asterpath-acceptance` | `run` / `resume` / `inspect`；用真实模块组装，向 stdout 输出 JSON 行进度标记 |
 | mock HTTP server | `asterpath-acceptance` | 场景 (b) 回放 Anthropic / OpenAI 线上协议（wiremock 或等价） |
 
-- `testdrive` 不依赖 `asterpath-cli`；CLI 的行为另有 CLI 测试。
+- `testdrive` 不依赖 `asterpath-app`；CLI 的行为另有 CLI 测试。
 - 进度标记示例：`{"event":"effect_applied","call":"..."}`、`{"event":"parent_waiting","children":2}`。
 - 测试通过 `assert_cmd` 启动 `testdrive`，从 stdout 等待标记，再 `libc::kill(pid, SIGKILL)`。
 - 日志断言直接打开同一个 SQLite 文件读取 session 流；不复用被测进程的内存状态。

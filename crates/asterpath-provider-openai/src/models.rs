@@ -26,7 +26,7 @@ use asterpath_protocol::ReasoningEffort::{self, High, Low, Max, Medium, Minimal,
 
 /// The request rules for one model behind one provider instance.
 ///
-/// The adapter's built-in table covers official model ids; hosts inject
+/// The adapter's built-in table covers official model ids; applications inject
 /// profiles for other endpoints with
 /// [`OpenAiProvider::with_default_profile`](crate::OpenAiProvider::with_default_profile)
 /// and [`with_model_profile`](crate::OpenAiProvider::with_model_profile).
@@ -114,7 +114,7 @@ const fn without_structured_output(mut profile: OpenAiModelProfile) -> OpenAiMod
     profile
 }
 
-/// PDF input (api/docs/guides/pdf-files) on every vision-capable model; hosts
+/// PDF input (api/docs/guides/pdf-files) on every vision-capable model; applications
 /// widen the list for other document types.
 const PDF: &[&str] = &["application/pdf"];
 
@@ -161,7 +161,7 @@ static LATEST_PROFILE: OpenAiModelProfile = OpenAiModelProfile {
     file_media_types: Cow::Borrowed(&[]),
 };
 
-/// Host model entries (first prefix match wins), then the host default, then
+/// Application model entries (first prefix match wins), then the application default, then
 /// the built-in table, then [`LATEST`].
 pub(crate) fn profile_for<'a>(
     models: &'a [(String, OpenAiModelProfile)],

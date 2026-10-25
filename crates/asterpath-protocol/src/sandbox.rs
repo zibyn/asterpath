@@ -1,8 +1,8 @@
 //! Sandbox contract: confine a spawn request according to a resolved policy.
 //!
 //! [`SandboxProvider::confine`] is a pure transform at a process spawn point.
-//! Policy resolution, audit and backend construction belong to the host
-//! (ADR-0019). The contract lives in protocol so hosts' own spawn-type tools can
+//! Policy resolution, audit and backend construction belong to the application
+//! (ADR-0019). The contract lives in protocol so applications' own spawn-type tools can
 //! use it without depending on MCP (ADR-0027).
 
 use std::collections::BTreeMap;
@@ -48,7 +48,7 @@ impl<'a> SpawnRequest<'a> {
     }
 }
 
-/// What a session's spawned processes start with (ADR-0037). The host's
+/// What a session's spawned processes start with (ADR-0037). The application's
 /// session environment supplies it; tools receive it in `ToolContext`.
 /// `Debug` prints variable names only: values may be secrets.
 #[non_exhaustive]
@@ -130,7 +130,7 @@ impl ConfinedSpawn {
     }
 }
 
-/// Filesystem policy resolved by the host.
+/// Filesystem policy resolved by the application.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxPolicy {

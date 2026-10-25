@@ -164,13 +164,13 @@ impl HttpFixture {
 }
 
 /// The embedder's sandbox wiring, reused across loads in one test.
-struct Host(Option<Arc<dyn SandboxProvider>>, SandboxPolicy);
+struct App(Option<Arc<dyn SandboxProvider>>, SandboxPolicy);
 
-fn host(sandbox: Option<Arc<dyn SandboxProvider>>, policy: SandboxPolicy) -> Host {
-    Host(sandbox, policy)
+fn app(sandbox: Option<Arc<dyn SandboxProvider>>, policy: SandboxPolicy) -> App {
+    App(sandbox, policy)
 }
 
-impl Host {
+impl App {
     async fn load(&self, configs: Vec<McpServerConfig>) -> Result<McpServers, McpError> {
         McpServers::load(configs, self.0.clone(), self.1.clone()).await
     }
@@ -231,11 +231,11 @@ fn failed_stage(status: &ServerStatus) -> LoadStage {
 
 #[tokio::test]
 async fn p1_duplicate_ids_fail_every_manifest_and_register_nothing() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let first = stdio_config("dup", &["--stdio"]);
     let second = stdio_config("dup", &["--stdio"]);
 
-    let servers = host.load(vec![first, second]).await.expect("optional");
+    let servers = app.load(vec![first, second]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(statuses.len(), 2);
     for status in statuses {
@@ -246,12 +246,12 @@ async fn p1_duplicate_ids_fail_every_manifest_and_register_nothing() {
 
 #[tokio::test]
 async fn p1_a_required_duplicate_aborts_startup() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let first = stdio_config("dup", &["--stdio"]);
     let mut second = stdio_config("dup", &["--stdio"]);
     second.required = true;
 
-    let error = host.load(vec![first, second]).await.unwrap_err();
+    let error = app.load(vec![first, second]).await.unwrap_err();
     assert_eq!(error.server.as_str(), "dup");
     assert_eq!(error.stage, LoadStage::Config);
 }
@@ -260,7 +260,7 @@ async fn p1_a_required_duplicate_aborts_startup() {
 
 #[tokio::test]
 async fn p2_one_broken_server_does_not_affect_another() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let mut broken = stdio_config("broken", &[]);
     broken.transport = McpTransport::Stdio {
         command: "/nonexistent/asterpath-test-binary".to_owned(),
@@ -270,7 +270,7 @@ async fn p2_one_broken_server_does_not_affect_another() {
     };
     let good = stdio_config("good", &["--stdio"]);
 
-    let servers = host.load(vec![broken, good]).await.expect("optional");
+    let servers = app.load(vec![broken, good]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(failed_stage(&statuses[0]), LoadStage::Spawn);
     assert_eq!(loaded_tools(&statuses[1]).len(), 3);
@@ -282,23 +282,23 @@ async fn p2_one_broken_server_does_not_affect_another() {
 
 #[tokio::test]
 async fn p3_version_mismatch_fails_handshake_and_required_aborts() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let config = stdio_config("weather", &["--stdio", "--force-version-mismatch"]);
-    let servers = host.load(vec![config]).await.expect("optional");
+    let servers = app.load(vec![config]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     assert!(servers.tools().is_empty());
 
     let mut required = stdio_config("weather", &["--stdio", "--force-version-mismatch"]);
     required.required = true;
-    let error = host.load(vec![required]).await.unwrap_err();
+    let error = app.load(vec![required]).await.unwrap_err();
     assert_eq!(error.stage, LoadStage::Handshake);
 }
 
 #[tokio::test]
 async fn m4_a_server_without_a_common_version_fails_handshake_without_spawning() {
     let provider = Arc::new(FakeSandboxProvider::full());
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
@@ -306,7 +306,7 @@ async fn m4_a_server_without_a_common_version_fails_handshake_without_spawning()
         "weather",
         &["--stdio", "--supported-versions", "2027-01-01"],
     );
-    let servers = host.load(vec![config]).await.expect("optional");
+    let servers = app.load(vec![config]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     assert!(servers.tools().is_empty());
@@ -316,13 +316,13 @@ async fn m4_a_server_without_a_common_version_fails_handshake_without_spawning()
 #[tokio::test]
 async fn version_intersection_is_checked_before_spawn() {
     let provider = Arc::new(FakeSandboxProvider::full());
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
     let mut config = stdio_config("weather", &["--stdio"]);
     config.protocol_versions = vec!["2025-11-25".to_owned()];
-    let servers = host.load(vec![config]).await.expect("optional");
+    let servers = app.load(vec![config]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     assert!(provider.recorded().is_empty());
@@ -332,7 +332,7 @@ async fn version_intersection_is_checked_before_spawn() {
 
 #[tokio::test]
 async fn p4_required_spawn_failure_aborts_and_never_leaks_secrets() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let mut config = stdio_config("bad", &[]);
     config.required = true;
     config.transport = McpTransport::Stdio {
@@ -344,7 +344,7 @@ async fn p4_required_spawn_failure_aborts_and_never_leaks_secrets() {
     let debug = format!("{config:?}");
     assert!(!debug.contains("s3cr4t"), "{debug}");
 
-    let error = host.load(vec![config]).await.unwrap_err();
+    let error = app.load(vec![config]).await.unwrap_err();
     assert_eq!(error.stage, LoadStage::Spawn);
     assert!(!error.to_string().contains("s3cr4t"));
 }
@@ -390,13 +390,13 @@ fn p9_manifest_debug_redacts_env_and_header_values() {
 #[tokio::test]
 async fn p5_m1_loads_paginates_registers_and_calls_tools() {
     let provider = Arc::new(FakeSandboxProvider::full());
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
     let config = stdio_config("weather", &["--stdio", "--page-size", "1"]);
 
-    let servers = host.load(vec![config]).await.expect("load");
+    let servers = app.load(vec![config]).await.expect("load");
     let statuses = servers.statuses();
     assert_eq!(
         loaded_tools(&statuses[0]),
@@ -450,8 +450,8 @@ async fn p5_m1_loads_paginates_registers_and_calls_tools() {
 
 #[tokio::test]
 async fn m14_maps_every_content_block_and_structured_content() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("load");
@@ -481,8 +481,8 @@ async fn m14_maps_every_content_block_and_structured_content() {
 
 #[tokio::test]
 async fn m5_a_repeated_cursor_fails_discovery() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-repeat-cursor"],
@@ -496,8 +496,8 @@ async fn m5_a_repeated_cursor_fails_discovery() {
 
 #[tokio::test]
 async fn m5_more_than_100_pages_fails_discovery() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-endless-pages"],
@@ -514,11 +514,11 @@ async fn m5_more_than_100_pages_fails_discovery() {
 #[tokio::test]
 async fn s8_a_broken_server_registers_nothing_and_a_healthy_one_still_loads() {
     for tool_set in ["collision", "oversized"] {
-        let host = host(None, SandboxPolicy::FullAccess);
+        let app = app(None, SandboxPolicy::FullAccess);
         let broken = stdio_config("broken", &["--stdio", "--tool-set", tool_set]);
         let healthy = stdio_config("healthy", &["--stdio"]);
 
-        let servers = host.load(vec![broken, healthy]).await.expect("load");
+        let servers = app.load(vec![broken, healthy]).await.expect("load");
         let statuses = servers.statuses();
         assert_eq!(
             failed_stage(&statuses[0]),
@@ -543,8 +543,8 @@ async fn s8_a_broken_server_registers_nothing_and_a_healthy_one_still_loads() {
 
 #[tokio::test]
 async fn m7_is_error_maps_to_internal_with_joined_text() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-is-error"],
@@ -563,8 +563,8 @@ async fn m7_is_error_maps_to_internal_with_joined_text() {
 
 #[tokio::test]
 async fn m15_input_required_is_internal_and_not_retried() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-input-required"],
@@ -582,10 +582,10 @@ async fn m15_input_required_is_internal_and_not_retried() {
 
 #[tokio::test]
 async fn m9_call_timeout_comes_from_the_manifest() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let mut config = stdio_config("weather", &["--stdio"]);
     config.timeouts.call = Some(Duration::from_millis(250));
-    let servers = host.load(vec![config]).await.expect("load");
+    let servers = app.load(vec![config]).await.expect("load");
 
     let descriptor = servers
         .get(&ToolName::new("weather__echo"))
@@ -597,8 +597,8 @@ async fn m9_call_timeout_comes_from_the_manifest() {
 
 #[tokio::test]
 async fn m10_crash_fails_in_flight_and_later_calls() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config(
             "weather",
             &["--stdio", "--fault-crash-after", "0"],
@@ -620,7 +620,7 @@ async fn m10_crash_fails_in_flight_and_later_calls() {
 
 #[tokio::test]
 async fn p7_a_config_with_millisecond_timeouts_loads() {
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     let value = json!({
         "id": "weather",
         "protocol_versions": ["2026-07-28"],
@@ -633,7 +633,7 @@ async fn p7_a_config_with_millisecond_timeouts_loads() {
         "timeouts": {"startup_ms": 5000, "call_ms": 250},
     });
     let config: McpServerConfig = serde_json::from_value(value).expect("valid config");
-    let servers = host.load(vec![config]).await.expect("load");
+    let servers = app.load(vec![config]).await.expect("load");
     assert_eq!(loaded_tools(&servers.statuses()[0]).len(), 3);
     assert_eq!(
         servers
@@ -691,10 +691,10 @@ fn unknown_transport_kinds_are_parse_errors() {
 async fn m2_http_json_loads_paginates_registers_and_calls() {
     let fixture = HttpFixture::spawn(&["--page-size", "1"]).await;
     // No sandbox provider: HTTP has no local process (S8).
-    let host = host(None, SandboxPolicy::ReadOnly);
+    let app = app(None, SandboxPolicy::ReadOnly);
     let config = http_config("weather", &fixture.url(), BTreeMap::new());
 
-    let servers = host.load(vec![config]).await.expect("load");
+    let servers = app.load(vec![config]).await.expect("load");
     let statuses = servers.statuses();
     assert_eq!(
         loaded_tools(&statuses[0]),
@@ -738,12 +738,12 @@ async fn m2_http_json_loads_paginates_registers_and_calls() {
 #[tokio::test]
 async fn m3_http_request_scoped_sse_ignores_notifications() {
     let fixture = HttpFixture::spawn(&[]).await;
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
     // Manifest Accept forces the fixture's request-scoped SSE path.
     let config = http_config("weather", &fixture.url(), sse_headers());
 
     // Handshake and discovery are SSE too; progress notifications are ignored.
-    let servers = host.load(vec![config]).await.expect("load");
+    let servers = app.load(vec![config]).await.expect("load");
     let statuses = servers.statuses();
     assert_eq!(loaded_tools(&statuses[0]).len(), 3);
 
@@ -758,11 +758,11 @@ async fn m3_http_request_scoped_sse_ignores_notifications() {
 #[tokio::test]
 async fn m11_sse_interruption_fails_only_that_call() {
     let relay = Relay::start().await;
-    let host = host(None, SandboxPolicy::FullAccess);
+    let app = app(None, SandboxPolicy::FullAccess);
 
     let healthy = HttpFixture::spawn(&[]).await;
     relay.point_at(&healthy);
-    let servers = host
+    let servers = app
         .load(vec![http_config("weather", &relay.url(), sse_headers())])
         .await
         .expect("load");
@@ -799,8 +799,8 @@ async fn m16_http_errors_do_not_leak_url_or_header_values() {
         headers.clone(),
     );
     assert!(!format!("{config:?}").contains("header-s3cr4t"));
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host.load(vec![config]).await.expect("optional");
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app.load(vec![config]).await.expect("optional");
     let statuses = servers.statuses();
     assert_eq!(failed_stage(&statuses[0]), LoadStage::Handshake);
     let rendered = format!("{:?}", statuses[0]);
@@ -815,7 +815,7 @@ async fn m16_http_errors_do_not_leak_url_or_header_values() {
         headers,
     );
     required.required = true;
-    let error = host.load(vec![required]).await.unwrap_err();
+    let error = app.load(vec![required]).await.unwrap_err();
     let rendered = error.to_string();
     assert!(!rendered.contains("s3cr4t"), "{rendered}");
     assert!(!rendered.contains("127.0.0.1"), "{rendered}");
@@ -825,8 +825,8 @@ async fn m16_http_errors_do_not_leak_url_or_header_values() {
 #[tokio::test]
 async fn http_no_common_version_fails_handshake() {
     let fixture = HttpFixture::spawn(&["--supported-versions", "2027-01-01"]).await;
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![http_config(
             "weather",
             &fixture.url(),
@@ -844,8 +844,8 @@ async fn http_no_common_version_fails_handshake() {
 
 #[tokio::test]
 async fn restricted_policy_without_a_provider_fails_without_spawning() {
-    let host = host(None, SandboxPolicy::ReadOnly);
-    let servers = host
+    let app = app(None, SandboxPolicy::ReadOnly);
+    let servers = app
         .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("optional");
@@ -857,7 +857,7 @@ async fn restricted_policy_without_a_provider_fails_without_spawning() {
 #[tokio::test]
 async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
     let provider = Arc::new(FakeSandboxProvider::full());
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
@@ -868,7 +868,7 @@ async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
         env: BTreeMap::from([("WEATHER_API_KEY".to_owned(), "test-token".to_owned())]),
         cwd: None,
     };
-    host.load(vec![config]).await.expect("load");
+    app.load(vec![config]).await.expect("load");
 
     let recorded = provider.recorded();
     assert_eq!(recorded.len(), 1);
@@ -896,11 +896,11 @@ async fn spawn_requests_carry_the_confined_policy_and_manifest_env() {
 #[tokio::test]
 async fn a_sandbox_refusal_fails_the_server_at_the_sandbox_stage() {
     let provider = Arc::new(FakeSandboxProvider::refused("policy denies spawn"));
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
-    let servers = host
+    let servers = app
         .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("optional");
@@ -912,8 +912,8 @@ async fn a_sandbox_refusal_fails_the_server_at_the_sandbox_stage() {
 
 #[tokio::test]
 async fn full_access_runs_without_a_provider() {
-    let host = host(None, SandboxPolicy::FullAccess);
-    let servers = host
+    let app = app(None, SandboxPolicy::FullAccess);
+    let servers = app
         .load(vec![stdio_config("weather", &["--stdio"])])
         .await
         .expect("load");
@@ -946,7 +946,7 @@ async fn partial_enforcement_fails_closed_before_the_process_starts() {
     let provider = Arc::new(FakeSandboxProvider::partial(vec![
         asterpath_protocol::SandboxAspect::FilesystemWrite,
     ]));
-    let host = host(
+    let app = app(
         Some(provider.clone() as Arc<dyn SandboxProvider>),
         SandboxPolicy::ReadOnly,
     );
@@ -959,14 +959,14 @@ async fn partial_enforcement_fails_closed_before_the_process_starts() {
         ),
     );
 
-    let servers = host.load(vec![config.clone()]).await.expect("optional");
+    let servers = app.load(vec![config.clone()]).await.expect("optional");
     assert_eq!(failed_stage(&servers.statuses()[0]), LoadStage::Sandbox);
     assert!(servers.tools().is_empty());
     assert_eq!(provider.recorded().len(), 1);
 
     let mut required = config;
     required.required = true;
-    let error = host.load(vec![required]).await.unwrap_err();
+    let error = app.load(vec![required]).await.unwrap_err();
     assert_eq!(error.stage, LoadStage::Sandbox);
 
     tokio::time::sleep(Duration::from_millis(100)).await;

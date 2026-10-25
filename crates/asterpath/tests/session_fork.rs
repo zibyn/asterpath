@@ -1,4 +1,4 @@
-//! Host session fork (ADR-0033): a new, parentless session whose initial
+//! Application session fork (ADR-0033): a new, parentless session whose initial
 //! history is the source's projection at its last committed turn.
 
 use std::collections::BTreeMap;
@@ -178,7 +178,11 @@ async fn forked_sessions_continue_independently() {
         panic!("first record is SessionCreated: {fork_events:?}");
     };
     assert_eq!(*parent, None, "a fork has no parent session");
-    assert_eq!(*metadata, self::metadata("copy"), "metadata is the host's");
+    assert_eq!(
+        *metadata,
+        self::metadata("copy"),
+        "metadata is the application's"
+    );
     let SessionEvent::ContextForked { source: from, .. } = &fork_events[1] else {
         panic!("second record is ContextForked: {fork_events:?}");
     };
@@ -351,7 +355,7 @@ async fn a_compaction_inside_the_turn_in_progress_is_not_copied() {
     turn(&source, 1, "one").await;
 
     // A second turn starts and compacts everything so far, then is still
-    // running when the host forks.
+    // running when the application forks.
     let turn_id = TurnId::from_bytes([2; 16]);
     source.submit_input(input(2, "two")).await.expect("input");
     for event in [

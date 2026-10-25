@@ -1,0 +1,61 @@
+[package]
+name = "asterpath-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# One local application, two entry points (ADR-0049). The library holds the
+# private modules both share: work-root assembly, `config.toml` parsing and
+# the desktop command layer, which builds and tests without Tauri.
+[lib]
+name = "asterpath_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asterpath"
+path = "src/bin/asterpath/main.rs"
+# Same name as the facade crate; its docs would overwrite the facade's.
+doc = false
+
+# The window needs the `tauri` feature, which needs the webkit2gtk / gtk
+# development packages (ADR-0035).
+[[bin]]
+name = "asterpath-desktop"
+path = "src/bin/asterpath-desktop/main.rs"
+required-features = ["tauri"]
+
+[features]
+default = ["anthropic", "openai", "sqlite"]
+anthropic = ["asterpath/anthropic"]
+openai = ["asterpath/openai"]
+sqlite = ["asterpath/sqlite"]
+tauri = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog"]
+
+[dependencies]
+asterpath = { path = "../../crates/asterpath", default-features = false }
+asterpath-mcp = { path = "../../crates/asterpath-mcp" }
+asterpath-protocol = { path = "../../crates/asterpath-protocol" }
+asterpath-skills = { path = "../../crates/asterpath-skills" }
+asterpath-tools = { path = "../../crates/asterpath-tools" }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+asterpath-sandbox-linux = { path = "../../crates/asterpath-sandbox-linux" }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+asterpath-storage-sqlite = { path = "../../crates/asterpath-storage-sqlite" }
+asterpath-testing = { path = "../../crates/asterpath-testing" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "sync", "time"] }

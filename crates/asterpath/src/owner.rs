@@ -77,7 +77,7 @@ impl Held {
 /// This process's claims and its process lease (ADR-0036). A claim is lost
 /// when the lease cannot be renewed or another process takes the tree over
 /// (a renewal reports it, or an owner write is refused): its drives stop,
-/// its owner writes are refused here, the tree is released and the hosts
+/// its owner writes are refused here, the tree is released and the applications
 /// are told.
 pub(crate) struct Ownership {
     /// The backend, not the commit log: claims and renewals are not records.

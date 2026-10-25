@@ -360,7 +360,7 @@ async fn spawn_agent_runs_a_fresh_child_and_returns_its_summary() {
     );
     assert!(
         metadata.is_empty(),
-        "a child never inherits the parent's host metadata"
+        "a child never inherits the parent's session metadata"
     );
     assert_eq!(
         parent.as_ref().map(|parent| parent.session),

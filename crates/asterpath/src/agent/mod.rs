@@ -56,7 +56,7 @@ pub(crate) struct Agent {
     providers: Arc<ProviderCatalog>,
     pipeline: ToolPipeline,
     clock: Arc<dyn Clock>,
-    /// Host hooks, called in registration order (ADR-0025). The pipeline
+    /// Application hooks, called in registration order (ADR-0025). The pipeline
     /// holds the same list for the tool hooks.
     hooks: Vec<Arc<dyn Hooks>>,
     /// Backs `StepCtx::usage`.
@@ -116,7 +116,7 @@ impl Agent {
         self
     }
 
-    /// Register host hooks; `usage` backs their `usage()` lookups.
+    /// Register application hooks; `usage` backs their `usage()` lookups.
     #[must_use]
     pub(crate) fn with_hooks(
         mut self,
@@ -475,7 +475,7 @@ impl Agent {
                             .commit_turn(session, turn, TurnEndReason::Cancelled, events)
                             .await;
                     }
-                    // Automatic threshold compaction (#46), before the host gate.
+                    // Automatic threshold compaction (#46), before the application gate.
                     if self.compactor.is_some()
                         && auto_compactions < config.compaction.max_auto_compactions_per_turn
                     {
@@ -594,7 +594,7 @@ impl Agent {
         Ok(count)
     }
 
-    /// Host `before_step` hooks in order; the first `EndTurn` wins and an
+    /// Application `before_step` hooks in order; the first `EndTurn` wins and an
     /// error or panic fails the turn.
     async fn before_step(&self, session: SessionId, turn: TurnId, step_index: u32) -> GateOutcome {
         if self.hooks.is_empty() {
@@ -934,7 +934,7 @@ impl Agent {
 
         // shortcut: the log keeps no output_index, so a resumed step reports
         // item positions; this step's live deltas went to an earlier process.
-        // Upgrade by recording output_index on AssistantMessage items if hosts
+        // Upgrade by recording output_index on AssistantMessage items if applications
         // need to correlate resumed ToolStarted with pre-crash deltas.
         let indexed: Vec<(u32, Item)> = (0..).zip(items.iter().cloned()).collect();
         // Recorded output intents are known by provenance; this only names

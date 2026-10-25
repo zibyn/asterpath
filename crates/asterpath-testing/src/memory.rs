@@ -21,7 +21,7 @@ use futures_util::stream;
 
 use crate::contract::StoreFactory;
 
-/// Parent, creation time and host metadata of one live session.
+/// Parent, creation time and session metadata of one live session.
 type SessionRow = (Option<SessionId>, Timestamp, BTreeMap<String, String>);
 
 #[derive(Default)]
@@ -30,7 +30,7 @@ struct State {
     next_log_id: i64,
     session_seq: HashMap<SessionId, u64>,
     dedup: HashMap<(SessionId, String, Option<String>), LogId>,
-    /// Live sessions, their parents, creation time and host metadata, like
+    /// Live sessions, their parents, creation time and session metadata, like
     /// SQLite's `sessions` table.
     sessions: BTreeMap<SessionId, SessionRow>,
     /// Retired sessions and their last log id.

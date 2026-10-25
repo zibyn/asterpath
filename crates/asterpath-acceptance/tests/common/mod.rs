@@ -59,7 +59,7 @@ pub fn mcp_fixture() -> PathBuf {
     bin
 }
 
-/// Proves a crashed host leaves no sandbox or fixture process behind. Because
+/// Proves a crashed application process leaves no sandbox or fixture process behind. Because
 /// the adapter now spawns its server in its own process group, a SIGKILL of the
 /// driver does not reach it: leftovers matching the fixture path and `delay`
 /// (a unique `--fault-delay-ms` value) are killed here before asserting.
@@ -251,7 +251,7 @@ impl Testdrive {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // The crash scenarios start a bwrap + fixture tree; killing the whole
-        // group mirrors a host crash and leaves nothing behind.
+        // group mirrors an application crash and leaves nothing behind.
         command.process_group(0);
         command
     }

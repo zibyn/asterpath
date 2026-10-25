@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "tauri": "tauri"
+    "tauri": "TAURI_APP_PATH=../asterpath tauri"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.5.0",

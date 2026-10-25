@@ -1,5 +1,5 @@
-//! ADR-0039: users are host metadata. Two users share one `Asterpath`; the
-//! catalog filters by metadata and a host provider wrapper picks
+//! ADR-0039: users are session metadata. Two users share one `Asterpath`; the
+//! catalog filters by metadata and an application provider wrapper picks
 //! credentials from the request's session context.
 #![cfg(feature = "sqlite")]
 
@@ -50,7 +50,7 @@ fn says(text: &str) -> Vec<Item> {
     }]
 }
 
-/// A host wrapper: picks an API key by the session's `user` metadata.
+/// An application wrapper: picks an API key by the session's `user` metadata.
 struct PerUserKeys {
     inner: ScriptedProvider,
     /// `(session, root, key)` per request.

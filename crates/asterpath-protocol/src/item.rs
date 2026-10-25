@@ -115,7 +115,7 @@ pub enum FileSource {
 }
 
 /// An ID in one provider's file store; only that provider can resolve it
-/// (ADR-0031). Uploading and deleting files is the host's job.
+/// (ADR-0031). Uploading and deleting files is the application's job.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderFileId {

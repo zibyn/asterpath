@@ -513,7 +513,7 @@ async fn a_recorded_approval_wins_over_the_policy() {
         .deliver(
             RECORDED,
             ApprovalDecision::Deny {
-                reason: Some("host said no".to_owned()),
+                reason: Some("application said no".to_owned()),
             },
         )
         .await;
@@ -530,7 +530,7 @@ async fn a_recorded_approval_wins_over_the_policy() {
     assert_eq!(started(&live), 1, "announced, then closed");
     let result = harness.result("call-1").await;
     assert_eq!(result.error_kind(), Some(ToolErrorKind::Denied));
-    assert_eq!(result.error.unwrap().message, "host said no");
+    assert_eq!(result.error.unwrap().message, "application said no");
 }
 
 #[tokio::test]

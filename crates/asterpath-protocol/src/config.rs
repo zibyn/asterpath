@@ -29,7 +29,7 @@ pub struct RequestConfig {
     pub reasoning: Option<ReasoningParams>,
     pub stop_sequences: Vec<String>,
     /// Per-provider JSON objects merged into the top level of that provider's
-    /// request body; entries for other providers are ignored. Values are host policy.
+    /// request body; entries for other providers are ignored. Values are application policy.
     pub provider_options: BTreeMap<ProviderId, JsonString>,
     /// Constrain the result to a JSON schema: message text in native mode,
     /// the output tool's arguments in tool mode (ADR-0034). The framework
@@ -220,7 +220,7 @@ pub enum ContextPolicy {
     Fork { at: LogId },
 }
 
-/// A host change to a session's configuration (ADR-0030), validated by
+/// An application change to a session's configuration (ADR-0030), validated by
 /// `SessionHandle::update_config` and recorded as one `ConfigChanged`. Each
 /// present field replaces the effective value whole; absent fields keep
 /// theirs. `append_system` is appended, never replaced; `remove_tools` and

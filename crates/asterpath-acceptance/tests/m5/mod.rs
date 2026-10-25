@@ -180,10 +180,10 @@ async fn e2e_stdio_server_loads_and_calls_inside_a_read_only_sandbox() {
     assert_eq!(turns(&events), vec![TurnEndReason::Completed]);
 }
 
-/// Scenario 2: a `Safe` (read-only) tool is in flight when the host is
+/// Scenario 2: a `Safe` (read-only) tool is in flight when the application is
 /// `SIGKILL`ed; resume reruns it exactly once and never duplicates the intent.
 #[tokio::test]
-async fn safe_external_tool_reruns_once_after_a_host_sigkill() {
+async fn safe_external_tool_reruns_once_after_an_application_sigkill() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("m5.sqlite");
     let effect = dir.path().join("unused");

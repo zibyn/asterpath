@@ -29,7 +29,7 @@ pub struct SessionSpec {
     pub turn: TurnConfig,
     pub compaction: CompactionConfig,
     pub subagents: SubagentConfig,
-    /// Opaque host metadata, recorded in `SessionCreated` and listed in the
+    /// Opaque session metadata, recorded in `SessionCreated` and listed in the
     /// catalog; never in the snapshot or a model request (ADR-0032).
     pub metadata: BTreeMap<String, String>,
 }
@@ -91,7 +91,7 @@ pub enum AgentEvent {
         /// The arguments the tool is invoked with, after `before_tool` hooks.
         args: JsonString,
     },
-    /// Carries the logged `ToolResult` content unredacted; redaction is the host's.
+    /// Carries the logged `ToolResult` content unredacted; redaction is the application's.
     ToolFinished {
         turn: TurnId,
         step: StepId,
@@ -110,7 +110,7 @@ pub enum AgentEvent {
     },
 }
 
-/// One tool call awaiting a host decision.
+/// One tool call awaiting an application decision.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct ApprovalRequest {

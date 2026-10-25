@@ -59,7 +59,7 @@ pub enum Thinking {
 
 /// The request rules for one model behind one provider instance.
 ///
-/// The adapter's built-in table covers official model ids; hosts inject
+/// The adapter's built-in table covers official model ids; applications inject
 /// profiles for other endpoints with
 /// [`AnthropicProvider::with_default_profile`](crate::AnthropicProvider::with_default_profile)
 /// and [`with_model_profile`](crate::AnthropicProvider::with_model_profile).
@@ -271,7 +271,7 @@ static TABLE: &[(&str, AnthropicModelProfile)] = &[
 
 static UNRECOGNIZED_PROFILE: AnthropicModelProfile = UNRECOGNIZED;
 
-/// Host model entries (first prefix match wins), then the host default, then
+/// Application model entries (first prefix match wins), then the application default, then
 /// the built-in table, then [`UNRECOGNIZED`].
 pub(crate) fn profile_for<'a>(
     models: &'a [(String, AnthropicModelProfile)],

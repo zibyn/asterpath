@@ -601,7 +601,7 @@ fn turn_committed(turn_id: TurnId) -> SessionEvent {
     }
 }
 
-/// Host metadata of the catalog's root session (ADR-0032).
+/// Session metadata of the catalog's root session (ADR-0032).
 fn root_metadata() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("cwd".to_owned(), "/work/项目".to_owned()),
@@ -617,7 +617,7 @@ fn created_under(parent: Option<SessionId>) -> SessionEvent {
             turn: turn(),
             tool_call: call(1),
         }),
-        // Roots carry the host's metadata; children carry none.
+        // Roots carry the application's metadata; children carry none.
         metadata: if parent.is_none() {
             root_metadata()
         } else {
@@ -733,7 +733,7 @@ async fn catalog(log: &dyn SessionStore, clock: &ManualClock) {
     assert_eq!(
         root_entry.metadata,
         root_metadata(),
-        "the entry carries SessionCreated's host metadata"
+        "the entry carries SessionCreated's session metadata"
     );
     let first_kid = all.iter().find(|entry| entry.session == kids[0]).unwrap();
     assert_eq!(first_kid.parent, Some(root));

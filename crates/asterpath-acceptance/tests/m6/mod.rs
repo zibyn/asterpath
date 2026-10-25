@@ -1,4 +1,4 @@
-//! M6 end-to-end gate: host-resolved `SKILL.md` packages, the frozen session
+//! M6 end-to-end gate: application-resolved `SKILL.md` packages, the frozen session
 //! index and the on-demand `load_skill` tool, including crash recovery,
 //! deletion and sub-agent inheritance.
 
@@ -84,11 +84,11 @@ fn roots(root: &Path) -> Vec<SkillRoot> {
     }]
 }
 
-/// The host's own system followed by the frozen index.
+/// The application's own system followed by the frozen index.
 fn session_system(roots: &[SkillRoot]) -> (Vec<Part>, Vec<SkillSummary>) {
     let discovery = discover(roots);
     let (index, _) = render_index(&discovery.skills, DEFAULT_INDEX_BUDGET);
-    let mut system = vec![text("host system")];
+    let mut system = vec![text("application system")];
     system.extend(index);
     (system, discovery.skills)
 }
@@ -668,7 +668,7 @@ async fn s8_fresh_children_inherit_the_index_and_loader_and_can_narrow_them_away
             .is_some_and(|text| text.contains("Body"))
     );
 
-    // Narrowed: the host removed every tool, so the child cannot see the
+    // Narrowed: the application removed every tool, so the child cannot see the
     // loader. The inherited index may remain; the live registry still knows
     // the tool, but a real model is never offered it.
     let db = dir.path().join("s8-narrow.db");
