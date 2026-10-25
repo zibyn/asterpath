@@ -257,7 +257,7 @@ pub enum AgentError {
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
 - `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。
-- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归宿主。每个落日志的 `ToolResult` 都有一条 `ToolFinished`，但 `ToolFinished` 可能没有对应的 `ToolStarted`：调用还没开始就结束时只发 `ToolFinished`，即 `Interrupted`（取消时尚未开始的调用）与预失败（`Failed`，`error.kind` 为 `Denied` / `NotFound` / `Internal`，来自审批拒绝、未注册工具或 `before_tool` 拒绝与出错）。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
+- 工具与用量字段（#121，供 CLI 显示、`stream-json` 与 `json` 结果使用）：`ToolStarted.args` 是实际交给工具的参数（`before_tool` 改写之后）；`ToolFinished.output` / `error` 与同一调用落日志的 `ToolResult` 相同（截断与 `after_tool` 之后；`Interrupted` 两者皆为 `None`）。都是原值，脱敏归宿主。输出工具调用（ADR-0034）的 `ToolFinished` 是 `Completed`，`output` 为框架补上的固定文本，不是结果本身（结果是该调用的参数，在日志的 `ToolCallRequested` 里）。每个落日志的 `ToolResult` 都有一条 `ToolFinished`，但 `ToolFinished` 可能没有对应的 `ToolStarted`：调用还没开始就结束时只发 `ToolFinished`，即输出工具调用、 `Interrupted`（取消时尚未开始的调用）与预失败（`Failed`，`error.kind` 为 `Denied` / `NotFound` / `Internal`，来自审批拒绝、未注册工具或 `before_tool` 拒绝与出错）。`TurnCommitted.usage` 是本回合模型调用与压缩用量之和，与 `usage(UsageScope::Turn)` 的 `model_calls + compaction` 一致，不含 `partial`；不另设用量事件。
 - 回合失败（模型不可重试、取消、`MaxStepsExceeded`、`ContextExhausted`）是 `TurnCommitted { reason }`，流正常结束；`AgentError` 只表示无法运行。
 - `RunTrigger::Resume` 用于恢复 open turn；`Input` 用于新输入或 steering。恢复位置完全由日志推导，`run` 不接收目标水位。
 - `Idle`：没有 open turn 且没有待处理输入时立即发出并结束。
@@ -331,6 +331,7 @@ pub enum AsterError {
 | `--output-format <text\|json\|stream-json>` | `exec` | 见 §4.3 |
 | `--input-format <text\|stream-json>` | `exec` | 见 §4.3 |
 | `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031）；写进新会话或分叉会话的配置，因此只用于新会话与 `--fork-session`，续原会话时是用法错误（没有单回合的请求选项，写进去会留在会话里） |
+| `--output-mode <native\|tool\|auto>` | `exec` | 结构化输出的输出模式（ADR-0034），默认 `native`；不带 `--output-schema` 是用法错误；配置文件无对应字段。各模式下结果都作最终消息输出（text 的 stdout、json / stream-json 结果对象的 `result`）：模型调用了输出工具时是其参数（多个取第一个），否则是最终助手文本。`tool` 模式下模型没有调用输出工具（结果未交付）时以退出码 1 失败 |
 
 - Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
 - 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。

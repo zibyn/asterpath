@@ -100,8 +100,9 @@ impl Asterpath {
                 asterpath_protocol::Provenance::External { .. } => {
                     asterpath_protocol::validate_external_tool_name(name)
                 }
-                // `Unknown` is an intent-only provenance; it is not registrable.
-                asterpath_protocol::Provenance::Unknown => {
+                // `Unknown` and `Output` are intent-only; they are not registrable.
+                asterpath_protocol::Provenance::Unknown
+                | asterpath_protocol::Provenance::Output => {
                     Err(asterpath_protocol::ToolNameError::InvalidToolName)
                 }
             };
@@ -235,6 +236,8 @@ impl Asterpath {
             });
         }
         check_metadata(&spec.metadata)?;
+        agent::output::check(&spec.request, |name| self.tools.get(name).is_some())
+            .map_err(|message| AsterError::Config { message })?;
         let tools = match &spec.tools {
             ToolSelection::All => self
                 .tools
@@ -521,6 +524,10 @@ impl SessionHandle {
             return Err(AsterError::Config {
                 message: "system may only contain text parts".to_owned(),
             });
+        }
+        if let Some(request) = &patch.request {
+            agent::output::check(request, |name| self.tools.get(name).is_some())
+                .map_err(|message| AsterError::Config { message })?;
         }
         let key = patch.id.map(dedup::config_changed);
         if patch.changes_tools() {

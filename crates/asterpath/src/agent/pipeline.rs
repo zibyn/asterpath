@@ -52,6 +52,8 @@ pub(crate) struct ToolStep<'a> {
     /// The step's effective tool set: a fresh call to any other name is
     /// `NotFound`, even if the registry holds it (ADR-0030).
     pub(crate) tools: &'a [ToolDescriptor],
+    /// The output tool this step's request carried (ADR-0034).
+    pub(crate) output: Option<&'a ToolName>,
     pub(crate) events: &'a EventSink,
     pub(crate) spawn: Option<&'a SpawnFn<'a>>,
 }
@@ -60,6 +62,8 @@ pub(crate) struct ToolStep<'a> {
 pub(crate) enum ToolOutcome {
     /// Every call has a result.
     Done,
+    /// Every call has a result and the output tool was called: the turn is over.
+    Delivered,
     /// The step was cancelled; every call still has a result.
     Cancelled,
 }
@@ -129,8 +133,20 @@ impl ToolPipeline {
         let budget = Arc::new(Mutex::new(self.config.max_output_bytes_per_step));
         let mut runnable: Vec<Runnable> = Vec::new();
         let mut cancelled = cancel.is_cancelled();
+        let mut done = ToolOutcome::Done;
 
         for call in tool_calls(items) {
+            // An output call never enters the pipeline; a recorded intent is
+            // known by its provenance, whatever the config says now.
+            let output = match recorded.intents.get(&call.provider_call_id) {
+                Some(intent) => intent.provenance == Provenance::Output,
+                None => step.output == Some(&call.name),
+            };
+            if output {
+                done = ToolOutcome::Delivered;
+                self.deliver(step, &recorded, call).await?;
+                continue;
+            }
             let Some(admitted) = self.resolve(step, &recorded, call).await? else {
                 continue;
             };
@@ -199,7 +215,7 @@ impl ToolPipeline {
             return Ok(ToolOutcome::Cancelled);
         }
         if runnable.is_empty() {
-            return Ok(ToolOutcome::Done);
+            return Ok(done);
         }
 
         let mut futures: FuturesUnordered<BoxFuture<'_, Result<(), AgentError>>> =
@@ -230,7 +246,7 @@ impl ToolPipeline {
                     }
                     None => return match failure {
                         Some(error) => Err(error),
-                        None => Ok(ToolOutcome::Done),
+                        None => Ok(done),
                     },
                 }
             }
@@ -258,6 +274,60 @@ impl ToolPipeline {
 
         self.finish_cancelled(step, &pending).await?;
         Ok(ToolOutcome::Cancelled)
+    }
+
+    /// Close an output tool call with the fixed result: no hooks, approval or
+    /// execution. A fresh call records its intent first.
+    async fn deliver(
+        &self,
+        step: &ToolStep<'_>,
+        recorded: &Recorded,
+        call: CallItem,
+    ) -> Result<(), AgentError> {
+        let tool_call_id = match recorded.intents.get(&call.provider_call_id) {
+            Some(intent) if recorded.closed.contains(&intent.tool_call_id) => return Ok(()),
+            Some(intent) => intent.tool_call_id,
+            None => {
+                let tool_call_id = ToolCallId::from_bytes(unique_bytes(self.clock.now()));
+                self.append(
+                    step.session,
+                    SessionEvent::ToolCallRequested {
+                        turn_id: step.turn,
+                        step_id: step.step,
+                        tool_call_id,
+                        provider_call_id: call.provider_call_id,
+                        name: call.name,
+                        raw_args: call.raw_args,
+                        replay: ReplaySafety::Safe,
+                        provenance: Provenance::Output,
+                    },
+                    Some(dedup::tool_call(tool_call_id)),
+                )
+                .await?;
+                tool_call_id
+            }
+        };
+        let output = vec![Part::Text {
+            text: super::output::DELIVERED.to_owned(),
+        }];
+        self.append_result(
+            step.session,
+            tool_call_id,
+            ToolResultStatus::Completed,
+            Some(output.clone()),
+            None,
+            false,
+        )
+        .await?;
+        step.events.push(Ok(AgentEvent::ToolFinished {
+            turn: step.turn,
+            step: step.step,
+            call: tool_call_id,
+            status: ToolResultStatus::Completed,
+            output: Some(output),
+            error: None,
+        }));
+        Ok(())
     }
 
     /// One read of the log per step: this step's recorded intents and which

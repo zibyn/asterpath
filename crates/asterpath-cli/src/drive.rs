@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use asterpath::SessionHandle;
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProviderErrorInfo, Role,
-    SessionEvent, SessionId, SessionStore, TurnEndReason, Usage, decode_entry, history, scan_all,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, Provenance,
+    ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason, Usage,
+    decode_entry, history, scan_all,
 };
 use futures_util::StreamExt;
 
@@ -186,6 +187,24 @@ pub fn final_assistant_text(entries: &[LogEntry]) -> Option<String> {
         }
     }
     None
+}
+
+/// The latest turn's structured result from the output tool: the arguments
+/// of its first output call (ADR-0034).
+pub fn output_result(entries: &[LogEntry]) -> Option<String> {
+    let mut first = None;
+    for entry in entries.iter().rev() {
+        match decode_entry(entry).ok()? {
+            SessionEvent::TurnStarted { .. } => break,
+            SessionEvent::ToolCallRequested {
+                raw_args,
+                provenance: Provenance::Output,
+                ..
+            } => first = Some(raw_args.as_str().to_owned()),
+            _ => {}
+        }
+    }
+    first
 }
 
 #[cfg(test)]

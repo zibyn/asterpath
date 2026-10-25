@@ -282,7 +282,7 @@ impl ApprovalPolicy for DefaultApprovalPolicy {
                 }
             }
             // The pipeline writes `NotFound` before approval for Unknown tools.
-            Provenance::Unknown => ApprovalVerdict::Deny { reason: None },
+            Provenance::Unknown | Provenance::Output => ApprovalVerdict::Deny { reason: None },
         }
     }
 }

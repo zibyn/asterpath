@@ -218,8 +218,16 @@ pub struct RequestConfig {
 }
 
 pub struct OutputFormat {
-    pub name: String,
+    pub name: String,            // 工具模式下即输出工具名
     pub schema: JsonSchema,
+    pub mode: OutputMode,        // serde default = Native（ADR-0034）
+}
+
+#[non_exhaustive]
+pub enum OutputMode {
+    Native,                      // 默认：供应商原生 schema 约束
+    Tool,                        // 引擎的输出工具 + 强制工具调用
+    Auto,                        // 每次请求按能力：原生 → 工具 → Unsupported
 }
 
 #[non_exhaustive]                // ModelRequest::new 构造
@@ -292,7 +300,7 @@ pub enum ReasoningEffort {
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。adapter 尚不认识的 `Part` 变体（system 与所有 item 中）在发 HTTP 前经 `asterpath_http::unrenderable_part` 返回 `Unsupported`。 |
 | R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于宿主策略。 |
 | R12 | `server_tools` 只取 `spec.provider` 对应的条目，每个值必须是 JSON 对象（否则 `InvalidRequest`），按序原样追加在函数工具之后；adapter 不校验内容。非空而模型 `server_tools` 能力为 false → `Unsupported`。只支持服务端执行的工具；客户端执行的供应商工具（OpenAI `shell` / `apply_patch` / `computer`，Anthropic `text_editor` / `computer` / `memory` 等）不在此机制内，误放时由供应商报错。`tool_choice` 不指向服务端工具。 |
-| R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。产出仍是普通 `Message` 文本，框架不解析、不校验。 |
+| R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。原生模式下结果是普通 `Message` 文本。输出模式（ADR-0034）由引擎在建请求时解析，adapter 不知道：`Tool`，或 `Auto` 且模型无 `structured_output` 而有 `forced_tool_choice`、宿主的 `tool_choice` 允许调用输出工具时，引擎把输出工具（名为 `OutputFormat.name`，参数 schema 为 `schema`）加入 `tools` 与 `baseline_tools`（计入工具集指纹），`tool_choice` 设为 `Required`（宿主指定的正是输出工具时保留 `Tool(name)`），清空 `output_format`；其余情况发原生约束，不支持时 `Unsupported`。输出工具调用以 `Provenance::Output` 记录意图，补一条固定内容的 `Completed` 结果，不经工具管线；该 step 其他调用照常执行，step 结束后回合 `Completed`。结果是该调用的参数；多个时取位置最前的。`create_session` / `update_config` 拒绝 `Tool` 加 `ToolChoice::None` 或指向其他工具，以及 `Tool` / `Auto` 下与已注册工具重名或不合法的输出工具名（`Config`）。框架不解析、不校验、不重试。 |
 | R14 | `Part::File` 需要 `file_input` 能力；media type 不被模型接受、出现在 assistant 消息、或 `ProviderFile` 指向其他 provider → `Unsupported`（`ImageSource::ProviderFile` 同理）。 |
 | R15 | `ToolDescriptor.strict: Option<bool>`：`Some` 时 Anthropic / OpenAI 都发送 `strict`，`None` 不发送。 |
 
@@ -680,6 +688,7 @@ pub enum ProviderErrorKind {
 | `max_output_tokens` | `max_tokens` | `max_output_tokens` |
 | `server_tools[provider]` | 追加到顶层 `tools`（inline 路径也在顶层，不进 `tool_addition`） | 追加到顶层 `tools` |
 | `output_format` | `output_config.format` | `text.format`（`strict: true`） |
+| 输出工具（工具模式，R13） | 普通 `tools[]` 条目 + `tool_choice: {type:"any"}` | 普通 `tools[]` 函数 + `tool_choice: "required"` |
 | `Part::File` | `document` block（`source`: `base64` / `url` / `file`）；接受的 media type 见模型规则 | `input_file`（`file_data` / `file_url` / `file_id`） |
 | `ImageSource::ProviderFile` | `image` block `source: {type:"file", file_id}` | `input_image` `file_id` |
 | `reasoning` | `thinking` | `reasoning` |

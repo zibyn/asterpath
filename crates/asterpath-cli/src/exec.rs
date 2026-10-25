@@ -5,10 +5,12 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use asterpath_protocol::{Clock, SystemClock, UserInput, unique_bytes};
-use asterpath_protocol::{FileSource, ImageSource, InputId, OutputFormat as SchemaFormat, Part};
+use asterpath_protocol::{
+    FileSource, ImageSource, InputId, OutputFormat as SchemaFormat, OutputMode, Part,
+};
 use clap::{Args, ValueEnum};
 
-use crate::drive::{self, final_assistant_text, scan, turn_result};
+use crate::drive::{self, final_assistant_text, output_result, scan, turn_result};
 use crate::session::{self, SessionArgs};
 use crate::stream;
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
@@ -26,6 +28,10 @@ pub struct ExecArgs {
     /// JSON Schema the final reply must follow (structured output).
     #[arg(long, value_name = "FILE")]
     output_schema: Option<PathBuf>,
+    /// How the schema is enforced (ADR-0034): the provider's constraint, the
+    /// output tool, or whichever the model supports.
+    #[arg(long, value_enum, requires = "output_schema")]
+    output_mode: Option<OutputModeArg>,
     /// Input; `-` or none reads stdin. Piped stdin is appended to a prompt.
     prompt: Option<String>,
 }
@@ -39,6 +45,14 @@ enum OutputFormat {
     Json,
     /// One `AgentEvent` per line, then the result object.
     StreamJson,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
+enum OutputModeArg {
+    #[default]
+    Native,
+    Tool,
+    Auto,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
@@ -66,7 +80,16 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         ));
     }
     // Files are read before the work root changes the process directory.
-    let schema = args.output_schema.as_deref().map(read_schema).transpose()?;
+    let mode = match args.output_mode.unwrap_or_default() {
+        OutputModeArg::Native => OutputMode::Native,
+        OutputModeArg::Tool => OutputMode::Tool,
+        OutputModeArg::Auto => OutputMode::Auto,
+    };
+    let schema = args
+        .output_schema
+        .as_deref()
+        .map(|path| read_schema(path, mode))
+        .transpose()?;
     let mut parts = Vec::new();
     let text = if commands {
         args.prompt.clone().filter(|prompt| prompt != "-")
@@ -115,7 +138,9 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     let entries = scan(opened.asterpath.store(), handle.id())
         .await
         .map_err(CliError::run)?;
-    let text = ran.then(|| final_assistant_text(&entries)).flatten();
+    let delivered = ran.then(|| output_result(&entries)).flatten();
+    let undelivered = ran && delivered.is_none() && args.output_mode == Some(OutputModeArg::Tool);
+    let text = delivered.or_else(|| ran.then(|| final_assistant_text(&entries)).flatten());
     match args.output_format {
         OutputFormat::Text if !ran => println!("idle"),
         OutputFormat::Text => {
@@ -137,7 +162,11 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     if let Some(error) = outcome.error {
         return Err(error);
     }
-    turn_result(outcome.reason.as_ref(), &entries)
+    turn_result(outcome.reason.as_ref(), &entries)?;
+    if undelivered {
+        return Err(CliError::run("the model did not call the output tool"));
+    }
+    Ok(())
 }
 
 pub async fn submit(handle: &asterpath::SessionHandle, parts: Vec<Part>) -> CliResult<()> {
@@ -182,12 +211,12 @@ fn read_stdin() -> CliResult<String> {
     Ok(text)
 }
 
-fn read_schema(path: &Path) -> CliResult<SchemaFormat> {
+fn read_schema(path: &Path, mode: OutputMode) -> CliResult<SchemaFormat> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| CliError::config(format!("cannot read {}: {error}", path.display())))?;
     let schema = serde_json::from_str(&text)
         .map_err(|error| CliError::config(format!("{}: {error}", path.display())))?;
-    Ok(SchemaFormat::new("output", schema))
+    Ok(SchemaFormat::new("output", schema).with_mode(mode))
 }
 
 /// An image or a PDF as an inline base64 part (ADR-0031).

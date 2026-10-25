@@ -579,6 +579,102 @@ fn output_schema_constrains_the_request() {
     );
 }
 
+#[test]
+fn output_mode_needs_an_output_schema() {
+    let server = MockServer::start(Vec::new());
+    let dir = TestDir::new("mode-usage");
+    dir.config(&config_body(&server, &dir.db()));
+    assert_eq!(
+        code(dir.exec(&dir.path).args(["--output-mode", "tool", "hi"])),
+        Some(2)
+    );
+    assert!(server.requests().is_empty());
+}
+
+/// Tool mode on either protocol: the output tool and a forced call replace
+/// the native constraint, and the tool's arguments are the result.
+#[test]
+fn output_mode_tool_returns_the_output_tool_arguments() {
+    let args = r#"{"city":"Paris"}"#;
+    for (protocol, reply, tool_name, choice, native) in [
+        (
+            "anthropic",
+            common::tool_use_sse("output", args),
+            "/name",
+            ("/tool_choice/type", "any"),
+            "/output_config",
+        ),
+        (
+            "openai",
+            common::openai_call_sse("output", args),
+            "/name",
+            ("/tool_choice", "required"),
+            "/text/format",
+        ),
+    ] {
+        let server = MockServer::start(vec![Reply::sse(reply)]);
+        let dir = TestDir::new("mode-tool");
+        dir.config(&vendor_protocol_config(
+            protocol,
+            &server,
+            &dir.db(),
+            "[providers.ds.profile]\nforced_tool_choice = true\n",
+        ));
+        let schema = dir.path.join("schema.json");
+        fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+
+        let (stdout, _) = ok(dir
+            .exec(&dir.path)
+            .env("DEEPSEEK_API_KEY", "ds-key")
+            .args(["--output-mode", "tool"])
+            .args(["--output-schema", schema.to_str().unwrap()])
+            .args(["--output-format", "json", "hi"]));
+
+        let result: serde_json::Value = serde_json::from_str(&stdout).expect("json result");
+        assert_eq!(result["result"], args, "{protocol}");
+        assert_eq!(result["reason"], "Completed", "{protocol}");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "{protocol}");
+        let body = requests[0].json_body();
+        let tools = body["tools"].as_array().expect("tools");
+        let output = serde_json::json!("output");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.pointer(tool_name) == Some(&output)),
+            "{body}"
+        );
+        assert_eq!(
+            body.pointer(choice.0),
+            Some(&serde_json::json!(choice.1)),
+            "{body}"
+        );
+        assert_eq!(body.pointer(native), None, "{body}");
+    }
+}
+
+#[test]
+fn output_mode_tool_fails_when_the_model_only_replies_with_text() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("just text"))]);
+    let dir = TestDir::new("mode-text");
+    dir.config(&config_body(&server, &dir.db()));
+    let schema = dir.path.join("schema.json");
+    fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+
+    let output = dir
+        .exec(&dir.path)
+        .args(["-c", "providers.anthropic.profile.forced_tool_choice=true"])
+        .args(["--output-mode", "tool"])
+        .args(["--output-schema", schema.to_str().unwrap(), "hi"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not call the output tool"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "just text");
+}
+
 /// A schema would stay in a continued session's config after this exec, so
 /// it is refused there; a fork is a new session and takes it.
 #[test]

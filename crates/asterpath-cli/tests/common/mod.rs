@@ -82,20 +82,41 @@ fn sse(stop_reason: &str, text: &str) -> String {
 
 /// A complete OpenAI Responses text response.
 pub fn openai_text_sse(text: &str) -> String {
-    use serde_json::json;
-    let item = json!({
+    openai_sse(serde_json::json!({
         "id": "msg_1",
         "type": "message",
         "status": "completed",
         "role": "assistant",
         "content": [{"type": "output_text", "text": text, "annotations": []}],
-    });
+    }))
+}
+
+/// A complete OpenAI Responses function-call response. `args` is raw JSON text.
+pub fn openai_call_sse(name: &str, args: &str) -> String {
+    openai_sse(serde_json::json!({
+        "id": "fc_1",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_1",
+        "name": name,
+        "arguments": args,
+    }))
+}
+
+/// One output `item`, announced empty and then completed.
+fn openai_sse(item: serde_json::Value) -> String {
+    use serde_json::json;
+    let mut added = item.clone();
+    added["status"] = json!("in_progress");
+    match added["type"].as_str() {
+        Some("message") => added["content"] = json!([]),
+        _ => added["arguments"] = json!(""),
+    }
     [
         json!({"type": "response.created", "sequence_number": 0,
             "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
         json!({"type": "response.output_item.added", "sequence_number": 1,
-            "output_index": 0, "item": {"id": "msg_1", "type": "message",
-                "status": "in_progress", "role": "assistant", "content": []}}),
+            "output_index": 0, "item": added}),
         json!({"type": "response.output_item.done", "sequence_number": 2,
             "output_index": 0, "item": item}),
         json!({"type": "response.completed", "sequence_number": 3,

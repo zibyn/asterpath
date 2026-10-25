@@ -152,6 +152,7 @@ impl Harness {
             recovering,
             cancel_grace: self.cancel_grace,
             tools: &tools,
+            output: None,
             events: &events,
             spawn: None,
         };

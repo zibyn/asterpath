@@ -31,8 +31,9 @@ pub struct RequestConfig {
     /// Per-provider JSON objects merged into the top level of that provider's
     /// request body; entries for other providers are ignored. Values are host policy.
     pub provider_options: BTreeMap<ProviderId, JsonString>,
-    /// Constrain the reply to a JSON schema. The reply is still ordinary
-    /// message text; the framework neither parses nor validates it.
+    /// Constrain the result to a JSON schema: message text in native mode,
+    /// the output tool's arguments in tool mode (ADR-0034). The framework
+    /// neither parses nor validates it.
     #[serde(default)]
     pub output_format: Option<OutputFormat>,
     /// Per-provider server-executed tool definitions (each a JSON object),
@@ -42,12 +43,15 @@ pub struct RequestConfig {
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
 }
 
-/// A named JSON schema the model's reply must follow (structured output).
+/// A named JSON schema the model's result must follow (structured output).
+/// In tool mode `name` is the output tool's name.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputFormat {
     pub name: String,
     pub schema: JsonSchema,
+    #[serde(default)]
+    pub mode: OutputMode,
 }
 
 impl OutputFormat {
@@ -55,8 +59,29 @@ impl OutputFormat {
         Self {
             name: name.into(),
             schema,
+            mode: OutputMode::Native,
         }
     }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: OutputMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+/// How structured output is implemented (ADR-0034).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputMode {
+    /// The provider's schema constraint; `Unsupported` without it.
+    #[default]
+    Native,
+    /// The engine's output tool with a forced tool call.
+    Tool,
+    /// Per request: native when the model supports it, else tool when it
+    /// supports forced tool choice, else `Unsupported`.
+    Auto,
 }
 
 impl Default for RequestConfig {
@@ -415,6 +440,8 @@ pub enum Provenance {
     },
     /// Only recorded in `ToolCallRequested` when the requested tool is not registered.
     Unknown,
+    /// Only recorded in `ToolCallRequested` for a call of the output tool (ADR-0034).
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -37,9 +37,9 @@ pub use compactor::{
 };
 pub use config::{
     CompactionConfig, ConfigPatch, ConfigSnapshot, ContextPolicy, ModelSpec, OutputFormat,
-    Parallelism, Provenance, ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig,
-    SamplingParams, SideEffect, SubagentConfig, ToolChoice, ToolConfig, ToolDescriptor,
-    TransportKind, TurnConfig, effective_config,
+    OutputMode, Parallelism, Provenance, ReasoningEffort, ReasoningParams, ReplaySafety,
+    RequestConfig, SamplingParams, SideEffect, SubagentConfig, ToolChoice, ToolConfig,
+    ToolDescriptor, TransportKind, TurnConfig, effective_config,
 };
 pub use contracts::{
     ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, DedupKey, LogEntry, LogQuery,

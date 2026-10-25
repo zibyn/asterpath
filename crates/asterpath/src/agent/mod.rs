@@ -10,6 +10,7 @@
 #![allow(clippy::result_large_err)]
 
 mod attempt;
+pub(crate) mod output;
 
 use attempt::{Attempts, Failure, Forced, Next};
 
@@ -26,10 +27,11 @@ use asterpath_protocol::{
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
     Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, ModelRequest, OpenStep,
-    ProjectedOrigin, ProviderCatalog, ProviderError, ProviderErrorInfo, ProviderErrorKind,
-    ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx, StopReason,
-    StorageError, StreamEvent, ToolConfig, ToolResultStatus, TurnConfig, TurnEndReason, Usage,
-    UsageAnchor, UsageError, UsageLookup, decode_entry, dedup, effective_config,
+    ProjectedOrigin, Provenance, ProviderCatalog, ProviderError, ProviderErrorInfo,
+    ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts, SessionState, StepCtx,
+    StopReason, StorageError, StreamEvent, ToolConfig, ToolName, ToolResultStatus, TurnConfig,
+    TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup, decode_entry, dedup,
+    effective_config,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, SessionId, SessionStore, StepId, Timestamp,
@@ -604,7 +606,7 @@ impl Agent {
         )?;
         // The projection is computed once per step; retries reuse it (L12).
         // A forced compaction re-projects the same step.
-        let mut request = self.build_request(session, config, watermark).await?;
+        let (mut request, mut output) = self.build_request(session, config, watermark).await?;
         let max_attempts = config.turn.max_attempts.get();
 
         loop {
@@ -617,7 +619,7 @@ impl Agent {
                     history.compacted = true;
                     let forced = self.force_compact(session, turn, watermark).await?;
                     if forced == Forced::Applied {
-                        request = self.build_request(session, config, watermark).await?;
+                        (request, output) = self.build_request(session, config, watermark).await?;
                     }
                     next = attempt::after_compaction(history, forced);
                     continue;
@@ -721,19 +723,28 @@ impl Agent {
                 .await?;
 
                 let had_calls = has_tool_calls(&items);
+                let mut delivered = false;
                 if had_calls {
+                    let tools = StepTools {
+                        recovering: false,
+                        output: output.as_ref(),
+                    };
                     let outcome = self
-                        .run_tools(session, config, turn, step, &indexed, false, cancel, events)
+                        .run_tools(session, config, turn, step, &indexed, tools, cancel, events)
                         .await?;
                     if outcome == ToolOutcome::Cancelled {
                         self.commit_step(session, turn, step).await?;
                         return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
                     }
+                    delivered = outcome == ToolOutcome::Delivered;
                 }
 
                 self.commit_step(session, turn, step).await?;
                 if cancel.is_cancelled() {
                     return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+                }
+                if delivered {
+                    return Ok(StepOutcome::Turn(TurnEndReason::Completed));
                 }
                 let pending_input = self.pending_input(session).await?;
                 return Ok(step_outcome(&stop_reason, had_calls, pending_input));
@@ -904,19 +915,31 @@ impl Agent {
         // need to correlate resumed ToolStarted with pre-crash deltas.
         let indexed: Vec<(u32, Item)> = (0..).zip(items.iter().cloned()).collect();
         let had_calls = has_tool_calls(&items);
+        let mut delivered = false;
         if had_calls {
+            // Recorded output intents are known by provenance; this only
+            // names the output tool for calls whose intent is not recorded.
+            let output = self.output_tool(config);
+            let tools = StepTools {
+                recovering: true,
+                output: output.as_ref(),
+            };
             let outcome = self
-                .run_tools(session, config, turn, step, &indexed, true, cancel, events)
+                .run_tools(session, config, turn, step, &indexed, tools, cancel, events)
                 .await?;
             if outcome == ToolOutcome::Cancelled {
                 self.commit_step(session, turn, step).await?;
                 return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
             }
+            delivered = outcome == ToolOutcome::Delivered;
         }
 
         self.commit_step(session, turn, step).await?;
         if cancel.is_cancelled() {
             return Ok(StepOutcome::Turn(TurnEndReason::Cancelled));
+        }
+        if delivered {
+            return Ok(StepOutcome::Turn(TurnEndReason::Completed));
         }
         let pending_input = self.pending_input(session).await?;
         Ok(step_outcome(&stop_reason, had_calls, pending_input))
@@ -932,7 +955,7 @@ impl Agent {
         turn: TurnId,
         step: StepId,
         items: &[(u32, Item)],
-        recovering: bool,
+        tools: StepTools<'_>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolOutcome, AgentError> {
@@ -948,9 +971,10 @@ impl Agent {
             session,
             turn,
             step,
-            recovering,
+            recovering: tools.recovering,
             cancel_grace: config.turn.cancel_grace,
             tools: &config.tools,
+            output: tools.output,
             events,
             spawn,
         };
@@ -983,14 +1007,22 @@ impl Agent {
         )
     }
 
+    /// The output tool `config` puts in this model's requests (ADR-0034).
+    fn output_tool(&self, config: &ConfigSnapshot) -> Option<ToolName> {
+        let provider = self.providers.get(&config.model.provider)?;
+        output::tool(&config.request, &provider.capabilities(&config.model))
+            .map(|format| ToolName::new(&format.name))
+    }
+
     /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
-    /// is a rewrite operator and is folded regardless of the waterline.
+    /// is a rewrite operator and is folded regardless of the waterline. Also
+    /// returns the output tool the request carries.
     async fn build_request(
         &self,
         session: SessionId,
         config: &ConfigSnapshot,
         watermark: u64,
-    ) -> Result<ModelRequest, AgentError> {
+    ) -> Result<(ModelRequest, Option<ToolName>), AgentError> {
         let entries = scan_all(&*self.log, session).await?;
         let mut visible = Vec::new();
         let mut prefix_epoch = 0u32;
@@ -1015,7 +1047,7 @@ impl Agent {
                 session,
                 detail: error.to_string(),
             })?;
-        Ok(ModelRequest::new(
+        let mut request = ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
             history.system,
@@ -1023,7 +1055,12 @@ impl Agent {
             config.tools.clone(),
             history.tools,
             &config.request,
-        ))
+        );
+        let output = self.output_tool(config);
+        if let Some(format) = output.as_ref().and(config.request.output_format.as_ref()) {
+            output::apply(&mut request, format);
+        }
+        Ok((request, output))
     }
 
     async fn commit_turn(
@@ -1499,6 +1536,13 @@ fn last_log_id(facts: &SessionFacts) -> LogId {
         .unwrap_or_else(|| LogId::from_i64(0))
 }
 
+/// How the pipeline treats one step's calls.
+#[derive(Clone, Copy)]
+struct StepTools<'a> {
+    recovering: bool,
+    output: Option<&'a ToolName>,
+}
+
 /// Where the attempt policy left a step: its watermark, attempt history and
 /// the next action.
 struct OpenAttempt {
@@ -1587,6 +1631,9 @@ fn committed_step_end(
         _ => None,
     })?;
     if let Some((items, stop_reason)) = assistant_message(decoded, turn, step) {
+        if delivered(decoded, turn, step) {
+            return Some(TurnEndReason::Completed);
+        }
         let had_calls = has_tool_calls(items);
         return match step_outcome(stop_reason, had_calls, facts.has_pending_input()) {
             StepOutcome::Continue => None,
@@ -1597,6 +1644,21 @@ fn committed_step_end(
         Some((_, Next::End(reason))) => Some(reason),
         _ => None,
     }
+}
+
+/// The step called the output tool: its turn is over (ADR-0034).
+fn delivered(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> bool {
+    decoded.iter().any(|(_, event)| {
+        matches!(
+            event,
+            SessionEvent::ToolCallRequested {
+                turn_id,
+                step_id,
+                provenance: Provenance::Output,
+                ..
+            } if *turn_id == turn && *step_id == step
+        )
+    })
 }
 
 fn has_tool_calls(items: &[Item]) -> bool {
