@@ -66,7 +66,7 @@ pub struct SpawnRequest {        // #[non_exhaustive]
 pub struct ChildRef { pub parent: ParentRef, pub child: SessionId }
 
 pub enum SpawnError {
-    DepthExceeded,                    // 未创建子会话
+    DepthExceeded { max_depth: u8 },  // 未创建子会话
     InvalidArgs { message: String },
     Execution(ExecutionError),
 }

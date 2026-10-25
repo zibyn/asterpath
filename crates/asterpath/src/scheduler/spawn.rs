@@ -227,7 +227,9 @@ impl Scheduler {
                 .map_err(SpawnError::Execution)?
                 .saturating_add(1);
             if child_depth > parent_config.subagents.max_depth {
-                return Err(SpawnError::DepthExceeded);
+                return Err(SpawnError::DepthExceeded {
+                    max_depth: parent_config.subagents.max_depth,
+                });
             }
 
             let model = match &req.model_alias {

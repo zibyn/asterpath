@@ -127,11 +127,13 @@ impl Scheduler {
                 result = &mut spawning => match result {
                     Ok(child) => child,
                     // Depth and argument errors mean no child exists and the
-                    // model must fix its call.
-                    Err(SpawnError::DepthExceeded) | Err(SpawnError::InvalidArgs { .. }) => {
-                        return Err(ToolError::InvalidArgs {
-                            message: "sub-agent spawn rejected: depth or arguments".to_owned(),
-                        });
+                    // model must fix its call, so it gets the reason (without the
+                    // `invalid spawn arguments:` prefix).
+                    Err(error @ SpawnError::DepthExceeded { .. }) => {
+                        return Err(ToolError::InvalidArgs { message: error.to_string() });
+                    }
+                    Err(SpawnError::InvalidArgs { message }) => {
+                        return Err(ToolError::InvalidArgs { message });
                     }
                     Err(SpawnError::Execution(error)) => {
                         return Err(infra(error));

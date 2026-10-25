@@ -58,8 +58,8 @@ pub(crate) struct ChildRef {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnError {
-    #[error("sub-agent depth exceeded")]
-    DepthExceeded,
+    #[error("max sub-agent depth {max_depth} reached")]
+    DepthExceeded { max_depth: u8 },
     #[error("invalid spawn arguments: {message}")]
     InvalidArgs { message: String },
     #[error(transparent)]

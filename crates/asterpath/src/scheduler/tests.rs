@@ -470,7 +470,10 @@ async fn depth_exceeded_creates_no_child() {
             vec![text("too deep")],
         ))
         .await;
-    assert!(matches!(result, Err(SpawnError::DepthExceeded)));
+    assert!(matches!(
+        result,
+        Err(SpawnError::DepthExceeded { max_depth: 3 })
+    ));
     assert!(
         !events(&*log, parent)
             .await
@@ -908,7 +911,7 @@ fn tool_context(parent: &asterpath_protocol::ParentRef) -> ToolContext {
 }
 
 #[tokio::test]
-async fn spawn_tool_maps_depth_to_invalid_args_and_rejects_overrides() {
+async fn spawn_tool_reports_the_rejection_reason_and_rejects_overrides() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, _) = seed_parent_at_depth(&log, 3, 3).await;
     let (scheduler, agent) = new_scheduler(log.clone(), BTreeMap::new());
@@ -918,7 +921,7 @@ async fn spawn_tool_maps_depth_to_invalid_args_and_rejects_overrides() {
         scheduler
             .run_spawn_tool(&agent, args, tool_context(&reference))
             .await,
-        Err(ToolError::InvalidArgs { .. })
+        Err(ToolError::InvalidArgs { message }) if message == "max sub-agent depth 3 reached"
     ));
     assert!(
         !events(&*log, parent)
@@ -926,6 +929,18 @@ async fn spawn_tool_maps_depth_to_invalid_args_and_rejects_overrides() {
             .iter()
             .any(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
     );
+
+    // The scheduler's reason reaches the model unchanged.
+    let fresh = Arc::new(InMemoryEventLog::new());
+    let (_, fresh_reference, _) = seed_parent(&fresh, 3).await;
+    let (fresh_scheduler, fresh_agent) = new_scheduler(fresh, BTreeMap::new());
+    let args = ToolArgs::new(r#"{"task":"x","model_alias":"missing"}"#);
+    assert!(matches!(
+        fresh_scheduler
+            .run_spawn_tool(&fresh_agent, args, tool_context(&fresh_reference))
+            .await,
+        Err(ToolError::InvalidArgs { message }) if message == "unknown model alias missing"
+    ));
 
     // A system/approval override cannot be expressed by the model.
     let args = ToolArgs::new(r#"{"task":"x","system":"override"}"#);
