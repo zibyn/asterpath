@@ -456,6 +456,7 @@ mod tests {
             ("asterpath", Role::Engine),
             ("asterpath-host", Role::Host),
             ("asterpath-cli", Role::App),
+            ("asterpath-desktop", Role::App),
             ("asterpath-acceptance", Role::App),
             ("asterpath-mcp-fixture", Role::Tool),
             ("xtask", Role::Tool),

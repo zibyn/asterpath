@@ -16,6 +16,7 @@ members = [
     "crates/asterpath",
     "crates/asterpath-host",
     "crates/asterpath-cli",
+    "apps/desktop/src-tauri",
     "xtask",
 ]
 

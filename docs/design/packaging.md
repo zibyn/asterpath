@@ -33,6 +33,7 @@
 | `asterpath-testing` | adapter | in-memory `SessionStore`（`InMemoryEventLog`，含会话目录与退役）、`ScriptedProvider`、四个故障注入装饰器 + `ManualClock`（五点，见 [testing.md](testing.md)）、契约套件、`FakeSandboxProvider` | `protocol` |
 | `asterpath-host` | host | 参考宿主共用层（ADR-0040）：按工作根组装（工作区工具、`AGENTS.md`、技能、MCP 加载、会话环境适配器 `WorkRoot`）、宿主元数据键与续会话规则，入参是普通值；`config` feature 解析 `config.toml` 与环境变量，`clap` feature 给模式枚举加 `ValueEnum`，默认都不开；不属于稳定面 | `asterpath`, `protocol`, `mcp`, `skills`, `tools`, `sandbox-linux` |
 | `asterpath-cli` | app | 参考 CLI 二进制 `asterpath` | 任意 |
+| `asterpath-desktop` | app | Tauri 桌面参考宿主（`apps/desktop/src-tauri`）；命令层是库，窗口在非默认 feature `tauri` 后（ADR-0035） | 任意 |
 | `asterpath-acceptance` | app | `testdrive` 二进制与三段验收测试；`publish = false` | 任意 |
 | `asterpath-mcp-fixture` | tool | 测试用 MCP server（stdio / HTTP）；`publish = false` | 无（仅外部依赖） |
 | `xtask` | tool | `check-deps` 与 CI 辅助；`publish = false` | 无 |

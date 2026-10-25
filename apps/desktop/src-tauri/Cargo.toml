@@ -1,0 +1,38 @@
+[package]
+name = "asterpath-desktop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The command layer is a plain library, built and tested without Tauri.
+# The window (`src/main.rs`) needs the `tauri` feature, which needs the
+# webkit2gtk / gtk development packages (ADR-0035).
+[lib]
+name = "asterpath_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asterpath-desktop"
+path = "src/main.rs"
+required-features = ["tauri"]
+
+[features]
+default = []
+tauri = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog"]
+
+[dependencies]
+asterpath = { path = "../../../crates/asterpath", default-features = false, features = ["sqlite"] }
+asterpath-host = { path = "../../../crates/asterpath-host", features = ["config", "anthropic", "openai"] }
+asterpath-protocol = { path = "../../../crates/asterpath-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[dev-dependencies]
+asterpath-testing = { path = "../../../crates/asterpath-testing" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
