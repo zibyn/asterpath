@@ -397,6 +397,15 @@ fn build_anthropic(
         if let Some(sampling) = entry.sampling {
             profile = profile.with_sampling(sampling);
         }
+        if let Some(structured) = entry.structured_output {
+            profile = profile.with_structured_output(structured);
+        }
+        if let Some(types) = entry.file_media_types() {
+            profile = profile.with_file_media_types(types);
+        }
+        if let Some(inline) = entry.inline_changes {
+            profile = profile.with_inline_changes(inline);
+        }
         Ok(profile)
     })?;
     let mut provider = asterpath::anthropic::AnthropicProvider::new(key).with_id(id);
@@ -438,6 +447,12 @@ fn build_openai(
         }
         if let Some(sampling) = entry.sampling {
             profile = profile.with_sampling(sampling);
+        }
+        if let Some(structured) = entry.structured_output {
+            profile = profile.with_structured_output(structured);
+        }
+        if let Some(types) = entry.file_media_types() {
+            profile = profile.with_file_media_types(types);
         }
         Ok(profile)
     })?;
@@ -574,6 +589,11 @@ impl ProviderSection {
                     "{path}: `thinking` and `thinking_default_on` need the anthropic protocol"
                 ));
             }
+            if protocol == Protocol::OpenAi && entry.inline_changes.is_some() {
+                return Err(format!(
+                    "{path}: `inline_changes` needs the anthropic protocol"
+                ));
+            }
         }
         Ok(())
     }
@@ -587,6 +607,10 @@ struct ProfileSection {
     thinking_default_on: Option<bool>,
     forced_tool_choice: Option<bool>,
     sampling: Option<bool>,
+    structured_output: Option<bool>,
+    file_media_types: Option<Vec<String>>,
+    /// Anthropic only.
+    inline_changes: Option<bool>,
 }
 
 impl ProfileSection {
@@ -595,6 +619,19 @@ impl ProfileSection {
             .as_ref()
             .map(|efforts| efforts.iter().map(|effort| parse_effort(effort)).collect())
             .transpose()
+    }
+
+    /// The adapters take `'static` media types.
+    // shortcut: leaks the strings once per provider build at CLI startup; take
+    // owned strings in the adapter profiles if providers are ever rebuilt per run.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    fn file_media_types(&self) -> Option<Vec<&'static str>> {
+        self.file_media_types.as_ref().map(|types| {
+            types
+                .iter()
+                .map(|media_type| &*Box::leak(media_type.clone().into_boxed_str()))
+                .collect()
+        })
     }
 }
 

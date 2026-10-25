@@ -410,8 +410,13 @@ base_url = "https://api.deepseek.com/anthropic"
 api_key_env = "DEEPSEEK_API_KEY"                # 缺省取协议原有变量；key 只从环境读
 
 [providers.deepseek.profile]                    # 实例默认；缺省字段取 LATEST
-efforts = ["off", "low", "high", "max"]         # 另有 thinking（仅 anthropic）、thinking_default_on（仅 anthropic）、forced_tool_choice、sampling
-thinking_default_on = true
+efforts = ["off", "low", "high", "max"]
+thinking_default_on = true                      # 仅 anthropic；另有 thinking（仅 anthropic）
+# forced_tool_choice = true / sampling = true
+# structured_output = true                      # 端点支持原生 schema 约束时打开（--output-schema）
+# file_media_types = ["application/pdf"]        # 端点接受的文件附件类型
+# inline_changes = true                         # 仅 anthropic
+# 协议不符的字段（openai 上写 thinking / thinking_default_on / inline_changes）是配置错误（退出码 2）
 
 [providers.deepseek.models."deepseek-v4-pro"]   # 按前缀，长者优先；完整 profile，不继承 profile
 efforts = ["low", "high", "max"]

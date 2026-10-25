@@ -79,3 +79,37 @@ fn sse(stop_reason: &str, text: &str) -> String {
         stop_reason = stop_reason,
     )
 }
+
+/// A complete OpenAI Responses text response.
+pub fn openai_text_sse(text: &str) -> String {
+    use serde_json::json;
+    let item = json!({
+        "id": "msg_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    });
+    [
+        json!({"type": "response.created", "sequence_number": 0,
+            "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
+        json!({"type": "response.output_item.added", "sequence_number": 1,
+            "output_index": 0, "item": {"id": "msg_1", "type": "message",
+                "status": "in_progress", "role": "assistant", "content": []}}),
+        json!({"type": "response.output_item.done", "sequence_number": 2,
+            "output_index": 0, "item": item}),
+        json!({"type": "response.completed", "sequence_number": 3,
+            "response": {"id": "resp_1", "status": "completed", "output": [item],
+                "usage": {"input_tokens": 5, "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 2, "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 7}}}),
+    ]
+    .iter()
+    .map(|data| {
+        format!(
+            "event: {}\ndata: {data}\n\n",
+            data["type"].as_str().unwrap()
+        )
+    })
+    .collect()
+}

@@ -1135,6 +1135,114 @@ fn a_vendor_model_entry_replaces_the_vendor_default() {
     assert_eq!(deepseek.requests().len(), 1);
 }
 
+/// A vendor instance of `protocol` on `server`, with `extra` appended.
+fn vendor_protocol_config(protocol: &str, server: &MockServer, db: &Path, extra: &str) -> String {
+    format!(
+        concat!(
+            "[model]\nprovider = \"ds\"\nid = \"ds-flash\"\n\n",
+            "[storage]\npath = \"{db}\"\n\n[skills]\nenabled = false\n\n",
+            "[providers.ds]\nprotocol = \"{protocol}\"\nbase_url = \"{url}\"\n",
+            "api_key_env = \"DEEPSEEK_API_KEY\"\n\n{extra}",
+        ),
+        db = db.display(),
+        protocol = protocol,
+        url = server.base_url(),
+        extra = extra,
+    )
+}
+
+/// `structured_output` in the profile lets a vendor model take a schema;
+/// without it the adapter refuses before any HTTP.
+#[test]
+fn a_profile_can_turn_on_structured_output_for_a_vendor_model() {
+    for (protocol, reply, format) in [
+        ("openai", common::openai_text_sse("{}"), "/text/format/type"),
+        (
+            "anthropic",
+            common::text_sse("{}"),
+            "/output_config/format/type",
+        ),
+    ] {
+        let server = MockServer::start(vec![Reply::sse(reply)]);
+        let dir = TestDir::new("vendor-schema");
+        dir.config(&vendor_protocol_config(protocol, &server, &dir.db(), ""));
+        let schema = dir.path.join("schema.json");
+        fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+        let exec = |flags: &[&str]| {
+            let mut command = dir.exec(&dir.path);
+            command.env("DEEPSEEK_API_KEY", "ds-key").args(flags).args([
+                "--output-schema",
+                schema.to_str().unwrap(),
+                "hi",
+            ]);
+            command
+        };
+
+        let refused = exec(&[]).output().unwrap();
+        assert!(!refused.status.success(), "{protocol}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("Unsupported"),
+            "{protocol}"
+        );
+        assert!(server.requests().is_empty(), "{protocol}");
+
+        ok(&mut exec(&[
+            "-c",
+            "providers.ds.profile.structured_output=true",
+        ]));
+        let body = server.requests()[0].json_body();
+        assert_eq!(
+            body.pointer(format),
+            Some(&serde_json::json!("json_schema")),
+            "{body}"
+        );
+    }
+}
+
+/// A model entry's fields apply to its prefix only; `file_media_types` lets
+/// a PDF through.
+#[test]
+fn a_model_entry_turns_on_capabilities_for_its_prefix_only() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::openai_text_sse("{}")),
+        Reply::sse(common::openai_text_sse("read")),
+    ]);
+    let dir = TestDir::new("vendor-prefix");
+    dir.config(&vendor_protocol_config(
+        "openai",
+        &server,
+        &dir.db(),
+        concat!(
+            "[providers.ds.models.\"ds-pro\"]\nstructured_output = true\n",
+            "file_media_types = [\"application/pdf\"]\n",
+        ),
+    ));
+    let schema = dir.path.join("schema.json");
+    fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+    fs::write(dir.path.join("doc.pdf"), b"abc").unwrap();
+    let run = |args: &[&str]| {
+        dir.exec(&dir.path)
+            .env("DEEPSEEK_API_KEY", "ds-key")
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let schema = schema.to_str().unwrap();
+
+    assert!(!run(&["--output-schema", schema, "hi"]));
+    assert!(!run(&["-i", "doc.pdf", "hi"]));
+    assert!(server.requests().is_empty());
+    assert!(run(&["-m", "ds-pro-1", "--output-schema", schema, "hi"]));
+    assert!(run(&["-m", "ds-pro-1", "-i", "doc.pdf", "hi"]));
+    let body = seen(&server, 1);
+    assert!(
+        body.contains("application/pdf") && body.contains("YWJj"),
+        "{body}"
+    );
+}
+
 #[test]
 fn doctor_accepts_vendor_providers_and_aliases_to_them() {
     let dir = TestDir::new("vendor-check");
@@ -1159,6 +1267,7 @@ fn doctor_rejects_bad_vendor_provider_sections_with_two() {
         "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.models.m]\nmystery = 1\n",
         "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\nthinking = \"adaptive\"\n",
         "[providers.openai.models.m]\nthinking_default_on = true\n",
+        "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\ninline_changes = true\n",
         "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nthinking = \"sometimes\"\n",
         "[providers.deepseek]\nprotocol = \"anthropic\"\napi_key = \"leaked\"\n",
     ] {
