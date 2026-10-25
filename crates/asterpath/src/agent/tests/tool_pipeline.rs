@@ -246,11 +246,12 @@ async fn pre_execute_deny_records_a_failed_intent_without_executing() {
         error_kind(&events, intent[0].0),
         Some(asterpath_protocol::ToolErrorKind::Denied)
     );
-    assert!(
-        !live
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolStarted { .. })),
-        "no execution event for a denied call"
+    assert_eq!(
+        live.iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+            .count(),
+        1,
+        "announced once, then closed without executing"
     );
 }
 
@@ -466,11 +467,12 @@ async fn an_unknown_tool_records_intent_and_not_found_without_execution() {
     let live = drive(&agent).await;
 
     assert_eq!(count.load(Ordering::SeqCst), 1, "pre-execute still runs");
-    assert!(
-        !live
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolStarted { .. })),
-        "nothing executes"
+    assert_eq!(
+        live.iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+            .count(),
+        1,
+        "announced once, then closed without executing"
     );
 
     let events = decoded(&log).await;

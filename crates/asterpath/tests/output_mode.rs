@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use asterpath::protocol::{
     AgentEvent, CompactionConfig, InputId, Item, JsonString, ModelId, ModelSpec, OutputFormat,
-    OutputMode, Part, Provenance, ProviderCapabilities, ProviderId, ReplaySafety, RequestConfig,
-    Role, SessionEvent, SessionSpec, SessionStore, SideEffect, StopReason, SubagentConfig, Tool,
-    ToolArgs, ToolChoice, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
-    ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage, UserInput, decode_entry,
-    scan_all,
+    OutputMode, Part, Provenance, ProviderCapabilities, ProviderErrorKind, ProviderId,
+    ReplaySafety, RequestConfig, Role, SessionEvent, SessionSpec, SessionStore, SideEffect,
+    StopReason, SubagentConfig, Tool, ToolArgs, ToolChoice, ToolContext, ToolDescriptor, ToolError,
+    ToolName, ToolOutput, ToolResultStatus, ToolSelection, TurnConfig, TurnEndReason, Usage,
+    UserInput, decode_entry, scan_all,
 };
 use asterpath::{AsterError, Asterpath, SessionHandle};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
@@ -241,12 +241,11 @@ async fn tool_mode_delivers_through_the_output_tool_and_ends_the_turn() {
     let request = &requests[0];
     assert_eq!(request.output_format, None);
     assert_eq!(request.tool_choice, ToolChoice::Required);
-    assert!(
-        request
-            .tools
-            .iter()
-            .any(|tool| tool.name.as_str() == OUTPUT)
-    );
+    let tool = request
+        .tools
+        .iter()
+        .find(|tool| tool.name.as_str() == OUTPUT);
+    assert_eq!(tool.expect("output tool").strict, Some(true));
     assert!(
         request
             .baseline_tools
@@ -257,11 +256,15 @@ async fn tool_mode_delivers_through_the_output_tool_and_ends_the_turn() {
     assert_eq!(run.reason(), Some(TurnEndReason::Completed));
     assert_eq!(run.intents(), [(OUTPUT.to_owned(), Provenance::Output)]);
     assert_eq!(run.results(), [delivered()]);
-    assert!(
-        !run.events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
-    );
+    let started: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolStarted { tool, args, .. } => Some((tool.as_str(), args.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, [(OUTPUT, r#"{"city":"Paris"}"#)]);
     assert!(run.events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolFinished {
@@ -306,7 +309,19 @@ async fn auto_picks_native_then_tool_then_unsupported() {
             Vec::new(),
         )
         .await;
-        assert_eq!(run.reason(), Some(reason), "{structured} {forced}");
+        assert_eq!(run.reason(), Some(reason.clone()), "{structured} {forced}");
+        let unsupported = run.log.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::ModelCallAborted { error: Some(error), .. }
+                    if error.kind == ProviderErrorKind::Unsupported
+            )
+        });
+        assert_eq!(
+            unsupported,
+            reason == TurnEndReason::Failed,
+            "{structured} {forced}"
+        );
         if let Some(request) = provider.requests().first() {
             let has_tool = request.tools.iter().any(|t| t.name.as_str() == OUTPUT);
             assert_eq!(has_tool, tool, "{structured} {forced}");

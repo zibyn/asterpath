@@ -1,5 +1,6 @@
 //! The tool pipeline driven directly: no provider, no turn loop.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -264,6 +265,23 @@ fn started(live: &[AgentEvent]) -> usize {
         .count()
 }
 
+/// Every call has exactly one `ToolStarted`, then exactly one `ToolFinished`.
+fn assert_paired(live: &[AgentEvent], calls: usize) {
+    let mut open = HashSet::new();
+    let mut finished = HashSet::new();
+    for event in live {
+        match event {
+            AgentEvent::ToolStarted { call, .. } => assert!(open.insert(*call), "{live:?}"),
+            AgentEvent::ToolFinished { call, .. } => {
+                assert!(open.contains(call), "finished before started: {live:?}");
+                assert!(finished.insert(*call), "{live:?}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((open.len(), finished.len()), (calls, calls), "{live:?}");
+}
+
 fn asked(live: &[AgentEvent]) -> usize {
     live.iter()
         .filter(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
@@ -388,7 +406,7 @@ async fn before_tool_deny_records_the_intent_and_a_denied_result() {
 
     assert_eq!(outcome, ToolOutcome::Done);
     assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(started(&live), 0);
+    assert_eq!(started(&live), 1, "announced, then closed");
     let result = harness.result("call-1").await;
     assert_eq!(result.status, ToolResultStatus::Failed);
     assert_eq!(result.error_kind(), Some(ToolErrorKind::Denied));
@@ -406,7 +424,7 @@ async fn an_unregistered_tool_is_recorded_unknown_and_not_found() {
 
     assert_eq!(outcome, ToolOutcome::Done);
     assert_eq!(before.load(Ordering::SeqCst), 1, "before_tool still runs");
-    assert_eq!(started(&live), 0);
+    assert_eq!(started(&live), 1, "announced, then closed");
     assert!(harness.events().await.iter().any(|event| matches!(
         event,
         SessionEvent::ToolCallRequested {
@@ -438,7 +456,7 @@ async fn policy_allow_executes_and_deny_records_the_reason() {
     });
     let harness = Harness::new(vec![echo("echo")]).await.policy(policy);
     let (_, live) = harness.run(&[tool_call("call-1", "echo", "{}")]).await;
-    assert_eq!(started(&live), 0);
+    assert_eq!(started(&live), 1, "announced, then closed");
     let result = harness.result("call-1").await;
     assert_eq!(result.error_kind(), Some(ToolErrorKind::Denied));
     assert_eq!(result.error.unwrap().message, "no");
@@ -509,7 +527,7 @@ async fn a_recorded_approval_wins_over_the_policy() {
         .await;
 
     assert_eq!(consulted.load(Ordering::SeqCst), 0);
-    assert_eq!(started(&live), 0);
+    assert_eq!(started(&live), 1, "announced, then closed");
     let result = harness.result("call-1").await;
     assert_eq!(result.error_kind(), Some(ToolErrorKind::Denied));
     assert_eq!(result.error.unwrap().message, "host said no");
@@ -785,7 +803,7 @@ async fn cancel_grace_lets_a_real_result_win_and_interrupts_the_rest() {
     let mut harness = Harness::new(vec![polite, stuck]).await;
     harness.cancel_grace = Duration::from_millis(50);
 
-    let (outcome, _) = harness
+    let (outcome, live) = harness
         .run_with(
             &[
                 tool_call("call-1", "polite", "{}"),
@@ -797,11 +815,55 @@ async fn cancel_grace_lets_a_real_result_win_and_interrupts_the_rest() {
         .await;
 
     assert_eq!(outcome, ToolOutcome::Cancelled);
+    assert_paired(&live, 2);
     let real = harness.result("call-1").await;
     assert_eq!(
         (real.status, real.text()),
         (ToolResultStatus::Completed, "real".to_owned())
     );
+    assert_eq!(
+        harness.result("call-2").await.status,
+        ToolResultStatus::Interrupted
+    );
+}
+
+/// A call still queued for a permit when the step is cancelled never ran,
+/// and is announced only as it is interrupted.
+#[tokio::test]
+async fn a_queued_call_cancelled_before_it_starts_is_still_announced() {
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let blocker = TestTool::new(descriptor("blocker"), Arc::default(), move |_args, ctx| {
+        let token = token.clone();
+        Box::pin(async move {
+            token.cancel();
+            ctx.cancel.cancelled().await;
+            Err(asterpath_protocol::ToolError::Cancelled {
+                message: "stopped".to_owned(),
+            })
+        })
+    });
+    let (queued, calls) = TestTool::echo(descriptor("queued"));
+    let mut harness = Harness::new(vec![blocker, queued]).await;
+    harness.config.max_parallel_calls = std::num::NonZeroUsize::MIN;
+
+    let (outcome, live) = harness
+        .run_with(
+            &[
+                tool_call("call-1", "blocker", "{}"),
+                tool_call("call-2", "queued", "{}"),
+            ],
+            false,
+            &cancel,
+        )
+        .await;
+
+    assert_eq!(outcome, ToolOutcome::Cancelled);
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the queued call never ran"
+    );
+    assert_paired(&live, 2);
     assert_eq!(
         harness.result("call-2").await.status,
         ToolResultStatus::Interrupted
@@ -863,11 +925,12 @@ async fn a_fresh_call_records_its_intent_before_it_sees_the_cancel() {
     let cancel = CancelToken::new();
     cancel.cancel();
 
-    let (outcome, _) = harness
+    let (outcome, live) = harness
         .run_with(&[tool_call("call-1", "ghost", "{}")], false, &cancel)
         .await;
 
     assert_eq!(outcome, ToolOutcome::Cancelled);
+    assert_paired(&live, 1);
     assert_eq!(before.load(Ordering::SeqCst), 1);
     assert_eq!(harness.intents().await.len(), 1);
     assert_eq!(consulted.load(Ordering::SeqCst), 0);

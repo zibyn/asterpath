@@ -151,30 +151,26 @@ impl ToolPipeline {
                 continue;
             };
             // Shared from here on: recorded and fresh intents differ only above.
+            let info = admitted.info();
             if cancelled {
-                self.interrupt(step, admitted.tool_call_id).await?;
+                self.interrupt(step, admitted.tool_call_id, Some(&info))
+                    .await?;
                 continue;
             }
             match admitted.pre_failure {
                 Some(PreFailure::Denied(reason)) => {
-                    self.deny(step, admitted.tool_call_id, reason).await?;
+                    self.deny(step, &info, reason).await?;
                     continue;
                 }
                 Some(PreFailure::Internal(message)) => {
-                    self.fail(
-                        step,
-                        admitted.tool_call_id,
-                        ToolErrorKind::Internal,
-                        message,
-                    )
-                    .await?;
+                    self.fail(step, &info, ToolErrorKind::Internal, message)
+                        .await?;
                     continue;
                 }
                 None => {}
             }
             let Some(tool) = admitted.tool.clone() else {
-                self.not_found(step, admitted.tool_call_id, &admitted.name)
-                    .await?;
+                self.not_found(step, &info).await?;
                 continue;
             };
             let descriptor = tool.descriptor().clone();
@@ -184,7 +180,8 @@ impl ToolPipeline {
             {
                 ToolDecision::Allow if cancel.is_cancelled() => {
                     cancelled = true;
-                    self.interrupt(step, admitted.tool_call_id).await?;
+                    self.interrupt(step, admitted.tool_call_id, Some(&info))
+                        .await?;
                 }
                 ToolDecision::Allow => runnable.push(Runnable {
                     tool,
@@ -196,22 +193,26 @@ impl ToolPipeline {
                     args: admitted.args,
                 }),
                 ToolDecision::Interrupt => {
-                    self.interrupt(step, admitted.tool_call_id).await?;
+                    self.interrupt(step, admitted.tool_call_id, Some(&info))
+                        .await?;
                 }
                 ToolDecision::Deny(reason) => {
-                    self.deny(step, admitted.tool_call_id, reason).await?;
+                    self.deny(step, &info, reason).await?;
                 }
                 ToolDecision::Cancelled => {
                     cancelled = true;
-                    self.interrupt(step, admitted.tool_call_id).await?;
+                    self.interrupt(step, admitted.tool_call_id, Some(&info))
+                        .await?;
                 }
             }
         }
 
-        let pending: Vec<ToolCallId> = runnable.iter().map(|item| item.tool_call_id).collect();
+        let pending: Vec<CallInfo> = runnable.iter().map(Runnable::info).collect();
+        // Calls whose `ToolStarted` went out; the rest get it when they finish.
+        let started = Arc::new(Mutex::new(HashSet::new()));
         if cancelled {
             // Calls that passed approval but never started are interrupted too.
-            self.finish_cancelled(step, &pending).await?;
+            self.finish_cancelled(step, &pending, &started).await?;
             return Ok(ToolOutcome::Cancelled);
         }
         if runnable.is_empty() {
@@ -227,6 +228,7 @@ impl ToolPipeline {
                 Arc::clone(&semaphore),
                 Arc::clone(&lock),
                 Arc::clone(&budget),
+                Arc::clone(&started),
                 cancel,
             ));
         }
@@ -272,7 +274,7 @@ impl ToolPipeline {
         }
         drop(futures);
 
-        self.finish_cancelled(step, &pending).await?;
+        self.finish_cancelled(step, &pending, &started).await?;
         Ok(ToolOutcome::Cancelled)
     }
 
@@ -284,9 +286,14 @@ impl ToolPipeline {
         recorded: &Recorded,
         call: CallItem,
     ) -> Result<(), AgentError> {
-        let tool_call_id = match recorded.intents.get(&call.provider_call_id) {
+        let output_index = call.output_index;
+        let (tool_call_id, name, args) = match recorded.intents.get(&call.provider_call_id) {
             Some(intent) if recorded.closed.contains(&intent.tool_call_id) => return Ok(()),
-            Some(intent) => intent.tool_call_id,
+            Some(intent) => (
+                intent.tool_call_id,
+                intent.name.clone(),
+                intent.args.clone(),
+            ),
             None => {
                 let tool_call_id = ToolCallId::from_bytes(unique_bytes(self.clock.now()));
                 self.append(
@@ -296,38 +303,38 @@ impl ToolPipeline {
                         step_id: step.step,
                         tool_call_id,
                         provider_call_id: call.provider_call_id,
-                        name: call.name,
-                        raw_args: call.raw_args,
+                        name: call.name.clone(),
+                        raw_args: call.raw_args.clone(),
                         replay: ReplaySafety::Safe,
                         provenance: Provenance::Output,
                     },
                     Some(dedup::tool_call(tool_call_id)),
                 )
                 .await?;
-                tool_call_id
+                (tool_call_id, call.name, call.raw_args)
             }
         };
+        self.announce(
+            step,
+            &CallInfo {
+                tool_call_id,
+                output_index,
+                name,
+                args,
+            },
+        );
         let output = vec![Part::Text {
             text: super::output::DELIVERED.to_owned(),
         }];
-        self.append_result(
-            step.session,
+        self.finish(
+            step,
             tool_call_id,
             ToolResultStatus::Completed,
-            Some(output.clone()),
+            Some(output),
             None,
             false,
         )
-        .await?;
-        step.events.push(Ok(AgentEvent::ToolFinished {
-            turn: step.turn,
-            step: step.step,
-            call: tool_call_id,
-            status: ToolResultStatus::Completed,
-            output: Some(output),
-            error: None,
-        }));
-        Ok(())
+        .await
     }
 
     /// One read of the log per step: this step's recorded intents and which
@@ -353,8 +360,13 @@ impl ToolPipeline {
             // A tool that was absent when its intent was recorded never
             // enters approval and is never rerun.
             if intent.provenance == Provenance::Unknown {
-                self.not_found(step, intent.tool_call_id, &intent.name)
-                    .await?;
+                let info = CallInfo {
+                    tool_call_id: intent.tool_call_id,
+                    output_index: call.output_index,
+                    name: intent.name.clone(),
+                    args: intent.args.clone(),
+                };
+                self.not_found(step, &info).await?;
                 return Ok(None);
             }
             return Ok(Some(Admitted {
@@ -448,7 +460,8 @@ impl ToolPipeline {
     async fn finish_cancelled(
         &self,
         step: &ToolStep<'_>,
-        pending: &[ToolCallId],
+        pending: &[CallInfo],
+        started: &Mutex<HashSet<ToolCallId>>,
     ) -> Result<(), AgentError> {
         let decoded = scan_decoded(&*self.log, step.session).await?;
         let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
@@ -484,40 +497,85 @@ impl ToolPipeline {
             .await?;
         }
         // Every pending call has a recorded intent; an open one has no result.
-        for tool_call_id in pending {
-            if facts.open_tool(*tool_call_id).is_some() {
-                self.interrupt(step, *tool_call_id).await?;
+        for call in pending {
+            if facts.open_tool(call.tool_call_id).is_some() {
+                let unstarted = !started
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&call.tool_call_id);
+                self.interrupt(step, call.tool_call_id, unstarted.then_some(call))
+                    .await?;
             }
         }
         Ok(())
     }
 
-    /// One interrupted `ToolResult`; the dedup key makes a racing real result win.
+    /// One interrupted `ToolResult`; the dedup key makes a racing real result
+    /// win. `unstarted` is a call whose `ToolStarted` has not gone out yet.
     async fn interrupt(
         &self,
         step: &ToolStep<'_>,
         tool_call_id: ToolCallId,
+        unstarted: Option<&CallInfo>,
     ) -> Result<(), AgentError> {
-        self.append_result(
-            step.session,
+        if let Some(call) = unstarted {
+            self.announce(step, call);
+        }
+        self.finish(
+            step,
             tool_call_id,
             ToolResultStatus::Interrupted,
             None,
             None,
             false,
         )
+        .await
+    }
+
+    /// `ToolStarted`: every `ToolFinished` follows one, so a call that never
+    /// runs is announced right before it is closed.
+    fn announce(&self, step: &ToolStep<'_>, call: &CallInfo) {
+        step.events.push(Ok(AgentEvent::ToolStarted {
+            turn: step.turn,
+            step: step.step,
+            output_index: call.output_index,
+            call: call.tool_call_id,
+            tool: call.name.clone(),
+            args: call.args.clone(),
+        }));
+    }
+
+    /// Record a call's `ToolResult` and emit the matching `ToolFinished`.
+    async fn finish(
+        &self,
+        step: &ToolStep<'_>,
+        tool_call_id: ToolCallId,
+        status: ToolResultStatus,
+        output: Option<Vec<Part>>,
+        error: Option<ToolErrorInfo>,
+        truncated: bool,
+    ) -> Result<(), AgentError> {
+        self.append_result(
+            step.session,
+            tool_call_id,
+            status,
+            output.clone(),
+            error.clone(),
+            truncated,
+        )
         .await?;
         step.events.push(Ok(AgentEvent::ToolFinished {
             turn: step.turn,
             step: step.step,
             call: tool_call_id,
-            status: ToolResultStatus::Interrupted,
-            output: None,
-            error: None,
+            status,
+            output,
+            error,
         }));
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute<'a, 'b: 'a>(
         &'a self,
         step: &'a ToolStep<'b>,
@@ -525,6 +583,7 @@ impl ToolPipeline {
         semaphore: Arc<tokio::sync::Semaphore>,
         lock: Arc<tokio::sync::RwLock<()>>,
         budget: Arc<Mutex<usize>>,
+        started: Arc<Mutex<HashSet<ToolCallId>>>,
         turn_cancel: &'a CancelToken,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
@@ -537,14 +596,11 @@ impl ToolPipeline {
                 Parallelism::Exclusive => StepLockGuard::Write(lock.write().await),
             };
 
-            step.events.push(Ok(AgentEvent::ToolStarted {
-                turn: step.turn,
-                step: step.step,
-                output_index: item.output_index,
-                call: item.tool_call_id,
-                tool: item.name.clone(),
-                args: item.args.clone(),
-            }));
+            started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(item.tool_call_id);
+            self.announce(step, &item.info());
 
             // A child of the turn token: the turn broadcasts to every tool, and
             // a per-call timeout cancels only this call.
@@ -665,23 +721,8 @@ impl ToolPipeline {
                 }
             }
 
-            self.append_result(
-                step.session,
-                item.tool_call_id,
-                status,
-                output.clone(),
-                error.clone(),
-                truncated,
-            )
-            .await?;
-            step.events.push(Ok(AgentEvent::ToolFinished {
-                turn: step.turn,
-                step: step.step,
-                call: item.tool_call_id,
-                status,
-                output,
-                error,
-            }));
+            self.finish(step, item.tool_call_id, status, output, error, truncated)
+                .await?;
 
             drop(_guard);
             Ok(())
@@ -787,56 +828,41 @@ impl ToolPipeline {
     async fn deny(
         &self,
         step: &ToolStep<'_>,
-        tool_call_id: ToolCallId,
+        call: &CallInfo,
         message: String,
     ) -> Result<(), AgentError> {
-        self.fail(step, tool_call_id, ToolErrorKind::Denied, message)
-            .await
+        self.fail(step, call, ToolErrorKind::Denied, message).await
     }
 
     /// The model-visible terminal for a tool that is not in the registry.
-    async fn not_found(
-        &self,
-        step: &ToolStep<'_>,
-        tool_call_id: ToolCallId,
-        name: &ToolName,
-    ) -> Result<(), AgentError> {
+    async fn not_found(&self, step: &ToolStep<'_>, call: &CallInfo) -> Result<(), AgentError> {
         self.fail(
             step,
-            tool_call_id,
+            call,
             ToolErrorKind::NotFound,
-            format!("tool {name} is not registered"),
+            format!("tool {} is not registered", call.name),
         )
         .await
     }
 
-    /// A call that fails before it starts: a `ToolFinished` with no `ToolStarted`.
+    /// A call that fails before it starts.
     async fn fail(
         &self,
         step: &ToolStep<'_>,
-        tool_call_id: ToolCallId,
+        call: &CallInfo,
         kind: ToolErrorKind,
         message: String,
     ) -> Result<(), AgentError> {
-        let error = ToolErrorInfo { kind, message };
-        self.append_result(
-            step.session,
-            tool_call_id,
+        self.announce(step, call);
+        self.finish(
+            step,
+            call.tool_call_id,
             ToolResultStatus::Failed,
             None,
-            Some(error.clone()),
+            Some(ToolErrorInfo { kind, message }),
             false,
         )
-        .await?;
-        step.events.push(Ok(AgentEvent::ToolFinished {
-            turn: step.turn,
-            step: step.step,
-            call: tool_call_id,
-            status: ToolResultStatus::Failed,
-            output: None,
-            error: Some(error),
-        }));
-        Ok(())
+        .await
     }
 
     async fn append_result(
@@ -962,6 +988,36 @@ struct Runnable {
     provider_call_id: String,
     tool: Arc<dyn Tool>,
     descriptor: ToolDescriptor,
+    tool_call_id: ToolCallId,
+    output_index: u32,
+    name: ToolName,
+    args: ToolArgs,
+}
+
+impl Admitted {
+    fn info(&self) -> CallInfo {
+        CallInfo {
+            tool_call_id: self.tool_call_id,
+            output_index: self.output_index,
+            name: self.name.clone(),
+            args: self.args.clone(),
+        }
+    }
+}
+
+impl Runnable {
+    fn info(&self) -> CallInfo {
+        CallInfo {
+            tool_call_id: self.tool_call_id,
+            output_index: self.output_index,
+            name: self.name.clone(),
+            args: self.args.clone(),
+        }
+    }
+}
+
+/// What `ToolStarted` reports about a call.
+struct CallInfo {
     tool_call_id: ToolCallId,
     output_index: u32,
     name: ToolName,

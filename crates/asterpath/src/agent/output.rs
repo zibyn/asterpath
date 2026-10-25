@@ -36,7 +36,9 @@ pub(crate) fn apply(request: &mut ModelRequest, format: &OutputFormat) {
         ToolName::new(&format.name),
         "Deliver the final result: call this tool with the result as its arguments.".to_owned(),
         format.schema.clone(),
-    );
+    )
+    // As strict as the native constraint (`strict: true`, R13).
+    .with_strict(Some(true));
     request.tools.push(descriptor.clone());
     request.baseline_tools.push(descriptor);
     if !matches!(request.tool_choice, ToolChoice::Tool(_)) {

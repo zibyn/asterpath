@@ -464,7 +464,7 @@ impl Hooks for FailingHook {
 }
 
 #[tokio::test]
-async fn a_failing_before_tool_emits_tool_finished_without_tool_started() {
+async fn a_failing_before_tool_is_announced_then_finished_as_internal() {
     let echo = EchoTool::new("echo");
     let recorder = Arc::new(Recorder::default());
     let provider = ScriptedProvider::new("p")
@@ -483,11 +483,19 @@ async fn a_failing_before_tool_emits_tool_finished_without_tool_started() {
     .await;
 
     assert!(echo.calls().is_empty());
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
-    );
+    // The call never ran, yet its ToolFinished still follows a ToolStarted.
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolStarted { call, .. } => Some(("started", *call)),
+            AgentEvent::ToolFinished { call, .. } => Some(("finished", *call)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_events.len(), 2, "{tool_events:?}");
+    assert_eq!(tool_events[0].0, "started");
+    assert_eq!(tool_events[1].0, "finished");
+    assert_eq!(tool_events[0].1, tool_events[1].1);
     let finished: Vec<_> = events
         .iter()
         .filter_map(|event| match event {

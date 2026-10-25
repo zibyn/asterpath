@@ -91,13 +91,15 @@ fn approval_is_asked_on_the_prompt_and_tool_calls_are_shown() {
         assert!(out.success, "stderr: {}", out.stderr);
         assert!(out.stdout.contains("allow? [y/N]"), "{}", out.stdout);
         assert_eq!(dir.path().join("ran").exists(), ran, "{answer:?}");
-        let started = out
-            .stdout
-            .contains(r#"[tool] bash {"command":"touch ran && echo made"}"#);
-        assert_eq!(started, ran, "{}", out.stdout);
-        if ran {
-            assert!(out.stdout.contains("[Completed] made"), "{}", out.stdout);
-        }
+        // A denied call is shown too, then its failure.
+        assert!(
+            out.stdout
+                .contains(r#"[tool] bash {"command":"touch ran && echo made"}"#),
+            "{}",
+            out.stdout
+        );
+        let finished = if ran { "[Completed] made" } else { "[Failed]" };
+        assert!(out.stdout.contains(finished), "{}", out.stdout);
     }
 }
 

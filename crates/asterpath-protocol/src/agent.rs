@@ -79,6 +79,9 @@ pub enum AgentEvent {
         part_index: u32,
         delta: PartDelta,
     },
+    /// Precedes the call's one `ToolFinished`. A call that never runs
+    /// (denied, not found, interrupted before it started, the output tool)
+    /// is announced right before it finishes.
     ToolStarted {
         turn: TurnId,
         step: StepId,

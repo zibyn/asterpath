@@ -438,18 +438,61 @@ fn stream_json_bad_command_cancels_and_exits_two_after_the_result() {
 /// The one `tool_finished` of a call that failed before it started, and
 /// asserts no `tool_started` came before it.
 fn pre_failed(events: &[serde_json::Value]) -> &serde_json::Value {
-    assert!(
-        !events.iter().any(|event| event["type"] == "tool_started"),
-        "{events:?}"
-    );
-    let finished: Vec<_> = events
+    let tool_events: Vec<_> = events
         .iter()
-        .filter(|event| event["type"] == "tool_finished")
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("tool_started" | "tool_finished")
+            )
+        })
         .collect();
-    assert_eq!(finished.len(), 1, "{events:?}");
-    assert_eq!(finished[0]["status"], "Failed");
-    assert_eq!(finished[0]["output"], serde_json::Value::Null);
-    finished[0]
+    // The call never ran, yet it is announced before it finishes.
+    assert_eq!(tool_events.len(), 2, "{events:?}");
+    let (started, finished) = (tool_events[0], tool_events[1]);
+    assert_eq!(started["type"], "tool_started");
+    assert_eq!(finished["type"], "tool_finished");
+    assert_eq!(started["call"], finished["call"]);
+    assert_eq!(finished["status"], "Failed");
+    assert_eq!(finished["output"], serde_json::Value::Null);
+    finished
+}
+
+/// The logged `ToolResult.error` of `call` (a JSON id) in `session`.
+fn logged_error(dir: &TestDir, session: &str, call: &serde_json::Value) -> serde_json::Value {
+    let session: asterpath_protocol::SessionId =
+        serde_json::from_value(serde_json::json!(session)).expect("session id");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let asterpath = Asterpath::builder()
+            .database(dir.db())
+            .provider(Arc::new(AnthropicProvider::new("test-key")))
+            .build()
+            .await
+            .expect("build");
+        let entries = asterpath_protocol::scan_all(&*asterpath.store(), session)
+            .await
+            .expect("scan");
+        asterpath.shutdown().await.expect("shutdown");
+        entries
+            .iter()
+            .find_map(
+                |entry| match asterpath_protocol::decode_entry(entry).ok()? {
+                    SessionEvent::ToolResult {
+                        tool_call_id,
+                        error,
+                        ..
+                    } if serde_json::to_value(tool_call_id).unwrap() == *call => {
+                        Some(serde_json::to_value(error).unwrap())
+                    }
+                    _ => None,
+                },
+            )
+            .expect("a logged result for the call")
+    })
 }
 
 fn stream_json_events(stdout: &str) -> Vec<serde_json::Value> {
@@ -468,7 +511,7 @@ fn stream_json_reports_a_call_denied_without_an_endpoint() {
     let dir = TestDir::new("stream-no-endpoint");
     dir.config(&config_body(&server, &dir.db()));
 
-    let (stdout, _) = ok(dir.exec(&dir.path).args([
+    let (stdout, session) = ok(dir.exec(&dir.path).args([
         "-a",
         "untrusted",
         "-s",
@@ -484,6 +527,10 @@ fn stream_json_reports_a_call_denied_without_an_endpoint() {
     assert_eq!(
         finished["error"]["message"],
         asterpath_protocol::NO_APPROVAL_ENDPOINT
+    );
+    assert_eq!(
+        finished["error"],
+        logged_error(&dir, &session, &finished["call"])
     );
 }
 
@@ -512,6 +559,8 @@ fn stream_json_reports_a_call_the_host_denied() {
         events.push(event);
     }
     host.close();
+    let session = host.next()["session"].as_str().unwrap().to_owned();
+    assert_eq!(host.exit_code(), Some(0));
 
     let finished = pre_failed(&events);
     assert_eq!(finished["call"], request["tool_call_id"]);
@@ -522,6 +571,10 @@ fn stream_json_reports_a_call_the_host_denied() {
             .unwrap()
             .contains("e2e says no"),
         "{finished}"
+    );
+    assert_eq!(
+        finished["error"],
+        logged_error(&dir, &session, &finished["call"])
     );
     assert!(!dir.path.join("ran").exists());
 }
@@ -535,12 +588,17 @@ fn stream_json_reports_a_call_to_an_unregistered_tool() {
     let dir = TestDir::new("stream-not-found");
     dir.config(&config_body(&server, &dir.db()));
 
-    let (stdout, _) = ok(dir
+    let (stdout, session) = ok(dir
         .exec(&dir.path)
         .args(["--output-format", "stream-json", "go"]));
 
     let events = stream_json_events(&stdout);
-    assert_eq!(pre_failed(&events)["error"]["kind"], "NotFound");
+    let finished = pre_failed(&events);
+    assert_eq!(finished["error"]["kind"], "NotFound");
+    assert_eq!(
+        finished["error"],
+        logged_error(&dir, &session, &finished["call"])
+    );
 }
 
 #[test]
@@ -596,11 +654,12 @@ fn output_mode_needs_an_output_schema() {
 #[test]
 fn output_mode_tool_returns_the_output_tool_arguments() {
     let args = r#"{"city":"Paris"}"#;
-    for (protocol, reply, tool_name, choice, native) in [
+    for (protocol, reply, tool_name, strict, choice, native) in [
         (
             "anthropic",
             common::tool_use_sse("output", args),
             "/name",
+            "/strict",
             ("/tool_choice/type", "any"),
             "/output_config",
         ),
@@ -608,6 +667,7 @@ fn output_mode_tool_returns_the_output_tool_arguments() {
             "openai",
             common::openai_call_sse("output", args),
             "/name",
+            "/strict",
             ("/tool_choice", "required"),
             "/text/format",
         ),
@@ -638,10 +698,13 @@ fn output_mode_tool_returns_the_output_tool_arguments() {
         let body = requests[0].json_body();
         let tools = body["tools"].as_array().expect("tools");
         let output = serde_json::json!("output");
-        assert!(
-            tools
-                .iter()
-                .any(|tool| tool.pointer(tool_name) == Some(&output)),
+        let tool = tools
+            .iter()
+            .find(|tool| tool.pointer(tool_name) == Some(&output))
+            .unwrap_or_else(|| panic!("no output tool: {body}"));
+        assert_eq!(
+            tool.pointer(strict),
+            Some(&serde_json::json!(true)),
             "{body}"
         );
         assert_eq!(
@@ -1380,6 +1443,28 @@ fn doctor_rejects_bad_vendor_provider_sections_with_two() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn inline_changes_on_an_openai_provider_names_the_field() {
+    let dir = TestDir::new("inline-openai");
+    let config = dir.config(concat!(
+        "[providers.deepseek]\nprotocol = \"openai\"\n",
+        "[providers.deepseek.models.\"ds-pro\"]\ninline_changes = true\n",
+    ));
+    let output = bin()
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .expect("run doctor");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "providers.deepseek.models.ds-pro: `inline_changes` needs the anthropic protocol"
+        ),
+        "{stderr}"
+    );
 }
 
 /// Create a session through the library: pending input, optionally with an
