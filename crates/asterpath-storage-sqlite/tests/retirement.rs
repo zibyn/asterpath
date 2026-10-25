@@ -62,6 +62,7 @@ fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) 
         session,
         schema_version: LOG_SCHEMA_VERSION,
         dedup_key,
+        owner: None,
         payload: serde_json::to_value(event).expect("serialize event"),
     }
 }

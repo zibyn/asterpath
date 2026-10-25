@@ -1,5 +1,5 @@
-//! SQLite-specific guarantees: real-SIGKILL durability (G1), writer lock,
-//! schema version gate, WAL/permissions, hard errors and the session catalog.
+//! SQLite-specific guarantees: real-SIGKILL durability (G1), cross-process
+//! session-tree ownership, schema version gate, WAL/permissions, hard errors and the session catalog.
 
 mod common;
 
@@ -53,6 +53,10 @@ fn helper_session() -> SessionId {
     session(0x11)
 }
 
+fn free_session() -> SessionId {
+    session(0x12)
+}
+
 fn input_recorded() -> SessionEvent {
     SessionEvent::InputRecorded { input: vec![] }
 }
@@ -62,6 +66,7 @@ fn entry(session: SessionId, event: &SessionEvent, dedup_key: Option<DedupKey>) 
         session,
         schema_version: LOG_SCHEMA_VERSION,
         dedup_key,
+        owner: None,
         payload: serde_json::to_value(event).expect("serialize event"),
     }
 }
@@ -108,21 +113,35 @@ fn helper_entry() {
             std::thread::sleep(Duration::from_secs(60));
             std::process::exit(0);
         }
-        "probe_writer_busy" => match open(&db) {
-            Err(StorageError::WriterBusy) => std::process::exit(0),
-            Ok(_) => std::process::exit(1),
-            Err(error) => {
-                eprintln!("unexpected open error: {error}");
-                std::process::exit(2);
+        "claim" => {
+            let storage = open(&db).expect("helper open");
+            let claim = block_on(storage.claim(helper_session())).expect("helper claim");
+            println!(
+                "{{\"event\":\"claimed\",\"epoch\":{}}}",
+                claim.token().epoch
+            );
+            use std::io::Write;
+            std::io::stdout().flush().expect("flush marker");
+            // Hold the tree until the parent kills the process.
+            std::thread::sleep(Duration::from_secs(60));
+            std::process::exit(0);
+        }
+        // Exit 0 when the held tree is refused and a free one is driven.
+        "probe_claims" => {
+            let storage = open(&db).expect("probe open");
+            match block_on(storage.claim(helper_session())) {
+                Err(StorageError::OwnedElsewhere { root }) if root == helper_session() => {}
+                other => {
+                    eprintln!("held tree: expected OwnedElsewhere, got {other:?}");
+                    std::process::exit(1);
+                }
             }
-        },
-        "probe_open" => match open(&db) {
-            Ok(_) => std::process::exit(0),
-            Err(error) => {
-                eprintln!("open failed: {error}");
-                std::process::exit(1);
-            }
-        },
+            let free = block_on(storage.claim(free_session())).expect("claim a free tree");
+            let mut owned = entry(free_session(), &input_recorded(), None);
+            owned.owner = Some(free.token());
+            append(storage.as_ref(), owned).expect("owner write");
+            std::process::exit(0);
+        }
         _ => std::process::exit(2),
     }
 }
@@ -147,6 +166,21 @@ fn append_survives_a_real_sigkill() {
     let dir = TempDir::new("g1");
     let db = dir.db();
     let mut child = spawn_helper("append", &db);
+    wait_for_marker(&mut child, "\"event\":\"appended\"");
+
+    // The append has returned in the child; kill it before it can clean up.
+    sigkill(child);
+
+    let storage = open(&db).expect("reopen after SIGKILL");
+    let entries = scan(storage.as_ref(), helper_session());
+    assert_eq!(entries.len(), 1, "G1: the committed entry is visible");
+    let entry = entries.into_iter().next().unwrap().expect("valid entry");
+    assert_eq!(entry.dedup_key, Some(DedupKey::new("g1")));
+    assert_eq!(entry.seq, 1);
+}
+
+/// The first stdout line of `child` containing `marker`.
+fn wait_for_marker(child: &mut Child, marker: &str) -> String {
     let stdout = child.stdout.take().expect("piped stdout");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -161,14 +195,15 @@ fn append_survives_a_real_sigkill() {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
-            Ok(Ok(line)) if line.contains("\"event\":\"appended\"") => break,
+            Ok(Ok(line)) if line.contains(marker) => return line,
             Ok(Ok(_)) => {}
             Ok(Err(error)) => panic!("reading helper stdout: {error}"),
-            Err(error) => panic!("helper produced no append marker within 15s: {error}"),
+            Err(error) => panic!("helper printed no {marker} within 15s: {error}"),
         }
     }
+}
 
-    // The append has returned in the child; kill it before it can clean up.
+fn sigkill(mut child: Child) {
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
     let status = child.wait().expect("wait for helper");
     assert_eq!(
@@ -176,41 +211,70 @@ fn append_survives_a_real_sigkill() {
         Some(libc::SIGKILL),
         "the helper must die from SIGKILL, not exit"
     );
-
-    let storage = open(&db).expect("reopen after SIGKILL");
-    let entries = scan(storage.as_ref(), helper_session());
-    assert_eq!(entries.len(), 1, "G1: the committed entry is visible");
-    let entry = entries.into_iter().next().unwrap().expect("valid entry");
-    assert_eq!(entry.dedup_key, Some(DedupKey::new("g1")));
-    assert_eq!(entry.seq, 1);
 }
 
 // ---------------------------------------------------------------------------
-// Writer lock.
+// Session-tree ownership across processes (ADR-0036).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn second_process_gets_writer_busy() {
-    let dir = TempDir::new("writer-busy");
+fn another_process_drives_other_trees_but_not_a_held_one() {
+    let dir = TempDir::new("owned-elsewhere");
     let db = dir.db();
-    let storage = open(&db).expect("first writer opens");
+    let storage = open(&db).expect("first process opens");
+    let _claim = block_on(storage.claim(helper_session())).expect("claim");
 
-    let status = spawn_helper("probe_writer_busy", &db)
+    let status = spawn_helper("probe_claims", &db)
         .wait()
         .expect("wait for probe");
-    assert!(
-        status.success(),
-        "the second process must observe WriterBusy, got {status:?}"
+    assert!(status.success(), "probe failed: {status:?}");
+    assert_eq!(scan(storage.as_ref(), free_session()).len(), 1);
+}
+
+#[test]
+fn a_killed_owner_releases_its_tree_and_its_epoch_is_fenced() {
+    let dir = TempDir::new("killed-owner");
+    let db = dir.db();
+    let storage = open(&db).expect("open");
+    let mut child = spawn_helper("claim", &db);
+    let line = wait_for_marker(&mut child, "\"event\":\"claimed\"");
+    let epoch: u64 = line
+        .rsplit(':')
+        .next()
+        .and_then(|tail| tail.trim_end_matches('}').parse().ok())
+        .expect("epoch in marker");
+    let dead = asterpath_protocol::OwnerToken {
+        root: helper_session(),
+        epoch,
+    };
+
+    assert!(matches!(
+        block_on(storage.claim(helper_session())),
+        Err(StorageError::OwnedElsewhere { .. })
+    ));
+    assert_eq!(
+        block_on(storage.owner(helper_session())).expect("owner"),
+        Some(dead)
     );
 
-    drop(storage);
-    let status = spawn_helper("probe_open", &db)
-        .wait()
-        .expect("wait for reopen probe");
-    assert!(
-        status.success(),
-        "after the writer dies another process can open, got {status:?}"
+    sigkill(child);
+    assert_eq!(
+        block_on(storage.owner(helper_session())).expect("owner"),
+        None,
+        "the OS released the dead process's lock"
     );
+    let claim = block_on(storage.claim(helper_session())).expect("take over");
+    assert!(claim.token().epoch > epoch);
+
+    let mut stale = entry(helper_session(), &input_recorded(), None);
+    stale.owner = Some(dead);
+    assert!(matches!(
+        append(storage.as_ref(), stale),
+        Err(StorageError::OwnedElsewhere { .. })
+    ));
+    let mut owned = entry(helper_session(), &input_recorded(), None);
+    owned.owner = Some(claim.token());
+    append(storage.as_ref(), owned).expect("the new owner writes");
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +341,7 @@ fn bad_payload_is_a_hard_error() {
             session: session(2),
             schema_version: LOG_SCHEMA_VERSION,
             dedup_key: None,
+            owner: None,
             payload: serde_json::json!({"NoSuchEvent": {}}),
         },
     )
@@ -466,7 +531,13 @@ fn a_new_database_has_only_the_current_tables() {
     let conn = rusqlite::Connection::open(&db).expect("raw open");
     assert_eq!(
         tables(&conn),
-        vec!["log", "retired_sessions", "sessions", "sqlite_sequence"]
+        vec![
+            "log",
+            "owners",
+            "retired_sessions",
+            "sessions",
+            "sqlite_sequence"
+        ]
     );
 }
 

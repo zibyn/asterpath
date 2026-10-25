@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    CatalogEntry, Clock, LogEntry, LogId, LogQuery, NewEntry, ParentFilter, RetirementError,
-    SessionId, SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
+    CatalogEntry, Claim, Clock, LogEntry, LogId, LogQuery, NewEntry, OwnerToken, ParentFilter,
+    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
@@ -34,6 +34,11 @@ struct State {
     sessions: BTreeMap<SessionId, SessionRow>,
     /// Retired sessions and their last log id.
     retired: HashMap<SessionId, LogId>,
+    /// Per root: the latest claim epoch and, while held, the holding handle
+    /// and its number of live claims.
+    owners: HashMap<SessionId, (u64, Option<(u64, usize)>)>,
+    /// Handles opened on this state, each standing for one process.
+    handles: u64,
 }
 
 impl State {
@@ -127,8 +132,10 @@ impl State {
 /// Append-only, per-session in-memory event log with idempotent appends,
 /// per-session monotonic `seq` and exclusive-cursor scans.
 pub struct InMemoryEventLog {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     clock: Arc<dyn Clock>,
+    /// Which handle this is; claims conflict across handles.
+    handle: u64,
 }
 
 impl Default for InMemoryEventLog {
@@ -145,13 +152,51 @@ impl InMemoryEventLog {
     /// A log that stamps `recorded_at` from `clock`.
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
-            state: Mutex::new(State::default()),
+            state: Arc::default(),
             clock,
+            handle: 0,
+        }
+    }
+
+    /// Another handle on the same log, as a second process would see it:
+    /// its claims conflict with this handle's (ADR-0036).
+    pub fn other_process(&self) -> Self {
+        let handle = {
+            let mut state = self.state();
+            state.handles += 1;
+            state.handles
+        };
+        Self {
+            state: Arc::clone(&self.state),
+            clock: Arc::clone(&self.clock),
+            handle,
         }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
+    }
+
+    fn claim_sync(&self, root: SessionId) -> Result<Claim, StorageError> {
+        let mut state = self.state();
+        let (epoch, held) = state.owners.entry(root).or_default();
+        match held {
+            Some((handle, claims)) if *handle == self.handle => *claims += 1,
+            Some(_) => return Err(StorageError::OwnedElsewhere { root }),
+            None => {
+                *epoch += 1;
+                *held = Some((self.handle, 1));
+            }
+        }
+        let token = OwnerToken {
+            root,
+            epoch: *epoch,
+        };
+        let release = Release {
+            state: Arc::clone(&self.state),
+            root,
+        };
+        Ok(Claim::new(token, release))
     }
 
     fn append_sync(&self, entry: NewEntry) -> Result<LogId, StorageError> {
@@ -166,6 +211,11 @@ impl InMemoryEventLog {
             return Err(StorageError::Retired {
                 session: entry.session,
             });
+        }
+        if let Some(owner) = entry.owner
+            && state.owners.get(&owner.root).map(|(epoch, _)| *epoch) != Some(owner.epoch)
+        {
+            return Err(StorageError::OwnedElsewhere { root: owner.root });
         }
         let dedup = entry
             .dedup_key
@@ -259,6 +309,22 @@ impl SessionStore for InMemoryEventLog {
         Box::pin(async move { Ok(parent) })
     }
 
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
+        let result = self.claim_sync(root);
+        Box::pin(async move { result })
+    }
+
+    fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
+        let owner = match self.state().owners.get(&root) {
+            Some((epoch, Some(_))) => Some(OwnerToken {
+                root,
+                epoch: *epoch,
+            }),
+            _ => None,
+        };
+        Box::pin(async move { Ok(owner) })
+    }
+
     /// Idle check, frontier CAS, delete and tombstone under one lock.
     fn retire(
         &self,
@@ -267,6 +333,30 @@ impl SessionStore for InMemoryEventLog {
     ) -> BoxFuture<'_, Result<(), RetirementError>> {
         let result = self.state().retire(session, expected_frontier);
         Box::pin(async move { result })
+    }
+}
+
+fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drops one claim; the last one releases the root.
+struct Release {
+    state: Arc<Mutex<State>>,
+    root: SessionId,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let mut state = lock(&self.state);
+        if let Some((_, held)) = state.owners.get_mut(&self.root)
+            && let Some((_, claims)) = held
+        {
+            *claims -= 1;
+            if *claims == 0 {
+                *held = None;
+            }
+        }
     }
 }
 
@@ -289,5 +379,9 @@ impl StoreFactory for MemoryBackend {
 
     fn open_with_clock(&self, clock: Arc<dyn Clock>) -> Arc<dyn SessionStore> {
         Arc::new(InMemoryEventLog::with_clock(clock))
+    }
+
+    fn open_other_process(&self) -> Arc<dyn SessionStore> {
+        Arc::new(self.store.other_process())
     }
 }

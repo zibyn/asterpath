@@ -112,6 +112,7 @@ async fn drive_session(store: Arc<dyn SessionStore>, session: SessionId) -> Vec<
                 session,
                 schema_version: LOG_SCHEMA_VERSION,
                 dedup_key: None,
+                owner: None,
                 payload: payload.clone(),
             })
             .await

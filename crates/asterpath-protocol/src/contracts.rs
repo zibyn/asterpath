@@ -38,7 +38,49 @@ pub struct NewEntry {
     pub session: SessionId,
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
+    /// Set on owner writes (agent loop, compaction, child scheduling): the
+    /// store rejects the entry with `OwnedElsewhere` unless `epoch` is still
+    /// the latest claim of `root`. External writes (input, approval
+    /// decisions, config changes) leave it `None` (ADR-0036).
+    pub owner: Option<OwnerToken>,
     pub payload: serde_json::Value,
+}
+
+/// The credential of one claim of a session tree: the root session id and
+/// the epoch the claim was granted, which every new claim of the root
+/// increments (ADR-0036).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OwnerToken {
+    pub root: SessionId,
+    pub epoch: u64,
+}
+
+/// Ownership of a session tree held through one store handle; dropping it
+/// releases this claim. Claims of one root through one handle share the
+/// ownership and its epoch; the tree is released when the last one drops.
+pub struct Claim {
+    token: OwnerToken,
+    _held: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl Claim {
+    /// For store adapters: dropping `held` releases the claim.
+    pub fn new(token: OwnerToken, held: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            token,
+            _held: Box::new(held),
+        }
+    }
+
+    pub fn token(&self) -> OwnerToken {
+        self.token
+    }
+}
+
+impl fmt::Debug for Claim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Claim").field(&self.token).finish()
+    }
 }
 
 /// A committed log record as returned by the storage layer.
@@ -132,6 +174,10 @@ impl CatalogEntry {
 /// The one storage adapter (ADR-0023): the append-only per-session event log
 /// plus the session catalog (`sessions` / `parent`) and optional
 /// whole-session retirement. Retired sessions are invisible to every read.
+///
+/// Ownership is per session tree, keyed by the root session id (ADR-0036):
+/// at most one process holds a root at a time, and the backend releases it
+/// natively when the holder dies. A store handle stands for one process.
 pub trait SessionStore: Send + Sync {
     fn append(&self, entry: NewEntry) -> BoxFuture<'_, Result<LogId, StorageError>>;
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>>;
@@ -146,6 +192,14 @@ pub trait SessionStore: Send + Sync {
     /// The parent recorded in `SessionCreated`; `None` for a root or unknown
     /// session.
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
+
+    /// Take ownership of the tree rooted at `root`. Held through this handle
+    /// already: the same epoch, shared. Held through another handle or
+    /// process: `OwnedElsewhere`. Otherwise a new, higher epoch.
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>>;
+    /// The live claim of `root` through any handle or process; `None` when
+    /// nobody holds it.
+    fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>>;
 
     /// Write the tombstone and delete the session's log and catalog row.
     /// `expected_frontier` must equal the current last log id. Backends

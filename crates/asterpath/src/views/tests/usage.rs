@@ -146,6 +146,7 @@ impl TestLog {
                 session,
                 schema_version: asterpath_protocol::LOG_SCHEMA_VERSION,
                 dedup_key: None,
+                owner: None,
                 payload: serde_json::json!({"NotAnEvent": {}}),
             },
             at,
@@ -242,6 +243,21 @@ impl SessionStore for TestLog {
         &self,
         _session: SessionId,
     ) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn claim(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::Claim, StorageError>> {
+        let token = asterpath_protocol::OwnerToken { root, epoch: 1 };
+        Box::pin(async move { Ok(asterpath_protocol::Claim::new(token, ())) })
+    }
+
+    fn owner(
+        &self,
+        _root: SessionId,
+    ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
         Box::pin(async { Ok(None) })
     }
 }

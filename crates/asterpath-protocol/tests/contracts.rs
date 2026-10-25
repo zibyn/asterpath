@@ -1,6 +1,6 @@
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
-    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
+    ApprovalGate, CatalogEntry, Claim, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
+    OwnerToken, RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -35,6 +35,14 @@ impl SessionStore for DummyStore {
     ) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         Box::pin(async { Ok(None) })
     }
+
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
+        Box::pin(async move { Ok(Claim::new(OwnerToken { root, epoch: 1 }, ())) })
+    }
+
+    fn owner(&self, _root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 #[test]
@@ -46,6 +54,7 @@ fn contract_traits_are_object_safe_and_values_have_the_documented_shape() {
         session,
         schema_version: 1,
         dedup_key: Some(DedupKey::new("dedup")),
+        owner: None,
         payload: serde_json::json!({ "SessionCreated": {} }),
     };
     let _entry = LogEntry {

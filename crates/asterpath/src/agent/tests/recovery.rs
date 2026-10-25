@@ -1673,6 +1673,20 @@ impl SessionStore for CorruptParentLog {
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
     }
+
+    fn claim(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::Claim, StorageError>> {
+        self.inner.claim(root)
+    }
+
+    fn owner(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.owner(root)
+    }
 }
 
 /// Crash after a refused step's `AssistantMessage`, with the step open or

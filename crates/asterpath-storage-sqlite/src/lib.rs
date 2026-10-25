@@ -9,18 +9,25 @@
 //! its `sessions` catalog row; `retire` folds the session facts, writes the
 //! tombstone and deletes the log and catalog row. Reads run on the caller
 //! over a separate read-only connection, so they never queue behind a fsync.
-//! The process takes a non-blocking `flock` at open, so a second process gets
-//! `WriterBusy`.
+//!
+//! Several processes may open one database (ADR-0036). Each session tree is
+//! owned through a byte-range lock on `<db>.owners`, one byte per root, held
+//! by this handle's open file description; the OS drops it with the process.
+//! Claims bump the root's epoch in the `owners` table, and an owner write is
+//! checked against it inside its write transaction.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use asterpath_protocol::{
-    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, ParentFilter,
-    RetirementError, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
+    CatalogEntry, Claim, Clock, DedupKey, LogEntry, LogId, LogQuery, NewEntry, OwnerToken,
+    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
+    SystemClock,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_channel::oneshot;
@@ -76,6 +83,10 @@ CREATE TABLE IF NOT EXISTS retired_sessions (
     last_log_id  INTEGER NOT NULL,
     retired_at   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS owners (
+    root   BLOB    PRIMARY KEY,
+    epoch  INTEGER NOT NULL
+);
 ";
 
 /// Open the database with the production defaults.
@@ -101,7 +112,7 @@ pub fn open_with_clock(
     let path = path.as_ref();
     create_private_file(path)?;
     let conn = Connection::open(path).map_err(backend)?;
-    let lock = acquire_writer_lock(path)?;
+    let owners = Arc::new(Owners::open(path)?);
     prepare(&conn, options.synchronous)?;
     let reader = Connection::open_with_flags(
         path,
@@ -113,7 +124,10 @@ pub fn open_with_clock(
     let (commands, queue) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("asterpath-sqlite-writer".to_owned())
-        .spawn(move || run_writer(conn, queue, clock))
+        .spawn({
+            let owners = Arc::clone(&owners);
+            move || run_writer(conn, queue, clock, &owners)
+        })
         .map_err(backend)?;
     Ok(Arc::new(SqliteStorage {
         writer: Writer {
@@ -121,16 +135,16 @@ pub fn open_with_clock(
             thread: Some(thread),
         },
         reader: Mutex::new(reader),
-        _lock: lock,
+        owners,
     }))
 }
 
 /// Field order is drop order: the writer drains and joins before the reader
-/// closes, and the `flock` is released last, so a same-process reopen works.
+/// closes.
 pub struct SqliteStorage {
     writer: Writer,
     reader: Mutex<Connection>,
-    _lock: WriterLock,
+    owners: Arc<Owners>,
 }
 
 /// Most writes group-committed in one transaction.
@@ -141,6 +155,11 @@ type WriterJob = Box<dyn FnOnce(&Connection) + Send>;
 
 enum Command {
     Write(Write),
+    /// Runs alone, in its own transaction, between batches.
+    Claim {
+        root: SessionId,
+        reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
     #[cfg(test)]
     Run(WriterJob),
 }
@@ -209,41 +228,76 @@ fn writer_stopped() -> StorageError {
     StorageError::Backend("sqlite writer stopped".to_owned())
 }
 
-fn run_writer(mut conn: Connection, queue: mpsc::Receiver<Command>, clock: Arc<dyn Clock>) {
-    while let Ok(first) = queue.recv() {
-        let mut batch = match first {
+fn run_writer(
+    conn: Connection,
+    queue: mpsc::Receiver<Command>,
+    clock: Arc<dyn Clock>,
+    owners: &Owners,
+) {
+    let mut next = queue.recv().ok();
+    while let Some(command) = next.take() {
+        let mut batch = match command {
+            Command::Write(write) => vec![write],
+            Command::Claim { root, reply } => {
+                // A caller that gave up does not keep the tree.
+                if let Err(Ok(_)) = reply.send(owners.claim(&conn, root)) {
+                    owners.release(root);
+                }
+                next = queue.recv().ok();
+                continue;
+            }
             #[cfg(test)]
             Command::Run(job) => {
                 job(&conn);
+                next = queue.recv().ok();
                 continue;
             }
-            Command::Write(write) => vec![write],
         };
         // Take only what is already queued: no timer, no added latency.
-        #[cfg(test)]
-        let mut after = None;
         while batch.len() < MAX_BATCH {
             match queue.try_recv() {
                 Ok(Command::Write(write)) => batch.push(write),
-                #[cfg(test)]
-                Ok(Command::Run(job)) => {
-                    after = Some(job);
+                Ok(other) => {
+                    next = Some(other);
                     break;
                 }
                 Err(_) => break,
             }
         }
-        commit_batch(&mut conn, batch, clock.as_ref());
-        #[cfg(test)]
-        if let Some(job) = after {
-            job(&conn);
+        commit_batch(&conn, batch, clock.as_ref());
+        if next.is_none() {
+            next = queue.recv().ok();
         }
     }
 }
 
-fn commit_batch(conn: &mut Connection, batch: Vec<Write>, clock: &dyn Clock) {
+/// `busy_timeout` waits out other processes' write transactions; on top of
+/// it, a `BUSY` that skips the busy handler is retried here, outside any
+/// transaction.
+fn retry_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let mut attempts = 0;
+    loop {
+        match op() {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < BUSY_RETRIES =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Retries of a `BUSY` the busy handler did not absorb, 1 ms apart.
+const BUSY_RETRIES: usize = 5_000;
+
+/// How long a statement waits for another process's write transaction.
+const BUSY_TIMEOUT_MS: i64 = 5_000;
+
+fn commit_batch(conn: &Connection, batch: Vec<Write>, clock: &dyn Clock) {
     let (done, commit): (Vec<_>, _) =
-        match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        match retry_busy(|| Transaction::new_unchecked(conn, TransactionBehavior::Immediate)) {
             Ok(mut tx) => {
                 let done = batch
                     .into_iter()
@@ -320,6 +374,21 @@ fn append_in(
         return Err(StorageError::Retired {
             session: entry.session,
         });
+    }
+
+    // The fence: an owner write lands only under the root's latest claim.
+    if let Some(owner) = entry.owner {
+        let epoch: Option<i64> = tx
+            .query_row(
+                "SELECT epoch FROM owners WHERE root = ?1",
+                [owner.root.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if epoch != Some(owner.epoch as i64) {
+            return Err(StorageError::OwnedElsewhere { root: owner.root });
+        }
     }
 
     if let Some(key) = &entry.dedup_key {
@@ -623,6 +692,34 @@ impl SqliteStorage {
         .collect()
     }
 
+    /// Held here, or locked by another handle or process; the epoch is the
+    /// latest committed claim.
+    fn owner_sync(&self, root: SessionId) -> Result<Option<OwnerToken>, StorageError> {
+        if let Some((epoch, _)) = self.owners.held().get(&root) {
+            return Ok(Some(OwnerToken {
+                root,
+                epoch: *epoch,
+            }));
+        }
+        if !self.owners.locked_elsewhere(root)? {
+            return Ok(None);
+        }
+        let epoch: Option<i64> = self
+            .reader()
+            .query_row(
+                "SELECT epoch FROM owners WHERE root = ?1",
+                [root.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        // A claim between its lock and its epoch commit still owns the tree.
+        Ok(Some(OwnerToken {
+            root,
+            epoch: epoch.unwrap_or(0) as u64,
+        }))
+    }
+
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
         let conn = self.reader();
         let parent: Option<Option<Vec<u8>>> = conn
@@ -674,6 +771,23 @@ impl SessionStore for SqliteStorage {
         Box::pin(async move { self.parent_sync(session) })
     }
 
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
+        Box::pin(async move {
+            let (reply, response) = oneshot::channel();
+            self.send(Command::Claim { root, reply })?;
+            let epoch = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
+            let release = Release {
+                owners: Arc::clone(&self.owners),
+                root,
+            };
+            Ok(Claim::new(OwnerToken { root, epoch }, release))
+        })
+    }
+
+    fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
+        Box::pin(async move { self.owner_sync(root) })
+    }
+
     fn retire(
         &self,
         session: SessionId,
@@ -693,10 +807,6 @@ impl SessionStore for SqliteStorage {
     }
 }
 
-struct WriterLock {
-    _file: std::fs::File,
-}
-
 fn create_private_file(path: &Path) -> Result<(), StorageError> {
     FsOpenOptions::new()
         .create(true)
@@ -709,30 +819,179 @@ fn create_private_file(path: &Path) -> Result<(), StorageError> {
         .map_err(backend)
 }
 
+// Linux open-file-description locks belong to this handle's descriptor, so
+// another handle (or process) conflicts and only process death or an unlock
+// releases them.
+#[cfg(target_os = "linux")]
+const SET_LOCK: libc::c_int = libc::F_OFD_SETLK;
+#[cfg(target_os = "linux")]
+const GET_LOCK: libc::c_int = libc::F_OFD_GETLK;
+// shortcut: elsewhere POSIX locks are per process, so two handles in one
+// process share them and closing either descriptor drops both; ownership
+// is only guaranteed on Linux until macOS gets a per-process lock table.
+#[cfg(not(target_os = "linux"))]
+const SET_LOCK: libc::c_int = libc::F_SETLK;
+#[cfg(not(target_os = "linux"))]
+const GET_LOCK: libc::c_int = libc::F_GETLK;
+
+/// Session-tree claims held through this handle: one write lock on byte
+/// `lock_offset(root)` of `<db>.owners` per root, shared by every claim of
+/// that root through this handle and counted here.
+struct Owners {
+    file: std::fs::File,
+    /// Root -> (epoch, live claims).
+    held: Mutex<HashMap<SessionId, (u64, usize)>>,
+}
+
+impl Owners {
+    fn open(db: &Path) -> Result<Self, StorageError> {
+        let mut path = db.as_os_str().to_os_string();
+        path.push(".owners");
+        let file = FsOpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(PathBuf::from(path))
+            .map_err(backend)?;
+        Ok(Self {
+            file,
+            held: Mutex::default(),
+        })
+    }
+
+    fn held(&self) -> MutexGuard<'_, HashMap<SessionId, (u64, usize)>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `fcntl` on the root's byte.
+    fn fcntl(
+        &self,
+        command: libc::c_int,
+        kind: libc::c_short,
+        root: SessionId,
+    ) -> io::Result<libc::flock> {
+        // SAFETY: `flock` is plain data; all-zero is a valid value.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = kind;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        lock.l_start = lock_offset(root);
+        lock.l_len = 1;
+        // SAFETY: the descriptor is open for the call and `lock` outlives it.
+        if unsafe { libc::fcntl(self.file.as_raw_fd(), command, &mut lock) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(lock)
+    }
+
+    fn lock(&self, root: SessionId) -> Result<(), StorageError> {
+        match self.fcntl(SET_LOCK, libc::F_WRLCK as libc::c_short, root) {
+            Ok(_) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EACCES) => {
+                Err(StorageError::OwnedElsewhere { root })
+            }
+            Err(error) => Err(backend(error)),
+        }
+    }
+
+    fn unlock(&self, root: SessionId) {
+        // Unlocking a held range cannot conflict; a failure leaves the lock
+        // to process exit.
+        let _ = self.fcntl(SET_LOCK, libc::F_UNLCK as libc::c_short, root);
+    }
+
+    fn locked_elsewhere(&self, root: SessionId) -> Result<bool, StorageError> {
+        let probe = self
+            .fcntl(GET_LOCK, libc::F_WRLCK as libc::c_short, root)
+            .map_err(backend)?;
+        Ok(probe.l_type != libc::F_UNLCK as libc::c_short)
+    }
+
+    /// On the writer thread: lock the root, then bump its epoch in its own
+    /// transaction. Claims through this handle share the lock and epoch.
+    fn claim(&self, conn: &Connection, root: SessionId) -> Result<u64, StorageError> {
+        let mut held = self.held();
+        if let Some((epoch, claims)) = held.get_mut(&root) {
+            *claims += 1;
+            return Ok(*epoch);
+        }
+        self.lock(root)?;
+        let bumped = retry_busy(|| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let epoch: i64 = tx.query_row(
+                "INSERT INTO owners (root, epoch) VALUES (?1, 1) \
+                 ON CONFLICT (root) DO UPDATE SET epoch = epoch + 1 RETURNING epoch",
+                [root.as_bytes()],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(epoch)
+        });
+        match bumped {
+            Ok(epoch) => {
+                let epoch = epoch as u64;
+                held.insert(root, (epoch, 1));
+                Ok(epoch)
+            }
+            Err(error) => {
+                self.unlock(root);
+                Err(backend(error))
+            }
+        }
+    }
+
+    fn release(&self, root: SessionId) {
+        let mut held = self.held();
+        if let Some((_, claims)) = held.get_mut(&root) {
+            *claims -= 1;
+            if *claims == 0 {
+                held.remove(&root);
+                self.unlock(root);
+            }
+        }
+    }
+}
+
+/// Drops one claim; see `Owners::release`.
+struct Release {
+    owners: Arc<Owners>,
+    root: SessionId,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.owners.release(self.root);
+    }
+}
+
+/// A stable byte per root, the same in every build and process: FNV-1a of
+/// the id, kept within the positive `off_t` range. A collision only makes
+/// two trees contend, never share.
+fn lock_offset(root: SessionId) -> libc::off_t {
+    let hash = root
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    (hash >> 2) as libc::off_t
+}
+
 /// Connection setup and schema migration every opener runs before serving.
 fn prepare(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageError> {
     configure(conn, synchronous)?;
     migrate(conn)?;
-    // Setup above waits out other openers (rusqlite's default busy timeout);
-    // serving never waits.
-    conn.pragma_update(None, "busy_timeout", 0).map_err(backend)
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+        .map_err(backend)
 }
 
 fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageError> {
     // Switching a fresh file to WAL can return BUSY without consulting the busy
     // handler (lock-upgrade deadlock between concurrent first openers), so retry.
-    let mut attempts = 0;
-    let mode: String = loop {
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)) {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 5_000 =>
-            {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            result => break result.map_err(backend)?,
-        }
-    };
+    let mode: String =
+        retry_busy(|| conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)))
+            .map_err(backend)?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(StorageError::Backend(format!(
             "could not enable WAL (journal_mode={mode})"
@@ -745,39 +1004,6 @@ fn configure(conn: &Connection, synchronous: Synchronous) -> Result<(), StorageE
     conn.pragma_update(None, "synchronous", synchronous)
         .map_err(backend)?;
     Ok(())
-}
-
-/// How long to keep retrying a contended writer lock (1 ms per attempt).
-/// A second *process* holds the lock indefinitely and still gets
-/// `WriterBusy`; this only absorbs the fork/exec window in which a child
-/// transiently inherits the lock descriptor before `CLOEXEC` closes it.
-const WRITER_LOCK_RETRIES: usize = 50;
-
-fn acquire_writer_lock(path: &Path) -> Result<WriterLock, StorageError> {
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    let file = FsOpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(PathBuf::from(lock_path))
-        .map_err(backend)?;
-    for _ in 0..WRITER_LOCK_RETRIES {
-        // SAFETY: `file` owns a valid descriptor for the duration of the call.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(WriterLock { _file: file });
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            _ => return Err(backend(error)),
-        }
-    }
-    Err(StorageError::WriterBusy)
 }
 
 /// Concurrent first opens race here: the version is read under the write lock
@@ -794,8 +1020,10 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
         });
     }
     // Pre-release: no DDL migrations; a database from an older layout is rebuilt.
+    // Every table is `IF NOT EXISTS`, so a version-1 file from before `owners`
+    // gains it here.
+    tx.execute_batch(SCHEMA).map_err(backend)?;
     if version == 0 {
-        tx.execute_batch(SCHEMA).map_err(backend)?;
         tx.pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
             .map_err(backend)?;
     }
@@ -885,7 +1113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_applies_wal_full_and_no_busy_wait() {
+    fn open_applies_wal_full_and_waits_for_other_writers() {
         for (options, expected_synchronous) in [
             (OpenOptions::default(), 2_i64),
             (
@@ -927,7 +1155,7 @@ mod tests {
                 (
                     "Text(\"wal\")".to_owned(),
                     format!("Integer({expected_synchronous})"),
-                    "Integer(0)".to_owned(),
+                    format!("Integer({BUSY_TIMEOUT_MS})"),
                     false,
                 )
             );
@@ -945,8 +1173,7 @@ mod tests {
 
     #[test]
     fn concurrent_first_opens_all_migrate_to_one_schema() {
-        // The writer lock serializes `open` today; ADR-0036 removes it, so race the
-        // connection setup and migration that every opener runs (#143).
+        // Several processes may open one database (ADR-0036); race `open` itself (#143).
         for round in 0..20 {
             let dir = std::env::temp_dir().join(format!(
                 "asterpath-sqlite-migrate-race-{}-{round}",
@@ -959,9 +1186,14 @@ mod tests {
                 .map(|_| {
                     let (path, barrier) = (path.clone(), barrier.clone());
                     std::thread::spawn(move || {
-                        let conn = Connection::open(&path).expect("open connection");
                         barrier.wait();
-                        prepare(&conn, Synchronous::Normal)?;
+                        let storage = open_with(
+                            &path,
+                            OpenOptions {
+                                synchronous: Synchronous::Normal,
+                            },
+                        )?;
+                        let conn = storage.reader();
                         let schema: Vec<String> = conn
                             .prepare(
                                 "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
@@ -1014,6 +1246,7 @@ mod tests {
             session,
             schema_version: LOG_SCHEMA_VERSION,
             dedup_key,
+            owner: None,
             payload: serde_json::to_value(event).expect("serialize event"),
         }
     }
@@ -1089,6 +1322,7 @@ mod tests {
             session: session(3),
             schema_version: LOG_SCHEMA_VERSION,
             dedup_key: None,
+            owner: None,
             payload: serde_json::json!({"NoSuchEvent": {}}),
         };
         let results = append_batch(

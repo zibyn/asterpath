@@ -16,6 +16,7 @@ pub fn encode_entry(
         session,
         schema_version: LOG_SCHEMA_VERSION,
         dedup_key,
+        owner: None,
         payload: serde_json::to_value(event)?,
     })
 }

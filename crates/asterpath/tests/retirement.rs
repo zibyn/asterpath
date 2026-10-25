@@ -182,6 +182,26 @@ impl SessionStore for NoRetirement {
     > {
         self.0.parent(session)
     }
+
+    fn claim(
+        &self,
+        root: SessionId,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<asterpath::protocol::Claim, asterpath::protocol::StorageError>,
+    > {
+        self.0.claim(root)
+    }
+
+    fn owner(
+        &self,
+        root: SessionId,
+    ) -> futures_core::future::BoxFuture<
+        '_,
+        Result<Option<asterpath::protocol::OwnerToken>, asterpath::protocol::StorageError>,
+    > {
+        self.0.owner(root)
+    }
 }
 
 #[tokio::test]

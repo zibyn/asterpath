@@ -1038,6 +1038,20 @@ impl SessionStore for PoisonLog {
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
     }
+
+    fn claim(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::Claim, StorageError>> {
+        self.inner.claim(root)
+    }
+
+    fn owner(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.owner(root)
+    }
 }
 
 // --- #49: fork materialization and replay --------------------------------
@@ -2101,6 +2115,20 @@ impl SessionStore for CompletesInGrace {
 
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
+    }
+
+    fn claim(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<asterpath_protocol::Claim, StorageError>> {
+        self.inner.claim(root)
+    }
+
+    fn owner(
+        &self,
+        root: SessionId,
+    ) -> BoxFuture<'_, Result<Option<asterpath_protocol::OwnerToken>, StorageError>> {
+        self.inner.owner(root)
     }
 }
 

@@ -1,5 +1,6 @@
 //! Backend-neutral `SessionStore` contract suite: the log (G2, G3, G4, G6),
-//! the session catalog and retirement (G8, R1-R7).
+//! the session catalog, retirement (G8, R1-R7) and session-tree ownership
+//! across two handles standing for two processes (ADR-0036).
 //!
 //! The suite only depends on protocol types, so every backend runs the same
 //! assertions. G1, `Corrupt` and backend-specific behaviour are not here.
@@ -11,9 +12,9 @@ use std::sync::Arc;
 
 use crate::ManualClock;
 use asterpath_protocol::{
-    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, ParentFilter,
-    RetirementError, SessionId, SessionQuery, SessionStore, StepId, StorageError, ToolCallId,
-    TurnId,
+    CatalogEntry, Clock, DedupKey, LogEntry, LogId, LogIdRange, LogQuery, NewEntry, OwnerToken,
+    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StepId, StorageError,
+    ToolCallId, TurnId,
 };
 use asterpath_protocol::{
     ChildOutcome, CompactionAbortReason, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -28,6 +29,10 @@ pub trait StoreFactory {
     fn open(&self) -> Arc<dyn SessionStore>;
     /// A fresh, empty store that stamps `recorded_at` from `clock`.
     fn open_with_clock(&self, clock: Arc<dyn Clock>) -> Arc<dyn SessionStore>;
+    /// A second handle on the store under test, as another process sharing
+    /// it would open it: claims made through one handle conflict with the
+    /// other's (ADR-0036).
+    fn open_other_process(&self) -> Arc<dyn SessionStore>;
 }
 
 /// Run the shared store contract against a backend. Retirement cases are
@@ -45,6 +50,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     let clock = Arc::new(ManualClock::new());
     catalog(&*factory.open_with_clock(clock.clone()), &clock).await;
     retirement(store).await;
+    ownership(store, &*factory.open_other_process()).await;
 }
 
 fn session(byte: u8) -> SessionId {
@@ -205,6 +211,7 @@ fn entry_for(
         session,
         schema_version,
         dedup_key,
+        owner: None,
         payload: serde_json::to_value(event).expect("serialize event"),
     }
 }
@@ -543,6 +550,7 @@ async fn hard_errors(log: &dyn SessionStore) {
                 session,
                 schema_version,
                 dedup_key: None,
+                owner: None,
                 payload,
             },
         )
@@ -566,6 +574,7 @@ async fn hard_errors(log: &dyn SessionStore) {
             session,
             schema_version: LOG_SCHEMA_VERSION,
             dedup_key: None,
+            owner: None,
             payload: json!({"InputRecorded": {"input": [], "extra_field": true}}),
         },
     )
@@ -895,4 +904,74 @@ async fn retirement(log: &dyn SessionStore) {
         Err(RetirementError::ParentNotIdle)
     ));
     assert_eq!(scan(log, middle).await.len(), 1, "the child is untouched");
+}
+
+// --- ownership (ADR-0036) ---------------------------------------------------
+
+async fn owned_append(
+    log: &dyn SessionStore,
+    session: SessionId,
+    owner: OwnerToken,
+) -> Result<LogId, StorageError> {
+    let mut entry = entry_for(session, LOG_SCHEMA_VERSION, &input_recorded(), None);
+    entry.owner = Some(owner);
+    log.append(entry).await
+}
+
+async fn ownership(here: &dyn SessionStore, elsewhere: &dyn SessionStore) {
+    let (mine, theirs) = (session(0xA1), session(0xA2));
+    create(here, mine, None).await;
+    create(here, theirs, None).await;
+    assert_eq!(here.owner(mine).await.expect("owner"), None, "unclaimed");
+
+    // Two processes hold different trees side by side.
+    let claim = here.claim(mine).await.expect("claim a free tree");
+    let token = claim.token();
+    assert_eq!(token.root, mine);
+    let other = elsewhere.claim(theirs).await.expect("claim another tree");
+    owned_append(here, mine, token).await.expect("owner write");
+    owned_append(elsewhere, theirs, other.token())
+        .await
+        .expect("owner write in the other process");
+
+    // A held tree: shared through the same handle, refused elsewhere.
+    let again = here.claim(mine).await.expect("re-claim through the holder");
+    assert_eq!(again.token(), token, "the holder's claims share one epoch");
+    let refused = elsewhere.claim(mine).await.expect_err("held elsewhere");
+    assert!(
+        matches!(refused, StorageError::OwnedElsewhere { root } if root == mine),
+        "{refused:?}"
+    );
+    assert_eq!(elsewhere.owner(mine).await.expect("owner"), Some(token));
+    assert_eq!(here.owner(mine).await.expect("owner"), Some(token));
+
+    // External writes need no claim.
+    append(elsewhere, mine, &input_recorded(), None).await;
+    assert_eq!(scan(here, mine).await.len(), 3);
+
+    // The tree stays held until its last claim drops.
+    drop(claim);
+    assert_eq!(elsewhere.owner(mine).await.expect("owner"), Some(token));
+    drop(again);
+    assert_eq!(elsewhere.owner(mine).await.expect("owner"), None);
+
+    // A new owner fences the old epoch out.
+    let taken = elsewhere.claim(mine).await.expect("claim a released tree");
+    assert!(taken.token().epoch > token.epoch, "epochs grow per claim");
+    let stale = owned_append(here, mine, token)
+        .await
+        .expect_err("a superseded epoch is rejected");
+    assert!(
+        matches!(stale, StorageError::OwnedElsewhere { root } if root == mine),
+        "{stale:?}"
+    );
+    owned_append(elsewhere, mine, taken.token())
+        .await
+        .expect("the new owner writes");
+    assert_eq!(
+        scan(here, mine).await.len(),
+        4,
+        "the stale write left nothing"
+    );
+    drop((taken, other));
 }

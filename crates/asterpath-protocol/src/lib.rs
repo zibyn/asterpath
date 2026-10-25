@@ -42,8 +42,9 @@ pub use config::{
     ToolDescriptor, TransportKind, TurnConfig, effective_config,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, DedupKey, LogEntry, LogQuery,
-    NewEntry, ParentFilter, PendingApproval, SessionQuery, SessionStore, scan_all,
+    ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, Claim, DedupKey, LogEntry,
+    LogQuery, NewEntry, OwnerToken, ParentFilter, PendingApproval, SessionQuery, SessionStore,
+    scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;

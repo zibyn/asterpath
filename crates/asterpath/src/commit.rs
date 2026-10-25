@@ -7,8 +7,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    CatalogEntry, LogEntry, LogId, LogQuery, NewEntry, RetirementError, SessionId, SessionQuery,
-    SessionStore, StorageError,
+    CatalogEntry, Claim, LogEntry, LogId, LogQuery, NewEntry, OwnerToken, RetirementError,
+    SessionId, SessionQuery, SessionStore, StorageError,
 };
 use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
 use futures_core::future::BoxFuture;
@@ -142,6 +142,14 @@ impl SessionStore for CommitLog {
 
     fn parent(&self, session: SessionId) -> BoxFuture<'_, Result<Option<SessionId>, StorageError>> {
         self.inner.parent(session)
+    }
+
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
+        self.inner.claim(root)
+    }
+
+    fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
+        self.inner.owner(root)
     }
 
     fn retire(

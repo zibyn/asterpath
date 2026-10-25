@@ -4,8 +4,10 @@ use crate::ids::{LogId, SessionId};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StorageError {
-    #[error("storage is already locked by another writer")]
-    WriterBusy,
+    /// Another process holds the session tree rooted at `root`, or an owner
+    /// write carried an epoch that a later claim superseded (ADR-0036).
+    #[error("session tree {root:?} is owned elsewhere")]
+    OwnedElsewhere { root: SessionId },
     #[error("storage schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: i64, supported: i64 },
     #[error("invalid log entry: {0}")]

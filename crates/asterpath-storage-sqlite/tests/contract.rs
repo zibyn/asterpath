@@ -23,6 +23,10 @@ impl StoreFactory for SqliteFactory {
         let path = self.dir.db().with_file_name("clocked.sqlite");
         open_with_clock(path, OpenOptions::default(), clock).expect("open clocked sqlite backend")
     }
+
+    fn open_other_process(&self) -> Arc<dyn SessionStore> {
+        open(self.dir.db()).expect("open the database again")
+    }
 }
 
 #[tokio::test]
