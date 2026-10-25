@@ -157,7 +157,7 @@ fn agent_for(
         Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
         Arc::new(ToolTable::new()),
         ToolConfig::default(),
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        Arc::new(DefaultApprovalPolicy),
         gate,
         Arc::new(Waits::new(log)),
         Arc::new(SystemClock),

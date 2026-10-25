@@ -50,7 +50,8 @@ use asterpath_protocol::{
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Claim, Clock, OwnerToken, SessionQuery, SessionStore, unique_bytes,
+    ApprovalGate, CatalogEntry, Claim, Clock, OwnerToken, SessionQuery, SessionStore, root_of,
+    unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -370,8 +371,8 @@ impl Asterpath {
     }
 
     /// One page of the session catalog, host metadata included (ADR-0032):
-    /// filtered by parent, newest `(created_at, session)` first, resumed
-    /// after `query.after`. Sorting or filtering by metadata is the host's.
+    /// filtered by parent and by metadata equality (ADR-0039), newest
+    /// `(created_at, session)` first, resumed after `query.after`.
     pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError> {
         Ok(self.store.sessions(query).await?)
     }
@@ -436,7 +437,8 @@ impl Asterpath {
         self.usage.totals(totals_filter(scope)).await
     }
 
-    /// Register an RAII endpoint here while the host can answer approvals.
+    /// Register an RAII endpoint per session tree (its root id) while the
+    /// host can answer that tree's approvals (ADR-0039).
     pub fn approval_gate(&self) -> Arc<ApprovalGate> {
         Arc::clone(&self.gate)
     }
@@ -452,24 +454,6 @@ impl Asterpath {
             .try_collect()
             .await
     }
-}
-
-/// Longest parent chain followed to a root; the scheduler caps nesting lower.
-const MAX_PARENT_CHAIN: usize = 64;
-
-/// The root of `session`'s tree: the key it is owned by (ADR-0036).
-async fn root_of(store: &dyn SessionStore, session: SessionId) -> Result<SessionId, AsterError> {
-    let mut root = session;
-    for _ in 0..MAX_PARENT_CHAIN {
-        match store.parent(root).await? {
-            Some(parent) => root = parent,
-            None => return Ok(root),
-        }
-    }
-    Err(AsterError::Agent(AgentError::Corrupt {
-        session,
-        detail: "session parent chain is cyclic".to_owned(),
-    }))
 }
 
 /// Host metadata limits (storage.md §5).
@@ -760,7 +744,7 @@ impl OwnedSession {
     ///   [`SessionFacts::has_pending_input`] holds.
     /// - **Reconnect by resubscribing.** A new client calls
     ///   `broadcast::Sender::subscribe`. An `ApprovalRequested` it missed is
-    ///   still listed by [`ApprovalGate::pending`] (via
+    ///   still listed by [`ApprovalGate::pending_in`] for the tree's root (via
     ///   [`Asterpath::approval_gate`]), and a re-drive after a dropped stream
     ///   emits it again.
     ///
@@ -820,7 +804,7 @@ impl OwnedSession {
     ///
     /// [`AgentError::Busy`]: asterpath_protocol::AgentError::Busy
     /// [`SessionFacts::has_pending_input`]: asterpath_protocol::SessionFacts::has_pending_input
-    /// [`ApprovalGate::pending`]: asterpath_protocol::ApprovalGate::pending
+    /// [`ApprovalGate::pending_in`]: asterpath_protocol::ApprovalGate::pending_in
     pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>> {
         let run = self.agent.run_as(
             RunRequest {

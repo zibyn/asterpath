@@ -544,7 +544,6 @@ fn approval_script() -> ScriptedProvider {
 async fn child_approval_is_scoped_to_the_child_session() {
     let db = temp_db("approval");
     let gate = Arc::new(ApprovalGate::new());
-    let _endpoint = gate.register();
     let asterpath = approval_fixture(&db, Arc::new(approval_script()), Arc::clone(&gate)).await;
     let handle = asterpath
         .create_session(spec(None))
@@ -554,6 +553,7 @@ async fn child_approval_is_scoped_to_the_child_session() {
         .await
         .unwrap();
     let parent = handle.id();
+    let _endpoint = gate.register(parent);
     handle.submit_input(input("go")).await.unwrap();
 
     let driver = tokio::spawn({
@@ -586,6 +586,15 @@ async fn child_approval_is_scoped_to_the_child_session() {
     assert_eq!(pending.len(), 1, "the child's wait is listed: {pending:?}");
     assert_eq!(pending[0].session, child, "listed under the child session");
     assert_eq!(pending[0].tool_call_id, call);
+    assert_eq!(
+        gate.pending_in(parent),
+        pending,
+        "listed under the tree's root"
+    );
+    assert!(
+        gate.pending_in(child).is_empty(),
+        "not under the child's own id"
+    );
 
     // The child's own session accepts the decision.
     asterpath
@@ -617,7 +626,6 @@ async fn child_approval_is_scoped_to_the_child_session() {
 async fn child_approval_wait_survives_a_restart() {
     let db = temp_db("durable-approval");
     let gate = Arc::new(ApprovalGate::new());
-    let _endpoint = gate.register();
     let provider = Arc::new(approval_script());
     let asterpath = approval_fixture(&db, provider.clone(), gate.clone()).await;
     let handle = asterpath
@@ -628,6 +636,7 @@ async fn child_approval_wait_survives_a_restart() {
         .await
         .unwrap();
     let parent = handle.id();
+    let _endpoint = gate.register(parent);
     handle.submit_input(input("go")).await.unwrap();
 
     let first_driver = tokio::spawn({

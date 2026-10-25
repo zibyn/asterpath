@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_core::future::BoxFuture;
@@ -235,19 +234,43 @@ pub async fn scan_all(
     Ok(entries)
 }
 
-/// Liveness declaration for approval responders, plus the requests waiting
-/// for a decision in this process (ADR-0028). Nothing here is durable:
+/// Longest parent chain followed to a root; the scheduler caps nesting lower.
+const MAX_PARENT_CHAIN: usize = 64;
+
+/// The root of `session`'s tree: the key it is owned and attended by
+/// (ADR-0036, ADR-0039). An unknown session is its own root.
+pub async fn root_of(
+    log: &dyn SessionStore,
+    session: SessionId,
+) -> Result<SessionId, StorageError> {
+    let mut root = session;
+    for _ in 0..MAX_PARENT_CHAIN {
+        match log.parent(root).await? {
+            Some(parent) => root = parent,
+            None => return Ok(root),
+        }
+    }
+    Err(StorageError::Corrupt {
+        session: Some(session),
+        detail: "session parent chain is cyclic".to_owned(),
+    })
+}
+
+/// Liveness declarations of approval responders, one per session tree, plus
+/// the requests waiting for a decision in this process (ADR-0028, ADR-0039).
+/// A tree is keyed by its root session id. Nothing here is durable:
 /// recovery re-emits `ApprovalRequested` after a restart.
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalGate {
-    open: Arc<AtomicUsize>,
+    open: Arc<Mutex<BTreeMap<SessionId, usize>>>,
     pending: Arc<Mutex<PendingRequests>>,
 }
 
 #[derive(Debug, Default)]
 struct PendingRequests {
     next: u64,
-    waiting: BTreeMap<u64, ApprovalRequest>,
+    /// Each request with the root of its session's tree.
+    waiting: BTreeMap<u64, (SessionId, ApprovalRequest)>,
 }
 
 impl ApprovalGate {
@@ -255,42 +278,61 @@ impl ApprovalGate {
         Self::default()
     }
 
-    /// Returns an RAII endpoint; dropping it closes that registration.
-    pub fn register(&self) -> ApprovalEndpoint {
-        self.open.fetch_add(1, Ordering::SeqCst);
+    /// Attend the tree rooted at `root` until the returned endpoint drops.
+    pub fn register(&self, root: SessionId) -> ApprovalEndpoint {
+        *lock(&self.open).entry(root).or_default() += 1;
         ApprovalEndpoint {
             open: Arc::clone(&self.open),
+            root,
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.open.load(Ordering::SeqCst) > 0
+    /// Whether any endpoint attends the tree rooted at `root`; endpoints of
+    /// other trees do not count.
+    pub fn is_open(&self, root: SessionId) -> bool {
+        lock(&self.open).contains_key(&root)
     }
 
-    /// Every request still waiting for a decision, across all sessions, in
-    /// the order they were requested.
+    /// Every request still waiting for a decision, across all trees, in the
+    /// order they were requested.
     pub fn pending(&self) -> Vec<ApprovalRequest> {
-        self.lock().waiting.values().cloned().collect()
+        lock(&self.pending)
+            .waiting
+            .values()
+            .map(|(_, request)| request.clone())
+            .collect()
     }
 
-    /// Lists `request` as pending until the returned guard drops, however the
-    /// wait ends: a decision, a cancel or a dropped drive stream.
+    /// The waiting requests of the tree rooted at `root` (its children's
+    /// included), in the order they were requested.
+    pub fn pending_in(&self, root: SessionId) -> Vec<ApprovalRequest> {
+        lock(&self.pending)
+            .waiting
+            .values()
+            .filter(|(tree, _)| *tree == root)
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    /// Lists `request`, from the tree rooted at `root`, as pending until the
+    /// returned guard drops, however the wait ends: a decision, a cancel or
+    /// a dropped drive stream.
     // Hidden: only the engine's tool pipeline (another crate) lists requests.
     #[doc(hidden)]
-    pub fn wait_for(&self, request: ApprovalRequest) -> PendingApproval {
-        let mut pending = self.lock();
+    pub fn wait_for(&self, root: SessionId, request: ApprovalRequest) -> PendingApproval {
+        let mut pending = lock(&self.pending);
         let key = pending.next;
         pending.next += 1;
-        pending.waiting.insert(key, request);
+        pending.waiting.insert(key, (root, request));
         PendingApproval {
             pending: Arc::clone(&self.pending),
             key,
         }
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, PendingRequests> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// RAII listing of one waiting request; see `ApprovalGate::wait_for`.
@@ -304,21 +346,25 @@ pub struct PendingApproval {
 
 impl Drop for PendingApproval {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .waiting
-            .remove(&self.key);
+        lock(&self.pending).waiting.remove(&self.key);
     }
 }
 
+/// One registration on a tree; see [`ApprovalGate::register`].
 #[derive(Debug)]
 pub struct ApprovalEndpoint {
-    open: Arc<AtomicUsize>,
+    open: Arc<Mutex<BTreeMap<SessionId, usize>>>,
+    root: SessionId,
 }
 
 impl Drop for ApprovalEndpoint {
     fn drop(&mut self) {
-        self.open.fetch_sub(1, Ordering::SeqCst);
+        let mut open = lock(&self.open);
+        if let Some(count) = open.get_mut(&self.root) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.root);
+            }
+        }
     }
 }

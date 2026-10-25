@@ -120,7 +120,7 @@ pub(super) fn agent(
     hooks: Vec<Arc<dyn Hooks>>,
 ) -> Agent {
     let gate = Arc::new(ApprovalGate::new());
-    let policy = Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate)));
+    let policy = Arc::new(DefaultApprovalPolicy);
     agent_with(log, provider, tools, tool_config, policy, gate, None).with_hooks(hooks, None)
 }
 

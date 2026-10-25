@@ -496,7 +496,6 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
         Usage::default(),
     ));
     let asterpath = build(&db, provider, vec![tool], Some(Arc::new(AlwaysAsk))).await;
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
         .await
@@ -504,6 +503,7 @@ async fn cancel_interrupts_an_approval_wait_with_an_interrupted_tool_result() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(input(1, "go")).await.unwrap();
 
     let mut stream = handle.drive();
@@ -711,7 +711,6 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
             ),
     );
     let asterpath = build(&db, provider.clone(), vec![tool], Some(Arc::new(AlwaysAsk))).await;
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec(TurnConfig::default()))
         .await
@@ -719,6 +718,7 @@ async fn input_during_a_persistent_wait_does_not_wake_it_but_steers_the_next_ste
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(input(1, "go")).await.unwrap();
 
     let mut stream = handle.drive();

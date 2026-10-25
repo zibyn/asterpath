@@ -183,7 +183,6 @@ async fn dropped_stream_redrive_requests_the_same_approval_again() {
         .build()
         .await
         .expect("build");
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec())
         .await
@@ -191,6 +190,7 @@ async fn dropped_stream_redrive_requests_the_same_approval_again() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -268,7 +268,6 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .build()
         .await
         .expect("build");
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec())
         .await
@@ -276,6 +275,7 @@ async fn ask_with_open_gate_suspends_then_allow_executes() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -353,7 +353,6 @@ async fn dropping_the_drive_stream_removes_the_pending_request() {
         .build()
         .await
         .expect("build");
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec())
         .await
@@ -361,6 +360,7 @@ async fn dropping_the_drive_stream_removes_the_pending_request() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -403,7 +403,6 @@ async fn ask_with_open_gate_deny_records_denied_with_reason() {
         .build()
         .await
         .expect("build");
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec())
         .await
@@ -411,6 +410,7 @@ async fn ask_with_open_gate_deny_records_denied_with_reason() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     handle.submit_input(text_input(1)).await.unwrap();
 
     let mut stream = handle.drive();
@@ -465,8 +465,6 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
         .build()
         .await
         .expect("build");
-    // RAII endpoint registered and dropped: the gate is closed again.
-    drop(asterpath.approval_gate().register());
     let handle = asterpath
         .create_session(spec())
         .await
@@ -474,6 +472,8 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
         .claim()
         .await
         .unwrap();
+    // RAII endpoint registered and dropped: the gate is closed again.
+    drop(asterpath.approval_gate().register(handle.id()));
     handle.submit_input(text_input(1)).await.unwrap();
 
     let events = drive_events(&handle).await;
@@ -495,6 +495,59 @@ async fn ask_without_live_endpoint_fails_closed_without_requesting() {
     );
     assert!(calls.lock().unwrap().is_empty());
     assert_eq!(kind_count(&entries, "ApprovalDecided"), 0);
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+/// ADR-0039: an endpoint attends one session tree. Another user's tree in
+/// the same process, with nobody attending, fails closed instead of waiting.
+#[tokio::test]
+async fn an_endpoint_for_one_tree_leaves_other_trees_closed() {
+    let db = temp_db("per-tree");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![tool_call("echo")],
+        StopReason::ToolUse,
+        Usage::default(),
+    ));
+    let asterpath = Asterpath::builder()
+        .database(&db)
+        .providers(vec![provider as Arc<dyn Provider>])
+        .tools(vec![echo_tool(Arc::clone(&calls))])
+        .approval(Arc::new(AlwaysAsk))
+        .build()
+        .await
+        .expect("build");
+    let attended = asterpath.create_session(spec()).await.unwrap();
+    let _endpoint = asterpath.approval_gate().register(attended.id());
+    let unattended = asterpath
+        .create_session(spec())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
+    unattended.submit_input(text_input(1)).await.unwrap();
+
+    let events = tokio::time::timeout(Duration::from_secs(5), drive_events(&unattended))
+        .await
+        .expect("an unattended tree does not wait for a decision");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ApprovalRequested(_)))
+    );
+    let entries = scan(asterpath.store(), unattended.id()).await;
+    let results = tool_results(&entries);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, asterpath::protocol::ToolResultStatus::Failed);
+    assert_eq!(
+        results[0].1.as_deref(),
+        Some(asterpath::protocol::NO_APPROVAL_ENDPOINT)
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    drop(attended);
 
     asterpath.shutdown().await.unwrap();
     cleanup(&db);
@@ -633,7 +686,6 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
         .build()
         .await
         .expect("build");
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .create_session(spec())
         .await
@@ -641,6 +693,7 @@ async fn decision_recorded_while_an_earlier_call_waits_is_not_reprompted() {
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     let session = handle.id();
 
     let turn = asterpath::protocol::TurnId::from_bytes([1; 16]);
@@ -919,7 +972,6 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
     assert!(calls.lock().unwrap().is_empty());
 
     // With an endpoint the same tool asks and, once allowed, executes.
-    let _endpoint = asterpath.approval_gate().register();
     let allowed = asterpath
         .create_session(spec())
         .await
@@ -927,6 +979,7 @@ async fn default_policy_fails_closed_for_external_tools_until_an_endpoint_listen
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(allowed.id());
     allowed.submit_input(text_input(2)).await.unwrap();
     let mut stream = allowed.drive();
     let request = loop {

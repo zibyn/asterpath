@@ -26,9 +26,9 @@ pub struct AsterpathConfig {
     /// default `Unsupported` retirement.
     pub store: Option<Arc<dyn SessionStore>>,
     pub clock: Arc<dyn Clock>,
-    /// Defaults to the built-in policy over [`Self::gate`].
+    /// Defaults to the built-in [`DefaultApprovalPolicy`].
     pub approval: Arc<dyn ApprovalPolicy>,
-    /// The framework approval endpoint gate, shared with the default policy.
+    /// The approval endpoints, per session tree, and pending requests.
     pub gate: Arc<ApprovalGate>,
     /// Process-wide cap on live child sessions across all parents.
     pub max_live_children: NonZeroUsize,
@@ -50,7 +50,7 @@ impl Default for AsterpathConfig {
             compactor: None,
             store: None,
             clock: Arc::new(SystemClock),
-            approval: Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+            approval: Arc::new(DefaultApprovalPolicy),
             gate,
             max_live_children: NonZeroUsize::new(32).expect("non-zero"),
             model_aliases: BTreeMap::new(),

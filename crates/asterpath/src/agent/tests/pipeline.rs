@@ -120,7 +120,7 @@ impl Harness {
         let policy = self
             .policy
             .clone()
-            .unwrap_or_else(|| Arc::new(DefaultApprovalPolicy::new(Arc::clone(&self.gate))));
+            .unwrap_or_else(|| Arc::new(DefaultApprovalPolicy));
         ToolPipeline::new(
             log,
             tool_table(self.tools.clone()),
@@ -479,7 +479,7 @@ async fn ask_with_a_closed_gate_denies_without_asking() {
 async fn ask_with_an_open_gate_waits_for_the_recorded_decision() {
     let (policy, _) = verdict(ApprovalVerdict::Ask);
     let harness = Harness::new(vec![echo("echo")]).await.policy(policy);
-    let _endpoint = harness.gate.register();
+    let _endpoint = harness.gate.register(SESSION);
 
     let approve = async {
         // The decision arrives once the intent it answers is recorded.
@@ -944,7 +944,7 @@ async fn a_fresh_call_records_its_intent_before_it_sees_the_cancel() {
 async fn a_recorded_intent_sees_the_cancel_before_approval() {
     let (policy, consulted) = verdict(ApprovalVerdict::Ask);
     let harness = Harness::new(vec![echo("echo")]).await.policy(policy);
-    let _endpoint = harness.gate.register();
+    let _endpoint = harness.gate.register(SESSION);
     harness
         .intent(RECORDED, "call-1", "echo", Provenance::InProcess)
         .await;

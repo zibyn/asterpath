@@ -14,10 +14,10 @@ use asterpath_mcp::{
     ADAPTER_PROTOCOL_VERSIONS, McpServerConfig, McpTimeouts, McpTransport, ServerId,
 };
 use asterpath_protocol::{
-    ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig,
-    ContextPolicy, DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderId,
-    ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SandboxPolicy, SideEffect,
-    SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
+    ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, ContextPolicy,
+    DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderId, ReasoningEffort,
+    ReasoningParams, RequestConfig, SamplingParams, SandboxPolicy, SideEffect, SubagentConfig,
+    ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -237,9 +237,9 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
 /// `untrusted` asks for every `Mutating` tool and otherwise keeps the
 /// framework default (in-process allowed, external asked); the pipeline
 /// denies `Ask` when no endpoint is open. `never` allows everything.
-pub fn approval_policy(mode: ApprovalMode, gate: Arc<ApprovalGate>) -> Arc<dyn ApprovalPolicy> {
+pub fn approval_policy(mode: ApprovalMode) -> Arc<dyn ApprovalPolicy> {
     match mode {
-        ApprovalMode::Untrusted => Arc::new(AskMutating(DefaultApprovalPolicy::new(gate))),
+        ApprovalMode::Untrusted => Arc::new(AskMutating(DefaultApprovalPolicy)),
         ApprovalMode::Never => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
     }
 }

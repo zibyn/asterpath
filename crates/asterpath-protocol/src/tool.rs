@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use crate::{ApprovalGate, SessionId, StepId, ToolCallId, TurnId};
+use crate::{SessionId, StepId, ToolCallId, TurnId};
 use futures_core::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -256,31 +256,17 @@ pub enum ApprovalDecision {
 /// Fixed reason used when `Ask` has no endpoint to answer it.
 pub const NO_APPROVAL_ENDPOINT: &str = "no approval endpoint is registered";
 
-/// Framework default: in-process tools are allowed; external tools ask while an
-/// endpoint is registered and are denied otherwise. `Unknown` is never asked.
-pub struct DefaultApprovalPolicy {
-    gate: Arc<ApprovalGate>,
-}
-
-impl DefaultApprovalPolicy {
-    pub fn new(gate: Arc<ApprovalGate>) -> Self {
-        Self { gate }
-    }
-}
+/// Framework default: in-process tools are allowed; external tools ask, which
+/// the pipeline turns into a deny with [`NO_APPROVAL_ENDPOINT`] when no
+/// endpoint attends the session's tree. `Unknown` is never asked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultApprovalPolicy;
 
 impl ApprovalPolicy for DefaultApprovalPolicy {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
         match request.provenance {
             Provenance::InProcess => ApprovalVerdict::Allow,
-            Provenance::External { .. } => {
-                if self.gate.is_open() {
-                    ApprovalVerdict::Ask
-                } else {
-                    ApprovalVerdict::Deny {
-                        reason: Some(NO_APPROVAL_ENDPOINT.to_owned()),
-                    }
-                }
-            }
+            Provenance::External { .. } => ApprovalVerdict::Ask,
             // The pipeline writes `NotFound` before approval for Unknown tools.
             Provenance::Unknown | Provenance::Output => ApprovalVerdict::Deny { reason: None },
         }

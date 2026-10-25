@@ -89,16 +89,21 @@ fn system_clock_returns_epoch_milliseconds() {
 }
 
 #[test]
-fn approval_gate_tracks_registered_endpoints() {
+fn approval_gate_tracks_registered_endpoints_per_tree() {
+    let (tree, other) = (
+        SessionId::from_bytes([1; 16]),
+        SessionId::from_bytes([2; 16]),
+    );
     let gate = ApprovalGate::new();
-    assert!(!gate.is_open());
+    assert!(!gate.is_open(tree));
 
-    let endpoint = gate.register();
-    assert!(gate.is_open());
+    let endpoint = gate.register(tree);
+    assert!(gate.is_open(tree));
+    assert!(!gate.is_open(other), "an endpoint attends only its tree");
 
-    let second = gate.register();
+    let second = gate.register(tree);
     drop(endpoint);
-    assert!(gate.is_open(), "one endpoint still registered");
+    assert!(gate.is_open(tree), "one endpoint still registered");
     drop(second);
-    assert!(!gate.is_open());
+    assert!(!gate.is_open(tree));
 }

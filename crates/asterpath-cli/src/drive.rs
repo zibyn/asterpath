@@ -1,10 +1,12 @@
 //! Driving a session to the end of its turn, with or without an operator
 //! approval prompt, and reading the result back from the log.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
-use asterpath::OwnedSession;
+use asterpath::{Asterpath, OwnedSession, SessionHandle};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin,
     Provenance, ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason,
@@ -66,13 +68,25 @@ pub struct Headless;
 
 impl Operator for Headless {}
 
+/// How often a drive looks for child sessions' approval requests.
+const CHILD_APPROVAL_POLL: Duration = Duration::from_millis(100);
+
 /// Drive to `TurnCommitted` or `Idle`; an interrupt cancels the turn and
 /// the drive runs on to its end. There is no exit code for "stopped at a wait".
-pub async fn drive(handle: &OwnedSession, operator: &mut impl Operator) -> CliResult<DriveOutcome> {
+/// Child sessions' requests never reach this stream, so the tree's pending
+/// list is polled for them.
+pub async fn drive(
+    asterpath: &Asterpath,
+    handle: &OwnedSession,
+    operator: &mut impl Operator,
+) -> CliResult<DriveOutcome> {
     let mut outcome = DriveOutcome {
         ran: true,
         ..DriveOutcome::default()
     };
+    let gate = asterpath.approval_gate();
+    let mut asked = HashSet::new();
+    let mut poll = tokio::time::interval(CHILD_APPROVAL_POLL);
     let mut stream = handle.drive();
     loop {
         let event = tokio::select! {
@@ -81,23 +95,46 @@ pub async fn drive(handle: &OwnedSession, operator: &mut impl Operator) -> CliRe
                 handle.cancel().await.map_err(aster_error)?;
                 continue;
             }
+            _ = poll.tick() => {
+                for request in gate.pending_in(handle.owner().root) {
+                    if request.session != handle.id()
+                        && asked.insert((request.session, request.tool_call_id))
+                    {
+                        let child = asterpath
+                            .open_session(request.session)
+                            .await
+                            .map_err(aster_error)?;
+                        respond(&child, handle, operator, &request).await?;
+                    }
+                }
+                continue;
+            }
         };
         let Some(event) = event else { break };
         let event = event.map_err(|error| CliError::run(format!("drive failed: {error}")))?;
         outcome.observe(&event);
         if let AgentEvent::ApprovalRequested(request) = &event {
-            match operator.decide(request).await {
-                Some(decision) => handle
-                    .approve(request.tool_call_id, decision)
-                    .await
-                    .map_err(aster_error)?,
-                None => handle.cancel().await.map_err(aster_error)?,
-            }
+            respond(handle, handle, operator, request).await?;
         } else {
             operator.show(&event);
         }
     }
     Ok(outcome)
+}
+
+/// Ask the operator and record the answer in `session`; no answer cancels
+/// the driven turn.
+async fn respond(
+    session: &SessionHandle,
+    driven: &OwnedSession,
+    operator: &mut impl Operator,
+    request: &ApprovalRequest,
+) -> CliResult<()> {
+    match operator.decide(request).await {
+        Some(decision) => session.approve(request.tool_call_id, decision).await,
+        None => driven.cancel().await,
+    }
+    .map_err(aster_error)
 }
 
 /// Print an approval request's fields and the question.
@@ -423,7 +460,6 @@ mod tests {
         let db = temp_db("allow");
         let calls = Arc::new(AtomicUsize::new(0));
         let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
-        let _endpoint = asterpath.approval_gate().register();
         let handle = asterpath
             .create_session(spec())
             .await
@@ -431,6 +467,7 @@ mod tests {
             .claim()
             .await
             .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -443,7 +480,7 @@ mod tests {
             reader: Cursor::new(b"y\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, &mut io).await.expect("drive");
+        let outcome = drive(&asterpath, &handle, &mut io).await.expect("drive");
 
         assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
         assert!(!outcome.idle);
@@ -481,7 +518,9 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let outcome = drive(&handle, &mut Headless).await.expect("drive");
+            let outcome = drive(&asterpath, &handle, &mut Headless)
+                .await
+                .expect("drive");
             let entries = scan(asterpath.store(), handle.id()).await.unwrap();
             if byte == 1 {
                 assert_eq!(final_assistant_text(&entries).as_deref(), Some("done"));
@@ -508,7 +547,6 @@ mod tests {
             Usage::default(),
         ));
         let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
-        let _endpoint = asterpath.approval_gate().register();
         let handle = asterpath
             .create_session(spec())
             .await
@@ -516,6 +554,7 @@ mod tests {
             .claim()
             .await
             .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -528,7 +567,7 @@ mod tests {
             reader: Cursor::new(b"n\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, &mut io).await.expect("drive");
+        let outcome = drive(&asterpath, &handle, &mut io).await.expect("drive");
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let values = tool_result_values(&asterpath, handle.id()).await;
@@ -547,7 +586,6 @@ mod tests {
 
         // Phase 1: reach the approval, record Allow, then drop the drive.
         let asterpath = build(&db, script(), echo_tool(Arc::clone(&calls))).await;
-        let _endpoint = asterpath.approval_gate().register();
         let handle = asterpath
             .create_session(spec())
             .await
@@ -555,6 +593,7 @@ mod tests {
             .claim()
             .await
             .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
         handle
             .submit_input(UserInput {
                 id: InputId::from_bytes([1; 16]),
@@ -590,7 +629,6 @@ mod tests {
             Usage::default(),
         ));
         let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
-        let _endpoint = asterpath.approval_gate().register();
         let handle = asterpath
             .open_session(session)
             .await
@@ -598,12 +636,13 @@ mod tests {
             .claim()
             .await
             .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
 
         let mut io = PromptIo {
             reader: Cursor::new(b"n\n"),
             writer: Vec::new(),
         };
-        let outcome = drive(&handle, &mut io).await.expect("resume");
+        let outcome = drive(&asterpath, &handle, &mut io).await.expect("resume");
 
         assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
         assert_eq!(
@@ -642,8 +681,7 @@ mod tests {
         )
         .expect("absolute root");
         let config = AsterpathConfig::default();
-        let policy =
-            config::approval_policy(config::ApprovalMode::Untrusted, Arc::clone(&config.gate));
+        let policy = config::approval_policy(config::ApprovalMode::Untrusted);
         AsterpathBuilder::from_config(config)
             .database(db)
             .providers(vec![provider as Arc<dyn Provider>])
@@ -660,7 +698,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("ask.db");
             let asterpath = ask_bash(&db, dir.path()).await;
-            let _endpoint = open.then(|| asterpath.approval_gate().register());
             let handle = asterpath
                 .create_session(spec())
                 .await
@@ -668,6 +705,7 @@ mod tests {
                 .claim()
                 .await
                 .unwrap();
+            let _endpoint = open.then(|| asterpath.approval_gate().register(handle.id()));
             handle
                 .submit_input(UserInput {
                     id: InputId::from_bytes([1; 16]),
@@ -680,7 +718,7 @@ mod tests {
                 reader: Cursor::new(b"n\n"),
                 writer: Vec::new(),
             };
-            drive(&handle, &mut io).await.expect("drive");
+            drive(&asterpath, &handle, &mut io).await.expect("drive");
 
             let asked = String::from_utf8(io.writer).unwrap().contains("tool: bash");
             assert_eq!(asked, open, "ApprovalRequested only while the gate is open");
@@ -695,6 +733,63 @@ mod tests {
             assert!(values[0].contains(reason), "{values:?}");
             asterpath.shutdown().await.unwrap();
         }
+    }
+
+    /// A child's `Ask` never reaches the parent's stream; the operator is
+    /// still asked, and the answer lands in the child (audit §2.3 item 5).
+    #[tokio::test]
+    async fn a_child_sessions_approval_is_prompted_too() {
+        let db = temp_db("child");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spawn = Item::ToolCall {
+            call_id: "call-spawn".to_owned(),
+            provider_item_id: None,
+            name: ToolName::new("spawn_agent"),
+            raw_args: JsonString::new(r#"{"task":"echo"}"#),
+            raw: None,
+        };
+        let provider = Arc::new(
+            ScriptedProvider::new("p")
+                .respond(vec![spawn], StopReason::ToolUse, Usage::default())
+                .respond(vec![tool_call()], StopReason::ToolUse, Usage::default())
+                .respond(vec![final_message()], StopReason::EndTurn, Usage::default())
+                .respond(vec![final_message()], StopReason::EndTurn, Usage::default()),
+        );
+        let asterpath = build(&db, provider, echo_tool(Arc::clone(&calls))).await;
+        let handle = asterpath
+            .create_session(spec())
+            .await
+            .unwrap()
+            .claim()
+            .await
+            .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
+        handle
+            .submit_input(UserInput {
+                id: InputId::from_bytes([1; 16]),
+                parts: vec![Part::Text { text: "go".into() }],
+            })
+            .await
+            .unwrap();
+
+        let mut io = PromptIo {
+            reader: Cursor::new(b"y\ny\n"),
+            writer: Vec::new(),
+        };
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), drive(&asterpath, &handle, &mut io))
+                .await
+                .expect("the child's approval does not hang the drive")
+                .expect("drive");
+
+        assert!(matches!(outcome.reason, Some(TurnEndReason::Completed)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the child ran echo");
+        let asked = String::from_utf8(io.writer).unwrap();
+        assert!(asked.contains("tool: spawn_agent"), "{asked}");
+        assert!(asked.contains("tool: echo"), "{asked}");
+
+        asterpath.shutdown().await.unwrap();
+        cleanup(&db);
     }
 
     async fn signal_count(asterpath: &Asterpath, session: SessionId) -> usize {

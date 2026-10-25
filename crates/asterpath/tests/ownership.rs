@@ -223,21 +223,16 @@ fn calls_echo() -> ScriptedProvider {
         )
 }
 
-/// A process whose every tool call asks, with an approval endpoint open.
-async fn asking_process(
-    db: &Path,
-    provider: ScriptedProvider,
-) -> (Asterpath, asterpath::protocol::ApprovalEndpoint) {
-    let asterpath = Asterpath::builder()
+/// A process whose every tool call asks.
+async fn asking_process(db: &Path, provider: ScriptedProvider) -> Asterpath {
+    Asterpath::builder()
         .database(db)
         .providers(vec![Arc::new(provider) as Arc<dyn Provider>])
         .tools(vec![echo()])
         .approval(Arc::new(AlwaysAsk))
         .build()
         .await
-        .expect("build");
-    let endpoint = asterpath.approval_gate().register();
-    (asterpath, endpoint)
+        .expect("build")
 }
 
 type Drive<'a> = BoxStream<'a, Result<AgentEvent, AsterError>>;
@@ -269,10 +264,11 @@ async fn last_event(stream: &mut Drive<'_>) -> Option<AgentEvent> {
 #[tokio::test]
 async fn an_approval_decided_in_another_process_reaches_the_owner() {
     let db = TempDb::new("approval");
-    let (desktop, _endpoint) = asking_process(&db.path(), calls_echo()).await;
+    let desktop = asking_process(&db.path(), calls_echo()).await;
     let cli = process(&db.path(), ScriptedProvider::new("p")).await;
 
     let session = desktop.create_session(spec()).await.unwrap();
+    let _endpoint = desktop.approval_gate().register(session.id());
     session.submit_input(input(1)).await.unwrap();
     let owned = session.claim().await.unwrap();
     let mut stream = owned.drive();
@@ -293,9 +289,10 @@ async fn an_approval_decided_in_another_process_reaches_the_owner() {
 #[tokio::test]
 async fn a_dead_owners_tree_is_claimed_and_recovered_elsewhere() {
     let db = TempDb::new("takeover");
-    let (desktop, endpoint) = asking_process(&db.path(), calls_echo()).await;
+    let desktop = asking_process(&db.path(), calls_echo()).await;
     let session = desktop.create_session(spec()).await.unwrap();
     let id = session.id();
+    let endpoint = desktop.approval_gate().register(id);
     session.submit_input(input(1)).await.unwrap();
     let owned = session.claim().await.unwrap();
     let mut stream = owned.drive();
@@ -304,7 +301,8 @@ async fn a_dead_owners_tree_is_claimed_and_recovered_elsewhere() {
     drop(stream);
     drop((owned, session, endpoint, desktop));
 
-    let (cli, _endpoint) = asking_process(&db.path(), answer()).await;
+    let cli = asking_process(&db.path(), answer()).await;
+    let _endpoint = cli.approval_gate().register(id);
     assert_eq!(cli.wakeable().await.unwrap(), vec![id]);
     let owned = cli.open_session(id).await.unwrap().claim().await.unwrap();
     let mut stream = owned.drive();

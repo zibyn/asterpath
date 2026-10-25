@@ -60,7 +60,10 @@ pub async fn interactive(
             return opened.shutdown().await;
         };
         // The TTY prompt is this mode's approval channel (§4.4).
-        let endpoint = opened.asterpath.approval_gate().register();
+        let endpoint = opened
+            .asterpath
+            .approval_gate()
+            .register(owned.owner().root);
         let next = repl(
             &opened.asterpath,
             owned,
@@ -195,6 +198,7 @@ async fn turn<W: Write>(
             .map_err(aster_error)?;
     }
     let outcome = drive::drive(
+        asterpath,
         handle,
         &mut Terminal {
             lines,
@@ -526,7 +530,6 @@ mod tests {
     async fn ctrl_c_during_an_approval_prompt_cancels_the_turn() {
         let dir = tempfile::tempdir().unwrap();
         let asterpath = setup(dir.path(), true).await;
-        let _endpoint = asterpath.approval_gate().register();
         let handle = asterpath
             .create_session(spec())
             .await
@@ -534,6 +537,7 @@ mod tests {
             .claim()
             .await
             .unwrap();
+        let _endpoint = asterpath.approval_gate().register(handle.id());
         let (line_tx, mut lines) = unbounded_channel::<String>();
         let (interrupt_tx, mut interrupts) = unbounded_channel();
         line_tx.send("go".into()).unwrap();

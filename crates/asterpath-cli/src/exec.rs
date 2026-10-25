@@ -177,18 +177,23 @@ async fn drive_owned(
             submit(handle, parts).await?;
         }
         // Only a host on stdin can answer; otherwise the framework denies every `Ask`.
-        let _endpoint = commands.then(|| opened.asterpath.approval_gate().register());
+        let _endpoint = commands.then(|| {
+            opened
+                .asterpath
+                .approval_gate()
+                .register(handle.owner().root)
+        });
         let stdin = commands.then(|| tokio::io::BufReader::new(tokio::io::stdin()));
         stream::run(handle, start, stdin, &mut io::stdout()).await?
     } else {
         // No approval channel: no endpoint is registered, so every `Ask` is denied.
         let mut outcome = drive::DriveOutcome::default();
         if recover {
-            outcome = drive::drive(handle, &mut drive::Headless).await?;
+            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless).await?;
         }
         if !parts.is_empty() {
             submit(handle, parts).await?;
-            outcome = drive::drive(handle, &mut drive::Headless).await?;
+            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless).await?;
         }
         outcome
     })

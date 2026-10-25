@@ -1,14 +1,12 @@
 //! Tool contract tests: default approval policy and tool-result projection
 //! ordering.
 
-use std::sync::Arc;
-
-use asterpath_protocol::{ApprovalGate, LogEntry, LogId, SessionId, ToolCallId};
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, DefaultApprovalPolicy, Item, JsonString,
     Part, Provenance, ReplaySafety, SessionEvent, SideEffect, ToolName, ToolResultStatus,
     TransportKind, encode_entry, history,
 };
+use asterpath_protocol::{LogEntry, LogId, SessionId, ToolCallId};
 
 fn session() -> SessionId {
     SessionId::from_bytes([1; 16])
@@ -44,29 +42,21 @@ fn request(provenance: Provenance) -> ApprovalRequest {
 }
 
 #[test]
-fn default_policy_allows_in_process_and_fails_external_calls_closed() {
-    let gate = Arc::new(ApprovalGate::new());
-    let policy = DefaultApprovalPolicy::new(Arc::clone(&gate));
+fn default_policy_allows_in_process_and_asks_for_external_calls() {
+    let policy = DefaultApprovalPolicy;
 
     assert_eq!(
         policy.classify(&request(Provenance::InProcess)),
         ApprovalVerdict::Allow
     );
-    assert!(matches!(
-        policy.classify(&request(Provenance::External {
-            transport: TransportKind::Stdio
-        })),
-        ApprovalVerdict::Deny { .. }
-    ));
-
-    let _endpoint = gate.register();
+    // The pipeline denies the `Ask` when no endpoint attends the tree.
     assert_eq!(
         policy.classify(&request(Provenance::External {
             transport: TransportKind::Http
         })),
         ApprovalVerdict::Ask
     );
-    // `Unknown` is never asked, even with an endpoint registered.
+    // `Unknown` is never asked.
     assert!(matches!(
         policy.classify(&request(Provenance::Unknown)),
         ApprovalVerdict::Deny { .. }

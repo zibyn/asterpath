@@ -144,7 +144,7 @@ fn harness(
         Arc::clone(&log),
         Arc::clone(&provider),
         tools,
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        Arc::new(DefaultApprovalPolicy),
         gate,
         None,
         None,
@@ -876,7 +876,7 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
         Arc::clone(&log),
         Arc::clone(&provider),
         vec![alpha, beta],
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        Arc::new(DefaultApprovalPolicy),
         gate,
         None,
         Some(hooks),
@@ -1003,7 +1003,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
     .await;
 
     let gate = Arc::new(ApprovalGate::new());
-    let _endpoint = gate.register();
+    let _endpoint = gate.register(SESSION);
     let waits = Arc::new(Waits::new(log.clone()));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
@@ -1381,7 +1381,7 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         Arc::clone(&log),
         Arc::clone(&provider),
         Vec::new(),
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        Arc::new(DefaultApprovalPolicy),
         gate,
         None,
         None,
@@ -1614,7 +1614,7 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
         log,
         provider,
         Vec::new(),
-        Arc::new(DefaultApprovalPolicy::new(Arc::clone(&gate))),
+        Arc::new(DefaultApprovalPolicy),
         gate,
         None,
         None,

@@ -19,7 +19,7 @@ use asterpath_protocol::{
     SessionEvent, SessionFacts, SessionId, SessionStore, StepId, Tool, ToolArgs, ToolCallCtx,
     ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind,
     ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnId, UsageLookup, dedup,
-    unique_bytes,
+    root_of, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -801,11 +801,13 @@ impl ToolPipeline {
                 reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
             )),
             ApprovalVerdict::Ask => {
-                if !self.gate.is_open() {
+                // Endpoints attend a whole tree (ADR-0039).
+                let root = root_of(&*self.log, step.session).await?;
+                if !self.gate.is_open(root) {
                     return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
                 }
                 // Listed until this wait ends for any reason, including drop.
-                let _pending = self.gate.wait_for(request.clone());
+                let _pending = self.gate.wait_for(root, request.clone());
                 step.events.push(Ok(AgentEvent::ApprovalRequested(request)));
                 // A decision recorded after this step's read is still returned here.
                 let wait = self.waits.await_approval(step.session, call.tool_call_id);

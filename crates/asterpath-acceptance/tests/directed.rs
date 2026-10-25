@@ -601,7 +601,6 @@ async fn t3_recorded_allow_survives_the_restart_and_executes_without_reprompting
         Some(Arc::new(AlwaysAsk)),
     )
     .await;
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .open_session(session)
         .await
@@ -609,6 +608,7 @@ async fn t3_recorded_allow_survives_the_restart_and_executes_without_reprompting
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
     let events = drive(&handle).await;
     assert!(
         !events
@@ -669,7 +669,6 @@ async fn t4_undecided_ask_resuspends_after_a_restart_and_waits_for_the_answer() 
         Some(Arc::new(AlwaysAsk)),
     )
     .await;
-    let _endpoint = asterpath.approval_gate().register();
     let handle = asterpath
         .open_session(session)
         .await
@@ -677,6 +676,7 @@ async fn t4_undecided_ask_resuspends_after_a_restart_and_waits_for_the_answer() 
         .claim()
         .await
         .unwrap();
+    let _endpoint = asterpath.approval_gate().register(handle.id());
 
     let mut stream = handle.drive();
     let request = loop {

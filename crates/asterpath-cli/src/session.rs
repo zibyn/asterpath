@@ -531,7 +531,7 @@ async fn assemble(settings: &config::Settings, tools: Vec<Arc<dyn Tool>>) -> Cli
     let catalog = ProviderCatalog::new(providers.clone())
         .map_err(|error| CliError::config(error.to_string()))?;
     let config = AsterpathConfig::default();
-    let approval = config::approval_policy(settings.approval, Arc::clone(&config.gate));
+    let approval = config::approval_policy(settings.approval);
     AsterpathBuilder::from_config(config)
         .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
         .database(&settings.db)
