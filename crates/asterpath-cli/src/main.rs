@@ -23,15 +23,11 @@ use std::path::PathBuf;
 
 use asterpath::AsterError;
 use asterpath_protocol::SessionId;
-use clap::{Args, Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "asterpath",
-    version,
-    about,
-    args_conflicts_with_subcommands = true
-)]
+#[command(name = "asterpath", version, about)]
 struct Cli {
     #[command(flatten)]
     global: GlobalArgs,
@@ -100,9 +96,31 @@ impl CliError {
 
 pub type CliResult<T> = Result<T, CliError>;
 
+impl Cli {
+    /// Global options may come before a subcommand; the interactive mode's
+    /// options and prompt may not, since the subcommand would drop them.
+    fn parse_checked() -> Self {
+        let matches = Self::command().get_matches();
+        if matches.subcommand().is_some()
+            // clap derive ids: the `SessionArgs` group and the `prompt` field.
+            && ["SessionArgs", "prompt"]
+                .into_iter()
+                .any(|id| matches.value_source(id) == Some(ValueSource::CommandLine))
+        {
+            Self::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "only --config and -c may come before a subcommand",
+                )
+                .exit();
+        }
+        Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let code = match dispatch(Cli::parse()).await {
+    let code = match dispatch(Cli::parse_checked()).await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("asterpath: {}", error.message);

@@ -1561,3 +1561,45 @@ fn vendor_config(anthropic: &MockServer, deepseek: &MockServer, db: &Path) -> St
         deepseek = deepseek.base_url(),
     )
 }
+
+#[test]
+fn global_options_before_the_subcommand_reach_it() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
+    let dir = TestDir::new("global-first");
+    let config = dir.config(&config_body(&server, &dir.db()));
+    let config = config.to_str().unwrap();
+
+    let output = bin()
+        .current_dir(&dir.path)
+        .args(["--config", config, "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("config ok"));
+
+    let (stdout, _) = ok(bin().current_dir(&dir.path).args([
+        "--config",
+        config,
+        "-c",
+        "model.id=c-model",
+        "exec",
+        "--output-format",
+        "json",
+        "hi",
+    ]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["result"],
+        "ok"
+    );
+    assert_eq!(server.requests()[0].json_body()["model"], "c-model");
+
+    // Session options and a prompt before a subcommand are never dropped silently.
+    for args in [
+        &["--config", config, "-C", ".", "doctor"][..],
+        &["--config", config, "-m", "x", "exec", "hi"],
+    ] {
+        let output = bin().current_dir(&dir.path).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+    }
+    assert_eq!(server.requests().len(), 1, "no model call");
+}

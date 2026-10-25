@@ -333,6 +333,7 @@ pub enum AsterError {
 | `--output-schema <file>` | `exec` | 结构化输出的 JSON Schema（ADR-0031）；写进新会话或分叉会话的配置，因此只用于新会话与 `--fork-session`，续原会话时是用法错误（没有单回合的请求选项，写进去会留在会话里） |
 | `--output-mode <native\|tool\|auto>` | `exec` | 结构化输出的输出模式（ADR-0034），默认 `native`；不带 `--output-schema` 是用法错误；配置文件无对应字段。各模式下结果都作最终消息输出（text 的 stdout、json / stream-json 结果对象的 `result`）：模型调用了输出工具时是其参数（多个取第一个），否则是最终助手文本。`tool` 模式下模型没有调用输出工具（结果未交付）时以退出码 1 失败 |
 
+- `--config` 与 `-c` 可写在子命令前后（`asterpath --config X doctor`）；交互模式的选项与 `PROMPT` 写在子命令前是用法错误（退出 2），不会被静默丢弃或当成提示词。
 - Codex 的 `-c` 与 Claude Code 的 `-c/--continue` 冲突，本 CLI 的短选项 `-c` 归配置覆盖，续会话只有长选项 `--continue`。
 - 不提供的选项（满足准入规则但不做）：`--add-dir`、`--ephemeral` / `--no-session-persistence`、`--dangerously-bypass-*`（用 `-a never -s full-access` 组合）、`mcp add/remove`。
 - 已移除：`run`、`resume`、`inspect`、`trace`、`usage`、`config check` 子命令，`--db`、`--provider`、`--approval`、`--json`、`--tools`、`--no-tools`、`--no-skills`。对应配置走 `-c storage.path=…`、`-c model.provider=…`、`-c tools.enabled=[…]`、`-c skills.enabled=false`。
