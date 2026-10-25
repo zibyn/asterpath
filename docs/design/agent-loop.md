@@ -294,7 +294,8 @@ C5 重试每 step 至多一次，且不占 `max_attempts` 预算：即使超限�
 | 条件 | `TurnEndReason` |
 | --- | --- |
 | 无工具调用、无 `pause_turn`、无 pending input | `Completed` |
-| refusal / 空响应 / 输出 `max_tokens` 截断 | `Completed`（`stop_reason` 留在 `AssistantMessage`） |
+| 空响应 / 输出 `max_tokens` 截断 | `Completed`（`stop_reason` 留在 `AssistantMessage`） |
+| `stop_reason` 为 refusal | `Refused`：不执行工具，不管有无 pending input；输出留在日志但不投影（I9） |
 | 用户取消 | `Cancelled` |
 | 模型错误不可重试 / 重试耗尽 | `Failed` |
 | `max_steps_per_turn` 达到 | `MaxStepsExceeded` |

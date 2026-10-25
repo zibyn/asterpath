@@ -983,6 +983,11 @@ fn child_outcome(events: &[(LogEntry, SessionEvent)]) -> Option<ChildOutcome> {
             reason: ChildFailure::CompactionFailed,
             summary,
         },
+        // The refused output is not the child's answer, and no earlier message is either.
+        TurnEndReason::Refused => ChildOutcome::Failed {
+            reason: ChildFailure::Refused,
+            summary: Summary { items: Vec::new() },
+        },
         // The child was stopped by its own host, not by the parent's wait.
         TurnEndReason::Cancelled => ChildOutcome::Cancelled {
             reason: CancelReason::Host,

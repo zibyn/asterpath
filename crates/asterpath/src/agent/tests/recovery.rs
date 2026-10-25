@@ -1674,3 +1674,55 @@ impl SessionStore for CorruptParentLog {
         self.inner.parent(session)
     }
 }
+
+/// Crash after a refused step's `AssistantMessage`, with the step open or
+/// committed: recovery runs none of its calls and ends the turn `Refused`.
+#[tokio::test]
+async fn a_recovered_refusal_runs_no_tools_and_ends_refused() {
+    for step_committed in [false, true] {
+        let (tool, calls) = echo("echo", ReplaySafety::Safe);
+        let log = seed(config(vec![described("echo", ReplaySafety::Safe)])).await;
+        open_turn(&log).await;
+        append(
+            &log,
+            SessionEvent::AssistantMessage {
+                turn_id: TURN,
+                step_id: STEP,
+                items: vec![tool_call("c1", "echo", "{}")],
+                raw: None,
+                model: model(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Refusal,
+            },
+            Some(dedup::assistant_message(TURN, STEP)),
+        )
+        .await;
+        if step_committed {
+            append(
+                &log,
+                SessionEvent::StepCommitted {
+                    turn_id: TURN,
+                    step_id: STEP,
+                },
+                None,
+            )
+            .await;
+        }
+
+        let provider = Arc::new(ScriptedProvider::new("p"));
+        let harness = harness(Arc::clone(&log), Arc::clone(&provider), vec![tool]);
+        let events = drive(&harness.agent).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStarted { .. })),
+            "step_committed={step_committed}"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        let entries = scan(&log).await;
+        assert_eq!(count(&entries, "ToolCallRequested"), 0);
+        assert_eq!(turn_reasons(&entries), vec![TurnEndReason::Refused]);
+        assert!(provider.requests().is_empty());
+    }
+}

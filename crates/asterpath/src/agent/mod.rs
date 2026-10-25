@@ -963,9 +963,11 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
-        let had_calls = items
-            .iter()
-            .any(|(_, item)| matches!(item, Item::ToolCall { .. }));
+        // A refused step's calls never run (I9).
+        let had_calls = *stop_reason != StopReason::Refusal
+            && items
+                .iter()
+                .any(|(_, item)| matches!(item, Item::ToolCall { .. }));
         let mut delivered = false;
         if had_calls {
             let outcome = self
@@ -1742,8 +1744,12 @@ fn has_tool_calls(items: &[Item]) -> bool {
 }
 
 fn step_outcome(stop_reason: &StopReason, had_calls: bool, pending_input: bool) -> StepOutcome {
-    if matches!(stop_reason, StopReason::ContextWindowExceeded) {
-        return StepOutcome::Turn(TurnEndReason::ContextExhausted);
+    match stop_reason {
+        StopReason::ContextWindowExceeded => {
+            return StepOutcome::Turn(TurnEndReason::ContextExhausted);
+        }
+        StopReason::Refusal => return StepOutcome::Turn(TurnEndReason::Refused),
+        _ => {}
     }
     if had_calls || matches!(stop_reason, StopReason::PauseTurn) || pending_input {
         StepOutcome::Continue

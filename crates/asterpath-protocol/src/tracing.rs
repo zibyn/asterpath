@@ -102,6 +102,7 @@ pub enum ErrorType {
     ContextExhausted,
     CompactionFailed,
     MaxSteps,
+    Refused,
     Internal,
     Other,
 }

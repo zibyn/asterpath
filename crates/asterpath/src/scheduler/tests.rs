@@ -615,6 +615,7 @@ async fn child_failure_reasons_map_to_child_failure() {
             TurnEndReason::CompactionFailed,
             ChildFailure::CompactionFailed,
         ),
+        (TurnEndReason::Refused, ChildFailure::Refused),
     ];
     for (reason, expected) in cases {
         let log = Arc::new(InMemoryEventLog::new());
@@ -651,6 +652,14 @@ async fn child_failure_reasons_map_to_child_failure() {
             matches!(outcome, ChildOutcome::Failed { reason, .. } if reason == expected),
             "{reason:?} must map to {expected:?}, got {outcome:?}"
         );
+        // A refusal summarizes nothing, not even an earlier assistant message.
+        if let ChildOutcome::Failed {
+            reason: ChildFailure::Refused,
+            summary,
+        } = &outcome
+        {
+            assert!(summary.items.is_empty(), "{summary:?}");
+        }
     }
 
     // Stopped is still a completed task.

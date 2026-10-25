@@ -16,7 +16,7 @@ use crate::{LogEntry, LogId, LogIdRange, ToolCallId};
 
 use crate::config::{ToolDescriptor, change_tools};
 use crate::decode::{LogDecodeError, decode_entry};
-use crate::event::{SessionEvent, ToolResultStatus};
+use crate::event::{SessionEvent, StopReason, ToolResultStatus};
 use crate::item::{Item, Part};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +152,10 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
                     }],
                 );
             }
-            SessionEvent::AssistantMessage { items, .. } => {
+            // I9: a refused step's output never reaches history.
+            SessionEvent::AssistantMessage {
+                items, stop_reason, ..
+            } if stop_reason != StopReason::Refusal => {
                 flush_results(&mut pending_results, &mut history);
                 push(&mut history, entry.log_id, items);
             }

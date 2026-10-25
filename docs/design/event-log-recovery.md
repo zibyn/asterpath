@@ -97,6 +97,7 @@ pub enum ToolErrorKind {
 pub enum TurnEndReason {
     Completed, Cancelled, Failed, Stopped { reason: String },
     MaxStepsExceeded, ContextExhausted, CompactionFailed,
+    Refused,                         // 模型拒答（StopReason::Refusal）
 }
 // ChildOutcome 的形状见 subagents.md §6。
 ```
@@ -179,7 +180,7 @@ pub fn decode_entry(entry: &LogEntry) -> Result<SessionEvent, LogDecodeError>;
 - **I6 等待是已记录的**：每个等待都有意图记录与最终终态（审批：`ToolCallRequested` → `ApprovalDecided` / `ToolResult`；子会话：`ChildSessionSpawned` → `ChildSessionCompleted`）；恢复不依赖内存中的等待者。
 - **I7 投影是折叠**：模型历史 = 对日志做只读折叠，`CompactionApplied` 丢弃 `replaces` 区间（含旧 summary）并在 `first_kept` 之前插入新 summary；原始记录保留。
 - **I8 幂等 append**：同一 `(session, 事件类型, dedup_key)` 永远只有一条记录。
-- **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。
+- **I9 部分输出不投影**：`ModelCallAborted.partial` 与中断工具的结果不进入模型历史，除非写成显式 `ToolResult::Interrupted`。以 `StopReason::Refusal` 结束的 `AssistantMessage` 完整写入日志，但投影跳过它的 `items`；其中的工具调用不写意图、不执行，回合以 `Refused` 结束（恢复路径同样）。
 
 ## 6. 检查点、恢复点与恢复
 

@@ -264,10 +264,14 @@ pub enum TurnEndReason {
     Completed,
     Cancelled,
     Failed,
-    Stopped { reason: String },
+    Stopped {
+        reason: String,
+    },
     MaxStepsExceeded,
     ContextExhausted,
     CompactionFailed,
+    /// The model refused (`StopReason::Refusal`); the step's output is not projected.
+    Refused,
 }
 
 #[non_exhaustive]
@@ -308,6 +312,7 @@ pub enum ChildFailure {
     ContextExhausted,
     MaxStepsExceeded,
     CompactionFailed,
+    Refused,
 }
 
 #[non_exhaustive]

@@ -788,6 +788,7 @@ fn turn_status(
         TurnEndReason::ContextExhausted => (SpanStatus::Error, Some(ErrorType::ContextExhausted)),
         TurnEndReason::CompactionFailed => (SpanStatus::Error, Some(ErrorType::CompactionFailed)),
         TurnEndReason::MaxStepsExceeded => (SpanStatus::Error, Some(ErrorType::MaxSteps)),
+        TurnEndReason::Refused => (SpanStatus::Error, Some(ErrorType::Refused)),
         _ => (SpanStatus::Error, Some(ErrorType::Other)),
     }
 }

@@ -36,7 +36,7 @@ pub enum SpanStatus { Unset, Ok, Error, Cancelled, Interrupted }
 pub enum ErrorType {
     ProviderRejected, Transport, ToolInvalidArgs, ToolDenied, ToolTimeout,
     ToolPanic, ToolCancelled, ToolNotFound, ContextExhausted,
-    CompactionFailed, MaxSteps, Internal, Other,
+    CompactionFailed, MaxSteps, Refused, Internal, Other,
 }
 
 pub struct LogIdRange { pub first: LogId, pub last: LogId }
@@ -206,6 +206,7 @@ struct AttemptEvent {
 | turn | `TurnCommitted(ContextExhausted)` | Error | `ContextExhausted` |
 | turn | `TurnCommitted(CompactionFailed)` | Error | `CompactionFailed` |
 | turn | `TurnCommitted(MaxStepsExceeded)` | Error | `MaxSteps` |
+| turn | `TurnCommitted(Refused)` | Error | `Refused`（model_call 仍为 Ok，`finish_reasons` 照常记录） |
 | step | 有 `StepCommitted`，turn 非取消 | Ok | — |
 | step | turn `Cancelled` | Cancelled | — |
 | model_call | 有 `AssistantMessage` | Ok | — |

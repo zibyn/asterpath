@@ -499,7 +499,7 @@ async fn non_retryable_rejection_ends_the_turn_failed() {
 }
 
 #[tokio::test]
-async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved() {
+async fn refusal_empty_and_max_tokens_end_with_stop_reason_preserved() {
     for (tag, items, stop_reason) in [
         (
             "refusal",
@@ -525,13 +525,15 @@ async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved(
 
         let entries = scan(asterpath.store(), handle.id()).await;
         let all = decoded(&entries);
-        assert!(matches!(
-            all.last(),
-            Some(SessionEvent::TurnCommitted {
-                reason: TurnEndReason::Completed,
-                ..
-            })
-        ));
+        let expected = if stop_reason == StopReason::Refusal {
+            TurnEndReason::Refused
+        } else {
+            TurnEndReason::Completed
+        };
+        assert!(
+            matches!(all.last(), Some(SessionEvent::TurnCommitted { reason, .. }) if *reason == expected),
+            "{tag}"
+        );
         let message = all
             .iter()
             .find_map(|event| match event {
@@ -544,6 +546,74 @@ async fn refusal_empty_and_max_tokens_still_complete_with_stop_reason_preserved(
         asterpath.shutdown().await.unwrap();
         cleanup(&db);
     }
+}
+
+/// The text streamed before a refusal stays in the log but never reaches the
+/// model again, its tool calls never run, and the turn ends `Refused`.
+#[tokio::test]
+async fn a_refused_step_is_logged_but_not_projected_or_executed() {
+    let db = temp_db("refused");
+    let mut refused = assistant_items("PARTIAL-BEFORE-REFUSAL");
+    refused.push(Item::ToolCall {
+        call_id: "c1".to_owned(),
+        provider_item_id: None,
+        name: asterpath::protocol::ToolName::new("echo"),
+        raw_args: asterpath::protocol::JsonString::new("{}"),
+        raw: None,
+    });
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(refused.clone(), StopReason::Refusal, usage(3, 2))
+            .respond(assistant_items("ok"), StopReason::EndTurn, usage(1, 1)),
+    );
+    let asterpath = open(&db, vec![provider.clone()]).await;
+    let handle = asterpath.create_session(spec("p")).await.unwrap();
+    handle.submit_input(input(1, "first")).await.unwrap();
+    let first = drive_all(&handle).await;
+    assert!(matches!(
+        first.last(),
+        Some(AgentEvent::TurnCommitted {
+            reason: TurnEndReason::Refused,
+            ..
+        })
+    ));
+    assert!(
+        !first
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+    );
+    assert_eq!(provider.requests().len(), 1);
+
+    handle.submit_input(input(2, "second")).await.unwrap();
+    drive_all(&handle).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let user = |message: &str| Item::Message {
+        role: Role::User,
+        parts: vec![text(message)],
+        raw: None,
+    };
+    assert_eq!(requests[1].items, [user("first"), user("second")]);
+
+    let entries = scan(asterpath.store(), handle.id()).await;
+    assert!(!kinds(&entries).contains(&"ToolCallRequested"));
+    let logged = decoded(&entries)
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::AssistantMessage {
+                items,
+                usage,
+                stop_reason: StopReason::Refusal,
+                ..
+            } => Some((items, usage)),
+            _ => None,
+        })
+        .expect("refused message is logged");
+    assert_eq!(logged, (refused, usage(3, 2)));
+
+    asterpath.shutdown().await.unwrap();
+    cleanup(&db);
 }
 
 #[tokio::test]

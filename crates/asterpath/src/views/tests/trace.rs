@@ -633,6 +633,64 @@ async fn t4_retry_exhaustion_marks_the_model_call_and_turn_error() {
 }
 
 #[tokio::test]
+async fn a_refused_turn_errors_while_its_model_call_stays_ok() {
+    let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
+    let session = sid(0x45);
+    let t = turn();
+    let s = step(0x72);
+    for (event, dedup) in [
+        (created(session), Some(dedup::session_created(session))),
+        (SessionEvent::TurnStarted { turn_id: t }, None),
+        (
+            SessionEvent::StepStarted {
+                turn_id: t,
+                step_id: s,
+            },
+            None,
+        ),
+        (
+            SessionEvent::AssistantMessage {
+                turn_id: t,
+                step_id: s,
+                items: Vec::new(),
+                raw: None,
+                model: model(),
+                usage: usage(10, 5),
+                stop_reason: StopReason::Refusal,
+            },
+            Some(dedup::assistant_message(t, s)),
+        ),
+        (
+            SessionEvent::StepCommitted {
+                turn_id: t,
+                step_id: s,
+            },
+            Some(dedup::step_committed(s)),
+        ),
+        (
+            SessionEvent::TurnCommitted {
+                turn_id: t,
+                reason: TurnEndReason::Refused,
+            },
+            Some(dedup::turn_committed(t)),
+        ),
+    ] {
+        append(&*log, session, &event, dedup).await;
+    }
+
+    let spans = fold(&log, session).await;
+    let model_span = span_of(&spans, SpanKind::ModelCall);
+    assert_eq!(model_span.status, SpanStatus::Ok);
+    let SpanAttributes::ModelCall(attrs) = &model_span.attributes else {
+        panic!("model call attributes");
+    };
+    assert_eq!(attrs.finish_reasons, [StopReason::Refusal]);
+    let turn_span = span_of(&spans, SpanKind::Turn);
+    assert_eq!(turn_span.status, SpanStatus::Error);
+    assert_eq!(turn_span.error_type, Some(ErrorType::Refused));
+}
+
+#[tokio::test]
 async fn t5_tool_failure_does_not_fail_the_step_or_turn() {
     let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
     let session = sid(5);

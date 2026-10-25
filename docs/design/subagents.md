@@ -161,7 +161,7 @@ stateDiagram-v2
     Queued --> Running: 并发槽可用
     Queued --> Rejected: 深度超限 / 参数非法
     Running --> Completed: 子 TurnCommitted(Completed | Stopped)
-    Running --> Failed: 子 TurnCommitted(Failed | ContextExhausted | MaxStepsExceeded | CompactionFailed)
+    Running --> Failed: 子 TurnCommitted(Failed | ContextExhausted | MaxStepsExceeded | CompactionFailed | Refused)
     Running --> Cancelled: 父取消 / 子被宿主取消 / 超时
     Running --> Lost: 子状态不可读
     Completed --> [*]
@@ -232,6 +232,7 @@ pub enum ChildFailure {
     ContextExhausted,
     MaxStepsExceeded,
     CompactionFailed,
+    Refused,
 }
 
 /// #17：取消必须带原因，恢复才能稳定还原 ToolResult 形态。
@@ -260,6 +261,7 @@ pub struct Summary {
 | `TurnCommitted(ContextExhausted)` | `Failed { reason: ContextExhausted, summary }` | `Completed` |
 | `TurnCommitted(MaxStepsExceeded)` | `Failed { reason: MaxStepsExceeded, summary }` | `Completed` |
 | `TurnCommitted(CompactionFailed)` | `Failed { reason: CompactionFailed, summary }` | `Completed` |
+| `TurnCommitted(Refused)` | `Failed { reason: Refused, summary: 空 }`（不回找更早的消息） | `Completed` |
 | 子被宿主取消 | `Cancelled { reason: Host }` | `Completed`（output 标明 cancelled） |
 | 父取消 | `Cancelled { reason: Parent }` | `Interrupted`（#6 收尾） |
 | 超时 | `Cancelled { reason: Timeout }` | `Failed{Timeout}` |
