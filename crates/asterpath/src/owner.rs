@@ -6,7 +6,7 @@
 //!
 //! [`Ownership`] keeps this process's claims and renews its process lease.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -18,28 +18,18 @@ use asterpath_protocol::{Claim, Hooks, OwnerToken, SessionId, SessionStore, Stor
 use tokio::sync::watch;
 
 thread_local! {
-    static OWNER: Cell<Option<OwnerToken>> = const { Cell::new(None) };
+    static OWNER: RefCell<Option<OwnerToken>> = const { RefCell::new(None) };
 }
 
 /// The claim of the owner operation being polled on this thread.
 pub(crate) fn current() -> Option<OwnerToken> {
-    OWNER.get()
+    OWNER.with_borrow(|owner| *owner)
 }
 
 /// Run `f` as `owner`; `None` keeps the enclosing claim (a child drive
 /// polled inside its parent's).
 pub(crate) fn within<R>(owner: Option<OwnerToken>, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<OwnerToken>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            OWNER.set(self.0);
-        }
-    }
-    let Some(owner) = owner else {
-        return f();
-    };
-    let _restore = Restore(OWNER.replace(Some(owner)));
-    f()
+    crate::scoped::within(&OWNER, owner, f)
 }
 
 /// A future polled as `owner`.

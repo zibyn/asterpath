@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath_protocol::{
-    AgentError, AgentEvent, CommittedRecord, LogId, LogQuery, SessionId, SessionStore, decode_entry,
+    AgentEvent, CommittedRecord, LogId, LogQuery, SessionId, SessionStore, decode_entry,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -108,10 +108,7 @@ impl Watch {
         });
         while let Some(entry) = records.next().await {
             let entry = entry?;
-            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
-                session: self.session,
-                detail: error.to_string(),
-            })?;
+            let event = decode_entry(&entry).map_err(crate::corrupt(self.session))?;
             self.after = Some(entry.log_id);
             self.pending
                 .push_back(WatchEvent::Record(Box::new(CommittedRecord::new(

@@ -20,17 +20,7 @@ pub(crate) fn current() -> Option<Arc<SessionEnvironment>> {
 
 /// Run `f` in `env`; `None` keeps the enclosing environment.
 pub(crate) fn within<R>(env: Option<&Arc<SessionEnvironment>>, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<Arc<SessionEnvironment>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CURRENT.set(self.0.take());
-        }
-    }
-    let Some(env) = env else {
-        return f();
-    };
-    let _restore = Restore(CURRENT.replace(Some(Arc::clone(env))));
-    f()
+    crate::scoped::within(&CURRENT, env.cloned(), f)
 }
 
 /// `name` in `env`, else in the builder's table.

@@ -18,6 +18,7 @@ mod fork;
 mod owner;
 mod scan;
 mod scheduler;
+mod scoped;
 mod tools;
 mod views;
 mod waits;
@@ -454,12 +455,7 @@ impl Asterpath {
                 continue;
             }
             let entries = scan_all(&*self.store, session).await?;
-            let facts = SessionFacts::fold(&entries).map_err(|error| {
-                AsterError::Agent(AgentError::Corrupt {
-                    session,
-                    detail: error.to_string(),
-                })
-            })?;
+            let facts = SessionFacts::fold(&entries).map_err(corrupt(session))?;
             if facts.is_wakeable() {
                 wakeable.push(session);
             }
@@ -757,24 +753,14 @@ impl SessionHandle {
     /// The session facts folded from the log, not driver memory.
     pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
         let entries = scan_all(&*self.store, self.session).await?;
-        SessionFacts::fold(&entries).map_err(|error| {
-            AsterError::Agent(asterpath_protocol::AgentError::Corrupt {
-                session: self.session,
-                detail: error.to_string(),
-            })
-        })
+        Ok(SessionFacts::fold(&entries).map_err(corrupt(self.session))?)
     }
 
     /// The model-visible projection folded from the log, not driver memory.
     /// Each entry keeps its origin so hosts can map items back to log ids.
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
         let entries = scan_all(&*self.store, self.session).await?;
-        asterpath_protocol::project(&entries).map_err(|error| {
-            AsterError::Agent(AgentError::Corrupt {
-                session: self.session,
-                detail: error.to_string(),
-            })
-        })
+        Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
     }
 
     /// Observe the session without driving it (ADR-0038): every committed
@@ -1002,5 +988,13 @@ impl OwnedSession {
             future: self.agent.compact_now(self.session),
         };
         Ok(compaction.await?)
+    }
+}
+
+/// A log of `session` that does not fold, as `AgentError::Corrupt`.
+pub(crate) fn corrupt<E: std::fmt::Display>(session: SessionId) -> impl FnOnce(E) -> AgentError {
+    move |error| AgentError::Corrupt {
+        session,
+        detail: error.to_string(),
     }
 }
