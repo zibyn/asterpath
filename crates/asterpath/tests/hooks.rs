@@ -450,6 +450,68 @@ async fn before_tool_hooks_rewrite_and_deny_in_registration_order() {
     assert!(denied, "the denial is recorded as a failed result");
 }
 
+/// Fails every call.
+struct FailingHook;
+
+impl Hooks for FailingHook {
+    fn before_tool<'a>(
+        &'a self,
+        _ctx: &'a ToolCallCtx,
+        _args: &'a mut ToolArgs,
+    ) -> BoxFuture<'a, Result<ToolGate, HookError>> {
+        Box::pin(async { Err(HookError::new("hook broke")) })
+    }
+}
+
+#[tokio::test]
+async fn a_failing_before_tool_emits_tool_finished_without_tool_started() {
+    let echo = EchoTool::new("echo");
+    let recorder = Arc::new(Recorder::default());
+    let provider = ScriptedProvider::new("p")
+        .respond(
+            vec![tool_call("c1", "echo", "{}")],
+            StopReason::ToolUse,
+            Usage::default(),
+        )
+        .respond(assistant("done"), StopReason::EndTurn, Usage::default());
+    let (session, events) = run(
+        "before-tool-error",
+        provider,
+        vec![echo.clone()],
+        vec![Arc::new(FailingHook), recorder.clone()],
+    )
+    .await;
+
+    assert!(echo.calls().is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+    );
+    let finished: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFinished {
+                status,
+                output,
+                error,
+                ..
+            } => Some((*status, output.clone(), error.clone())),
+            _ => None,
+        })
+        .collect();
+    let logged = recorder
+        .events(session)
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ToolResult { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a recorded result");
+    assert_eq!(finished, [(ToolResultStatus::Failed, None, logged.clone())]);
+    assert_eq!(logged.map(|info| info.kind), Some(ToolErrorKind::Internal));
+}
+
 // --- on_record ---------------------------------------------------------------
 
 struct Panics;

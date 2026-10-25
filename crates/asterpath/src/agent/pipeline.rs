@@ -141,13 +141,12 @@ impl ToolPipeline {
             }
             match admitted.pre_failure {
                 Some(PreFailure::Denied(reason)) => {
-                    self.deny(step.session, admitted.tool_call_id, reason)
-                        .await?;
+                    self.deny(step, admitted.tool_call_id, reason).await?;
                     continue;
                 }
                 Some(PreFailure::Internal(message)) => {
                     self.fail(
-                        step.session,
+                        step,
                         admitted.tool_call_id,
                         ToolErrorKind::Internal,
                         message,
@@ -158,7 +157,7 @@ impl ToolPipeline {
                 None => {}
             }
             let Some(tool) = admitted.tool.clone() else {
-                self.not_found(step.session, admitted.tool_call_id, &admitted.name)
+                self.not_found(step, admitted.tool_call_id, &admitted.name)
                     .await?;
                 continue;
             };
@@ -184,8 +183,7 @@ impl ToolPipeline {
                     self.interrupt(step, admitted.tool_call_id).await?;
                 }
                 ToolDecision::Deny(reason) => {
-                    self.deny(step.session, admitted.tool_call_id, reason)
-                        .await?;
+                    self.deny(step, admitted.tool_call_id, reason).await?;
                 }
                 ToolDecision::Cancelled => {
                     cancelled = true;
@@ -285,7 +283,7 @@ impl ToolPipeline {
             // A tool that was absent when its intent was recorded never
             // enters approval and is never rerun.
             if intent.provenance == Provenance::Unknown {
-                self.not_found(step.session, intent.tool_call_id, &intent.name)
+                self.not_found(step, intent.tool_call_id, &intent.name)
                     .await?;
                 return Ok(None);
             }
@@ -718,23 +716,23 @@ impl ToolPipeline {
 
     async fn deny(
         &self,
-        session: SessionId,
+        step: &ToolStep<'_>,
         tool_call_id: ToolCallId,
         message: String,
     ) -> Result<(), AgentError> {
-        self.fail(session, tool_call_id, ToolErrorKind::Denied, message)
+        self.fail(step, tool_call_id, ToolErrorKind::Denied, message)
             .await
     }
 
     /// The model-visible terminal for a tool that is not in the registry.
     async fn not_found(
         &self,
-        session: SessionId,
+        step: &ToolStep<'_>,
         tool_call_id: ToolCallId,
         name: &ToolName,
     ) -> Result<(), AgentError> {
         self.fail(
-            session,
+            step,
             tool_call_id,
             ToolErrorKind::NotFound,
             format!("tool {name} is not registered"),
@@ -742,22 +740,33 @@ impl ToolPipeline {
         .await
     }
 
+    /// A call that fails before it starts: a `ToolFinished` with no `ToolStarted`.
     async fn fail(
         &self,
-        session: SessionId,
+        step: &ToolStep<'_>,
         tool_call_id: ToolCallId,
         kind: ToolErrorKind,
         message: String,
     ) -> Result<(), AgentError> {
+        let error = ToolErrorInfo { kind, message };
         self.append_result(
-            session,
+            step.session,
             tool_call_id,
             ToolResultStatus::Failed,
             None,
-            Some(ToolErrorInfo { kind, message }),
+            Some(error.clone()),
             false,
         )
-        .await
+        .await?;
+        step.events.push(Ok(AgentEvent::ToolFinished {
+            turn: step.turn,
+            step: step.step,
+            call: tool_call_id,
+            status: ToolResultStatus::Failed,
+            output: None,
+            error: Some(error),
+        }));
+        Ok(())
     }
 
     async fn append_result(

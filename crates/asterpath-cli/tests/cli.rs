@@ -435,6 +435,114 @@ fn stream_json_bad_command_cancels_and_exits_two_after_the_result() {
     assert!(!dir.path.join("ran").exists());
 }
 
+/// The one `tool_finished` of a call that failed before it started, and
+/// asserts no `tool_started` came before it.
+fn pre_failed(events: &[serde_json::Value]) -> &serde_json::Value {
+    assert!(
+        !events.iter().any(|event| event["type"] == "tool_started"),
+        "{events:?}"
+    );
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_finished")
+        .collect();
+    assert_eq!(finished.len(), 1, "{events:?}");
+    assert_eq!(finished[0]["status"], "Failed");
+    assert_eq!(finished[0]["output"], serde_json::Value::Null);
+    finished[0]
+}
+
+fn stream_json_events(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one json value per line"))
+        .collect()
+}
+
+#[test]
+fn stream_json_reports_a_call_denied_without_an_endpoint() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-no-endpoint");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, _) = ok(dir.exec(&dir.path).args([
+        "-a",
+        "untrusted",
+        "-s",
+        "full-access",
+        "--output-format",
+        "stream-json",
+        "go",
+    ]));
+
+    let events = stream_json_events(&stdout);
+    let finished = pre_failed(&events);
+    assert_eq!(finished["error"]["kind"], "Denied");
+    assert_eq!(
+        finished["error"]["message"],
+        asterpath_protocol::NO_APPROVAL_ENDPOINT
+    );
+}
+
+#[test]
+fn stream_json_reports_a_call_the_host_denied() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-deny");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut host = Host::start(&dir);
+
+    host.send(GO);
+    let request = host.until("approval_requested");
+    host.send(&format!(
+        r#"{{"type":"approval","call":{},"decision":{{"Deny":{{"reason":"e2e says no"}}}}}}"#,
+        request["tool_call_id"]
+    ));
+    let mut events = Vec::new();
+    loop {
+        let event = host.next();
+        if event["type"] == "turn_committed" {
+            break;
+        }
+        events.push(event);
+    }
+    host.close();
+
+    let finished = pre_failed(&events);
+    assert_eq!(finished["call"], request["tool_call_id"]);
+    assert_eq!(finished["error"]["kind"], "Denied");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("e2e says no"),
+        "{finished}"
+    );
+    assert!(!dir.path.join("ran").exists());
+}
+
+#[test]
+fn stream_json_reports_a_call_to_an_unregistered_tool() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("no_such_tool", "{}")),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-not-found");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, _) = ok(dir
+        .exec(&dir.path)
+        .args(["--output-format", "stream-json", "go"]));
+
+    let events = stream_json_events(&stdout);
+    assert_eq!(pre_failed(&events)["error"]["kind"], "NotFound");
+}
+
 #[test]
 fn stream_json_input_needs_stream_json_output() {
     let dir = TestDir::new("stream-input-usage");
