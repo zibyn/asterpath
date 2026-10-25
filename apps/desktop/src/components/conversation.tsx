@@ -52,10 +52,10 @@ export function Conversation({ session }: { session: string }) {
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["approvals", session] }),
   });
 
-  const mode = useQuery({ queryKey: ["permission-mode", session], queryFn: () => commands.permissionMode(session) });
+  const mode = useQuery({ queryKey: ["approval-mode", session], queryFn: () => commands.approvalMode(session) });
   const setMode = useMutation({
-    mutationFn: (next: commands.PermissionMode) => commands.setPermissionMode(session, next),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ["permission-mode", session] }),
+    mutationFn: (next: commands.ApprovalMode) => commands.setApprovalMode(session, next),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["approval-mode", session] }),
   });
   const [detail, setDetail] = useState<Detail>("normal");
 
@@ -145,15 +145,15 @@ export function Conversation({ session }: { session: string }) {
           </div>
           <div className="mt-2 flex items-center gap-3 text-xs text-muted-foreground">
             <select
-              aria-label="Permission mode"
+              aria-label="Approval mode"
               className="h-7 rounded-md border bg-background px-1 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
               value={mode.data ?? ""}
               disabled={readOnly || !mode.data}
-              onChange={(event) => setMode.mutate(event.target.value as commands.PermissionMode)}
+              onChange={(event) => setMode.mutate(event.target.value as commands.ApprovalMode)}
             >
-              <option value="read_only">Read only</option>
-              <option value="workspace_write">Workspace write (ask)</option>
-              <option value="full_trust">Full trust</option>
+              <option value="deny">Read only (deny changes)</option>
+              <option value="ask">Ask before changes</option>
+              <option value="allow">Allow all</option>
             </select>
             <label className="flex items-center gap-1">
               <input

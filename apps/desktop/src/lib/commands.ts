@@ -60,13 +60,13 @@ export type Answer = { kind: "allow_once" } | { kind: "allow_for_session" } | { 
 export const approve = (request: ApprovalRequest, answer: Answer) =>
   invoke<void>("approve", { session: request.session, call: request.tool_call_id, answer });
 
-/** What tool calls may do without asking; in memory, applies from the next call. */
-export type PermissionMode = "read_only" | "workspace_write" | "full_trust";
+/** What a session tree's mutating tool calls get; in memory, applies from the next call. */
+export type ApprovalMode = "deny" | "ask" | "allow";
 
-export const permissionMode = (session: string) => invoke<PermissionMode>("permission_mode", { session });
+export const approvalMode = (session: string) => invoke<ApprovalMode>("approval_mode", { session });
 
-export const setPermissionMode = (session: string, mode: PermissionMode) =>
-  invoke<void>("set_permission_mode", { session, mode });
+export const setApprovalMode = (session: string, mode: ApprovalMode) =>
+  invoke<void>("set_approval_mode", { session, mode });
 
 export interface ModelSpec {
   provider: string;

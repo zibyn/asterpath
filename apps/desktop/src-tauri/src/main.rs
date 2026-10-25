@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
 use asterpath_desktop::{
-    Access, Answer, Desktop, PermissionMode, Project, SessionInfo, SessionSummary, ViewEvent,
+    Access, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary, ViewEvent,
 };
 use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
@@ -136,21 +136,20 @@ async fn approve(
 }
 
 #[tauri::command]
-fn permission_mode(
+async fn approval_mode(
     backend: State<'_, Backend>,
     session: SessionId,
-) -> Result<PermissionMode, String> {
-    Ok(backend.get()?.permission_mode(session))
+) -> Result<ApprovalMode, String> {
+    backend.get()?.approval_mode(session).await
 }
 
 #[tauri::command]
-fn set_permission_mode(
+async fn set_approval_mode(
     backend: State<'_, Backend>,
     session: SessionId,
-    mode: PermissionMode,
+    mode: ApprovalMode,
 ) -> Result<(), String> {
-    backend.get()?.set_permission_mode(session, mode);
-    Ok(())
+    backend.get()?.set_approval_mode(session, mode).await
 }
 
 #[tauri::command]
@@ -197,8 +196,8 @@ fn main() {
             cancel,
             approvals,
             approve,
-            permission_mode,
-            set_permission_mode,
+            approval_mode,
+            set_approval_mode,
             models,
             session_info,
             set_model

@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
-use asterpath_host::config::{self, ApprovalMode, Settings};
+use asterpath_host::config::{self, Settings};
 use asterpath_host::{CWD, NAME, WorkRoot, Workspace, new_session_spec, work_root};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
     CatalogEntry, Clock, ConfigPatch, EnvironmentAdapter, InputId, ModelSpec, ParentFilter, Part,
     SessionEvent, SessionQuery, SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId,
-    ToolName, ToolSelection, UsageScope, UserInput, decode_entry, effective_config, scan_all,
-    unique_bytes,
+    ToolName, ToolSelection, UsageScope, UserInput, decode_entry, effective_config, root_of,
+    scan_all, unique_bytes,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -108,26 +108,27 @@ pub enum Access {
     Elsewhere,
 }
 
-/// The composer's permission mode: what a session's tool calls may do
-/// without a card.
-// shortcut: only the approval policy changes; the sandbox stays `config.toml`'s, since a session's tools are built once when it is opened
+/// The composer's approval mode: what a session tree's mutating tool calls
+/// get from the approval policy. The sandbox is `config.toml`'s in every
+/// mode; `Deny` keeps a tree read-only because every in-process tool that
+/// writes or runs a process (`bash` included) declares itself mutating.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PermissionMode {
-    /// Mutating tools are denied.
-    ReadOnly,
-    /// Mutating tools ask (`untrusted`).
+pub enum ApprovalMode {
+    /// Mutating tools are denied; external tools still ask.
+    Deny,
+    /// Mutating and external tools ask (`config.toml`'s `untrusted`).
     #[default]
-    WorkspaceWrite,
+    Ask,
     /// Nothing asks (`never`).
-    FullTrust,
+    Allow,
 }
 
-impl From<ApprovalMode> for PermissionMode {
-    fn from(mode: ApprovalMode) -> Self {
+impl From<config::ApprovalMode> for ApprovalMode {
+    fn from(mode: config::ApprovalMode) -> Self {
         match mode {
-            ApprovalMode::Untrusted => Self::WorkspaceWrite,
-            ApprovalMode::Never => Self::FullTrust,
+            config::ApprovalMode::Untrusted => Self::Ask,
+            config::ApprovalMode::Never => Self::Allow,
         }
     }
 }
@@ -146,50 +147,59 @@ pub enum Answer {
 }
 
 #[derive(Default)]
-struct SessionPermissions {
-    mode: Option<PermissionMode>,
+struct TreeApprovals {
+    mode: Option<ApprovalMode>,
     allowed: BTreeSet<ToolName>,
 }
 
-/// The desktop's approval policy: each session's mode and the tools allowed
-/// for it, in memory only (ADR-0035), so a restart asks again.
-// shortcut: keyed by the asking session, so a subagent starts from the default mode and asks for its own tools; key by tree once requests carry their root
-pub struct Permissions {
-    default: PermissionMode,
+/// The desktop's approval policy: each session tree's mode and the tools
+/// allowed for it, keyed by the root so subagents follow their tree; in
+/// memory only (ADR-0035), so a restart asks again.
+pub struct ApprovalModes {
+    default: ApprovalMode,
     asks_mutating: Arc<dyn ApprovalPolicy>,
-    sessions: Mutex<HashMap<SessionId, SessionPermissions>>,
+    trees: Mutex<HashMap<SessionId, TreeApprovals>>,
 }
 
-impl Permissions {
-    pub fn new(default: PermissionMode) -> Self {
+impl ApprovalModes {
+    pub fn new(default: ApprovalMode) -> Self {
         Self {
             default,
-            asks_mutating: config::approval_policy(ApprovalMode::Untrusted),
-            sessions: Mutex::default(),
+            asks_mutating: config::approval_policy(config::ApprovalMode::Untrusted),
+            trees: Mutex::default(),
         }
     }
 
-    fn sessions(&self) -> MutexGuard<'_, HashMap<SessionId, SessionPermissions>> {
-        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The mode of the tree rooted at `root`.
+    pub fn mode(&self, root: SessionId) -> ApprovalMode {
+        lock(&self.trees)
+            .get(&root)
+            .and_then(|tree| tree.mode)
+            .unwrap_or(self.default)
     }
 
-    fn mode(&self, session: SessionId) -> PermissionMode {
-        self.sessions()
-            .get(&session)
-            .and_then(|permissions| permissions.mode)
-            .unwrap_or(self.default)
+    pub fn set_mode(&self, root: SessionId, mode: ApprovalMode) {
+        lock(&self.trees).entry(root).or_default().mode = Some(mode);
+    }
+
+    /// Stop asking for `tool` anywhere in the tree rooted at `root`.
+    pub fn allow(&self, root: SessionId, tool: ToolName) {
+        lock(&self.trees)
+            .entry(root)
+            .or_default()
+            .allowed
+            .insert(tool);
     }
 }
 
-impl ApprovalPolicy for Permissions {
+impl ApprovalPolicy for ApprovalModes {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        let allowed = self
-            .sessions()
-            .get(&request.session)
-            .is_some_and(|permissions| permissions.allowed.contains(&request.tool));
-        match self.mode(request.session) {
-            PermissionMode::FullTrust => ApprovalVerdict::Allow,
-            PermissionMode::ReadOnly if matches!(request.side_effect, SideEffect::Mutating) => {
+        let allowed = lock(&self.trees)
+            .get(&request.root)
+            .is_some_and(|tree| tree.allowed.contains(&request.tool));
+        match self.mode(request.root) {
+            ApprovalMode::Allow => ApprovalVerdict::Allow,
+            ApprovalMode::Deny if matches!(request.side_effect, SideEffect::Mutating) => {
                 ApprovalVerdict::Deny {
                     reason: Some("the session is read-only".to_owned()),
                 }
@@ -216,7 +226,7 @@ type Errors = Arc<Mutex<HashMap<SessionId, String>>>;
 pub struct Desktop {
     asterpath: Asterpath,
     /// The policy `asterpath` was built with.
-    permissions: Arc<Permissions>,
+    modes: Arc<ApprovalModes>,
     /// New sessions' work-root rules and `config.toml` spec.
     workspace: Workspace,
     template: SessionSpec,
@@ -232,17 +242,17 @@ impl Desktop {
     /// `asterpath`'s environment adapter treats every session as continued
     /// (`WorkRoot { new: false }`); a new session gets `workspace`'s
     /// new-session tools as its explicit selection instead. `asterpath`'s
-    /// approval policy must be `permissions`.
+    /// approval policy must be `modes`.
     pub fn new(
         asterpath: Asterpath,
-        permissions: Arc<Permissions>,
+        modes: Arc<ApprovalModes>,
         workspace: Workspace,
         template: SessionSpec,
         projects_file: PathBuf,
     ) -> Self {
         Self {
             asterpath,
-            permissions,
+            modes,
             workspace,
             models: vec![template.model.clone()],
             template,
@@ -264,11 +274,11 @@ impl Desktop {
             pinned: None,
         };
         // shortcut: no MCP servers yet; they are loaded per work root, which a multi-project process does not have
-        let permissions = Arc::new(Permissions::new(settings.approval.into()));
-        let asterpath = config::assemble(&settings, Vec::new(), environment, permissions.clone())
+        let modes = Arc::new(ApprovalModes::new(settings.approval.into()));
+        let asterpath = config::assemble(&settings, Vec::new(), environment, modes.clone())
             .await
             .map_err(text)?;
-        let mut desktop = Self::new(asterpath, permissions, workspace, template, projects_file);
+        let mut desktop = Self::new(asterpath, modes, workspace, template, projects_file);
         for model in config::model_aliases(&settings).into_values() {
             if !desktop.models.contains(&model) {
                 desktop.models.push(model);
@@ -521,12 +531,7 @@ impl Desktop {
                     .into_iter()
                     .find(|request| request.session == session && request.tool_call_id == call)
                     .ok_or("the request is no longer waiting")?;
-                self.permissions
-                    .sessions()
-                    .entry(session)
-                    .or_default()
-                    .allowed
-                    .insert(request.tool);
+                self.modes.allow(request.root, request.tool);
                 ApprovalDecision::Allow
             }
             Answer::Deny { reason } => ApprovalDecision::Deny { reason },
@@ -535,13 +540,25 @@ impl Desktop {
         handle.approve(call, decision).await.map_err(text)
     }
 
-    pub fn permission_mode(&self, session: SessionId) -> PermissionMode {
-        self.permissions.mode(session)
+    /// The mode of `session`'s tree.
+    pub async fn approval_mode(&self, session: SessionId) -> Result<ApprovalMode, String> {
+        Ok(self.modes.mode(self.root(session).await?))
     }
 
-    /// Applies from the session's next tool call.
-    pub fn set_permission_mode(&self, session: SessionId, mode: PermissionMode) {
-        self.permissions.sessions().entry(session).or_default().mode = Some(mode);
+    /// Applies to `session`'s whole tree from its next tool call.
+    pub async fn set_approval_mode(
+        &self,
+        session: SessionId,
+        mode: ApprovalMode,
+    ) -> Result<(), String> {
+        self.modes.set_mode(self.root(session).await?, mode);
+        Ok(())
+    }
+
+    async fn root(&self, session: SessionId) -> Result<SessionId, String> {
+        root_of(&*self.asterpath.store(), session)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Writer access to `session`; refused while another process drives it.
