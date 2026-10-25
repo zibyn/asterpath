@@ -1,19 +1,19 @@
 # 存储抽象与 SQLite 首实现
 
-> 来源：[#5](https://github.com/zibyn/asterpath/issues/5)。
+> 来源：[#5](https://github.com/zibyn/asterpath/issues/5)、[#144](https://github.com/zibyn/asterpath/issues/144)。
 >
 > 前置：[事件日志与检查点恢复](event-log-recovery.md)。
 >
-> 范围：单进程、单写者、崩溃安全；存储只有一个 `SessionStore` trait（日志 + 会话目录 + 可选退役），唤醒由 facade 折叠会话事实发现。
+> 范围：多个进程共用一个存储、每棵会话树一个属主、崩溃安全；存储只有一个 `SessionStore` trait（日志 + 会话目录 + 可选退役），唤醒由 facade 折叠会话事实发现。
 >
-> 相关 ADR：[0023 存储契约](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)、[0002 日志模型](../adr/0002-log-topology-and-commit-semantics.md)。
+> 相关 ADR：[0023 存储契约](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)、[0036 会话树属主](../adr/0036-per-session-tree-ownership.md)、[0002 日志模型](../adr/0002-log-topology-and-commit-semantics.md)。
 
 ## 1. 决策摘要
 
 - **一个 SQLite 文件装全部 session。** 后端只实现一个 `SessionStore` trait（日志、会话目录、可选退役），由 `asterpath-storage-sqlite` 一个模块实现。
 - **信封强类型列 + `payload` JSON。** `SessionEvent` 不拆成 typed columns，事件形状变化不改 DDL（ADR-0002）。
 - **`journal_mode=WAL` + `synchronous=FULL` 为默认。** `NORMAL` 只作为显式配置项，供测试/开发用。
-- **写者是进程独占的。** `flock` 写者锁在打开时非阻塞获取，进程死亡由 OS 释放；不续约、不过期。第二个进程打开即 `WriterBusy`。
+- **写者独占的单位是会话树**（ADR-0036）。多个进程可以打开同一个库；驱动一棵树要先 `claim(root)`，被别的进程持有时得到 `OwnedElsewhere`。属主死亡由后端原生机制释放（SQLite：进程级字节区间锁），不续约、不过期。每次认领递增属主纪元，属主写入携带纪元，过期纪元在写事务内被拒绝。
 - **一条日志记录 = 一个 savepoint；同时排队的记录 group commit 进一个事务**（#97）。不设等待窗口；`seq` 在事务内用 `MAX(seq)+1` 分配，同批内的查重与 `seq` 看得到同批前面的记录，结果与逐条提交一致。
 - **只有会话目录 `sessions` 在 `append` 内同一事务维护**：它是日志的派生索引，不是真相源。唤醒与空闲不物化，由会话事实（protocol 的 `SessionFacts`）按需折叠。
 - **`idle` 是未闭合意图的谓词，不是缓存列。** `sessions` 没有 `state`；存在任一非 compaction 的 open intent 即非 `idle`。退役、唤醒与恢复共用同一个折叠（[event-log-recovery.md](event-log-recovery.md) §6）。
@@ -24,9 +24,9 @@
 
 | 层 | 负责 | 不负责 |
 | --- | --- | --- |
-| `SessionStore`（protocol） | append、按游标 scan、frontier；会话目录 `sessions` / `parent`；可选 `retire` | 调度、唤醒判定 |
+| `SessionStore`（protocol） | append、按游标 scan、frontier；会话目录 `sessions` / `parent`；`claim` / `owner`；可选 `retire` | 调度、唤醒判定 |
 | facade `Asterpath::wakeable()` | 唤醒发现：对 `sessions()` 逐个折叠会话事实 | 何时、按什么顺序驱动（宿主策略） |
-| `asterpath-storage-sqlite`（模块） | 实现 `SessionStore`；`sessions` 目录行；写者锁；WAL | 事件解码语义（归 protocol） |
+| `asterpath-storage-sqlite`（模块） | 实现 `SessionStore`；`sessions` 目录行；属主锁与纪元；WAL | 事件解码语义（归 protocol） |
 
 ## 3. 合约签名
 
@@ -39,8 +39,16 @@ pub struct NewEntry {
     pub session: SessionId,
     pub schema_version: u16,
     pub dedup_key: Option<DedupKey>,
+    pub owner: Option<OwnerToken>,  // 属主写入携带；外部写入为 None
     pub payload: serde_json::Value, // protocol 已序列化的 SessionEvent
 }
+
+/// 一次认领的凭证：根会话与认领时的纪元（ADR-0036）。
+pub struct OwnerToken { pub root: SessionId, pub epoch: u64 }
+
+/// 经一个存储句柄持有的认领；drop 释放。同一句柄对同一根的认领共享纪元，
+/// 最后一个 drop 时整棵树才释放。
+pub struct Claim { /* token() -> OwnerToken */ }
 
 pub struct LogEntry {
     pub log_id: LogId,
@@ -72,6 +80,13 @@ pub trait SessionStore: Send + Sync {
     fn parent(&self, session: SessionId)
         -> BoxFuture<'_, Result<Option<SessionId>, StorageError>>;
 
+    /// 认领以 `root` 为根的会话树。本句柄已持有：同一纪元、共享；别的句柄或
+    /// 进程持有：`OwnedElsewhere`；否则纪元加一。
+    fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>>;
+    /// 任一句柄或进程当前持有的认领；无人持有为 `None`。
+    fn owner(&self, root: SessionId)
+        -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>>;
+
     /// 整会话退役（retention.md）；默认 `RetirementError::Unsupported`。
     fn retire(&self, session: SessionId, expected_frontier: LogId)
         -> BoxFuture<'_, Result<(), RetirementError>> { /* Unsupported */ }
@@ -87,7 +102,7 @@ pub struct CatalogEntry {
 
 #[non_exhaustive]
 pub enum StorageError {
-    WriterBusy,
+    OwnedElsewhere { root: SessionId },   // 树被别处持有，或属主写入的纪元已过期
     SchemaTooNew { found: i64, supported: i64 },
     InvalidEntry(String),
     Corrupt { session: Option<SessionId>, detail: String },
@@ -97,7 +112,7 @@ pub enum StorageError {
 
 这套信封是 protocol 的唯一形状（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）：`append` 收 `NewEntry`，因为 `seq`、`log_id`、`recorded_at` 由存储分配（#3 §4）；#2 的 `append(LogEntry)` 与 `{ kind, schema_version, payload }` 已删除。类型化解码与 upcast 不在存储，由 protocol 的 `decode_entry(&LogEntry)` 负责（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）；`StorageError` 不带 `source`，符合「库契约不暴露 `Box<dyn Error>`」。
 
-存储不提供 `enqueue`、租约或 ack，也不回答「哪些会话要唤醒」：唤醒是 facade 的只读折叠（§7）。同一 session 的并发驱动由 facade 的 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。子会话与审批的等待唤醒属于引擎的持久等待（module-contracts.md §3.4），存储不参与。
+存储不提供 `enqueue`、租约或 ack，也不回答「哪些会话要唤醒」：唤醒是 facade 的只读折叠（§7）。一个存储句柄代表一个进程。跨进程的单驱动由认领保证；同一进程内同一 session 的并发驱动由 `drive()` 单飞拒绝；重复驱动不产生重复记录（幂等 append）。子会话与审批的等待唤醒属于引擎的持久等待（module-contracts.md §3.4），存储不参与。
 
 ## 4. SQLite schema
 
@@ -131,17 +146,23 @@ CREATE TABLE retired_sessions (
     last_log_id  INTEGER NOT NULL,
     retired_at   INTEGER NOT NULL               -- 仅诊断
 );
+
+-- 每棵会话树最近一次认领的纪元（ADR-0036）
+CREATE TABLE owners (
+    root   BLOB    PRIMARY KEY,
+    epoch  INTEGER NOT NULL
+);
 ```
 
-- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions`。
-- 发布前只有一个 DDL 版本（1），不写迁移；旧布局的开发库删掉重建。
+- `retired_sessions` **不是派生索引**：日志删除后无法重建，它是管理的真相来源。G7 只覆盖 `sessions`。`owners` 同样不是派生索引。
+- 发布前只有一个 DDL 版本（1），不写迁移；旧布局的开发库删掉重建。所有表都是 `CREATE TABLE IF NOT EXISTS`，每次打开都在 `BEGIN IMMEDIATE` 里执行一遍，所以早于 `owners` 的版本 1 库打开时补上这张表；并发首次打开只有一个建表。
 - **日志 schema 版本**：每条记录带写入时的 `schema_version`（`LOG_SCHEMA_VERSION`，当前固定为 1）；读到高于自身支持的版本即拒绝打开，不降级。发布前不承担历史数据兼容：不写 upcaster、不维护历史 fixture、持久 payload 不用 `#[serde(default)]`，形状变化直接改，开发库删掉重建。首个发布版的兼容策略（upcast 位置、逐版本黄金 fixture、兼容性门禁）届时以新 ADR 决定。
 
 - `UNIQUE(session_id, seq)` 同时承担 scan 顺序索引，不另建索引。
 - `event_kind` 由 `append` 从 payload 顶层键派生，不进 `NewEntry` / `LogEntry`，只参与幂等查重；扫描仍按 `(session, seq)`。判别式是持久值：变体改名时映射保持旧值（[ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)）。
 - `log_id` 用 `AUTOINCREMENT`：id 不复用，保持单调。
 - `recorded_at` 由 `append` 分配，不接受调用方传入；只供 trace/审计读取，不参与任何逻辑。
-- 无外键：单写者 + 派生索引，外键只会增加写放大。
+- 无外键：派生索引，外键只会增加写放大。
 - 物理 DDL 版本记在 `PRAGMA user_version`：0 → 建表；打开时发现更高版本 → `SchemaTooNew`。逐级前向迁移从首个发布版起才写。与 `LOG_SCHEMA_VERSION` 完全独立（ADR-0002）。
 
 ## 5. 写路径与事务边界
@@ -152,6 +173,9 @@ CREATE TABLE retired_sessions (
 BEGIN IMMEDIATE
   event = decode(payload)                        -- 失败 -> InvalidEntry；顶层键给出 event_kind
   kind = event_kind(event)
+  if session 已退役: return Retired
+  if owner 非空 且 owners[owner.root].epoch != owner.epoch:
+      return OwnedElsewhere                      -- 纪元围栏，在写事务内
   if dedup_key 非空:
       SELECT log_id FROM log WHERE session_id=? AND event_kind=? AND dedup_key=?
       if 命中: ROLLBACK; return 原 log_id        -- 不写
@@ -182,21 +206,22 @@ COMMIT                                           -- FULL 下返回时已 fsync
 
 - `PRAGMA journal_mode=WAL`；`synchronous=FULL`（默认）或 `NORMAL`（显式配置）。
 - **FULL 的承诺**：append 返回后，条目能扛进程崩溃**与掉电**。**NORMAL 的承诺**：能扛进程崩溃，掉电可能丢最近提交（Pi Durable 的取舍），只用于测试/开发。
-- 写者锁：`<db>.lock` 上非阻塞 `flock(2)`，进程生命周期持有；拿不到 → `WriterBusy`。不另设租约表。
-- 不允许多进程共享同一 DB；只读外部连接不在契约内。
-- `busy_timeout=0`：任何 `SQLITE_BUSY` 立即以 `Backend` 暴露，不静默等待。
-- 连接模型（#97）：写连接归一个专用 writer 线程；`append` / `retire` 经无界命令队列发给它，用 oneshot 回复。线程取到一条命令后把已排队的命令取完（单批上限 64），放进一个 `BEGIN IMMEDIATE` 事务，每条命令一个 `SAVEPOINT`：单条失败只回滚该条、只给该调用方回错误；`COMMIT` 成功后才回复，`COMMIT` 失败则整批都收到错误。读（`scan` / `frontier` / `sessions` / `parent`）走一条独立只读连接，在调用方同步执行，不排在 fsync 后面；append 返回后立即读必能读到。writer 线程停止后，在途与后续写都得到 `Backend`。drop 时先关队列、join 线程，最后释放 `flock`。
+- 属主锁：`<db>.owners` 文件上每个根会话一个字节的写锁，偏移是根会话 id 的 FNV-1a（与构建无关，各进程一致；碰撞只会让两棵树互斥，不会共享）。Linux 用 OFD 锁（`F_OFD_SETLK`），锁属于该存储句柄打开的文件描述，进程死亡由 OS 释放；同一句柄对同一根的多次认领在进程内引用计数，最后一个 `Claim` drop 时解锁。**macOS 暂不保证**：只有 POSIX 进程级锁，同一进程两个句柄共享锁、关掉任一描述符就全部释放。
+- 认领在 writer 线程上单独执行（不进批）：先取锁，再在自己的 `BEGIN IMMEDIATE` 事务里 `INSERT ... ON CONFLICT DO UPDATE SET epoch = epoch + 1 RETURNING epoch`；事务失败则解锁。调用方放弃等待时 writer 立即释放这次认领。`owner(root)`：本句柄持有则直接返回，否则用 `F_OFD_GETLK` 探测，被锁时读 `owners` 的纪元。
+- 多个进程可以共用一个 DB（同一台主机；WAL 的共享内存不能放在网络文件系统上）。
+- `busy_timeout=5000` ms：等其他进程的写事务。busy handler 之外的 `SQLITE_BUSY`（例如并发首次切换 WAL）在事务外以 1 ms 间隔重试，上限 5000 次；`BEGIN IMMEDIATE` 同样在事务外重试，不重放已执行的 savepoint。
+- 连接模型（#97）：写连接归一个专用 writer 线程；`append` / `retire` 经无界命令队列发给它，用 oneshot 回复。线程取到一条命令后把已排队的命令取完（单批上限 64），放进一个 `BEGIN IMMEDIATE` 事务，每条命令一个 `SAVEPOINT`：单条失败只回滚该条、只给该调用方回错误；`COMMIT` 成功后才回复，`COMMIT` 失败则整批都收到错误。读（`scan` / `frontier` / `sessions` / `parent`）走一条独立只读连接，在调用方同步执行，不排在 fsync 后面；append 返回后立即读必能读到。writer 线程停止后，在途与后续写都得到 `Backend`。drop 时先关队列、join 线程，再关读连接；属主锁随最后一个 `Claim` 释放。
 - **取消语义**：append 请求一旦发出，丢弃其 future 不会撤回写入——记录**可能已提交**而调用方不知道 `log_id`。状态以日志折叠为准：引擎在 select 中途放弃 drive、取消宽限期丢弃 future 的路径之后都会重读日志。
 - 文件创建时权限 `0600`。
 - 框架不做 WAL checkpoint、`VACUUM` 或 `journal_size_limit` 调参；日志保留/归档的 seam 见 [retention.md](retention.md)。删除释放页供复用，不保证文件缩小。
 
 ## 7. 唤醒发现
 
-- **唤醒发现归 facade，不归存储**（ADR-0023）。`Asterpath::wakeable() -> Result<Vec<SessionId>, AsterError>` 遍历 `store.sessions()`，逐会话 `scan_all` + `SessionFacts::fold`，保留 `is_wakeable()` 为真者（存在非 compaction 未闭合意图，或有待处理输入），按 id 排序、每个会话一次。退役会话不在 `sessions()` 中，因此永不唤醒。
-- **没有持久队列、租约或 ack。** 宿主的恢复循环是 `wakeable → open_session → drive`；并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
+- **唤醒发现归 facade，不归存储**（ADR-0023）。`Asterpath::wakeable() -> Result<Vec<SessionId>, AsterError>` 遍历 `store.sessions()`，跳过根会话被任何进程（含本进程）持有的树，再逐会话 `scan_all` + `SessionFacts::fold`，保留 `is_wakeable()` 为真者（存在非 compaction 未闭合意图，或有待处理输入），按 id 排序、每个会话一次。退役会话不在 `sessions()` 中，因此永不唤醒。
+- **没有持久队列、租约或 ack。** 宿主的恢复循环是 `wakeable → open_session → claim → drive`；认领失败（`OwnedElsewhere`）说明别的进程刚拿走这棵树；同一进程内的并发驱动由 `drive()` 单飞拒绝（`AgentError::Busy`），重复记录由幂等 append 吸收。
 - 成本随会话总量线性增长（启动时全量折叠）；会话量大时在 SQLite 模块内部加索引，不改接口。
 - spawn 超时不经存储：截止时间在 `ChildSessionSpawned.deadline` 上，open 的子会话意图已让父会话可唤醒，到期由 spawn 重放处理（[subagents.md](subagents.md) §9）。
-- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 取写者锁 → 读 `user_version`（新库建表）→ 宿主对 `wakeable()` 结果逐个驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
+- 没有 `recover_at_startup`：恢复是 per-session 的（`open_session` 折叠日志）。启动顺序：打开连接 → 设 PRAGMA → 读 `user_version`（建表）→ 宿主对 `wakeable()` 结果逐个认领并驱动。只有 `CompactionStarted` 未闭合的 session 仍视为 idle（丢弃一次摘要调用是安全的）。**不**预验证日志末条，不跑 `integrity_check`；解码失败在 scan 时暴露。
 
 ## 8. 保证清单
 
@@ -210,8 +235,30 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **G6 无跨流原子性**：任意两个 session 的写入不构成原子组。
 - **G7 索引可重建**：`sessions` 可完全由日志重建，不是真相源。
 - **G8 退役原子性（可选能力）**：`SessionStore::retire` 在同一事务里折叠会话事实判定空闲、写墓碑、删日志与 `sessions` 行；要么全部生效，要么全部不生效；退役后的会话对 `SessionStore` 的全部读取不可见。契约见 [retention.md](retention.md)。
+- **G9 属主（ADR-0036）**：同一时刻一棵树至多一个持有者；同一句柄的认领共享纪元，其他句柄得到 `OwnedElsewhere`；每次新认领纪元严格增大；带过期纪元的写入被拒绝且不留记录；不带凭证的写入不受属主限制；持有者死亡后树可被再次认领。
 
-trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、`flock`、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。
+trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径、文件锁、JSON 文本编码。SQLite 特有实现（`MAX(seq)`、partial index、`AUTOINCREMENT`）留在模块内。
+
+### 多进程下的降级语义（ADR-0036）
+
+- **规模靠单进程**：一个进程内 writer 线程合并提交；进程之间没有合并提交，各自 fsync，多进程只用于共存（CLI 与桌面端）和滚动重启。
+- **`max_live_children` 是每进程上限**，不是整个存储的上限。
+- **`Hooks::on_record` 在每个进程内对每条记录恰好一次**；跨进程同一条记录可能被两个进程各展示一次（例如非属主写入审批决定后，属主下一次 append 补扫到它），实时导出的宿主按 `(session, log_id)` 去重。
+- **跨进程审批有轮询延迟**：属主等待审批或子会话时至少每 500 ms 重读日志，别的进程写入的 `ApprovalDecided` 在一个轮询间隔内生效。
+- **属主迁移时调度器的准入缓存按纪元重建**：一棵树在新的纪元下第一次调度子会话时，丢掉旧纪元在内存里的排队与 Running 计数，从日志重建。
+
+`concurrency_bench` 的 `multi_process_bench`（2026-10-25，本地 SSD，release；每进程 8 棵树、每棵 100 次属主 append，墙钟含进程启动）：
+
+| synchronous | 进程数 | append/s | p50 (ms) | p99 (ms) | max (ms) |
+| --- | --- | --- | --- | --- | --- |
+| Full | 1 | 871 | 8.5 | 14.6 | 34.3 |
+| Full | 2 | 890 | 8.2 | 16.7 | 32.5 |
+| Full | 4 | 542 | 8.2 | 112.9 | 221.0 |
+| Normal | 1 | 1669 | 0.3 | 103.5 | 219.5 |
+| Normal | 2 | 2682 | 0.3 | 108.2 | 219.8 |
+| Normal | 4 | 3796 | 0.3 | 4.6 | 328.8 |
+
+FULL 下吞吐不随进程数增长，4 个进程时长尾来自 busy handler 的睡眠退避（不排队）。
 
 ## 9. 故障注入与测试
 
@@ -228,6 +275,8 @@ trait 不暴露：SQL、WAL、fsync、`log_id` 的 rowid 性质、文件路径�
 | 场景 | 归属 |
 | --- | --- |
 | S4 坏 payload → `Corrupt`；S5 幂等；S8 `seq` 单调、`recorded_at` 不参与逻辑；会话目录与退役 | 共享 `session_store_contract`（sqlite 与 memory） |
+| G9 属主：两个句柄并行持有不同的树、同一棵树被拒、释放后纪元增大、过期纪元被拒 | 共享 `session_store_contract`（`open_other_process`） |
+| 另一个进程认领别的树、被 SIGKILL 的属主释放树且其纪元被围栏 | SQLite 多进程测试 |
 | 新库只有当前表；更高 `user_version` → `SchemaTooNew` | SQLite crate 单测 |
 | S13 活会话不判 idle；S18 steering 输入后崩溃仍可唤醒；仅 compaction 未闭合时不可唤醒 | facade `wakeable` 双后端测试；会话事实单测 |
 | S1 `Safe` 工具中 kill、S2 `Unsafe` 工具中 kill、S3 模型流中 kill、S6 父等子时 kill | #6 / #17 的进程级验收；本轮只固定注入点契约 |

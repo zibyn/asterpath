@@ -56,7 +56,7 @@ pub enum CompactResult {
 | 触发 | 时机 | 规则 |
 | --- | --- | --- |
 | 自动阈值 | 每个 `BetweenSteps` | 估算输入超过 usable window，且存在可删前缀，且本回合自动压缩次数 < `max_auto_compactions_per_turn` |
-| 手动 | 仅 `Idle` | `SessionHandle::compact_now()`；不写 `TurnStarted` / `TurnCommitted` |
+| 手动 | 仅 `Idle` | `OwnedSession::compact_now()`；不写 `TurnStarted` / `TurnCommitted` |
 | provider 错误 | step 内，尚无 `AssistantMessage` | `ProviderError::context_exceeded`：每 step 强制压缩一次并重试同一 step |
 | `stop_reason` | 已有 `AssistantMessage` | `StopReason::ContextWindowExceeded`：不压缩、不重试，回合 `ContextExhausted` |
 
@@ -157,7 +157,7 @@ project(entries):
 
 ### 手动压缩
 
-- `SessionHandle::compact_now() -> Result<CompactResult, AsterError>` 委托引擎 agent 的 `compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，宿主先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
+- `OwnedSession::compact_now() -> Result<CompactResult, AsterError>` 委托引擎 agent 的 `compact_now(session)`；仅 `Idle` 且无活跃驱动者时允许，否则返回 `AsterError::Agent(AgentError::Busy)`，宿主先取消或等驱动结束。它与 `drive()` 共用 session 单飞，避免与下一次 `TurnStarted` 竞争。
 - 成功路径写 `CompactionStarted{trigger: Manual}` + `CompactionApplied` 两条事件，不写回合记录；无可删前缀返回 `NothingToDo`，未配置窗口或未装配 Compactor 返回 `NotConfigured`。
 - 摘要调用失败追加 `CompactionAborted{SummaryFailed}` 并返回 `Err(AsterError::Agent(AgentError::Compaction(..)))`；压后仍超窗追加 `CompactionAborted{Insufficient}` 并返回 `Ok(CompactResult::Insufficient)`，不改投影。
 - `NotConfigured` / `NothingToDo` / `Insufficient` 都是状态，不是错误；只有真正失败才是 `Err`。
@@ -243,6 +243,6 @@ pub struct CompactionConfig {
 - **#11**：已定。`Item::Compaction` 的形状与双协议渲染、`ModelSpec.context_window`、`Usage` 见 [protocol.md](protocol.md)。
 - **#12**：已定。`CompactionStarted` → `CompactionApplied` 的 span 见 [tracing.md](tracing.md)。
 - **#13**：已定。`compaction` 桶、turn / session / 子会话 rollup 与估算边界见 [usage.md](usage.md)。
-- **#15**：已定。`Compactor` 契约与 `SessionHandle::compact_now()` 见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。
+- **#15**：已定。`Compactor` 契约与 `OwnedSession::compact_now()` 见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。
 - **#19**：C3 / C4 / C10 的崩溃注入点与确定性测试。
 - **#27**：已定。两段式 trait、可选装配与 M0 组装见 [protocol.md](protocol.md) §6.1 与 [ADR-0002](../adr/0002-log-topology-and-commit-semantics.md)。

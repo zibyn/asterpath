@@ -11,7 +11,7 @@
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade（`asterpath`）、`asterpath-protocol` 与日志 schema**，适配器 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
 - `protocol` 无 feature；feature 只出现在 facade、CLI 与后端 crate。
-- 没有后台 driver：宿主显式调用 `SessionHandle::drive()`；同一 session 单飞；丢弃流不等于取消。
+- 没有后台 driver：宿主认领会话树后显式调用 `OwnedSession::drive()`；同一 session 单飞；丢弃流不等于取消。
 - 参考 CLI 对齐 Codex / Claude Code 共有核心子集：交互、`exec`、`doctor`、`debug`；专用 flag 有准入规则，其余配置走 `-c key=value`；退出码 `0/1/2`（§4）。
 - 三段验收由 `asterpath-acceptance` 的 `testdrive` 二进制 + 真 `SIGKILL` 驱动；#19 只负责五个注入点工具链。
 - v1 的 provider/model 在 session 创建时快照，**不支持 turn 内切换**；验收 (b) 验证的是 adapter 可替换性与规范化历史等价。
@@ -39,7 +39,7 @@
 - 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`app` / `tool` 只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
 - `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-skills` 是可选适配器（M6 交付）；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。技能不新增事件，日志 schema 不变。
-- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核、`ToolContext` 或日志；多项目宿主每个项目一个 `Asterpath` 实例。
+- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核、`ToolContext` 或日志；多项目宿主每个项目一个 `Asterpath` 实例，这些实例（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
 - `asterpath-testing` **不得**依赖 facade；需要组装真实引擎的测试放 facade 的 `tests/` 或 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：任何 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件或引擎内部测试，`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 
@@ -105,7 +105,7 @@ pub struct ConfigSnapshot {
 
 ## 3. 公共 API
 
-类型归属：ID（`SessionId` / `InputId` / … / `LogId`）、`Clock` / `Timestamp`、存储契约与 `scan_all`、`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` / `Hooks` / `UsageScope` / `UsageReport` / `Span` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `AsterError` / `DefaultCompactor` 在 facade。`McpServerConfig` 属于适配器 crate `asterpath-mcp`，技能相关类型属于 `asterpath-skills`，都不在稳定面。
+类型归属：ID（`SessionId` / `InputId` / … / `LogId`）、`Clock` / `Timestamp`、存储契约与 `scan_all`、`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` / `Hooks` / `UsageScope` / `UsageReport` / `Span` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `OwnedSession` / `AsterError` / `DefaultCompactor` 在 facade。`OwnedSession` 也在 facade；`McpServerConfig` 属于适配器 crate `asterpath-mcp`，技能相关类型属于 `asterpath-skills`，都不在稳定面。
 
 ### 3.1 稳定层级与版本
 
@@ -132,7 +132,7 @@ pub struct AsterpathConfig {
     pub approval: Arc<dyn ApprovalPolicy>,      // 默认见 tools.md §4
     pub tool: ToolConfig,                       // 管线并发、截断与外进程超时
     pub model_aliases: BTreeMap<ModelAlias, ModelSpec>,
-    pub max_live_children: NonZeroUsize,        // 调度器全局活子会话上限，默认 32
+    pub max_live_children: NonZeroUsize,        // 本进程调度器的活子会话上限，默认 32
     pub hooks: Vec<Arc<dyn Hooks>>,             // 扩展钩子，按此顺序调用（ADR-0025）
     pub spawn_tool: bool,                       // 是否注册模型可见的 spawn_agent，默认 true
 }
@@ -147,7 +147,9 @@ impl Asterpath {
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
     pub async fn sessions(&self, query: SessionQuery) -> Result<Vec<CatalogEntry>, AsterError>;  // 会话目录（ADR-0032）
-    pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 唤醒发现（storage.md §7）
+    pub async fn wakeable(&self) -> Result<Vec<SessionId>, AsterError>;  // 无主会话的唤醒发现（storage.md §7）
+    pub async fn owner(&self, session: SessionId)
+        -> Result<Option<OwnerToken>, AsterError>;      // 会话树当前的认领（ADR-0036）
     pub fn approval_gate(&self) -> Arc<ApprovalGate>;   // 宿主注册审批端点；见 tools.md §4
     pub async fn usage(&self, scope: UsageScope) -> Result<UsageReport, UsageError>;
     pub async fn trace(&self, session: SessionId) -> Result<Vec<Span>, TraceError>;
@@ -192,28 +194,41 @@ pub enum ToolSelection { All, Names(Vec<ToolName>) }
 
 pub struct UserInput { pub id: InputId, pub parts: Vec<Part> }
 
+/// 只读句柄：读取与外部写入（输入、审批决定、配置变更），任何进程都可用。
 impl SessionHandle {
     pub fn id(&self) -> SessionId;
+    pub async fn claim(&self) -> Result<OwnedSession, AsterError>;  // 认领会话树（ADR-0036）
     pub async fn submit_input(&self, input: UserInput) -> Result<InputId, AsterError>;
-    pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>>;
-    pub async fn cancel(&self) -> Result<(), AsterError>;
     pub async fn state(&self) -> Result<SessionState, AsterError>;
     pub async fn facts(&self) -> Result<SessionFacts, AsterError>;
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError>;
-    pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
     pub async fn update_config(&self, patch: ConfigPatch) -> Result<(), AsterError>;
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
     ) -> Result<(), AsterError>;
 }
+
+/// 属主句柄：Deref 到 SessionHandle；最后一个克隆 drop 时释放会话树。
+#[derive(Clone)]
+pub struct OwnedSession { /* .. */ }
+
+impl OwnedSession {
+    pub fn owner(&self) -> OwnerToken;
+    pub fn drive(&self) -> BoxStream<'_, Result<AgentEvent, AsterError>>;
+    pub async fn cancel(&self) -> Result<(), AsterError>;
+    pub async fn compact_now(&self) -> Result<CompactResult, AsterError>;
+}
 ```
+
+- `create_session` / `open_session` / `fork_session` 都返回只读句柄；驱动、手动压缩、取消（子会话调度在驱动内）只在 `claim()` 得到的 `OwnedSession` 上。认领的是会话所在树的根：同一个 `Asterpath` 内重复认领共享同一纪元，另一个进程持有时得到 `AsterError::Storage(StorageError::OwnedElsewhere)`。非属主进程要取消，先用 `Asterpath::owner` 找到属主，由宿主路由过去。
+- 驱动与手动压缩期间的每条 append 都携带认领的 `OwnerToken`，存储拒绝过期纪元；输入、审批决定与配置变更不携带，任何进程都可以写。
 
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
 - `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。
 - `projection()` 返回对日志折叠出的模型可见投影（每项带来源 log id），不读驱动者内存。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
-- `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒该调用的等待。
+- `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒本进程内该调用的等待；属主在另一个进程时，它的等待至多 500 ms 后从日志读到决定。
 - `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。宿主直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是宿主选的 dedup key，随补丁落日志：追加与增删工具不幂等，宿主重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
@@ -253,7 +268,7 @@ pub enum AgentError {
 }
 ```
 
-- agent 循环是引擎内部的 `Agent`，不是 trait、不可替换（ADR-0026）；`SessionHandle::drive()` / `compact_now()` 是它的公开入口。
+- agent 循环是引擎内部的 `Agent`，不是 trait、不可替换（ADR-0026）；`OwnedSession::drive()` / `compact_now()` 是它的公开入口。
 - `AgentEvent` 是实时 UI 流，不是日志；恢复后的历史用 `store()` / `trace(session)`。
 - `AgentEvent` 的 JSON 形状属于 Tier 1 兼容承诺：tag 为 `type`、变体名 snake_case（`PartDelta` 同样），ID 沿用现有序列化形式；`AgentEvent` / `ApprovalRequest` / `PartDelta` 只派生 `Serialize`。日志类型（`SessionEvent` 等）的 serde 形状不受影响。
 - `(step, output_index)` 是流内块的身份：`ModelDelta.output_index` / `part_index` 原样取自适配器的 `StreamEvent::PartDelta`；`ToolStarted.output_index` 是该调用 item 在本 step 响应中的 `output_index`，UI 据此把此前的 `JsonArgs` 片段归属到 `call`。恢复执行的 step 不记录 `output_index`，此时为 item 在 `AssistantMessage` 中的位置。

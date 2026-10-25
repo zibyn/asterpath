@@ -41,11 +41,11 @@
 | --- | --- | --- |
 | `asterpath-protocol` | `SessionStore::retire`、`RetirementError`、会话事实 `is_idle()` | 策略、文件格式、调度、导出 |
 | `asterpath-storage-sqlite` | 退役事务、墓碑、目录行清理 | 何时退役、归档落盘、恢复 |
-| 宿主 / 未来扩展模块 | 保留策略、导出与 JSONL、重试、恢复 | 直接写 SQLite、绕过写者锁 |
+| 宿主 / 未来扩展模块 | 保留策略、导出与 JSONL、重试、恢复 | 直接写 SQLite、绕过存储模块 |
 
 - 退役是 `SessionStore` 的可选方法：默认实现返回 `RetirementError::Unsupported`，后端覆盖它即提供退役。
 - 宿主调用 `Asterpath::store().retire(session, frontier)`；注入的自定义存储可能返回 `Unsupported`。
-- 写操作只能经过存储模块：目录行必须在同一事务维护，写者锁也由它独占。宿主不得打开同一个 SQLite 文件，也不得依赖具体模块 crate。
+- 写操作只能经过存储模块：目录行必须在同一事务维护，属主锁与纪元也由它维护。宿主进程可以经存储模块打开同一个 SQLite 文件（ADR-0036），但不得用自己的连接写它，也不得依赖具体模块 crate。
 - 保留策略**不进** `ConfigSnapshot`，与审批策略一样是宿主代码，不持久化。
 
 ## 4. 合约
@@ -96,7 +96,7 @@ pub enum RetirementError {
 - **`idle` 就是「没有非 compaction 的未闭合意图」**：open turn / step / 工具（含审批等待）/ 子会话等待都会让会话非 idle（[storage.md](storage.md) §5）。唯一例外是 `CompactionStarted`，它没有副作用，丢弃它是安全的。退役读两个会话的完整日志；退役是低频管理操作，可接受。
 - **`ParentNotIdle`** 是“父会话没有未闭合 spawn 意图”的可强制执行形式：父会话 `idle` 意味着它所有工具意图都已闭合，`ChildSessionCompleted` 必已写入。调用方仍负责自底向上删除；级联删除不做。
 - **幂等重试**：退役是单事务，提交后、调用方收到结果前崩溃时，用同一 `expected_frontier` 重试返回成功。frontier 不同说明会话在导出后被推进过，必须先重新导出。
-- 退役由单写者串行化；CAS 针对的是同进程内并发驱动，不是多进程。
+- 退役与所有进程的 append 一样在 SQLite 写事务内串行化；CAS 挡住的是导出之后任何进程推进了会话。退役不要求认领。
 - 删除后 `retired_sessions` 行**永不自动清理**。墓碑清理与 id 复用不在 v1 合约内。
 - 对已退役会话的 `append` 返回 `StorageError::Retired`，不写入（含去重命中的重试）；两个后端一致，进 contract suite。
 

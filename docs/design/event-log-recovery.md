@@ -282,12 +282,12 @@ recover(session):
 | S15 | 崩溃于批量写 `ToolCallRequested` 之间 | 恢复按 `provider_call_id` 补齐剩余意图，不重复、不串位；每条 `ToolResult` 绑定自己的 `ToolCall` |
 | S16 | 崩溃于 pre-execute 之后、意图写入之前 / 意图写入之后 | 前者恢复重跑 pre-execute；后者不重跑，工具按已记录的 effective args 执行 |
 | S17 | 恢复遇到 `ToolCallRequested{provenance: Unknown}` | 恰写一条 `ToolResult{Failed, NotFound}`；不查审批、不重跑；模型可见 |
-| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Asterpath::wakeable()`；宿主 `open_session` + `drive()` 后输入恰被投影一次 |
+| S18 | `submit_input` 之后、`drive()` 之前崩溃 | 重启后该 session 出现在 `Asterpath::wakeable()`；宿主 `open_session` + `claim()` + `drive()` 后输入恰被投影一次 |
 
 ## 8. 留给下游
 
 - **#4**：`schema_version` 与发布前的兼容口径见 [storage.md](storage.md) §4；首个发布版的兼容策略届时另立 ADR。
-- **#5**：已定。存储契约、DDL、写者锁、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0023](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
+- **#5**：已定。存储契约、DDL、属主锁（ADR-0036）、事务边界、故障注入点见 [storage.md](storage.md) 与 [ADR-0023](../adr/0023-storage-holds-log-and-catalog-wake-by-fold.md)。SQLite 提交原子，因此没有 torn-tail 修复；坏数据一律硬错误。
 - **#6**：已定。turn/step、取消、steering、默认配置见 [agent-loop.md](agent-loop.md) 与 [ADR-0006](../adr/0006-agent-loop-execution-model.md)。
 - **#7**：已定。工具契约、执行管线与审批边界见 [tools.md](tools.md) 与 [ADR-0007](../adr/0007-approval-and-sandbox-layers.md)。
 - **#8**：已定。spawn 是同步工具调用；上下文策略、结果形状、取消与孤儿规则见 [subagents.md](subagents.md) 与 [ADR-0008](../adr/0008-subagent-model.md)。

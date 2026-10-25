@@ -541,7 +541,7 @@ pub enum CompactionError {
 - `plan` 不产生 I/O：读入投影、算切点与估算；`compact` 只做摘要调用与压后校验。`compact` 只返回 `Applied` / `Insufficient`。
 - `first_kept` 必须是 `step_starts` 中的某个 `LogId`；`replaces.first` = `history` 首条的 origin 起点；`replaces.last` = `first_kept` 之前**最后一个模型可见 origin**（不是原始日志的前一条）。见 [compaction.md](compaction.md) §4。
 - 估算：`estimated_input = last_usage.usage.input_total() + bytes/3(history 中 origin > last_usage.origin 的条目)`；无 `last_usage` 时不做自动压缩。
-- `CompactResult` 是 `SessionHandle::compact_now` 与 loop 的公开展示；`NotConfigured` / `NothingToDo` / `Insufficient` 是状态，不是错误。
+- `CompactResult` 是 `OwnedSession::compact_now` 与 loop 的公开展示；`NotConfigured` / `NothingToDo` / `Insufficient` 是状态，不是错误。
 - 类型归属：本节 trait 与值类型在 `asterpath-protocol`；`LogIdRange` 也在 protocol；`CompactionConfig` 见 [compaction.md](compaction.md) §8。
 
 ## 7. Usage 归一化

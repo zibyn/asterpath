@@ -277,7 +277,7 @@ pub struct Summary {
 - `child.depth = parent.depth + 1`；root = 0；`max_depth = 3` 表示允许的最大子 depth。超限直接 `Failed{InvalidArgs}`，不创建子会话。
 - 并发按**每父会话**计：已创建且未完成的子会话数，默认 `8`。
   - spawn 是 `Parallel` 工具，同一 step 内受工具管线 `ToolConfig.max_parallel_calls`（部署级，默认 `8`）约束，因此每父实际并发 = min(`max_concurrent_children`, `max_parallel_calls`)。默认两者相等，每父上限不触发；它的用途是按会话调低，在不降低普通工具并行度的前提下单独限制子智能体（2026-10-23 越界设计审计候选 7：核实后保留）。
-- 调度器全局 `max_live_children = 32`：部署级，配置在 `AsterpathConfig.max_live_children`，不进会话快照。
+- 调度器全局 `max_live_children = 32`：部署级，配置在 `AsterpathConfig.max_live_children`，不进会话快照。它是**每进程**上限：多个进程共用一个存储时各算各的（ADR-0036）。
 - 超限 **FIFO 排队**，不报错；排队是内存状态（§3.4），崩溃后按 open spawn 调用重建。
 - 排队期间 spawn 工具调用保持 open；父取消时排队项直接丢弃。
 - 不做跨父公平调度、抢占或优先级；v1 只有单父内 FIFO，**跨父准入顺序无保证**（跨流没有单一 `seq` 可排序）。
@@ -286,7 +286,7 @@ pub struct Summary {
 
 ### 父取消
 
-1. 父 `SessionHandle::cancel()` 广播 `CancelToken`；spawn 工具观察 token。
+1. 父 `OwnedSession::cancel()` 广播 `CancelToken`；spawn 工具观察 token。
 2. 父驱动方把本次 step 的 child 等待标记为 cancelling；scheduler 向子会话发取消。
 3. 父最多等 `cancel_grace`（#6，默认 10s）。
 4. 收尾顺序：`ChildSessionCompleted{Cancelled{Parent}}` → spawn 的 `ToolResult{Interrupted}` → `StepCommitted` → `TurnCommitted(Cancelled)`。

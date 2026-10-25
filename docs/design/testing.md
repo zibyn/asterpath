@@ -12,7 +12,7 @@
 - 装饰器命中后的动作只有两档：`Halt`（写 marker 后永久挂起，由父进程 `SIGKILL`）与 `Panic`（进程内测试）。
 - **不用 panic / `abort` / `exit` / 注入异常冒充崩溃**；进程级验收一律真 `SIGKILL`（[acceptance.md](../spec/acceptance.md) §1）。
 - protocol 提供最小 `Clock { now() }` + `SystemClock`；存储契约不收时间（#73）；`ManualClock` 在 `asterpath-testing`。
-- 后端中立契约套件：**G2–G7 在 in-memory 与 SQLite 上都跑**；G1、G8、`Corrupt`、WAL/`flock`、迁移只测 SQLite。
+- 后端中立契约套件：**G2–G7 在 in-memory 与 SQLite 上都跑**；G1、G8、`Corrupt`、WAL、迁移只测 SQLite。G9 属主在两个后端上都跑（第二个存储句柄代表第二个进程），真进程间的属主锁与 `SIGKILL` 释放只测 SQLite。
 - CI 分三层：单测+契约（5 分钟）、进程级验收（Linux，整套 5 分钟，单 marker 等待 15 秒）、feature 矩阵。
 - 验收 fixture 单一来源：`asterpath-acceptance/fixtures/*.json`；#6 的 L 场景与 #17 的 R 场景复用，不另建。
 
@@ -157,7 +157,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F);
 仅 SQLite（`asterpath-storage-sqlite` 自己的测试，不放进共享套件）：
 
 - G1：`append` 返回后 `SIGKILL`，重启能读到该条；FULL 下的掉电承诺以 `synchronous=FULL` 配置测试，不在 CI 模拟真实掉电。
-- `Corrupt` 硬错误、WAL 模式、`flock` → `WriterBusy`、`busy_timeout=0`、`0600` 权限、`user_version`（新库只有当前表、更高版本 → `SchemaTooNew`）。
+- `Corrupt` 硬错误、WAL 模式、另一进程持有的树 → `OwnedElsewhere`、被 `SIGKILL` 的属主释放树且其纪元被拒、`busy_timeout=5000`、`0600` 权限、`user_version`（新库只有当前表、更高版本 → `SchemaTooNew`）。
 - G8：退役事务中途失败整体回滚；跨重启的墓碑幂等与残留行（[retention.md](retention.md)）。
 
 in-memory 后端在文档与代码中显式标注 **不满足 G1**；它实现退役，语义与 SQLite 一致（同一把锁内判定、CAS、删除、墓碑）。

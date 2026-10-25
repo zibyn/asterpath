@@ -21,7 +21,7 @@
 
 **回合**：
 
-- 由输入驱动。`InputRecorded` 到达即落盘；驱动方调用 `SessionHandle::drive`（引擎 agent 的 `run`）时，session 空闲则写 `TurnStarted` 开始新回合，已有回合则把输入作为 steering 并入当前回合。
+- 由输入驱动。`InputRecorded` 到达即落盘；驱动方调用 `OwnedSession::drive`（引擎 agent 的 `run`）时，session 空闲则写 `TurnStarted` 开始新回合，已有回合则把输入作为 steering 并入当前回合。
 - 包含零或多个 step。零 step 的回合只可能由 pre-step gate 或压缩路径（失败 / 仍超窗）结束。
 - 由 `TurnCommitted { reason }` 结束；之后 session 回到 Idle。
 
@@ -249,7 +249,7 @@ StepCommitted
 
 ## 6. 取消
 
-- `SessionHandle::cancel()`：回合级、幂等。Idle 时是 no-op；取消后 session 仍接受新输入（新回合）。
+- `OwnedSession::cancel()`：回合级、幂等。Idle 时是 no-op；取消后 session 仍接受新输入（新回合）。
 - **模型流中**：立即 abort，写 `ModelCallAborted{Cancelled}`，不重试；`StepCommitted`；`TurnCommitted(Cancelled)`。
 - **退避等待中**：打断 sleep，同上。
 - **工具执行中**：向所有在途工具发取消信号；在 `cancel_grace` 内返回的工具按真实结果记 `Completed` / `Failed`；到期仍未返回的 drop future 并写 `ToolResult{Interrupted, output: None}`。一个调用只有一个终态写入者；取消接管后不再触发该调用的超时（[tools.md](tools.md) §6）。
@@ -370,6 +370,6 @@ pub struct TurnConfig {
 - **#11**：已定。`ProviderError` 的 retryable/上下文分类、`Usage`、`StopReason`（含 `PauseTurn`、`ContextWindowExceeded`）见 [protocol.md](protocol.md)。
 - **#12**：span 命名与属性映射。
 - **#13**：已定。token 聚合、`partial` 桶与实时观察（`on_record` + `usage_of`）见 [usage.md](usage.md)。
-- **#15**：已定。`SessionHandle::drive` / `AgentEvent` / `AgentError` 的精确签名（agent 是引擎内部类型，ADR-0026）与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
+- **#15**：已定。`OwnedSession::drive` / `AgentEvent` / `AgentError` 的精确签名（agent 是引擎内部类型，ADR-0026）与驱动模型见 [packaging.md](packaging.md) §3.3–§3.4。
 - **#17**：已定。spawn 工具重放吸收 R1–R3、子会话等待见 [ADR-0008](../adr/0008-subagent-model.md)。
 - **#27**：已定。`Compactor` 契约、未装配时的 `NotConfigured` 路径见 [protocol.md](protocol.md) §6.1 与 [packaging.md](packaging.md) §3.3–§3.4。
