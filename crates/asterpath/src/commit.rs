@@ -16,6 +16,8 @@ use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::lock::Mutex as AsyncMutex;
 
+use crate::watch::Watchers;
+
 /// Last record shown to `on_record` for one session.
 #[derive(Clone, Copy, Default)]
 enum Cursor {
@@ -32,14 +34,21 @@ pub(crate) struct CommitLog {
     // shortcut: one cursor per session touched by this process, never evicted;
     // evict on retirement if long-lived hosts touch very many sessions.
     cursors: Mutex<HashMap<SessionId, Arc<AsyncMutex<Cursor>>>>,
+    /// Told of every commit, so this process's watchers need not poll.
+    watchers: Arc<Watchers>,
 }
 
 impl CommitLog {
-    pub(crate) fn new(inner: Arc<dyn SessionStore>, hooks: Vec<Arc<dyn Hooks>>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn SessionStore>,
+        hooks: Vec<Arc<dyn Hooks>>,
+        watchers: Arc<Watchers>,
+    ) -> Self {
         Self {
             inner,
             hooks,
             cursors: Mutex::new(HashMap::new()),
+            watchers,
         }
     }
 
@@ -121,11 +130,17 @@ impl SessionStore for CommitLog {
         // A write made while a drive or compaction is polled is an owner
         // write: it carries that claim (ADR-0036).
         entry.owner = entry.owner.or(crate::owner::current());
-        // No hooks, no observation work (#74).
-        if self.hooks.is_empty() {
-            return self.inner.append(entry);
-        }
-        Box::pin(self.append_observed(entry))
+        let session = entry.session;
+        Box::pin(async move {
+            // No hooks, no observation work (#74).
+            let log_id = if self.hooks.is_empty() {
+                self.inner.append(entry).await?
+            } else {
+                self.append_observed(entry).await?
+            };
+            self.watchers.committed(session);
+            Ok(log_id)
+        })
     }
 
     fn scan(&self, query: LogQuery) -> BoxStream<'_, Result<LogEntry, StorageError>> {

@@ -59,7 +59,7 @@ pub struct ConfinedSpawn {                 // #[non_exhaustive]
 规则：
 
 - **纯变换、无状态、无 session**：策略已由调用方解析好；provider 不认 `SessionId`，可直接单测。
-- **完整环境进出**：调用方负责把继承环境与覆盖项合并成完整 `env`；provider 有权净化或追加。这样「MCP 服务进程继承宿主环境」的风险有了统一的收窄点。
+- **完整环境进出**：调用方负责把继承环境与覆盖项合并成完整 `env`；provider 有权净化或追加。继承部分只有 `INHERITED_ENV` 白名单（`PATH`、`HOME`、`LANG` 等），覆盖项来自会话环境的 `SpawnEnv.vars` 或 MCP 配置的 `env`，进程里的其他变量不会进入子进程（ADR-0037，`SpawnEnv::complete`）。
 - **返回数据，不返回 `Command`**：调用方自己构造进程与管道；stdio 归调用方，provider 不碰。
 - **不经过 shell**：`program` 与 `args` 原样传递，与 [#16](./plugins.md) 的传输规则一致。
 - provider 在组装期构造；后端缺失或初始化失败时由宿主决定中止启动，还是让受限调用点 fail closed。

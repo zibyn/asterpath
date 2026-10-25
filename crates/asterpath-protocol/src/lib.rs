@@ -10,6 +10,7 @@ pub mod contracts;
 pub mod decode;
 pub mod dedup;
 pub mod encode;
+pub mod environment;
 pub mod error;
 pub mod event;
 pub mod facts;
@@ -48,6 +49,7 @@ pub use contracts::{
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
+pub use environment::{EnvironmentAdapter, EnvironmentError, SessionEnvironment};
 pub use error::{ExecutionError, RetirementError, StorageError};
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,
@@ -84,8 +86,8 @@ pub use provider::{
     ProviderError, ProviderErrorKind, SessionContext, StreamEvent,
 };
 pub use sandbox::{
-    ConfinedSpawn, Enforcement, SandboxAspect, SandboxError, SandboxPolicy, SandboxProvider,
-    SpawnRequest,
+    ConfinedSpawn, Enforcement, INHERITED_ENV, SandboxAspect, SandboxError, SandboxPolicy,
+    SandboxProvider, SpawnEnv, SpawnRequest,
 };
 pub use time::{Clock, SystemClock, Timestamp, unique_bytes};
 pub use tool::{

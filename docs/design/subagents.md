@@ -249,7 +249,7 @@ pub struct Summary {
 
 - `summary` 取子会话**最后一条已提交 `AssistantMessage`** 的 text/refusal item；剥掉 reasoning 与工具调用；可能为空（例如最后一步只有工具调用）。
 - 结果进入父上下文时受 #7 的截断上限（默认 64 KiB/调用）。
-- 父不自动获得子的完整 transcript；宿主可通过 `Asterpath::store()` 读取子流。
+- 父不自动获得子的完整 transcript；宿主可通过 `Asterpath::store()` 读取子流，或对子会话 `watch`（[ADR-0038](../adr/0038-watch-separates-observing-from-driving.md)）：已提交记录照常可见，子驱动的实时事件（`AgentEvent`）不进父的 `drive` 流，而是扇出给本进程内该子会话的订阅者。
 
 映射：
 

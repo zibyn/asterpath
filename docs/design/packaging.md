@@ -39,7 +39,7 @@
 - 角色规则（`xtask` 强制）：`protocol` 不依赖任何成员、不声明 feature；`adapter` 只依赖 `protocol` 与白名单列出的同类适配器；`engine` 只依赖 `protocol` 与它再导出 / 按 feature 装配的适配器；`app` / `tool` 只受各自 `allow` 列表约束（`"*"` = 任意成员，仅 app）。没有"模块之间零依赖"规则：引擎内部的协作是同 crate 的 `mod`（ADR-0026）。
 - `asterpath-sandbox-macos` 仍为预留名，不建。`asterpath-storage-admin` 不建（[#18](https://github.com/zibyn/asterpath/issues/18)：策略与归档由宿主实现）；MCP adapter 在 `asterpath-mcp` 内，ACP 不做（[#20](https://github.com/zibyn/asterpath/issues/20)）。
 - `asterpath-skills` 是可选适配器（M6 交付）；只依赖 `protocol` 与外部 `saphyr`、`futures-core`、`serde`、`serde_json`。技能不新增事件，日志 schema 不变。
-- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核、`ToolContext` 或日志；多项目宿主每个项目一个 `Asterpath` 实例，这些实例（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
+- `asterpath-tools` 是可选适配器（#83）：每个工具接收一个绝对根目录，路径越出根目录返回 `Denied`；`bash` 只经由 `SandboxProvider` 启动进程，没有 provider 时仅 `FullAccess` 放行。工作区不进入内核或日志。多工作根的宿主在 builder 上注册会话环境适配器（`EnvironmentAdapter`，ADR-0037）：创建、分叉、打开会话时按根会话的宿主元数据解析出该会话的工具、沙箱策略与子进程变量（`SessionEnvironment`），子会话用根会话的；同名时会话环境的工具优先于 builder 的。认领时若解析出的描述符与生效配置不同就替换，解析不到的工具移除（追加一条 `ConfigChanged`），从不自动新增。`ToolContext::spawn` 把沙箱策略与变量交给工具；`bash` 与 MCP stdio 只继承 `INHERITED_ENV` 白名单。一个 `Asterpath`（以及 CLI、桌面端等其他进程）可以共用一个数据库，各自认领自己驱动的会话树（ADR-0036）。
 - `asterpath-testing` **不得**依赖 facade；需要组装真实引擎的测试放 facade 的 `tests/` 或 `asterpath-acceptance`。反向的 `[dev-dependencies]` 允许：任何 crate 可 dev-depend on `asterpath-testing` 跑共享契约套件或引擎内部测试，`cargo xtask check-deps` 只校验普通依赖边。
 - 机器可读白名单在根目录 `deps-allowlist.toml`；上表是它的规范副本，冲突以文件为准并由 `xtask` 报错。
 
@@ -105,7 +105,7 @@ pub struct ConfigSnapshot {
 
 ## 3. 公共 API
 
-类型归属：ID（`SessionId` / `InputId` / … / `LogId`）、`Clock` / `Timestamp`、存储契约与 `scan_all`、`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` / `Hooks` / `UsageScope` / `UsageReport` / `Span` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `OwnedSession` / `AsterError` / `DefaultCompactor` 在 facade。`OwnedSession` 也在 facade；`McpServerConfig` 属于适配器 crate `asterpath-mcp`，技能相关类型属于 `asterpath-skills`，都不在稳定面。
+类型归属：ID（`SessionId` / `InputId` / … / `LogId`）、`Clock` / `Timestamp`、存储契约与 `scan_all`、`SessionSpec` / `ToolSelection` / `UserInput` / `ConfigSnapshot` / `AgentEvent` / `AgentError` / `RunRequest` / `SessionState` / `ModelAlias` / `ApprovalDecision` / `CancelToken` / `ApprovalPolicy` / `ToolConfig` / `Compactor` / `CompactResult` / `Hooks` / `UsageScope` / `UsageReport` / `Span` 在 `asterpath-protocol`；`Asterpath` / `AsterpathBuilder` / `AsterpathConfig` / `SessionHandle` / `OwnedSession` / `WatchEvent` / `AsterError` / `DefaultCompactor` 在 facade。`OwnedSession` 也在 facade；`McpServerConfig` 属于适配器 crate `asterpath-mcp`，技能相关类型属于 `asterpath-skills`，都不在稳定面。
 
 ### 3.1 稳定层级与版本
 
@@ -207,6 +207,16 @@ impl SessionHandle {
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
     ) -> Result<(), AsterError>;
+    // 观察而不驱动（ADR-0038）；不需要认领，流不会自行结束
+    pub fn watch(&self, after: Option<LogId>)
+        -> BoxStream<'static, Result<WatchEvent, AsterError>>;
+}
+
+#[non_exhaustive]
+pub enum WatchEvent {
+    Record(Box<CommittedRecord>),  // 已提交记录，按日志顺序；log_id 即续订游标
+    Synced,                   // 重放追平，之后是新提交；每次 watch 一次
+    Live(AgentEvent),         // 本进程内驱动的实时事件，不重放
 }
 
 /// 属主句柄：Deref 到 SessionHandle；最后一个克隆 drop 时释放会话树。
@@ -232,6 +242,7 @@ impl OwnedSession {
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒本进程内该调用的等待；属主在另一个进程时，它的等待至多 500 ms 后从日志读到决定。
 - `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。宿主直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是宿主选的 dedup key，随补丁落日志：追加与增删工具不幂等，宿主重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
+- `watch(after)` 先订阅本进程的实时事件，再从游标（不含；`None` 为整条日志）重放已提交记录，追平处发一次 `Synced`，之后推送新提交。本进程的提交即时唤醒订阅者；另一进程的提交靠轮询存储，至多 500 ms 后到达。`Live` 是本进程内任何 `drive`（含父会话驱动的子会话）产生的 `AgentEvent`，扇出给该会话的所有订阅者，不只给驱动者；跨进程订阅者只看到记录。订阅者落后超过缓冲（1024 条）时跳过部分 `Live`，记录不丢。同一次唤醒中先给 `Live` 再给记录。续订时传最后一条 `Record` 的 `log_id`，不丢不重。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由宿主负责，宿主退出等价于崩溃，恢复走日志。
 - 丢弃 stream **不**触发取消：已 append 的记录保留，未闭合意图由恢复处理。取消必须显式调用 `cancel()`。
 
@@ -383,7 +394,9 @@ pub enum AsterError {
 
 - 新会话：宿主元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
 - MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
-- 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：新会话以工作根目录为根、按沙箱策略调用 `asterpath_tools::coding(...)` 注册六个工具；`[tools] enabled = [...]` 选子集，未知工具名是配置错误（退出 2）。续会话总是注册全部六个，模型可见的子集由日志里的生效配置决定。
+- 工作根（ADR-0037）：CLI 不改进程当前目录。它注册一个按元数据 `cwd`（续会话时显式 `-C` 优先）解析的会话环境，工作区工具、技能加载工具与 `workspace-write` 的可写根都以工作根为根；没配 `cwd` 的 MCP stdio 服务在工作根启动。
+- 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：新会话以工作根目录为根、按沙箱策略调用 `asterpath_tools::coding(...)` 解析出六个工具；`[tools] enabled = [...]` 选子集，未知工具名是配置错误（退出 2）。续会话总是解析全部六个，模型可见的子集由日志里的生效配置决定。
+- 子进程环境：`bash` 只看到 `PATH`、`HOME`、`LANG` 等最小白名单与 `[sandbox] env` 列出的变量。
 - 技能：`[skills] enabled` 只影响新会话（[skills.md](skills.md)）。
 - 压缩：总是装配 `DefaultCompactor`；是否压缩取决于 `[model] context_window`，未配置时压缩路径为 `NotConfigured`。
 
@@ -399,6 +412,7 @@ context_window = 200000       # 映射到 ModelSpec.context_window；省略 = �
 
 [sandbox]
 mode = "workspace-write"      # read-only | workspace-write（默认，可写根 = 工作根目录）| full-access
+env = ["SSH_AUTH_SOCK"]       # 传给 bash 的本进程变量名；默认只传最小白名单（ADR-0037）
 
 [mcp_servers.docs]            # 表名即 server id（[a-z0-9-]{1,32}），工具名为 docs__<tool>
 command = "docs-mcp"          # stdio：command / args / env / cwd

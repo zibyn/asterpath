@@ -3,7 +3,10 @@
 //!
 //! Each tool is built for one absolute root directory; every path argument is
 //! resolved against it and anything that leaves it is `Denied`. A host serving
-//! several projects builds one tool set (and one `Asterpath`) per project.
+//! several projects builds one tool set per project in its session
+//! environment (ADR-0037). `bash` gets only the minimal inherited environment
+//! plus the session's `ToolContext::spawn` variables, and runs under the
+//! session's sandbox policy when it names one.
 //!
 //! The file tools open each path component by component beneath the root
 //! without following symlinks, and read and write through those descriptors,
@@ -387,7 +390,8 @@ async fn run_bash(
     ctx: &ToolContext,
 ) -> Result<String, ToolError> {
     let args = [OsString::from("-c"), OsString::from(command)];
-    let env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    let env: BTreeMap<OsString, OsString> = ctx.spawn.complete();
+    let policy = ctx.spawn.sandbox.as_ref().unwrap_or(policy);
     let request = SpawnRequest::new(OsStr::new("bash"), &args, Some(root), &env, policy);
     let confined = match (sandbox, policy) {
         (Some(sandbox), _) => sandbox

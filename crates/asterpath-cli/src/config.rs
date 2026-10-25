@@ -5,8 +5,9 @@
 //! of this model.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ pub enum SandboxMode {
 }
 
 /// The file with `-c` overrides merged in, then the dedicated flags.
+#[derive(Clone)]
 pub struct Settings {
     pub db: PathBuf,
     pub approval: ApprovalMode,
@@ -753,6 +755,8 @@ struct ModelSection {
 #[serde(default, deny_unknown_fields)]
 struct SandboxSection {
     mode: SandboxMode,
+    /// Names of this process's variables passed on to bash (ADR-0037).
+    env: Vec<String>,
 }
 
 /// Codex-style `[mcp_servers.<id>]`: stdio uses `command`/`args`/`env`/`cwd`,
@@ -808,16 +812,26 @@ impl Settings {
         &self.file.skills.paths
     }
 
-    /// `[sandbox] mode`; `workspace-write` makes the working directory the
-    /// only writable root.
-    pub fn sandbox_policy(&self) -> SandboxPolicy {
+    /// `[sandbox] mode`; `workspace-write` makes the work root the only
+    /// writable root.
+    pub fn sandbox_policy(&self, root: &Path) -> SandboxPolicy {
         match self.file.sandbox.mode {
             SandboxMode::ReadOnly => SandboxPolicy::ReadOnly,
             SandboxMode::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
-                writable_roots: std::env::current_dir().into_iter().collect(),
+                writable_roots: vec![root.to_path_buf()],
             },
             SandboxMode::FullAccess => SandboxPolicy::FullAccess,
         }
+    }
+
+    /// `[sandbox] env`: the listed variables this process has, for bash.
+    pub fn spawn_vars(&self) -> BTreeMap<OsString, OsString> {
+        self.file
+            .sandbox
+            .env
+            .iter()
+            .filter_map(|name| Some((OsString::from(name), env_os(name)?)))
+            .collect()
     }
 
     /// `[mcp_servers.<id>]` mapped to adapter configs, in id order.

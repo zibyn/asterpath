@@ -1,6 +1,6 @@
 # 会话环境由宿主适配器按会话解析，子进程默认不继承进程环境
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-25)
 **调研**: [design-audit-2026-10-25.md](../research/design-audit-2026-10-25.md)、[kernel-host-boundary-audit.md](../research/kernel-host-boundary-audit.md)
 
 ## Context
