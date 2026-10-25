@@ -1050,6 +1050,42 @@ fn untrusted_denies_mutating_tools_in_exec_and_never_runs_them() {
     }
 }
 
+/// `-C` roots bash in the work root without moving the process, and bash
+/// sees only the minimal inherited environment plus `[sandbox] env`
+/// (ADR-0037).
+#[test]
+fn bash_runs_in_the_work_root_without_the_process_environment() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse(
+            "bash",
+            r#"{"command":"pwd > where.txt; echo \"${ASTERPATH_LEAK-unset} ${ASTERPATH_PASS-unset}\" >> where.txt"}"#,
+        )),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("bash-env");
+    dir.config(&format!(
+        "{}\n[sandbox]\nenv = [\"ASTERPATH_PASS\"]\n",
+        config_body(&server, &dir.db())
+    ));
+    let project = dir.sub("project");
+
+    ok(dir
+        .exec(&dir.path)
+        .env("ASTERPATH_LEAK", "secret")
+        .env("ASTERPATH_PASS", "passed")
+        .args(["-a", "never", "-s", "full-access", "-C"])
+        .arg(&project)
+        .arg("go"));
+
+    assert_eq!(
+        fs::read_to_string(project.join("where.txt")).unwrap(),
+        format!(
+            "{}\nunset passed\n",
+            project.canonicalize().unwrap().display()
+        )
+    );
+}
+
 #[test]
 fn doctor_validates_without_initialising_modules() {
     let dir = TestDir::new("doctor-ok");
