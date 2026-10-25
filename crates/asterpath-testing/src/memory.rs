@@ -110,6 +110,12 @@ impl State {
                 ParentFilter::Roots => parent.is_none(),
                 ParentFilter::ChildrenOf(of) => *parent == Some(of),
             })
+            .filter(|(_, (.., metadata))| {
+                query
+                    .metadata
+                    .iter()
+                    .all(|(key, value)| metadata.get(key) == Some(value))
+            })
             .map(|(session, (parent, created_at, metadata))| {
                 CatalogEntry::new(
                     *session,

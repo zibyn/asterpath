@@ -647,6 +647,7 @@ impl SqliteStorage {
         let limit = query
             .limit
             .map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        let metadata = serde_json::to_string(&query.metadata).map_err(backend)?;
         let conn = self.reader();
         let mut statement = conn
             .prepare(
@@ -657,13 +658,15 @@ impl SqliteStorage {
                  WHERE s.session_id NOT IN (SELECT session_id FROM retired_sessions) \
                  AND (?1 = 0 OR (?1 = 1 AND s.parent_id IS NULL) OR (?1 = 2 AND s.parent_id = ?2)) \
                  AND (?3 IS NULL OR s.created_at < ?3 OR (s.created_at = ?3 AND s.session_id < ?4)) \
+                 AND NOT EXISTS (SELECT 1 FROM json_each(?6) f WHERE NOT EXISTS \
+                     (SELECT 1 FROM json_each(s.metadata) m WHERE m.key = f.key AND m.value = f.value)) \
                  ORDER BY s.created_at DESC, s.session_id DESC \
                  LIMIT ?5",
             )
             .map_err(backend)?;
         let rows = statement
             .query_map(
-                params![mode, of, after_created, after_session, limit],
+                params![mode, of, after_created, after_session, limit, metadata],
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,

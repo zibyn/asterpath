@@ -122,9 +122,12 @@ pub struct CatalogCursor {
 }
 
 /// A page request over the session catalog (ADR-0028).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionQuery {
     pub parent: ParentFilter,
+    /// Host metadata every listed entry carries: each key equals its value
+    /// (ADR-0039). Empty matches all.
+    pub metadata: BTreeMap<String, String>,
     /// Exclusive cursor: the page starts after this entry.
     pub after: Option<CatalogCursor>,
     pub limit: Option<usize>,
@@ -184,7 +187,7 @@ pub trait SessionStore: Send + Sync {
     fn frontier(&self, session: SessionId) -> BoxFuture<'_, Result<Option<LogId>, StorageError>>;
 
     /// Sessions that have a `SessionCreated` and are not retired, filtered by
-    /// parent, ordered by `(created_at, session)` descending (ADR-0028).
+    /// parent and metadata, ordered by `(created_at, session)` descending (ADR-0028).
     fn sessions(
         &self,
         query: SessionQuery,

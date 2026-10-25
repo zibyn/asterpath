@@ -836,6 +836,7 @@ async fn sessions_lists_host_metadata_across_a_reopen() {
         parent: ParentFilter::Roots,
         after,
         limit: Some(1),
+        ..SessionQuery::default()
     };
     let newest = reopened.sessions(page(None)).await.unwrap();
     assert_eq!(newest.len(), 1);

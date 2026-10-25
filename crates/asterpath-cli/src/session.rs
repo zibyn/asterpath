@@ -338,7 +338,10 @@ async fn catalog(asterpath: &Asterpath) -> CliResult<Vec<CatalogEntry>> {
         ..SessionQuery::default()
     };
     loop {
-        let page = asterpath.sessions(query).await.map_err(aster_error)?;
+        let page = asterpath
+            .sessions(query.clone())
+            .await
+            .map_err(aster_error)?;
         let Some(last) = page.last() else {
             return Ok(all);
         };

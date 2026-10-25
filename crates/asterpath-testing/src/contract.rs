@@ -49,6 +49,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     hard_errors(store).await;
     let clock = Arc::new(ManualClock::new());
     catalog(&*factory.open_with_clock(clock.clone()), &clock).await;
+    metadata_filter(store).await;
     retirement(store).await;
     ownership(store, &*factory.open_other_process()).await;
 }
@@ -659,6 +660,7 @@ async fn paged(log: &dyn SessionStore, parent: ParentFilter, limit: usize) -> Ve
                 parent,
                 after,
                 limit: Some(limit),
+                ..SessionQuery::default()
             },
         )
         .await;
@@ -768,6 +770,109 @@ async fn catalog(log: &dyn SessionStore, clock: &ManualClock) {
     assert_eq!(parent(log, root).await, None);
     assert_eq!(parent(log, kid).await, Some(root));
     assert_eq!(parent(log, unknown).await, None);
+}
+
+/// Metadata filters match every pair by equality, ANDed, with parent
+/// filters and pages applied to the matches (ADR-0039).
+async fn metadata_filter(log: &dyn SessionStore) {
+    let tenant = |user: &str, extra: &[(&str, &str)]| {
+        let mut metadata = BTreeMap::from([("tenant".to_owned(), user.to_owned())]);
+        metadata.extend(
+            extra
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        );
+        metadata
+    };
+    let created = |metadata, parent: Option<SessionId>| SessionEvent::SessionCreated {
+        config: config(),
+        parent: parent.map(|session| ParentRef {
+            session,
+            turn: turn(),
+            tool_call: call(1),
+        }),
+        metadata,
+    };
+    let (alice, alice_too, bob, kid) = (session(0xa1), session(0xa2), session(0xa3), session(0xa4));
+    let quoted = [("name", "a \"quoted\" 名")];
+    for (session, metadata, parent) in [
+        (alice, tenant("alice", &quoted), None),
+        (alice_too, tenant("alice", &[]), None),
+        (bob, tenant("bob", &quoted), None),
+        (kid, tenant("alice", &[]), Some(alice)),
+    ] {
+        append(
+            log,
+            session,
+            &created(metadata, parent),
+            Some(dedup::session_created(session)),
+        )
+        .await;
+    }
+    let ids = |entries: Vec<CatalogEntry>| {
+        let mut ids: Vec<SessionId> = entries.iter().map(|entry| entry.session).collect();
+        ids.sort();
+        ids
+    };
+    let query = |metadata, parent| SessionQuery {
+        parent,
+        metadata,
+        ..SessionQuery::default()
+    };
+
+    assert_eq!(
+        ids(list(log, query(tenant("alice", &[]), ParentFilter::Any)).await),
+        vec![alice, alice_too, kid],
+        "an equal pair matches; other keys do not matter"
+    );
+    assert_eq!(
+        ids(list(log, query(tenant("bob", &[]), ParentFilter::Any)).await),
+        vec![bob]
+    );
+    assert_eq!(
+        ids(list(log, query(tenant("alice", &quoted), ParentFilter::Any)).await),
+        vec![alice],
+        "every pair must match"
+    );
+    assert_eq!(
+        ids(list(log, query(tenant("alice", &[]), ParentFilter::Roots)).await),
+        vec![alice, alice_too],
+        "parent and metadata filters combine"
+    );
+    assert!(
+        list(log, query(tenant("carol", &[]), ParentFilter::Any))
+            .await
+            .is_empty()
+    );
+    assert!(
+        list(log, query(tenant("ali", &[]), ParentFilter::Any))
+            .await
+            .is_empty(),
+        "equality, not prefix"
+    );
+
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let page = list(
+            log,
+            SessionQuery {
+                metadata: tenant("alice", &[]),
+                after,
+                limit: Some(1),
+                ..SessionQuery::default()
+            },
+        )
+        .await;
+        let Some(last) = page.last() else { break };
+        after = Some(last.cursor());
+        pages.extend(page);
+    }
+    assert_eq!(
+        pages,
+        list(log, query(tenant("alice", &[]), ParentFilter::Any)).await,
+        "pages count only matching entries"
+    );
 }
 
 async fn retire(
