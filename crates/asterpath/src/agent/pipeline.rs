@@ -787,6 +787,8 @@ impl ToolPipeline {
             return approval_decision(step.session, decision);
         }
 
+        // Endpoints and policies attend a whole tree (ADR-0039).
+        let root = root_of(&*self.log, step.session).await?;
         let request = ApprovalRequest::new(
             step.session,
             step.turn,
@@ -797,7 +799,8 @@ impl ToolPipeline {
             descriptor.replay,
             descriptor.side_effect,
             descriptor.provenance,
-        );
+        )
+        .with_root(root);
         match self.approval.classify(&request) {
             // A recorded decision above always wins. Without one, recovery
             // never reruns an unsafe tool.
@@ -811,8 +814,6 @@ impl ToolPipeline {
                 reason.unwrap_or_else(|| DENIED_WITHOUT_REASON.to_owned()),
             )),
             ApprovalVerdict::Ask => {
-                // Endpoints attend a whole tree (ADR-0039).
-                let root = root_of(&*self.log, step.session).await?;
                 if !self.gate.is_open(root) {
                     return Ok(ToolDecision::Deny(NO_APPROVAL_ENDPOINT.to_owned()));
                 }

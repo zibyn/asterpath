@@ -585,6 +585,7 @@ async fn child_approval_is_scoped_to_the_child_session() {
     let pending = gate.pending();
     assert_eq!(pending.len(), 1, "the child's wait is listed: {pending:?}");
     assert_eq!(pending[0].session, child, "listed under the child session");
+    assert_eq!(pending[0].root, parent, "the request names its tree");
     assert_eq!(pending[0].tool_call_id, call);
     assert_eq!(
         gate.pending_in(parent),

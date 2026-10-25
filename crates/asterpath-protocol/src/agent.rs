@@ -115,6 +115,9 @@ pub enum AgentEvent {
 #[non_exhaustive]
 pub struct ApprovalRequest {
     pub session: SessionId,
+    /// The root of `session`'s tree, which a policy keys tree-wide state by
+    /// (ADR-0039); `session` itself for a root session.
+    pub root: SessionId,
     pub turn: TurnId,
     pub step: StepId,
     pub tool_call_id: ToolCallId,
@@ -140,6 +143,7 @@ impl ApprovalRequest {
     ) -> Self {
         Self {
             session,
+            root: session,
             turn,
             step,
             tool_call_id,
@@ -149,6 +153,12 @@ impl ApprovalRequest {
             side_effect,
             provenance,
         }
+    }
+
+    /// The request of a subagent in the tree rooted at `root`.
+    pub fn with_root(mut self, root: SessionId) -> Self {
+        self.root = root;
+        self
     }
 }
 

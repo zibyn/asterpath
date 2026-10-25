@@ -149,7 +149,7 @@ fn approval_requested() {
     assert_eq!(
         json(AgentEvent::ApprovalRequested(request)),
         format!(
-            r#"{{"type":"approval_requested","session":"{HEX1}","turn":"{HEX1}","step":"{HEX2}","tool_call_id":"{HEX3}","tool":"write","args":"{{\"path\":\"x\"}}","replay":"Unsafe","side_effect":"Mutating","provenance":"InProcess"}}"#
+            r#"{{"type":"approval_requested","session":"{HEX1}","root":"{HEX1}","turn":"{HEX1}","step":"{HEX2}","tool_call_id":"{HEX3}","tool":"write","args":"{{\"path\":\"x\"}}","replay":"Unsafe","side_effect":"Mutating","provenance":"InProcess"}}"#
         )
     );
 }
