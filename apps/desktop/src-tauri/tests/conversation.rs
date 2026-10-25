@@ -10,9 +10,9 @@ use asterpath::Asterpath;
 use asterpath_desktop::{Access, Desktop, ViewEvent};
 use asterpath_host::{WorkRoot, Workspace};
 use asterpath_protocol::{
-    AgentEvent, InputId, Item, ModelRequest, ModelSpec, Part, Provider, ProviderCapabilities,
-    ProviderError, ProviderId, Role, SessionEvent, StopReason, StreamEvent, TurnEndReason, Usage,
-    UserInput,
+    AgentEvent, InputId, Item, LogId, ModelRequest, ModelSpec, Part, PartDelta, Provider,
+    ProviderCapabilities, ProviderError, ProviderId, Role, SessionEvent, StepId, StopReason,
+    StreamEvent, TurnEndReason, TurnId, Usage, UserInput,
 };
 use asterpath_testing::ScriptedProvider;
 use common::template;
@@ -351,5 +351,54 @@ async fn a_session_another_process_drives_is_read_only_but_watched() {
             text: "theirs".to_owned()
         }]],
         "the refused input was never logged"
+    );
+}
+
+/// The JSON `src/lib/commands.ts` reads.
+#[test]
+fn view_events_serialize_as_the_frontend_types_them() {
+    let turn = TurnId::from_bytes([1; 16]);
+    let events = [
+        ViewEvent::Record {
+            log_id: LogId::from_i64(3),
+            event: SessionEvent::InputRecorded {
+                input: vec![Part::Text {
+                    text: "hi".to_owned(),
+                }],
+            },
+        },
+        ViewEvent::Record {
+            log_id: LogId::from_i64(4),
+            event: SessionEvent::TurnCommitted {
+                turn_id: turn,
+                reason: TurnEndReason::Cancelled,
+            },
+        },
+        ViewEvent::Synced,
+        ViewEvent::Live {
+            event: AgentEvent::ModelDelta {
+                turn,
+                step: StepId::from_bytes([2; 16]),
+                output_index: 0,
+                part_index: 1,
+                delta: PartDelta::ReasoningSummary {
+                    text: "hm".to_owned(),
+                },
+            },
+        },
+    ];
+    let turn = "01".repeat(16);
+    assert_eq!(
+        serde_json::to_value(events).unwrap(),
+        serde_json::json!([
+            {"kind": "record", "log_id": 3, "event": {"InputRecorded": {"input": [{"Text": {"text": "hi"}}]}}},
+            {"kind": "record", "log_id": 4, "event": {"TurnCommitted": {"turn_id": turn, "reason": "Cancelled"}}},
+            {"kind": "synced"},
+            {"kind": "live", "event": {
+                "type": "model_delta", "turn": turn, "step": "02".repeat(16),
+                "output_index": 0, "part_index": 1,
+                "delta": {"type": "reasoning_summary", "text": "hm"},
+            }},
+        ])
     );
 }
