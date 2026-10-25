@@ -42,7 +42,12 @@ async fn add_project(
     app: tauri::AppHandle,
     backend: State<'_, Backend>,
 ) -> Result<Option<Project>, String> {
-    let Some(dir) = app.dialog().file().blocking_pick_folder() else {
+    // The picker blocks until closed; keep it off the async workers.
+    let picked =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|error| error.to_string())?;
+    let Some(dir) = picked else {
         return Ok(None);
     };
     let dir = dir.into_path().map_err(|error| error.to_string())?;
