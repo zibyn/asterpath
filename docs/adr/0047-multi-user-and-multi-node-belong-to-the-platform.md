@@ -1,7 +1,7 @@
 # 多用户与多机部署归集成平台；内核只保证会话树单写者与两种存储后端
 
 **Status**: accepted (2026-10-25)
-**部分取代**: [ADR-0036](0036-per-session-tree-ownership.md) 的「跨进程审批与取消走日志」与 Context 中的多机理由；[ADR-0039](0039-multi-user-embedding-mechanisms.md) 的 Context 前提
+**部分取代**: [ADR-0036](0036-per-session-tree-ownership.md) 的「取消请求落日志」「由变更通知唤醒」与 Context 中的多机理由；[ADR-0039](0039-multi-user-embedding-mechanisms.md) 的 Context 前提
 **否决**: [ADR-0041](0041-wake-discovery-caches-folds.md)、[ADR-0042](0042-approval-asks-are-logged.md)、[ADR-0043](0043-change-notification-is-a-framework-hint.md)
 **相关**: [ADR-0046](0046-local-hosts-and-web-sdk-do-not-share.md)
 **调研**: [pi-and-pi-durable.md](../research/pi-and-pi-durable.md)、[mastra.md](../research/mastra.md)、[agno.md](../research/agno.md)、[llamaindex.md](../research/llamaindex.md)
@@ -21,9 +21,9 @@ ADR-0046 之后，web 是把 `asterpath` 门面作为 SDK 集成进平台。多�
 
 ## Decision
 
-- **内核不承担多用户与多机部署**：不提供跨节点的询问可见、审批与取消送达、变更通知或推送、节点间路由，也不为单进程上千会话做专门的优化。这些由集成平台用 SDK 搭建。
+- **内核不承担多用户与多机部署**：不提供跨节点的询问可见、持久化的取消、变更通知或推送、节点间路由，也不为单进程上千会话做专门的优化。这些由集成平台用 SDK 搭建。
 - **内核保证会话树单写者**：ADR-0036 的显式认领、进程租约与属主纪元保留，定位是「一棵会话树至多一个写者」的正确性保证，适用于任何共用存储的进程组合。存储仍只做读、写与条件写。
-- **跨进程送达交给宿主**：审批应答、取消与驱动都在属主进程内发生；非属主进程要把它们送到属主，由宿主路由（本地两端只读观察，web 平台自选粘滞路由、转发或队列）。`owner(session)` 查询保留，供宿主找到属主。
+- **跨进程只保留已有的外部写入**：用户输入、审批决定、配置变更仍是任何进程可写的外部写入，属主在驱动与等待时轮询日志读到（ADR-0036，已实现）。取消与驱动只在属主进程内执行，不落日志；非属主进程要取消，由宿主路由到属主（本地两端只读观察，web 平台自选粘滞路由、转发或队列）。`owner(session)` 查询保留，供宿主找到属主。
 - **存储后端是 SQLite 与 Postgres**：Postgres 后端实现完整的 `SessionStore` 契约（含进程租约与属主行），不承担多机协调。
 - **通用机制保留**：只读句柄的 `watch`（ADR-0038，跨进程靠轮询存储）、会话目录按元数据过滤、按会话树注册审批端点、provider 请求携带会话上下文（ADR-0039）、可修改的宿主元数据（ADR-0044）。它们是 CLI 与桌面端也在用的机制，平台可以拿来实现多用户，内核不赋予它们用户语义。
 - **唤醒发现**保持 ADR-0023：全量折叠，实测到瓶颈再加索引。
@@ -31,7 +31,7 @@ ADR-0046 之后，web 是把 `asterpath` 门面作为 SDK 集成进平台。多�
 ## Consequences
 
 - ADR-0041、0042、0043 否决；#148、#155、#158、#159、#160、#163、#164 关闭。
-- 审批仍按 ADR-0007：询问只活在属主进程内，没有在线审批端点即 fail closed。
+- 审批仍按 ADR-0007：询问只活在属主进程内，没有在线审批端点即 fail closed；别的进程要应答，得先经宿主知道有询问（例如路由到属主进程，或从 `watch` 看到工具调用意图），再写入审批决定。
 - 没有持久化的取消请求：取消由属主进程执行；属主在别处时，宿主把取消路由过去。
 - 多机部署的平台要自己负责：把同一会话树的请求送到属主、跨节点感知新记录（可以用 `watch` 或自己的通知）、属主宕机后的接管时机（进程租约过期后任何进程可认领）。
 - 内核与参照框架里 Mastra、Agno 的做法一致之处只在单写者 fencing；其余与 pi-durable、LlamaIndex 一样留在核心之外。
