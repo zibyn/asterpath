@@ -149,9 +149,14 @@ pub async fn open(
         new: false,
         pinned,
     };
-    let asterpath = config::assemble(&settings, mcp.tools(), environment)
-        .await
-        .map_err(aster_error)?;
+    let asterpath = config::assemble(
+        &settings,
+        mcp.tools(),
+        environment,
+        config::approval_policy(settings.approval),
+    )
+    .await
+    .map_err(aster_error)?;
     let (handle, continued) = if args.fork_session {
         let metadata = metadata(&root, args.name.as_deref());
         let handle = asterpath
@@ -234,9 +239,14 @@ async fn create(
         new: true,
         pinned: None,
     };
-    let asterpath = config::assemble(settings, mcp.tools(), environment)
-        .await
-        .map_err(aster_error)?;
+    let asterpath = config::assemble(
+        settings,
+        mcp.tools(),
+        environment,
+        config::approval_policy(settings.approval),
+    )
+    .await
+    .map_err(aster_error)?;
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
     let owned = Some(handle.claim().await.map_err(aster_error)?);

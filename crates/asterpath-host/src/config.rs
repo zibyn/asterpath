@@ -233,13 +233,15 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
 }
 
 /// The composition root: providers, storage and limits from `settings`,
-/// `tools` for every session and `environment` per session. No approval
+/// `tools` for every session, `environment` per session and `approval` (the
+/// CLI's is [`approval_policy`] of `settings.approval`). No approval
 /// endpoint is registered here: a host that can ask registers one around
 /// its drive.
 pub async fn assemble(
     settings: &Settings,
     tools: Vec<Arc<dyn Tool>>,
     environment: WorkRoot,
+    approval: Arc<dyn ApprovalPolicy>,
 ) -> Result<Asterpath, AsterError> {
     let config_error = |message: String| AsterError::Config { message };
     let providers = providers(settings).map_err(config_error)?;
@@ -247,7 +249,6 @@ pub async fn assemble(
     let catalog =
         ProviderCatalog::new(providers.clone()).map_err(|error| config_error(error.to_string()))?;
     let config = AsterpathConfig::default();
-    let approval = approval_policy(settings.approval);
     AsterpathBuilder::from_config(config)
         .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
         .database(&settings.db)

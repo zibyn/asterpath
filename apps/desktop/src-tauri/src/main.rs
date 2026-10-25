@@ -7,7 +7,10 @@ use std::sync::Mutex;
 
 use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
-use asterpath_desktop::{Access, Desktop, Project, SessionInfo, SessionSummary, ViewEvent};
+use asterpath_desktop::{
+    Access, Answer, Desktop, PermissionMode, Project, SessionInfo, SessionSummary, ViewEvent,
+};
+use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
@@ -115,6 +118,42 @@ async fn cancel(backend: State<'_, Backend>, session: SessionId) -> Result<(), S
 }
 
 #[tauri::command]
+fn approvals(
+    backend: State<'_, Backend>,
+    session: SessionId,
+) -> Result<Vec<ApprovalRequest>, String> {
+    Ok(backend.get()?.approvals(session))
+}
+
+#[tauri::command]
+async fn approve(
+    backend: State<'_, Backend>,
+    session: SessionId,
+    call: ToolCallId,
+    answer: Answer,
+) -> Result<(), String> {
+    backend.get()?.approve(session, call, answer).await
+}
+
+#[tauri::command]
+fn permission_mode(
+    backend: State<'_, Backend>,
+    session: SessionId,
+) -> Result<PermissionMode, String> {
+    Ok(backend.get()?.permission_mode(session))
+}
+
+#[tauri::command]
+fn set_permission_mode(
+    backend: State<'_, Backend>,
+    session: SessionId,
+    mode: PermissionMode,
+) -> Result<(), String> {
+    backend.get()?.set_permission_mode(session, mode);
+    Ok(())
+}
+
+#[tauri::command]
 fn models(backend: State<'_, Backend>) -> Result<Vec<ModelSpec>, String> {
     Ok(backend.get()?.models())
 }
@@ -156,6 +195,10 @@ fn main() {
             unwatch,
             send,
             cancel,
+            approvals,
+            approve,
+            permission_mode,
+            set_permission_mode,
             models,
             session_info,
             set_model

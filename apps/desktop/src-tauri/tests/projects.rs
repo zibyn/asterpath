@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asterpath::Asterpath;
-use asterpath_desktop::Desktop;
+use asterpath_desktop::{Desktop, PermissionMode, Permissions};
 use asterpath_host::Workspace;
 use asterpath_protocol::Provider;
 use asterpath_testing::ScriptedProvider;
@@ -43,6 +43,7 @@ async fn a_session_the_cli_created_is_listed_under_its_project() {
 
     let desktop = Desktop::new(
         engine(&db).await,
+        Arc::new(Permissions::new(PermissionMode::default())),
         Workspace::default(),
         template(),
         dir.path().join("projects.json"),
@@ -77,6 +78,7 @@ async fn an_added_project_is_listed_without_sessions_and_kept_across_restarts() 
 
     let desktop = Desktop::new(
         engine(&db).await,
+        Arc::new(Permissions::new(PermissionMode::default())),
         Workspace::default(),
         template(),
         projects.clone(),
@@ -93,6 +95,7 @@ async fn an_added_project_is_listed_without_sessions_and_kept_across_restarts() 
 
     let desktop = Desktop::new(
         engine(&db).await,
+        Arc::new(Permissions::new(PermissionMode::default())),
         Workspace::default(),
         template(),
         projects,
