@@ -118,11 +118,30 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "asterpath",
+ "asterpath-host",
+ "asterpath-mcp",
+ "asterpath-protocol",
+ "asterpath-skills",
+ "asterpath-storage-sqlite",
+ "asterpath-testing",
+ "asterpath-tools",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "asterpath-host"
+version = "0.1.0"
+dependencies = [
+ "asterpath",
  "asterpath-mcp",
  "asterpath-protocol",
  "asterpath-sandbox-linux",
  "asterpath-skills",
- "asterpath-storage-sqlite",
  "asterpath-testing",
  "asterpath-tools",
  "clap",

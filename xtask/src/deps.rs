@@ -6,14 +6,16 @@ use serde::Deserialize;
 
 /// Role rules (ADR-0026): the protocol crate depends on no member; adapters
 /// depend only on protocol and other adapters; the engine only on protocol and
-/// the adapters it re-exports or feature-gates. Apps and tools are bounded only
-/// by their `allow` list.
+/// the adapters it re-exports or feature-gates; the host kit (ADR-0040) on
+/// anything but apps and other host crates, and only apps depend on it. Apps
+/// and tools are otherwise bounded only by their `allow` list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Protocol,
     Adapter,
     Engine,
+    Host,
     App,
     Tool,
 }
@@ -24,7 +26,15 @@ impl Role {
         match self {
             Role::Protocol => Some(&[]),
             Role::Adapter | Role::Engine => Some(&[Role::Protocol, Role::Adapter]),
+            Role::Host => Some(&[Role::Protocol, Role::Adapter, Role::Engine]),
             Role::App | Role::Tool => None,
+        }
+    }
+
+    fn may_depend_on_role(self, role: Role) -> bool {
+        match self.may_depend_on() {
+            Some(permitted) => permitted.contains(&role),
+            None => role != Role::Host || self == Role::App,
         }
     }
 }
@@ -121,8 +131,8 @@ pub fn check(packages: &[PackageInfo], allow: &[AllowedPackage]) -> Vec<Violatio
         }
 
         for dependency in &package.normal_workspace_deps {
-            if let (Some(permitted), Some(role)) = (entry.role.may_depend_on(), role_of(dependency))
-                && !permitted.contains(&role)
+            if let Some(role) = role_of(dependency)
+                && !entry.role.may_depend_on_role(role)
             {
                 violations.push(Violation::RoleDependency {
                     from: package.name.clone(),
@@ -327,6 +337,45 @@ mod tests {
     }
 
     #[test]
+    fn only_apps_may_depend_on_the_host_kit_and_it_not_on_apps() {
+        let packages = [
+            package("asterpath-host", &[], &["asterpath", "asterpath-cli"]),
+            package("asterpath", &[], &[]),
+            package("asterpath-cli", &[], &["asterpath-host"]),
+            package("asterpath-skills", &[], &["asterpath-host"]),
+            package("xtask", &[], &["asterpath-host"]),
+        ];
+        let allow = [
+            allowed("asterpath-host", Role::Host, &["*"]),
+            allowed("asterpath", Role::Engine, &[]),
+            allowed("asterpath-cli", Role::App, &["*"]),
+            allowed("asterpath-skills", Role::Adapter, &["asterpath-host"]),
+            allowed("xtask", Role::Tool, &["asterpath-host"]),
+        ];
+
+        assert_eq!(
+            check(&packages, &allow),
+            [
+                Violation::RoleDependency {
+                    from: "asterpath-host".to_string(),
+                    to: "asterpath-cli".to_string(),
+                    role: Role::App,
+                },
+                Violation::RoleDependency {
+                    from: "asterpath-skills".to_string(),
+                    to: "asterpath-host".to_string(),
+                    role: Role::Host,
+                },
+                Violation::RoleDependency {
+                    from: "xtask".to_string(),
+                    to: "asterpath-host".to_string(),
+                    role: Role::Host,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_a_workspace_dependency_outside_the_allowlist() {
         let packages = [
             package("asterpath-skills", &[], &["asterpath-http"]),
@@ -405,6 +454,7 @@ mod tests {
             ("asterpath-tools", Role::Adapter),
             ("asterpath-testing", Role::Adapter),
             ("asterpath", Role::Engine),
+            ("asterpath-host", Role::Host),
             ("asterpath-cli", Role::App),
             ("asterpath-acceptance", Role::App),
             ("asterpath-mcp-fixture", Role::Tool),
@@ -420,7 +470,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from allowlist"));
             assert_eq!(entry.role, role, "wrong role for {name}");
             match role {
-                Role::Protocol | Role::Adapter | Role::Engine => assert!(
+                Role::Protocol | Role::Adapter | Role::Engine | Role::Host => assert!(
                     !entry.allow.iter().any(|allowed| allowed == "*"),
                     "{name} must list explicit dependencies"
                 ),

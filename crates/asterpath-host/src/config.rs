@@ -3,28 +3,34 @@
 //! Precedence is flag > `-c` > file. The only environment variables are
 //! `ASTERPATH_CONFIG` and the provider API keys; keys are deliberately not part
 //! of this model.
+// `AsterError` is the facade's error, returned as is.
+#![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use asterpath::{AsterError, Asterpath, AsterpathBuilder, AsterpathConfig, DefaultCompactor};
 use asterpath_mcp::{
     ADAPTER_PROTOCOL_VERSIONS, McpServerConfig, McpTimeouts, McpTransport, ServerId,
 };
 use asterpath_protocol::{
     ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig,
-    ContextPolicy, DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderId,
-    ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SandboxPolicy, SideEffect,
-    SubagentConfig, ToolChoice, ToolConfig, ToolName, TurnConfig,
+    ContextPolicy, DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider,
+    ProviderCatalog, ProviderId, ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams,
+    SideEffect, SubagentConfig, Tool, ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
-use clap::ValueEnum;
+use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
+use crate::{SandboxMode, WorkRoot, Workspace};
+
 /// `-a` and `[approval] default`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
     /// Read-only in-process tools run; mutating and external tools ask.
@@ -32,16 +38,6 @@ pub enum ApprovalMode {
     Untrusted,
     /// Never ask; the sandbox is the only guard.
     Never,
-}
-
-/// `-s` and `[sandbox] mode`.
-#[derive(Clone, Copy, Debug, Default, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxMode {
-    ReadOnly,
-    #[default]
-    WorkspaceWrite,
-    FullAccess,
 }
 
 /// The file with `-c` overrides merged in, then the dedicated flags.
@@ -234,6 +230,36 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
         config.max_parallel_calls = calls;
     }
     config
+}
+
+/// The composition root: providers, storage and limits from `settings`,
+/// `tools` for every session and `environment` per session. No approval
+/// endpoint is registered here: a host that can ask registers one around
+/// its drive.
+pub async fn assemble(
+    settings: &Settings,
+    tools: Vec<Arc<dyn Tool>>,
+    environment: WorkRoot,
+) -> Result<Asterpath, AsterError> {
+    let config_error = |message: String| AsterError::Config { message };
+    let providers = providers(settings).map_err(config_error)?;
+    // Sessions without a context window still report `NotConfigured`.
+    let catalog =
+        ProviderCatalog::new(providers.clone()).map_err(|error| config_error(error.to_string()))?;
+    let config = AsterpathConfig::default();
+    let approval = approval_policy(settings.approval, Arc::clone(&config.gate));
+    AsterpathBuilder::from_config(config)
+        .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
+        .database(&settings.db)
+        .providers(providers)
+        .tools(tools)
+        .environment(Arc::new(environment))
+        .tool(tool_config(settings))
+        .max_live_children(max_live_children(settings))
+        .model_aliases(model_aliases(settings))
+        .approval(approval)
+        .build()
+        .await
 }
 
 /// `untrusted` asks for every `Mutating` tool and otherwise keeps the
@@ -797,41 +823,39 @@ impl Settings {
         })
     }
 
-    /// `[skills] enabled`; absent means enabled.
-    pub fn skills_enabled(&self) -> bool {
-        self.file.skills.enabled.unwrap_or(true)
-    }
-
-    /// `[tools] enabled`; `None` means every workspace tool.
-    pub fn tool_names(&self) -> Option<&[String]> {
-        self.file.tools.enabled.as_deref()
-    }
-
-    /// Explicit skill roots, highest priority first.
-    pub fn skill_paths(&self) -> &[PathBuf] {
-        &self.file.skills.paths
-    }
-
-    /// `[sandbox] mode`; `workspace-write` makes the work root the only
-    /// writable root.
-    pub fn sandbox_policy(&self, root: &Path) -> SandboxPolicy {
-        match self.file.sandbox.mode {
-            SandboxMode::ReadOnly => SandboxPolicy::ReadOnly,
-            SandboxMode::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![root.to_path_buf()],
-            },
-            SandboxMode::FullAccess => SandboxPolicy::FullAccess,
+    /// The work-root values: `[sandbox]`, `[tools] enabled`, `[skills]`
+    /// (absent `enabled` means enabled) with the user roots under
+    /// `$XDG_CONFIG_HOME` and `$HOME`, the `[sandbox] env` variables this
+    /// process has, and `[mcp_servers]`.
+    pub fn workspace(&self) -> Result<Workspace, String> {
+        let mut user_skill_roots = Vec::new();
+        if let Some(home) = config_home() {
+            user_skill_roots.push(SkillRoot {
+                path: home.join("asterpath/skills"),
+                label: SkillRootLabel::UserNative,
+            });
         }
-    }
-
-    /// `[sandbox] env`: the listed variables this process has, for bash.
-    pub fn spawn_vars(&self) -> BTreeMap<OsString, OsString> {
-        self.file
-            .sandbox
-            .env
-            .iter()
-            .filter_map(|name| Some((OsString::from(name), env_os(name)?)))
-            .collect()
+        if let Some(home) = std::env::var_os("HOME") {
+            user_skill_roots.push(SkillRoot {
+                path: PathBuf::from(home).join(".agents/skills"),
+                label: SkillRootLabel::UserAgents,
+            });
+        }
+        Ok(Workspace {
+            sandbox: self.file.sandbox.mode,
+            tools: self.file.tools.enabled.clone(),
+            skills_enabled: self.file.skills.enabled.unwrap_or(true),
+            skill_paths: self.file.skills.paths.clone(),
+            user_skill_roots,
+            spawn_vars: self
+                .file
+                .sandbox
+                .env
+                .iter()
+                .filter_map(|name| Some((OsString::from(name), env_os(name)?)))
+                .collect(),
+            mcp_servers: self.mcp_servers()?,
+        })
     }
 
     /// `[mcp_servers.<id>]` mapped to adapter configs, in id order.
