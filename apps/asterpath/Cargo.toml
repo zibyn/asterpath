@@ -3,6 +3,8 @@ name = "asterpath-app"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# `tauri dev` runs `cargo run` without `--bin`; the CLI is `--bin asterpath`.
+default-run = "asterpath-desktop"
 
 # One local application, two entry points (ADR-0049). The library holds the
 # private modules both share: work-root assembly, `config.toml` parsing and
@@ -41,7 +43,7 @@ clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", optional = true }
+tauri = { version = "2", optional = true , features = [] }
 tauri-plugin-dialog = { version = "2", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
@@ -51,7 +53,7 @@ toml = "0.9"
 asterpath-sandbox-linux = { path = "../../crates/asterpath-sandbox-linux" }
 
 [build-dependencies]
-tauri-build = { version = "2", optional = true }
+tauri-build = { version = "2", optional = true , features = [] }
 
 [dev-dependencies]
 assert_cmd = "2"
