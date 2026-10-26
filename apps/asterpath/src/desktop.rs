@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
-    CWD, NAME, WorkRoot, Workspace, in_root, new_session_spec, roots, work_root,
+    AGENT, CWD, NAME, WorkRoot, Workspace, agent_profiles, in_root, load_agent, new_session_spec,
+    roots, work_root,
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
@@ -44,6 +45,22 @@ pub struct SessionInfo {
     pub tokens: u64,
     /// Why this process last stopped driving it, until the next send.
     pub error: Option<String>,
+    /// The agent profile it was created with; fixed for its life (ADR-0051).
+    pub agent: Option<String>,
+}
+
+/// An agent profile the new-session picker offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentChoice {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// A project's agent profiles and the one preselected (`default_agent`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Agents {
+    pub default: Option<String>,
+    pub agents: Vec<AgentChoice>,
 }
 
 /// A work root in the sidebar.
@@ -71,6 +88,7 @@ pub struct SessionSummary {
     pub created_at: i64,
     pub last_activity: i64,
     pub status: Status,
+    pub agent: Option<String>,
 }
 
 impl SessionSummary {
@@ -81,6 +99,7 @@ impl SessionSummary {
             created_at: entry.created_at,
             last_activity: entry.last_activity,
             status,
+            agent: entry.metadata.get(AGENT).cloned(),
         }
     }
 }
@@ -414,18 +433,45 @@ impl Desktop {
         Ok(sessions)
     }
 
-    /// A session in `root` as the CLI creates one: `AGENTS.md`, the skill
-    /// index, session metadata and the tools a new session gets there.
+    /// The agent profiles a new session in `root` may use.
+    pub fn agents(&self, root: &Path) -> Result<Agents, String> {
+        let root = work_root(root).map_err(text)?;
+        // shortcut: no builtin agent profiles until #186 passes the bundled directory
+        let agents = agent_profiles(&self.workspace, None, &root)
+            .map_err(text)?
+            .into_iter()
+            .map(|file| AgentChoice {
+                // A broken profile is still listed; creating with it reports why.
+                description: load_agent(&file)
+                    .ok()
+                    .and_then(|profile| profile.description),
+                name: file.name,
+            })
+            .collect();
+        Ok(Agents {
+            default: self.workspace.agent.clone(),
+            agents,
+        })
+    }
+
+    /// A session in `root` as the CLI creates one: the agent profile
+    /// (`agent`, else `default_agent`), `AGENTS.md`, the skill index,
+    /// session metadata and the tools a new session gets there.
     pub async fn create_session(
         &self,
         root: &Path,
         name: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<SessionSummary, String> {
         let root = work_root(root).map_err(text)?;
         let mut spec = self.template.clone();
+        let mut workspace = self.workspace.clone();
+        if let Some(agent) = agent {
+            workspace.agent = Some(agent.to_owned());
+        }
         // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
-        // shortcut: no builtin agent profiles until #185/#186 pass the bundled directory
-        new_session_spec(&self.workspace, None, &root, name, &mut spec).map_err(text)?;
+        // shortcut: no builtin agent profiles until #186 passes the bundled directory
+        new_session_spec(&workspace, None, &root, name, &mut spec).map_err(text)?;
         let fresh = WorkRoot {
             workspace: self.workspace.clone(),
             new_session: true,
@@ -446,11 +492,17 @@ impl Desktop {
                 .collect(),
         );
         let name = spec.metadata.get(NAME).cloned();
+        let agent = spec.metadata.get(AGENT).cloned();
+        // Providers are built once from config.toml; a profile cannot add one.
+        let provider = spec.model.provider.clone();
         let id = self
             .asterpath
             .create_session(spec)
             .await
-            .map_err(text)?
+            .map_err(|error| match &agent {
+                Some(agent) => format!("agent {agent} (provider {provider}): {error}"),
+                None => error.to_string(),
+            })?
             .id();
         // Its only record so far is `SessionCreated`, whose time the catalog shows.
         let created = scan_all(&*self.asterpath.store(), id)
@@ -464,6 +516,7 @@ impl Desktop {
             created_at: created,
             last_activity: created,
             status: Status::Idle,
+            agent,
         })
     }
 
@@ -510,6 +563,10 @@ impl Desktop {
                 Ok((entry, event))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let agent = records.iter().find_map(|(_, event)| match event {
+            SessionEvent::SessionCreated { metadata, .. } => metadata.get(AGENT).cloned(),
+            _ => None,
+        });
         let model = effective_config(&records, u64::MAX)
             .ok_or_else(|| format!("session {} does not exist", session.to_hex()))?
             .model;
@@ -522,6 +579,7 @@ impl Desktop {
             model,
             tokens: usage.own.total() + usage.descendants.total(),
             error: lock(&self.errors).get(&session).cloned(),
+            agent,
         })
     }
 

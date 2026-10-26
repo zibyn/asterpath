@@ -128,7 +128,7 @@ async fn a_new_session_gets_the_new_session_tools_and_answers_in_the_background(
     let desktop = desktop(&fixture, provider.clone()).await;
 
     let created = desktop
-        .create_session(&fixture.root, Some("fix"))
+        .create_session(&fixture.root, Some("fix"), None)
         .await
         .unwrap();
     let listed = desktop.sessions(&fixture.root).await.unwrap();
@@ -234,7 +234,7 @@ async fn input_sent_during_a_turn_steers_it_and_streams_live() {
     );
     let desktop = desktop(&fixture, provider.clone()).await;
     let id = desktop
-        .create_session(&fixture.root, None)
+        .create_session(&fixture.root, None, None)
         .await
         .unwrap()
         .id;
@@ -285,7 +285,7 @@ async fn stop_cancels_the_running_turn() {
     let (provider, _permits) = gated(ScriptedProvider::new("p"));
     let desktop = desktop(&fixture, provider).await;
     let id = desktop
-        .create_session(&fixture.root, None)
+        .create_session(&fixture.root, None, None)
         .await
         .unwrap()
         .id;
@@ -438,9 +438,15 @@ async fn sessions_run_at_once_in_the_background_and_list_their_status() {
             .respond(reply("b"), StopReason::EndTurn, Usage::default()),
     );
     let desktop = desktop(&fixture, provider).await;
-    let a = desktop.create_session(&fixture.root, None).await.unwrap();
+    let a = desktop
+        .create_session(&fixture.root, None, None)
+        .await
+        .unwrap();
     assert_eq!(a.status, Status::Idle);
-    let b = desktop.create_session(&fixture.root, None).await.unwrap();
+    let b = desktop
+        .create_session(&fixture.root, None, None)
+        .await
+        .unwrap();
 
     // Nobody watches either session: driving does not need a view.
     desktop.send(a.id, "go a".to_owned()).await.unwrap();
@@ -496,7 +502,7 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
         fixture.root.join("projects.json"),
     );
     let id = desktop
-        .create_session(&fixture.root, None)
+        .create_session(&fixture.root, None, None)
         .await
         .unwrap()
         .id;
@@ -528,7 +534,7 @@ async fn the_status_bar_shows_the_model_and_tokens_and_switches_the_model() {
     let desktop = desktop(&fixture, provider.clone()).await;
     assert_eq!(desktop.models(), [template().model]);
     let id = desktop
-        .create_session(&fixture.root, None)
+        .create_session(&fixture.root, None, None)
         .await
         .unwrap()
         .id;
@@ -680,7 +686,7 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
         fixture.root.join("projects.json"),
     );
     let id = desktop
-        .create_session(&fixture.root, None)
+        .create_session(&fixture.root, None, None)
         .await
         .unwrap()
         .id;
@@ -699,4 +705,77 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
     .await;
     let last = provider.inner.requests().pop().unwrap();
     assert_eq!(user_texts(&last), ["go", "more"]);
+}
+
+#[tokio::test]
+async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tools() {
+    let fixture = fixture();
+    let agents = fixture.root.join(".asterpath/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("coder.md"),
+        "---\ndescription: Writes code\n---\nYou code.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("reviewer.md"),
+        "---\ntools: [glob]\n---\nYou review.\n",
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        reply("ok"),
+        StopReason::EndTurn,
+        Usage::default(),
+    ));
+    let desktop = Desktop::new(
+        engine(&fixture.db, provider.clone()).await,
+        Arc::new(ApprovalModes::new(ApprovalMode::default())),
+        Workspace {
+            agent: Some("coder".to_owned()),
+            ..workspace()
+        },
+        template(),
+        fixture.root.join("projects.json"),
+    );
+
+    let choices = desktop.agents(&fixture.root).unwrap();
+    assert_eq!(choices.default.as_deref(), Some("coder"));
+    let names: Vec<(&str, Option<&str>)> = choices
+        .agents
+        .iter()
+        .map(|agent| (agent.name.as_str(), agent.description.as_deref()))
+        .collect();
+    assert_eq!(names, [("coder", Some("Writes code")), ("reviewer", None)]);
+
+    let defaulted = desktop
+        .create_session(&fixture.root, None, None)
+        .await
+        .unwrap();
+    assert_eq!(defaulted.agent.as_deref(), Some("coder"));
+    let created = desktop
+        .create_session(&fixture.root, None, Some("reviewer"))
+        .await
+        .unwrap();
+    assert_eq!(created.agent.as_deref(), Some("reviewer"));
+    let listed = desktop.sessions(&fixture.root).await.unwrap();
+    assert!(listed.contains(&created), "{listed:?}");
+    let info = desktop.session_info(created.id).await.unwrap();
+    assert_eq!(info.agent.as_deref(), Some("reviewer"));
+    let unknown = desktop
+        .create_session(&fixture.root, None, Some("missing"))
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("unknown agent missing"), "{unknown}");
+
+    let mut view = desktop.watch(created.id, None).await.unwrap();
+    desktop.send(created.id, "hi".to_owned()).await.unwrap();
+    until(&mut view, |event| turn_committed(event).is_some()).await;
+    let request = &provider.requests()[0];
+    assert!(
+        matches!(&request.system[0], Part::Text { text } if text == "You review."),
+        "{:?}",
+        request.system
+    );
+    // `glob` is whitelisted but not a workspace tool; `read_file` is not whitelisted.
+    assert!(request.tools.is_empty(), "{:?}", request.tools);
 }

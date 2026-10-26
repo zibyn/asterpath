@@ -9,8 +9,8 @@ use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
 use asterpath_app::config::SetupChoice;
 use asterpath_app::desktop::{
-    self, Access, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary, Setup,
-    ViewEvent,
+    self, Access, Agents, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary,
+    Setup, ViewEvent,
 };
 use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
@@ -94,8 +94,17 @@ async fn create_session(
     backend: State<'_, Backend>,
     root: PathBuf,
     name: Option<String>,
+    agent: Option<String>,
 ) -> Result<SessionSummary, String> {
-    backend.get()?.create_session(&root, name.as_deref()).await
+    backend
+        .get()?
+        .create_session(&root, name.as_deref(), agent.as_deref())
+        .await
+}
+
+#[tauri::command]
+async fn agents(backend: State<'_, Backend>, root: PathBuf) -> Result<Agents, String> {
+    backend.get()?.agents(&root)
 }
 
 #[tauri::command]
@@ -234,6 +243,7 @@ fn main() {
             add_project,
             sessions,
             create_session,
+            agents,
             access,
             watch,
             unwatch,
