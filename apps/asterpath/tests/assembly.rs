@@ -11,8 +11,8 @@ use asterpath::protocol::{
     ToolSelection, TurnConfig, Usage, UserInput, decode_entry, scan_all,
 };
 use asterpath_app::workspace::{
-    AGENT, CWD, NAME, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
-    new_session_spec,
+    AGENT, CWD, NAME, STYLE, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
+    new_session_spec, style_files,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
@@ -406,5 +406,148 @@ fn without_any_default_profile_or_builtin_directory_a_session_has_no_base_prompt
         .unwrap();
         assert_eq!(spec.system, [text("be brief")]);
         assert_eq!(spec.metadata.get(AGENT), None);
+        assert_eq!(spec.metadata.get(STYLE), None);
     }
+}
+
+/// The bundled style directory sits beside the bundled agent directory.
+fn builtin_styles(agents: &Agents) -> PathBuf {
+    agents.builtin.parent().unwrap().join("styles")
+}
+
+fn styled(
+    agents: &Agents,
+    agent: Option<&str>,
+    style: &str,
+) -> Result<SessionSpec, WorkspaceError> {
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some(style.to_owned()),
+            user_styles: Some(agents.user.join("styles")),
+            ..agents.workspace(agent)
+        },
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )?;
+    Ok(spec)
+}
+
+fn framed(body: &str) -> Part {
+    text(&format!(
+        "The output style below takes precedence over any output requirements above.\n\n{body}"
+    ))
+}
+
+#[test]
+fn an_output_style_follows_the_profile_and_project_overrides_user_overrides_builtin() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.user.join("code.md"), "user code");
+    let builtin = builtin_styles(&agents);
+    let user = agents.user.join("styles");
+    let project = agents.root.join(".asterpath/styles");
+    write(&builtin.join("terse.md"), "builtin terse");
+    write(&builtin.join("warm.md"), "builtin warm");
+    write(&builtin.join("teach.md"), "builtin teach");
+    write(
+        &user.join("warm.md"),
+        "---\ndescription: friendly\n---\nuser warm\n",
+    );
+    write(&user.join("teach.md"), "user teach");
+    write(&project.join("teach.md"), "project teach");
+
+    let files = style_files(
+        &Workspace {
+            user_styles: Some(user.clone()),
+            ..workspace()
+        },
+        Some(&agents.builtin),
+        &agents.root,
+    )
+    .unwrap();
+    let sources: Vec<_> = files
+        .iter()
+        .map(|file| (file.name.as_str(), file.path.clone()))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            ("teach", project.join("teach.md")),
+            ("terse", builtin.join("terse.md")),
+            ("warm", user.join("warm.md")),
+        ]
+    );
+
+    for (style, body) in [
+        ("terse", "builtin terse"),
+        ("warm", "user warm"),
+        ("teach", "project teach"),
+    ] {
+        let spec = styled(&agents, Some("code"), style).unwrap();
+        assert_eq!(
+            spec.system,
+            [text("user code"), framed(body), text("be brief")]
+        );
+        assert_eq!(spec.metadata.get(STYLE).map(String::as_str), Some(style));
+        assert_eq!(spec.metadata.get(AGENT).map(String::as_str), Some("code"));
+    }
+}
+
+#[test]
+fn a_style_works_without_a_profile_and_an_empty_style_adds_nothing() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    let user = agents.user.join("styles");
+    write(&user.join("terse.md"), "terse");
+    write(&user.join("empty.md"), "---\ndescription: nothing\n---\n\n");
+
+    let spec = styled(&agents, None, "terse").unwrap();
+    assert_eq!(spec.system, [framed("terse"), text("be brief")]);
+    assert_eq!(spec.metadata.get(AGENT), None);
+
+    let spec = styled(&agents, None, "empty").unwrap();
+    assert_eq!(spec.system, [text("be brief")]);
+    assert_eq!(spec.metadata.get(STYLE).map(String::as_str), Some("empty"));
+}
+
+#[test]
+fn an_unknown_style_or_a_field_other_than_description_is_a_config_error() {
+    let agents = Agents::new();
+    let user = agents.user.join("styles");
+    write(&user.join("fast.md"), "---\nmodel: q/fast\n---\nbody");
+    write(&user.join("narrow.md"), "---\ntools: [grep]\n---\nbody");
+    assert!(matches!(
+        styled(&agents, None, "missing"),
+        Err(WorkspaceError::Config(message)) if message.contains("unknown style missing")
+    ));
+    for (style, field) in [("fast", "model"), ("narrow", "tools")] {
+        let error = styled(&agents, None, style).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&user.join(format!("{style}.md")).display().to_string()),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn the_style_flag_wins_over_output_style() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "output_style = \"terse\"\n").unwrap();
+    let mut settings = asterpath_app::config::load(Some(config), &[]).unwrap();
+    assert_eq!(
+        settings.workspace().unwrap().style.as_deref(),
+        Some("terse")
+    );
+    settings.set_style(Some("warm".to_owned()));
+    assert_eq!(settings.workspace().unwrap().style.as_deref(), Some("warm"));
+    settings.set_style(None);
+    assert_eq!(settings.workspace().unwrap().style, None);
 }

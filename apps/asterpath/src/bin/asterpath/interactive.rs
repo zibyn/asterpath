@@ -39,13 +39,14 @@ pub enum Next {
 
 pub async fn interactive(
     global: &GlobalArgs,
-    args: SessionArgs,
+    mut args: SessionArgs,
     prompt: Option<String>,
 ) -> CliResult<()> {
     let mut first: Vec<Part> = prompt.map(|text| Part::Text { text }).into_iter().collect();
     for path in &args.images {
         first.push(attachment(path)?);
     }
+    args.config_style = true;
     let mut opened = session::open(global, &args, None).await?;
     // After `open`: the `-r` picker reads stdin itself.
     let mut lines = stdin_lines();
@@ -106,6 +107,8 @@ fn new_session(args: &SessionArgs, model: Option<String>) -> SessionArgs {
         fork_session: false,
         name: None,
         agent: args.agent.clone(),
+        style: args.style.clone(),
+        config_style: args.config_style,
         images: Vec::new(),
     }
 }

@@ -61,6 +61,8 @@ impl From<AsterError> for WorkspaceError {
 pub const CWD: &str = "cwd";
 pub const NAME: &str = "name";
 pub const AGENT: &str = "agent";
+/// The output style a session was created with (ADR-0052).
+pub const STYLE: &str = "style";
 /// The agent profile of new sessions when none is configured (ADR-0051).
 pub const DEFAULT_AGENT: &str = "default";
 
@@ -93,6 +95,10 @@ pub struct Workspace {
     pub agent: Option<String>,
     /// User-level agent profiles, between the builtin and project ones.
     pub user_agents: Option<PathBuf>,
+    /// The output style of new sessions (ADR-0052); `None` adds none.
+    pub style: Option<String>,
+    /// User-level output styles, between the builtin and project ones.
+    pub user_styles: Option<PathBuf>,
 }
 
 impl Default for Workspace {
@@ -107,6 +113,8 @@ impl Default for Workspace {
             mcp_servers: Vec::new(),
             agent: None,
             user_agents: None,
+            style: None,
+            user_styles: None,
         }
     }
 }
@@ -134,9 +142,10 @@ pub fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
 }
 
 /// A new session's spec from its work root: the selected agent profile's
-/// prompt, `AGENTS.md`, then the skill index, appended to `spec.system`; the
-/// profile's model and tools; and the session metadata. `builtin_agents` is
-/// the bundled profile directory, if any. Returns the skill diagnostics for
+/// prompt, the output style, `AGENTS.md`, then the skill index, appended to
+/// `spec.system`; the profile's model and tools; and the session metadata.
+/// `builtin_agents` is the bundled profile directory, if any; the bundled
+/// styles are its sibling `styles`. Returns the skill diagnostics for
 /// the caller to show.
 pub fn new_session_spec(
     workspace: &Workspace,
@@ -150,6 +159,7 @@ pub fn new_session_spec(
         Some(file) => Some((file.name.clone(), load_agent(file)?)),
         None => None,
     };
+    let style = selected_style(workspace, builtin_agents, root)?;
     let (index, diagnostics) = skill_index(workspace, root);
     if let Some((_, profile)) = &agent {
         if !profile.prompt.is_empty() {
@@ -171,6 +181,13 @@ pub fn new_session_spec(
             spec.tools = ToolSelection::Names(tools.iter().cloned().map(ToolName::new).collect());
         }
     }
+    if let Some((_, style)) = &style
+        && !style.prompt.is_empty()
+    {
+        spec.system.push(Part::Text {
+            text: format!("{STYLE_FRAMING}\n\n{}", style.prompt),
+        });
+    }
     if let Some(agents) = agents_md(root)? {
         spec.system.push(agents);
     }
@@ -180,6 +197,9 @@ pub fn new_session_spec(
     spec.metadata = metadata(root, name);
     if let Some((name, _)) = agent {
         spec.metadata.insert(AGENT.to_owned(), name);
+    }
+    if let Some((name, _)) = style {
+        spec.metadata.insert(STYLE.to_owned(), name);
     }
     Ok(diagnostics)
 }
@@ -197,6 +217,27 @@ pub fn selected_agent<'a>(
             .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}"))),
         None => Ok(find(DEFAULT_AGENT)),
     }
+}
+
+/// The framing line before an output style's body (ADR-0052).
+const STYLE_FRAMING: &str =
+    "The output style below takes precedence over any output requirements above.";
+
+/// `workspace.style`, loaded; an unknown name is an error.
+fn selected_style(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<Option<(String, OutputStyle)>, WorkspaceError> {
+    let Some(name) = &workspace.style else {
+        return Ok(None);
+    };
+    let files = style_files(workspace, builtin_agents, root)?;
+    let file = files
+        .iter()
+        .find(|file| &file.name == name)
+        .ok_or_else(|| WorkspaceError::Config(format!("unknown style {name}")))?;
+    Ok(Some((name.clone(), load_style(file)?)))
 }
 
 /// The builtin agent directory: the first of the application's `candidates`
@@ -217,7 +258,8 @@ pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<P
     found
 }
 
-/// An agent profile file (ADR-0051): its name is the file name without `.md`.
+/// An agent profile or output style file (ADR-0051, ADR-0052): its name is
+/// the file name without `.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentFile {
     pub name: String,
@@ -244,11 +286,36 @@ pub fn agent_profiles(
     builtin_agents: Option<&Path>,
     root: &Path,
 ) -> Result<Vec<AgentFile>, WorkspaceError> {
-    let dirs = builtin_agents
-        .map(Path::to_path_buf)
-        .into_iter()
-        .chain(workspace.user_agents.clone())
-        .chain([root.join(".asterpath/agents")]);
+    named_files(
+        builtin_agents
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(workspace.user_agents.clone())
+            .chain([root.join(".asterpath/agents")]),
+    )
+}
+
+/// The `*.md` output styles of the `styles` directory beside
+/// `builtin_agents`, the user directory and `<root>/.asterpath/styles`, with
+/// the same precedence as [`agent_profiles`].
+pub fn style_files(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<Vec<AgentFile>, WorkspaceError> {
+    named_files(
+        builtin_agents
+            .and_then(Path::parent)
+            .map(|dir| dir.join("styles"))
+            .into_iter()
+            .chain(workspace.user_styles.clone())
+            .chain([root.join(".asterpath/styles")]),
+    )
+}
+
+/// The `*.md` files of `dirs` by name; a later directory's file replaces an
+/// earlier one of the same name. Missing directories are empty.
+fn named_files(dirs: impl Iterator<Item = PathBuf>) -> Result<Vec<AgentFile>, WorkspaceError> {
     let mut found = BTreeMap::new();
     for dir in dirs {
         let io = |source| WorkspaceError::Io {
@@ -278,14 +345,10 @@ pub fn agent_profiles(
 
 /// Read and parse a profile; an unknown frontmatter field is an error.
 pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
-    let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
-        context: format!("cannot read {}", file.path.display()),
-        source,
-    })?;
     let invalid = |message: String| {
         WorkspaceError::Config(format!("agent {}: {message}", file.path.display()))
     };
-    let (fields, body) = parse_frontmatter(&content).map_err(invalid)?;
+    let (fields, body) = read_frontmatter(file, invalid)?;
     let mut profile = AgentProfile {
         description: None,
         model: None,
@@ -313,6 +376,50 @@ pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
         }
     }
     Ok(profile)
+}
+
+/// An output style's description and body (ADR-0052).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputStyle {
+    pub description: Option<String>,
+    /// Appended after the profile's prompt, trimmed.
+    pub prompt: String,
+}
+
+/// Read and parse a style; any field but `description` is an error.
+pub fn load_style(file: &AgentFile) -> Result<OutputStyle, WorkspaceError> {
+    let invalid = |message: String| {
+        WorkspaceError::Config(format!("style {}: {message}", file.path.display()))
+    };
+    let (fields, body) = read_frontmatter(file, invalid)?;
+    let mut style = OutputStyle {
+        description: None,
+        prompt: body.trim().to_owned(),
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("description", FrontmatterValue::String(text)) => style.description = Some(text),
+            ("description", _) => {
+                return Err(invalid("`description` must be a string".to_owned()));
+            }
+            _ => return Err(invalid(format!("unknown field `{key}`"))),
+        }
+    }
+    Ok(style)
+}
+
+/// A profile or style file's frontmatter fields and body; `invalid` wraps a
+/// parse error.
+fn read_frontmatter(
+    file: &AgentFile,
+    invalid: impl Fn(String) -> WorkspaceError,
+) -> Result<(BTreeMap<String, FrontmatterValue>, String), WorkspaceError> {
+    let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
+        context: format!("cannot read {}", file.path.display()),
+        source,
+    })?;
+    let (fields, body) = parse_frontmatter(&content).map_err(invalid)?;
+    Ok((fields, body.to_owned()))
 }
 
 /// New-session skill policy: `skills_enabled`. The loader tool comes from
