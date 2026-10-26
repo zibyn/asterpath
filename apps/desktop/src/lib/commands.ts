@@ -93,8 +93,13 @@ export const setModel = (session: string, model: ModelSpec) => invoke<void>("set
 /** Where a provider's key comes from; the key itself never leaves the backend. */
 export type KeySource = { kind: "env"; name: string } | { kind: "file" } | { kind: "missing" };
 
+export type Protocol = "anthropic" | "openai";
+
 export interface ProviderKey {
   id: string;
+  protocol: Protocol;
+  /** `null`: the adapter's default endpoint. */
+  base_url: string | null;
   key: KeySource;
 }
 
@@ -111,9 +116,20 @@ export interface Setup {
 
 export const setup = () => invoke<Setup>("setup");
 
-/** Write `config.toml` and restart the backend; an empty key keeps the file's. */
-export const saveSetup = (provider: string, model: string, apiKey: string) =>
-  invoke<Setup>("save_setup", { provider, model, apiKey });
+/** `config.toml`'s `[model]` and `[providers.<provider>]` values. */
+export interface SetupChoice {
+  provider: string;
+  model: string;
+  /** A provider instance's protocol; `null` keeps the file's. */
+  protocol: Protocol | null;
+  /** `null` keeps the file's; empty reverts to the default endpoint. */
+  base_url: string | null;
+  /** `null` or empty keeps the file's. */
+  api_key: string | null;
+}
+
+/** Write `config.toml` and restart the backend. */
+export const saveSetup = (choice: SetupChoice) => invoke<Setup>("save_setup", { choice });
 
 /** Replay the session's records, then follow it. Resolves to the function that stops watching. */
 export async function watch(session: string, onEvent: (event: ViewEvent) => void): Promise<() => void> {

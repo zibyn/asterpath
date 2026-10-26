@@ -4,8 +4,18 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use asterpath_app::config::KeySource;
+use asterpath_app::config::{KeySource, SetupChoice};
 use asterpath_app::desktop::{Desktop, save_setup, setup};
+
+fn choice(provider: &str, model: &str, api_key: Option<&str>) -> SetupChoice {
+    SetupChoice {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        protocol: None,
+        base_url: None,
+        api_key: api_key.map(str::to_owned),
+    }
+}
 
 /// A config with comments and an instance whose key variable is never set.
 fn write_config(dir: &Path) -> std::path::PathBuf {
@@ -41,7 +51,11 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
         .unwrap();
     assert_eq!(deepseek.key, KeySource::Missing);
 
-    save_setup(Some(path.clone()), "deepseek", "ds-pro", Some("sk-secret")).unwrap();
+    save_setup(
+        Some(path.clone()),
+        &choice("deepseek", "ds-pro", Some("sk-secret")),
+    )
+    .unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert!(
         text.contains("# keep me") && text.contains("# and me"),
@@ -62,7 +76,11 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
     assert!(!serde_json::to_string(&after).unwrap().contains("sk-secret"));
 
     // An empty key keeps the file's.
-    save_setup(Some(path.clone()), "deepseek", "ds-flash", Some("")).unwrap();
+    save_setup(
+        Some(path.clone()),
+        &choice("deepseek", "ds-flash", Some("")),
+    )
+    .unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
 
     let desktop = Desktop::open(Some(path), dir.path().join("projects.json"))
@@ -76,8 +94,8 @@ fn an_invalid_choice_leaves_the_file_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(dir.path());
     let before = fs::read_to_string(&path).unwrap();
-    assert!(save_setup(Some(path.clone()), "gemini", "m", Some("k")).is_err());
-    assert!(save_setup(Some(path.clone()), "deepseek", " ", None).is_err());
+    assert!(save_setup(Some(path.clone()), &choice("gemini", "m", Some("k"))).is_err());
+    assert!(save_setup(Some(path.clone()), &choice("deepseek", " ", None)).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), before);
 }
 
@@ -85,7 +103,11 @@ fn an_invalid_choice_leaves_the_file_alone() {
 fn a_missing_file_is_created_owner_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("new/config.toml");
-    save_setup(Some(path.clone()), "anthropic", "claude-test", Some("sk")).unwrap();
+    save_setup(
+        Some(path.clone()),
+        &choice("anthropic", "claude-test", Some("sk")),
+    )
+    .unwrap();
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -93,4 +115,33 @@ fn a_missing_file_is_created_owner_only() {
     let text = fs::read_to_string(&path).unwrap();
     assert!(!text.contains("[providers]\n"), "{text}");
     assert!(text.contains("[providers.anthropic]"), "{text}");
+}
+
+#[test]
+fn a_new_instance_gets_its_protocol_and_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path());
+    let mut custom = choice("relay", "m", Some("sk"));
+    custom.protocol = Some("openai".to_owned());
+    custom.base_url = Some("http://127.0.0.1:9/v1".to_owned());
+    save_setup(Some(path.clone()), &custom).unwrap();
+
+    let relay = setup(Some(path.clone()))
+        .providers
+        .into_iter()
+        .find(|p| p.id == "relay")
+        .unwrap();
+    assert_eq!(relay.protocol, "openai");
+    assert_eq!(relay.base_url.as_deref(), Some("http://127.0.0.1:9/v1"));
+    // Its own variable, not OPENAI_API_KEY.
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains("api_key_env = \"RELAY_API_KEY\"")
+    );
+
+    // Empty clears it back to the adapter's default; `None` keeps it.
+    custom.base_url = Some(String::new());
+    save_setup(Some(path.clone()), &custom).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("base_url"));
 }

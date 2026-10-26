@@ -4,10 +4,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
 
-const builtins: commands.ProviderKey[] = [
-  { id: "anthropic", key: { kind: "missing" } },
-  { id: "openai", key: { kind: "missing" } },
-];
+const builtins = ["anthropic", "openai"];
 
 function describe(key: commands.KeySource) {
   if (key.kind === "env") return `Set (env:${key.name})`;
@@ -15,7 +12,7 @@ function describe(key: commands.KeySource) {
   return "Not set";
 }
 
-/** Provider, model and API key, written back to `config.toml` (ADR-0050). */
+/** Provider, endpoint, model and API key, written back to `config.toml` (ADR-0050). */
 export function Settings() {
   const setup = useQuery({ queryKey: ["setup"], queryFn: commands.setup });
   if (!setup.data) {
@@ -27,19 +24,31 @@ export function Settings() {
 
 function SettingsForm({ setup }: { setup: commands.Setup }) {
   const queryClient = useQueryClient();
-  const providers = setup.providers.length > 0 ? setup.providers : builtins;
-  const [provider, setProvider] = useState(setup.provider ?? providers[0].id);
+  const known = (id: string) => setup.providers.find((option) => option.id === id);
+  const [provider, setProvider] = useState(setup.provider ?? "anthropic");
+  const [protocol, setProtocol] = useState<commands.Protocol>(known(provider)?.protocol ?? "anthropic");
+  const [baseUrl, setBaseUrl] = useState(known(provider)?.base_url ?? "");
   const [model, setModel] = useState(setup.model ?? "");
   const [apiKey, setApiKey] = useState("");
+  const id = provider.trim();
+  // Built-in names imply their protocol; any other id is an instance (ADR-0029).
+  const custom = !builtins.includes(id);
   const save = useMutation({
-    mutationFn: () => commands.saveSetup(provider, model.trim(), apiKey),
+    mutationFn: () =>
+      commands.saveSetup({
+        provider: id,
+        model: model.trim(),
+        protocol: custom ? protocol : null,
+        base_url: baseUrl.trim(),
+        api_key: apiKey || null,
+      }),
     onSuccess: (saved) => {
       queryClient.setQueryData(["setup"], saved);
       // The backend was replaced; everything it served is stale.
       void queryClient.invalidateQueries();
     },
   });
-  const key = providers.find((option) => option.id === provider)?.key ?? { kind: "missing" };
+  const key = known(id)?.key ?? { kind: "missing" };
 
   return (
     <form
@@ -54,17 +63,49 @@ function SettingsForm({ setup }: { setup: commands.Setup }) {
       {setup.error && <p className="text-destructive">{setup.error}</p>}
       <label className="flex flex-col gap-1">
         Provider
-        <select
+        <input
           className="rounded border bg-background px-2 py-1"
+          list="providers"
           value={provider}
-          onChange={(event) => setProvider(event.target.value)}
-        >
-          {providers.map((option) => (
-            <option key={option.id} value={option.id}>
-              {option.id}
-            </option>
+          required
+          onChange={(event) => {
+            const next = known(event.target.value.trim());
+            setProvider(event.target.value);
+            if (next) {
+              setProtocol(next.protocol);
+              setBaseUrl(next.base_url ?? "");
+            }
+          }}
+        />
+        <datalist id="providers">
+          {setup.providers.map((option) => (
+            <option key={option.id} value={option.id} />
           ))}
-        </select>
+        </datalist>
+        <span className="text-xs text-muted-foreground">anthropic, openai, or a name of your own (e.g. deepseek)</span>
+      </label>
+      {custom && (
+        <label className="flex flex-col gap-1">
+          Protocol
+          <select
+            className="rounded border bg-background px-2 py-1"
+            value={protocol}
+            onChange={(event) => setProtocol(event.target.value as commands.Protocol)}
+          >
+            <option value="anthropic">anthropic</option>
+            <option value="openai">openai</option>
+          </select>
+        </label>
+      )}
+      <label className="flex flex-col gap-1">
+        Base URL
+        <input
+          className="rounded border bg-background px-2 py-1"
+          placeholder={custom ? "https://api.example.com" : "Default endpoint"}
+          value={baseUrl}
+          required={custom}
+          onChange={(event) => setBaseUrl(event.target.value)}
+        />
       </label>
       <label className="flex flex-col gap-1">
         Model id
@@ -93,7 +134,7 @@ function SettingsForm({ setup }: { setup: commands.Setup }) {
       </label>
       {setup.path && <p className="text-xs text-muted-foreground">Saved to {setup.path}</p>}
       {save.error && <p className="text-destructive">{String(save.error)}</p>}
-      <Button type="submit" disabled={save.isPending || !model.trim()}>
+      <Button type="submit" disabled={save.isPending || !id || !model.trim()}>
         Save
       </Button>
     </form>

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
+use asterpath_app::config::SetupChoice;
 use asterpath_app::desktop::{
     self, Access, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary, Setup,
     ViewEvent,
@@ -211,15 +212,10 @@ fn setup() -> Setup {
     desktop::setup(None)
 }
 
-/// Write the settings and restart the backend; an empty key keeps the file's.
+/// Write the settings and restart the backend.
 #[tauri::command]
-async fn save_setup(
-    backend: State<'_, Backend>,
-    provider: String,
-    model: String,
-    api_key: Option<String>,
-) -> Result<Setup, String> {
-    desktop::save_setup(None, &provider, &model, api_key.as_deref())?;
+async fn save_setup(backend: State<'_, Backend>, choice: SetupChoice) -> Result<Setup, String> {
+    desktop::save_setup(None, &choice)?;
     backend.reopen().await?;
     Ok(desktop::setup(None))
 }

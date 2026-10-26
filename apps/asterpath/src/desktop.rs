@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::config::{self, KeySource, Settings};
+use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
     CWD, NAME, WorkRoot, Workspace, in_root, new_session_spec, roots, work_root,
 };
@@ -217,6 +217,10 @@ impl ApprovalPolicy for ApprovalModes {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProviderKey {
     pub id: String,
+    /// `anthropic` or `openai`.
+    pub protocol: String,
+    /// `None`: the adapter's default endpoint.
+    pub base_url: Option<String>,
     pub key: KeySource,
 }
 
@@ -253,20 +257,24 @@ pub fn setup(config: Option<PathBuf>) -> Setup {
             };
         }
     };
-    let mut providers: Vec<ProviderKey> = ["anthropic", "openai"]
+    let mut ids = vec!["anthropic".to_owned(), "openai".to_owned()];
+    for (id, _) in config::key_sources(&settings) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let providers = ids
         .into_iter()
         .filter_map(|id| {
+            let (protocol, base_url) = config::endpoint(&settings, &id)?;
             Some(ProviderKey {
-                id: id.to_owned(),
-                key: config::key_source(&settings, id)?,
+                protocol: protocol.to_owned(),
+                base_url: base_url.map(str::to_owned),
+                key: config::key_source(&settings, &id)?,
+                id,
             })
         })
         .collect();
-    for (id, key) in config::key_sources(&settings) {
-        if !providers.iter().any(|provider| provider.id == id) {
-            providers.push(ProviderKey { id, key });
-        }
-    }
     let provider = settings.provider().ok().map(str::to_owned);
     let model = settings.model_id().map(str::to_owned);
     let needed = model.is_none()
@@ -283,18 +291,11 @@ pub fn setup(config: Option<PathBuf>) -> Setup {
     }
 }
 
-/// Write the page's values to `config`'s file; an empty `api_key` keeps
-/// the file's.
-pub fn save_setup(
-    config: Option<PathBuf>,
-    provider: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> Result<(), String> {
+/// Write the page's values to `config`'s file.
+pub fn save_setup(config: Option<PathBuf>, choice: &SetupChoice) -> Result<(), String> {
     let path = config::config_path(config)
         .ok_or("no configuration path: neither XDG_CONFIG_HOME nor HOME is set")?;
-    let api_key = api_key.filter(|key| !key.is_empty());
-    config::save_setup(&path, provider, model, api_key).map_err(text)
+    config::save_setup(&path, choice).map_err(text)
 }
 
 /// The background task driving a session tree this process claimed.

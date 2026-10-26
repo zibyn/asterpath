@@ -169,13 +169,23 @@ fn create_parent(path: &Path) -> std::io::Result<()> {
 
 /// Set `[model] provider`, `[model] id` and, unless `api_key` is `None`,
 /// `[providers.<provider>] api_key` in the file at `path`, keeping its
-/// comments and order. The result is validated before it is written, `0600`.
-pub fn save_setup(
-    path: &Path,
-    provider: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> Result<(), WorkspaceError> {
+/// The desktop settings page's values. No `Debug`: it may hold a key.
+#[derive(Clone, Deserialize)]
+pub struct SetupChoice {
+    pub provider: String,
+    pub model: String,
+    /// `protocol` of a provider instance; `None` keeps the file's.
+    pub protocol: Option<String>,
+    /// `None` keeps the file's; empty removes it (the adapter's default endpoint).
+    pub base_url: Option<String>,
+    /// `None` or empty keeps the file's.
+    pub api_key: Option<String>,
+}
+
+/// Write `choice` to the file at `path`: `[model] provider` / `id` and the
+/// `[providers.<provider>]` fields it sets, keeping the file's comments and
+/// order. The result is validated before it is written, `0600`.
+pub fn save_setup(path: &Path, choice: &SetupChoice) -> Result<(), WorkspaceError> {
     let io = |context: &str, source| WorkspaceError::Io {
         context: format!("{context} {}", path.display()),
         source,
@@ -190,11 +200,34 @@ pub fn save_setup(
             parse_error(&contents, error.message(), error.span())
         })?;
     let section = table(doc.as_table_mut(), "model", false)?;
-    section["provider"] = toml_edit::value(provider);
-    section["id"] = toml_edit::value(model);
-    if let Some(key) = api_key {
+    section["provider"] = toml_edit::value(&choice.provider);
+    section["id"] = toml_edit::value(&choice.model);
+    let api_key = choice.api_key.as_deref().filter(|key| !key.is_empty());
+    if choice.protocol.is_some() || choice.base_url.is_some() || api_key.is_some() {
         let providers = table(doc.as_table_mut(), "providers", true)?;
-        table(providers, provider, false)?["api_key"] = toml_edit::value(key);
+        let section = table(providers, &choice.provider, false)?;
+        if let Some(protocol) = &choice.protocol {
+            section["protocol"] = toml_edit::value(protocol);
+            // Without its own variable an instance would read the protocol's
+            // (`ANTHROPIC_API_KEY`), which then beats the key saved here.
+            if Protocol::parse(&choice.provider).is_none() && !section.contains_key("api_key_env") {
+                let env = format!(
+                    "{}_API_KEY",
+                    choice.provider.to_uppercase().replace('-', "_")
+                );
+                section["api_key_env"] = toml_edit::value(env);
+            }
+        }
+        match choice.base_url.as_deref() {
+            Some("") => {
+                section.remove("base_url");
+            }
+            Some(url) => section["base_url"] = toml_edit::value(url),
+            None => {}
+        }
+        if let Some(key) = api_key {
+            section["api_key"] = toml_edit::value(key);
+        }
     }
     let text = doc.to_string();
     let parsed =
@@ -561,6 +594,17 @@ pub fn key_source(settings: &Settings, id: &str) -> Option<KeySource> {
     provider_available(id, &settings.file).then(|| file_key_source(id, &settings.file))
 }
 
+/// Provider `id`'s protocol name and `base_url`; `None` when `id` is not available.
+pub fn endpoint<'a>(settings: &'a Settings, id: &str) -> Option<(&'static str, Option<&'a str>)> {
+    let protocol = protocol(id, &settings.file).ok().filter(|p| p.enabled())?;
+    let base_url = settings
+        .file
+        .providers
+        .get(id)
+        .and_then(|section| section.base_url.as_deref());
+    Some((protocol.name(), base_url))
+}
+
 /// The environment variable first, then the file.
 fn file_key_source(id: &str, file: &FileConfig) -> KeySource {
     let section = file.providers.get(id);
@@ -601,6 +645,13 @@ impl Protocol {
         match self {
             Self::Anthropic => cfg!(feature = "anthropic"),
             Self::OpenAi => cfg!(feature = "openai"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
         }
     }
 
