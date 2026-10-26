@@ -58,5 +58,6 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0047](0047-multi-user-and-multi-node-belong-to-the-platform.md) | 多用户与多机部署归集成平台；内核只保证会话树单写者与 SQLite、Postgres 两种后端 |
 | [0048](0048-no-host-tier-workspace-and-config-are-facade-features.md) | 没有宿主这一层；「宿主」改称「应用」（并入门面 feature 部分由 0049 取代） |
 | [0049](0049-cli-and-desktop-are-one-application-crate.md) | CLI 与桌面端是一个应用 crate 的两个入口；组装与配置是它的私有模块 |
+| [0050](0050-user-config-holds-api-keys-and-is-created-on-first-run.md) | 用户配置在首次运行时创建，API key 可以存在里面（文件须只有属主可读） |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。

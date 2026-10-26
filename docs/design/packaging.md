@@ -406,7 +406,7 @@ pub enum AsterError {
 
 ### 4.7 配置
 
-默认读 `$XDG_CONFIG_HOME/asterpath/config.toml`（`--config` 或 `ASTERPATH_CONFIG` 可换文件）；默认路径不存在时使用默认值，`--config` 或 `ASTERPATH_CONFIG` 指定的文件不存在是配置错误（退出 2）。只有用户级一层，没有项目级配置。优先级：专用 flag > `-c key=value` > 文件。
+默认读 `$XDG_CONFIG_HOME/asterpath/config.toml`（`--config` 或 `ASTERPATH_CONFIG` 可换文件）。默认路径不存在时，CLI 与桌面端的每个入口都先写一份只含注释示例的模板（目录 `0700`、文件 `0600`），再按默认值继续；创建失败只在 stderr 提示一行（ADR-0050）。`--config` 或 `ASTERPATH_CONFIG` 指定的文件不存在是配置错误（退出 2），不创建。只有用户级一层，没有项目级配置。优先级：专用 flag > `-c key=value` > 文件。
 
 ```toml
 [model]
@@ -443,7 +443,8 @@ base_url = "https://api.openai.com/v1"
 [providers.deepseek]
 protocol = "anthropic"                          # anthropic | openai
 base_url = "https://api.deepseek.com/anthropic"
-api_key_env = "DEEPSEEK_API_KEY"                # 缺省取协议原有变量；key 只从环境读
+api_key_env = "DEEPSEEK_API_KEY"                # 缺省取协议原有变量；环境变量优先于 api_key
+# api_key = "sk-…"                              # 可选（ADR-0050）；文件须只有属主可读
 
 [providers.deepseek.profile]                    # 实例默认；缺省字段取 LATEST
 efforts = ["off", "low", "high", "max"]
@@ -487,7 +488,7 @@ default = "untrusted"         # untrusted | never
 ```
 
 - `max_steps_per_turn = 0` 是配置错误（退出码 2）；不设上限靠省略该字段。
-- API key **只从环境变量读**：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`。配置文件出现 `api_key` / `secret` / `token` 字段直接报错（退出码 2）。
+- API key（ADR-0050）：先取环境变量（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY` 或该实例的 `api_key_env`），没有再取 `[providers.<id>] api_key`。别处出现 `api_key` / `secret` / `token` 字段、或用 `-c` 设 `api_key`，都是配置错误（退出码 2）。Unix 上文件含 `api_key` 且组或其他人有任何权限时是配置错误，提示 `chmod 600`。`doctor` 与错误信息只显示 key 是否已设置及来源，不显示值。
 - 环境变量只有 `ASTERPATH_CONFIG` 与各 provider 的 API key 变量；其余覆盖用 `-c`。
 - `base_url` 是为验收与自建网关准备的；指向 mock server 时不会走真实网络。
 - 未知字段（任一层级）是配置错误（退出码 2）。
