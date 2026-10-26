@@ -777,3 +777,143 @@ fn a_profile_that_fails_to_load_is_skipped_with_a_diagnostic() {
         Err(WorkspaceError::Config(message)) if message.contains("unknown field `mood`")
     ));
 }
+
+async fn resolve_child_system(agents: &Agents, metadata: &[(&str, &str)]) -> Option<Vec<Part>> {
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let mut metadata: BTreeMap<String, String> = metadata
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    metadata.insert(CWD.to_owned(), agents.root.display().to_string());
+    asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap()
+        .child_system
+}
+
+#[tokio::test]
+async fn a_styled_root_offers_its_unstyled_system_to_its_children() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.user.join("code.md"), "user code");
+
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "code")]).await,
+        Some(vec![text("user code"), text("be brief"), index("- code\n")])
+    );
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse")]).await,
+        Some(vec![text("be brief"), index("- code\n")])
+    );
+    assert_eq!(
+        resolve_child_system(&agents, &[(AGENT, "code")]).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_styled_roots_fresh_child_is_created_without_the_style() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    let user_styles = agents.user.join("styles");
+    write(&user_styles.join("terse.md"), "terse");
+    let workspace = Workspace {
+        style: Some("terse".to_owned()),
+        user_styles: Some(user_styles),
+        ..agents.workspace(None)
+    };
+    let mut spec = base_spec();
+    new_session_spec(
+        &workspace,
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    assert_eq!(spec.system, [framed("terse"), text("be brief")]);
+
+    let say = |value: &str| {
+        vec![Item::Message {
+            role: Role::Assistant,
+            parts: vec![text(value)],
+            raw: None,
+        }]
+    };
+    let provider = ScriptedProvider::new("p")
+        .respond(
+            vec![Item::ToolCall {
+                call_id: "call-1".to_owned(),
+                provider_item_id: None,
+                name: ToolName::new("spawn_agent"),
+                raw_args: JsonString::new(r#"{"task":"t"}"#),
+                raw: None,
+            }],
+            StopReason::ToolUse,
+            Usage::default(),
+        )
+        .respond(say("child done"), StopReason::EndTurn, Usage::default())
+        .respond(say("parent done"), StopReason::EndTurn, Usage::default());
+    let asterpath = Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .environment(Arc::new(WorkRoot {
+            workspace,
+            new_session: false,
+            pinned: None,
+            builtin_agents: Some(agents.builtin.clone()),
+        }))
+        .build()
+        .await
+        .unwrap();
+    let root = asterpath.create_session(spec).await.unwrap();
+    drive(&root.claim().await.unwrap()).await;
+    let (child, spawned) = events(&asterpath, root.id())
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { child, config, .. } => Some((child, config)),
+            _ => None,
+        })
+        .expect("the root spawns a child");
+    let SessionEvent::SessionCreated {
+        config: created, ..
+    } = &events(&asterpath, child).await[0]
+    else {
+        panic!("the child starts with SessionCreated");
+    };
+    let unstyled = vec![text("be brief")];
+    assert_eq!(created.system, unstyled);
+    assert_eq!(spawned.system, unstyled);
+}
+
+async fn drive(owned: &asterpath::OwnedSession) {
+    owned
+        .submit_input(UserInput {
+            id: InputId::from_bytes([1; 16]),
+            parts: vec![text("go")],
+        })
+        .await
+        .unwrap();
+    let mut stream = owned.drive();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+}
+
+async fn events(
+    asterpath: &Asterpath,
+    session: asterpath::protocol::SessionId,
+) -> Vec<SessionEvent> {
+    scan_all(&*asterpath.store(), session)
+        .await
+        .unwrap()
+        .iter()
+        .map(|entry| decode_entry(entry).unwrap())
+        .collect()
+}

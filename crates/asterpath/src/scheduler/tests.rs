@@ -2499,3 +2499,48 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
         }]
     );
 }
+
+fn child_system_env(system: &str) -> asterpath_protocol::SessionEnvironment {
+    let mut env = asterpath_protocol::SessionEnvironment::default();
+    env.child_system = Some(vec![text(system)]);
+    env
+}
+
+#[tokio::test]
+async fn a_replayed_spawn_does_not_read_the_child_system_again() {
+    let log = Arc::new(InMemoryEventLog::new());
+    let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+    let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
+
+    let request = SpawnRequest::new(reference, caused_by, vec![text("go")]);
+    let child = in_env(
+        child_system_env("child system"),
+        scheduler.spawn(request.clone()),
+    )
+    .await
+    .expect("spawn");
+
+    // The environment's child system changes; the recorded spawn replays as before.
+    for env in [
+        asterpath_protocol::SessionEnvironment::default(),
+        child_system_env("changed system"),
+    ] {
+        let again = in_env(env, scheduler.spawn(request.clone()))
+            .await
+            .expect("replay spawn");
+        assert_eq!(again.child, child.child);
+    }
+    let created = events(&*log, child.child).await;
+    let SessionEvent::SessionCreated { config, .. } = &created[0] else {
+        unreachable!()
+    };
+    assert_eq!(config.system, vec![text("child system")]);
+    assert_eq!(
+        events(&*log, parent)
+            .await
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+            .count(),
+        1
+    );
+}

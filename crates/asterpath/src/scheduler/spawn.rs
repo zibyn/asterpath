@@ -299,7 +299,12 @@ impl Scheduler {
                 (None, ContextPolicy::Fork { at }) => {
                     fork_system(&parent_events, *at).map_err(SpawnError::Execution)?
                 }
-                (None, ContextPolicy::Fresh) => parent_config.system.clone(),
+                // Only the root's direct children take the environment's
+                // child system (ADR-0054).
+                (None, ContextPolicy::Fresh) => crate::environment::current()
+                    .and_then(|env| env.child_system.clone())
+                    .filter(|_| child_depth == 1)
+                    .unwrap_or_else(|| parent_config.system.clone()),
             };
 
             let config = ConfigSnapshot {
