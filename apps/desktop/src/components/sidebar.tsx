@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { FolderPlus, Plus, Settings } from "lucide-react";
+import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
@@ -48,8 +49,12 @@ function ProjectItem({ project }: { project: commands.Project }) {
     // shortcut: statuses are polled; switch to a change notification (ADR-0043) once the facade has one
     refetchInterval: 1000,
   });
+  const agents = useQuery({ queryKey: ["agents", project.root], queryFn: () => commands.agents(project.root) });
+  // `null` until picked: the configured default.
+  const [picked, setPicked] = useState<string | null>(null);
+  const agent = picked ?? agents.data?.default ?? null;
   const create = useMutation({
-    mutationFn: () => commands.createSession(project.root),
+    mutationFn: () => commands.createSession(project.root, undefined, agent),
     onSuccess: (session) => {
       void queryClient.invalidateQueries({ queryKey: ["sessions", project.root] });
       void navigate({ to: "/sessions/$sessionId", params: { sessionId: session.id } });
@@ -62,6 +67,21 @@ function ProjectItem({ project }: { project: commands.Project }) {
         <h2 className="truncate px-1 py-1 text-xs font-medium text-muted-foreground" title={project.root}>
           {project.name}
         </h2>
+        {!!agents.data?.agents.length && (
+          <select
+            aria-label={`Agent of a new session in ${project.name}`}
+            className="ml-auto mr-1 max-w-28 rounded border bg-background px-1 py-0.5 text-xs"
+            value={agent ?? ""}
+            onChange={(event) => setPicked(event.target.value)}
+          >
+            {!agent && <option value="">No agent</option>}
+            {agents.data.agents.map((choice) => (
+              <option key={choice.name} value={choice.name} title={choice.description ?? undefined}>
+                {choice.name}
+              </option>
+            ))}
+          </select>
+        )}
         <Button
           variant="ghost"
           size="icon"
@@ -84,6 +104,7 @@ function ProjectItem({ project }: { project: commands.Project }) {
               className="flex items-center gap-2 rounded-md px-2 py-1 text-sm hover:bg-accent [&.active]:bg-accent"
             >
               <span className="flex-1 truncate">{session.name ?? session.id.slice(0, 8)}</span>
+              {session.agent && <span className="shrink-0 text-xs text-muted-foreground">{session.agent}</span>}
               <StatusBadge status={session.status} />
             </Link>
           </li>

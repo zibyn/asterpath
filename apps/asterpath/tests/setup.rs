@@ -86,7 +86,10 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
     let desktop = Desktop::open(Some(path), dir.path().join("projects.json"), None)
         .await
         .unwrap();
-    desktop.create_session(dir.path(), None).await.unwrap();
+    desktop
+        .create_session(dir.path(), None, None)
+        .await
+        .unwrap();
 }
 
 #[test]

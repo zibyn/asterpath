@@ -16,6 +16,8 @@ export interface SessionSummary {
   created_at: number;
   last_activity: number;
   status: Status;
+  /** The agent profile it was created with; fixed for its life. */
+  agent: string | null;
 }
 
 /** A session's sidebar badge; `elsewhere` = another process drives it. */
@@ -28,8 +30,22 @@ export const addProject = () => invoke<Project | null>("add_project");
 
 export const sessions = (root: string) => invoke<SessionSummary[]>("sessions", { root });
 
-export const createSession = (root: string, name?: string) =>
-  invoke<SessionSummary>("create_session", { root, name: name ?? null });
+/** `agent`: the profile; `null` uses `default_agent`. */
+export const createSession = (root: string, name?: string, agent?: string | null) =>
+  invoke<SessionSummary>("create_session", { root, name: name ?? null, agent: agent ?? null });
+
+export interface AgentChoice {
+  name: string;
+  description: string | null;
+}
+
+/** A project's agent profiles; `default` (`default_agent`) is preselected. */
+export interface Agents {
+  default: string | null;
+  agents: AgentChoice[];
+}
+
+export const agents = (root: string) => invoke<Agents>("agents", { root });
 
 /** Who may drive a session: this app, nobody, or another process (read-only here). */
 export type Access = "here" | "free" | "elsewhere";
@@ -80,6 +96,7 @@ export interface SessionInfo {
   model: ModelSpec;
   tokens: number;
   error: string | null;
+  agent: string | null;
 }
 
 /** The configured model and the model aliases' models. */

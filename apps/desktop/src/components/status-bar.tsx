@@ -43,6 +43,7 @@ export function StatusBar({ session }: { session: string }) {
           </option>
         ))}
       </select>
+      {info.data?.agent && <span title="Agent profile">{info.data.agent}</span>}
       {info.data && <span>{info.data.tokens.toLocaleString()} tokens</span>}
       {error && (
         <span className="truncate text-destructive" title={String(error)}>
