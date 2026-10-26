@@ -1107,7 +1107,7 @@ fn doctor_validates_without_initialising_modules() {
 fn doctor_rejects_bad_configs_with_two() {
     for (body, overrides) in [
         ("[turn]\nmax_steps_per_turn = 0\n", &[][..]),
-        ("[providers.anthropic]\napi_key = \"leaked\"\n", &[]),
+        ("[model]\napi_key = \"leaked\"\n", &[]),
         ("[providers.anthropic]\nsecret = \"leaked\"\n", &[]),
         ("[providers.anthropic]\ntoken = \"leaked\"\n", &[]),
         ("", &["-c", "providers.anthropic.api_key=leaked"]),
@@ -1182,6 +1182,119 @@ fn config_flag_beats_the_environment_which_beats_the_default_path() {
         .assert()
         .code(2);
     doctor().env("ASTERPATH_CONFIG", &missing).assert().code(2);
+    assert!(!missing.exists(), "a named file is never created");
+}
+
+#[test]
+fn first_run_writes_an_owner_only_template() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TestDir::new("first-run");
+    let xdg = dir.path.join("xdg");
+    bin()
+        .env("XDG_CONFIG_HOME", &xdg)
+        .arg("doctor")
+        .assert()
+        .success();
+    let file = xdg.join("asterpath/config.toml");
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(&xdg.join("asterpath")), 0o700);
+    assert!(fs::read_to_string(&file).unwrap().contains("# api_key"));
+}
+
+#[test]
+fn a_template_that_cannot_be_written_is_only_a_hint() {
+    // `common::bin` points the default path under an unwritable directory.
+    let output = bin().arg("doctor").output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot create"), "{stderr}");
+}
+
+/// `config_body` plus a key in the file, owner-only.
+fn keyed_config(dir: &TestDir, server: &MockServer) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let body = config_body(server, &dir.db()).replace(
+        "[providers.anthropic]\n",
+        "[providers.anthropic]\napi_key = \"file-key-123\"\n",
+    );
+    let path = dir.config(&body);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+#[test]
+fn the_environment_key_beats_the_file_key() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+    ]);
+    let dir = TestDir::new("file-key");
+    keyed_config(&dir, &server);
+
+    ok(dir
+        .exec(&dir.path)
+        .env_remove("ANTHROPIC_API_KEY")
+        .arg("hi"));
+    ok(dir.exec(&dir.path).arg("hi"));
+    let requests = server.requests();
+    assert!(
+        requests[0].head.contains("file-key-123"),
+        "{}",
+        requests[0].head
+    );
+    assert!(
+        requests[1].head.contains("test-key"),
+        "{}",
+        requests[1].head
+    );
+}
+
+#[test]
+fn a_key_file_open_to_others_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start(Vec::new());
+    let dir = TestDir::new("key-mode");
+    let path = keyed_config(&dir, &server);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = bin()
+        .args(["doctor", "--config", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chmod 600"), "{stderr}");
+    assert!(!stderr.contains("file-key-123"), "{stderr}");
+    // Without a key the mode is not checked.
+    let plain = dir.config("[turn]\nmax_steps_per_turn = 3\n");
+    fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+    bin()
+        .args(["doctor", "--config", plain.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn doctor_shows_key_sources_not_keys() {
+    let server = MockServer::start(Vec::new());
+    let dir = TestDir::new("key-doctor");
+    let path = keyed_config(&dir, &server);
+    let doctor = || {
+        let mut command = bin();
+        command.args(["doctor", "--config", path.to_str().unwrap()]);
+        command
+    };
+    let output = doctor().env_remove("ANTHROPIC_API_KEY").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("provider anthropic: key file"), "{stdout}");
+    assert!(!stdout.contains("file-key-123"), "{stdout}");
+    let output = doctor().output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider anthropic: key env:ANTHROPIC_API_KEY"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("test-key"), "{stdout}");
 }
 
 #[test]
@@ -1500,7 +1613,7 @@ fn doctor_rejects_bad_vendor_provider_sections_with_two() {
         "[providers.openai.models.m]\nthinking_default_on = true\n",
         "[providers.deepseek]\nprotocol = \"openai\"\n[providers.deepseek.profile]\ninline_changes = true\n",
         "[providers.deepseek]\nprotocol = \"anthropic\"\n[providers.deepseek.profile]\nthinking = \"sometimes\"\n",
-        "[providers.deepseek]\nprotocol = \"anthropic\"\napi_key = \"leaked\"\n",
+        "[providers.deepseek.profile]\napi_key = \"leaked\"\n",
     ] {
         let dir = TestDir::new("vendor-bad");
         let config = dir.config(body);

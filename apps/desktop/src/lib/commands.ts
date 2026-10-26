@@ -90,6 +90,31 @@ export const sessionInfo = (session: string) => invoke<SessionInfo>("session_inf
 /** Use `model` from the session's next step on. */
 export const setModel = (session: string, model: ModelSpec) => invoke<void>("set_model", { session, model });
 
+/** Where a provider's key comes from; the key itself never leaves the backend. */
+export type KeySource = { kind: "env"; name: string } | { kind: "file" } | { kind: "missing" };
+
+export interface ProviderKey {
+  id: string;
+  key: KeySource;
+}
+
+/** The settings page. `needed`: no provider, model or key, so nothing can run yet. */
+export interface Setup {
+  path: string | null;
+  provider: string | null;
+  model: string | null;
+  providers: ProviderKey[];
+  needed: boolean;
+  /** The configuration fails to load for another reason. */
+  error: string | null;
+}
+
+export const setup = () => invoke<Setup>("setup");
+
+/** Write `config.toml` and restart the backend; an empty key keeps the file's. */
+export const saveSetup = (provider: string, model: string, apiKey: string) =>
+  invoke<Setup>("save_setup", { provider, model, apiKey });
+
 /** Replay the session's records, then follow it. Resolves to the function that stops watching. */
 export async function watch(session: string, onEvent: (event: ViewEvent) => void): Promise<() => void> {
   const channel = new Channel<ViewEvent>();

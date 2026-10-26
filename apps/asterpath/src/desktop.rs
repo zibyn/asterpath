@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::config::{self, Settings};
+use crate::config::{self, KeySource, Settings};
 use crate::workspace::{
     CWD, NAME, WorkRoot, Workspace, in_root, new_session_spec, roots, work_root,
 };
@@ -213,6 +213,90 @@ impl ApprovalPolicy for ApprovalModes {
     }
 }
 
+/// A provider the settings page offers, with where its key comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderKey {
+    pub id: String,
+    pub key: KeySource,
+}
+
+/// What the settings page shows; never a key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Setup {
+    pub path: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// `anthropic` and `openai`, then the file's other instances.
+    pub providers: Vec<ProviderKey>,
+    /// No provider, model or key for that provider: the page must be shown.
+    pub needed: bool,
+    /// Why the configuration does not load, when it is not just missing setup.
+    pub error: Option<String>,
+}
+
+/// The settings of `config` (resolved as [`Desktop::open`] does).
+pub fn setup(config: Option<PathBuf>) -> Setup {
+    let path = config::config_path(config.clone()).map(|path| path.display().to_string());
+    let settings = match config::load(config, &[]).and_then(|settings| {
+        config::validate(&settings)?;
+        Ok(settings)
+    }) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return Setup {
+                path,
+                provider: None,
+                model: None,
+                providers: Vec::new(),
+                needed: false,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let mut providers: Vec<ProviderKey> = ["anthropic", "openai"]
+        .into_iter()
+        .filter_map(|id| {
+            Some(ProviderKey {
+                id: id.to_owned(),
+                key: config::key_source(&settings, id)?,
+            })
+        })
+        .collect();
+    for (id, key) in config::key_sources(&settings) {
+        if !providers.iter().any(|provider| provider.id == id) {
+            providers.push(ProviderKey { id, key });
+        }
+    }
+    let provider = settings.provider().ok().map(str::to_owned);
+    let model = settings.model_id().map(str::to_owned);
+    let needed = model.is_none()
+        || provider.as_deref().is_none_or(|id| {
+            config::key_source(&settings, id).is_none_or(|key| key == KeySource::Missing)
+        });
+    Setup {
+        path,
+        provider,
+        model,
+        providers,
+        needed,
+        error: None,
+    }
+}
+
+/// Write the page's values to `config`'s file; an empty `api_key` keeps
+/// the file's.
+pub fn save_setup(
+    config: Option<PathBuf>,
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let path = config::config_path(config)
+        .ok_or("no configuration path: neither XDG_CONFIG_HOME nor HOME is set")?;
+    let api_key = api_key.filter(|key| !key.is_empty());
+    config::save_setup(&path, provider, model, api_key).map_err(text)
+}
+
 /// The background task driving a session tree this process claimed.
 struct Driver {
     owned: OwnedSession,
@@ -263,9 +347,9 @@ impl Desktop {
         }
     }
 
-    /// The default `config.toml` (or `ASTERPATH_CONFIG`) and its database.
-    pub async fn open(projects_file: PathBuf) -> Result<Self, String> {
-        let settings: Settings = config::load(None, &[]).map_err(text)?;
+    /// `config` (else `ASTERPATH_CONFIG`, else the default `config.toml`) and its database.
+    pub async fn open(config: Option<PathBuf>, projects_file: PathBuf) -> Result<Self, String> {
+        let settings: Settings = config::load(config, &[]).map_err(text)?;
         config::validate(&settings).map_err(text)?;
         let workspace = settings.workspace().map_err(text)?;
         let template = config::session_spec(&settings).map_err(text)?;

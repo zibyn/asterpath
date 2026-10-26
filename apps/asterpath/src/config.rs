@@ -1,15 +1,15 @@
 //! `config.toml`, `-c key=value` overrides and flag resolution.
 //!
 //! Precedence is flag > `-c` > file. The only environment variables are
-//! `ASTERPATH_CONFIG` and the provider API keys; keys are deliberately not part
-//! of this model.
+//! `ASTERPATH_CONFIG` and the provider API keys. A key may also sit in
+//! `[providers.<id>] api_key`; the environment wins (ADR-0050).
 // `AsterError` is the facade's error, returned as is.
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,37 +45,65 @@ pub struct Settings {
     pub db: PathBuf,
     pub approval: ApprovalMode,
     pub file: FileConfig,
+    /// The file read, or the default path; `None` without a home directory.
+    pub path: Option<PathBuf>,
 }
 
 /// Load the configuration file (`--config`, else `ASTERPATH_CONFIG`, else
-/// `$XDG_CONFIG_HOME/asterpath/config.toml`; only that default may be missing) and merge
-/// each `-c key=value` over it.
+/// `$XDG_CONFIG_HOME/asterpath/config.toml`; only that default may be missing,
+/// and it is created from [`TEMPLATE`] then) and merge each `-c key=value` over it.
 pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, WorkspaceError> {
-    let explicit = config.or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from));
     // Only the default file may be missing; a named one that is not there is a typo.
-    let named = explicit.is_some();
-    let path = explicit.or_else(|| config_home().map(|home| home.join("asterpath/config.toml")));
-    let mut table = match path {
+    let named = config.is_some() || env_os("ASTERPATH_CONFIG").is_some();
+    let path = config_path(config);
+    if let Some(path) = &path
+        && !named
+        && !path.exists()
+        && let Err(error) = create_template(path)
+    {
+        eprintln!(
+            "asterpath: cannot create {}: {error}; using defaults",
+            path.display()
+        );
+    }
+    let mut table = match &path {
         Some(path) if named || path.exists() => {
-            let contents = std::fs::read_to_string(&path).map_err(|source| WorkspaceError::Io {
+            let contents = std::fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
                 context: format!("cannot read {}", path.display()),
                 source,
             })?;
-            toml::from_str(&contents)
-                .map_err(|error| WorkspaceError::Config(format!("invalid config: {error}")))?
+            let table: toml::Table = toml::from_str(&contents)
+                .map_err(|error| parse_error(&contents, error.message(), error.span()))?;
+            check_key_permissions(path, &table).map_err(WorkspaceError::Config)?;
+            table
         }
         _ => toml::Table::new(),
     };
     for raw in overrides {
-        merge(
-            &mut table,
-            parse_override(raw).map_err(WorkspaceError::Config)?,
-        );
+        let parsed = parse_override(raw).map_err(WorkspaceError::Config)?;
+        if has_key(&parsed, "api_key") {
+            return Err(WorkspaceError::Config(format!(
+                "-c {}: API keys go in the environment or the config file, not -c",
+                raw.split_once('=').map_or(raw.as_str(), |(key, _)| key)
+            )));
+        }
+        merge(&mut table, parsed);
     }
+    from_table(table, path)
+}
+
+/// `--config`, else `ASTERPATH_CONFIG`, else the default path.
+pub fn config_path(config: Option<PathBuf>) -> Option<PathBuf> {
+    config
+        .or_else(|| env_os("ASTERPATH_CONFIG").map(PathBuf::from))
+        .or_else(|| config_home().map(|home| home.join("asterpath/config.toml")))
+}
+
+fn from_table(table: toml::Table, path: Option<PathBuf>) -> Result<Settings, WorkspaceError> {
     let value = toml::Value::Table(table);
-    if let Some(field) = secret_field(&value) {
+    if let Some(field) = secret_field(&value, &[]) {
         return Err(WorkspaceError::Config(format!(
-            "config must not contain `{field}`; API keys are read from the environment"
+            "config must not contain `{field}`; API keys go in [providers.<id>] api_key or the environment"
         )));
     }
     let file: FileConfig = value
@@ -89,7 +117,159 @@ pub fn load(config: Option<PathBuf>, overrides: &[String]) -> Result<Settings, W
         db,
         approval: file.approval.default.unwrap_or_default(),
         file,
+        path,
     })
+}
+
+/// The file written on first run: commented examples only, no chosen values.
+pub const TEMPLATE: &str = r#"# asterpath configuration. Uncomment and edit; `asterpath doctor` checks it.
+
+# [model]
+# provider = "anthropic"          # or "openai", or a [providers.<id>] instance
+# id = "claude-fable-5-1"
+
+# [providers.anthropic]
+# The environment variable (ANTHROPIC_API_KEY, OPENAI_API_KEY or api_key_env)
+# wins over api_key. A file holding a key must be readable by its owner only.
+# api_key = "sk-..."
+
+# [providers.openai]
+# api_key = "sk-..."
+
+# [sandbox]
+# mode = "workspace-write"        # read-only | workspace-write | full-access
+"#;
+
+/// Write [`TEMPLATE`] at `path`: the directory `0700`, the file `0600` (Unix).
+fn create_template(path: &Path) -> std::io::Result<()> {
+    create_parent(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(mut file) => std::io::Write::write_all(&mut file, TEMPLATE.as_bytes()),
+        // Another process created it first.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// `path`'s missing directories, `0700` (Unix).
+fn create_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(parent)
+}
+
+/// Set `[model] provider`, `[model] id` and, unless `api_key` is `None`,
+/// `[providers.<provider>] api_key` in the file at `path`, keeping its
+/// comments and order. The result is validated before it is written, `0600`.
+pub fn save_setup(
+    path: &Path,
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<(), WorkspaceError> {
+    let io = |context: &str, source| WorkspaceError::Io {
+        context: format!("{context} {}", path.display()),
+        source,
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(io("cannot read", error)),
+    };
+    let mut doc: toml_edit::DocumentMut =
+        contents.parse().map_err(|error: toml_edit::TomlError| {
+            parse_error(&contents, error.message(), error.span())
+        })?;
+    let section = table(doc.as_table_mut(), "model", false)?;
+    section["provider"] = toml_edit::value(provider);
+    section["id"] = toml_edit::value(model);
+    if let Some(key) = api_key {
+        let providers = table(doc.as_table_mut(), "providers", true)?;
+        table(providers, provider, false)?["api_key"] = toml_edit::value(key);
+    }
+    let text = doc.to_string();
+    let parsed =
+        toml::from_str(&text).map_err(|error| parse_error(&text, error.message(), error.span()))?;
+    let settings = from_table(parsed, Some(path.to_owned()))?;
+    validate(&settings)?;
+
+    // A sibling file renamed over the original: a failed write never truncates it.
+    create_parent(path).map_err(|error| io("cannot create", error))?;
+    let temp = path.with_extension("toml.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| io("cannot write", error))?;
+    // Owner-only before the key is in it; `mode` above only applies to a new file.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| io("cannot write", error))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            io("cannot write", error)
+        })
+}
+
+/// A parse error by line, without the source line: it may hold a key.
+fn parse_error(text: &str, message: &str, span: Option<std::ops::Range<usize>>) -> WorkspaceError {
+    let line = span.map_or(String::new(), |span| {
+        let line = text[..span.start.min(text.len())].lines().count().max(1);
+        format!(" at line {line}")
+    });
+    WorkspaceError::Config(format!("invalid config{line}: {}", message.trim()))
+}
+
+/// The table `key` of `parent`, created when missing (`implicit`: no header of its own).
+fn table<'a>(
+    parent: &'a mut toml_edit::Table,
+    key: &str,
+    implicit: bool,
+) -> Result<&'a mut toml_edit::Table, WorkspaceError> {
+    let item = parent.entry(key).or_insert_with(|| {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(implicit);
+        toml_edit::Item::Table(table)
+    });
+    item.as_table_mut()
+        .ok_or_else(|| WorkspaceError::Config(format!("`{key}` must be a table")))
+}
+
+/// A file holding a key must not be open to the group or others (Unix).
+fn check_key_permissions(path: &Path, table: &toml::Table) -> Result<(), String> {
+    #[cfg(unix)]
+    if has_key(table, "api_key") {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} holds an API key but is readable by others (mode {:o}); run `chmod 600 {}`",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, table);
+    Ok(())
 }
 
 /// `key=value` as a one-line TOML document: the key may be dotted or quoted,
@@ -106,7 +286,8 @@ fn parse_override(raw: &str) -> Result<toml::Table, String> {
                 toml::Value::String(value.to_owned())
             ))
         })
-        .map_err(|_| format!("-c {raw}: invalid key {key}"))
+        // Not `raw`: its value may be a key.
+        .map_err(|_| format!("-c: invalid key {key}"))
 }
 
 /// Tables merge key by key; anything else replaces.
@@ -303,17 +484,101 @@ impl ApprovalPolicy for FixedApproval {
     }
 }
 
-fn secret_field(value: &toml::Value) -> Option<String> {
+/// A secret-looking field anywhere but `providers.<id>.api_key`.
+fn secret_field(value: &toml::Value, path: &[&str]) -> Option<String> {
     match value {
         toml::Value::Table(table) => table.iter().find_map(|(key, value)| {
-            if matches!(key.as_str(), "api_key" | "secret" | "token") {
+            let allowed = key == "api_key" && matches!(path, ["providers", _]);
+            if !allowed && matches!(key.as_str(), "api_key" | "secret" | "token") {
                 Some(key.clone())
             } else {
-                secret_field(value)
+                secret_field(value, &[path, &[key.as_str()]].concat())
             }
         }),
-        toml::Value::Array(items) => items.iter().find_map(secret_field),
+        toml::Value::Array(items) => items.iter().find_map(|item| secret_field(item, path)),
         _ => None,
+    }
+}
+
+fn has_key(table: &toml::Table, name: &str) -> bool {
+    fn within(value: &toml::Value, name: &str) -> bool {
+        match value {
+            toml::Value::Table(table) => has_key(table, name),
+            toml::Value::Array(items) => items.iter().any(|item| within(item, name)),
+            _ => false,
+        }
+    }
+    table
+        .iter()
+        .any(|(key, value)| key == name || within(value, name))
+}
+
+/// Where a provider's API key comes from; never the key itself.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub enum KeySource {
+    /// The named environment variable.
+    Env(String),
+    /// `[providers.<id>] api_key`.
+    File,
+    /// Neither is set.
+    Missing,
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Env(name) => write!(f, "env:{name}"),
+            Self::File => f.write_str("file"),
+            Self::Missing => f.write_str("not set"),
+        }
+    }
+}
+
+/// The selected provider, the aliases' and every `[providers.<id>]`, each
+/// with its key source; unavailable ids are left out.
+pub fn key_sources(settings: &Settings) -> Vec<(String, KeySource)> {
+    let file = &settings.file;
+    let mut ids: Vec<&String> = file.model.provider.iter().collect();
+    ids.extend(file.model_aliases.values().map(|model| &model.provider));
+    ids.extend(file.providers.keys());
+    let mut seen = Vec::new();
+    for id in ids {
+        if !seen.contains(id) && provider_available(id, file) {
+            seen.push(id.clone());
+        }
+    }
+    seen.into_iter()
+        .map(|id| {
+            let source = file_key_source(&id, file);
+            (id, source)
+        })
+        .collect()
+}
+
+/// Provider `id`'s key source; `None` when `id` is not available.
+pub fn key_source(settings: &Settings, id: &str) -> Option<KeySource> {
+    provider_available(id, &settings.file).then(|| file_key_source(id, &settings.file))
+}
+
+/// The environment variable first, then the file.
+fn file_key_source(id: &str, file: &FileConfig) -> KeySource {
+    let section = file.providers.get(id);
+    let env = section
+        .and_then(|section| section.api_key_env.clone())
+        .or_else(|| protocol(id, file).ok().map(|p| p.key_env().to_owned()));
+    match env {
+        Some(env) if env_string(&env).is_some() => KeySource::Env(env),
+        _ if section.is_some_and(|section| {
+            section
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty())
+        }) =>
+        {
+            KeySource::File
+        }
+        _ => KeySource::Missing,
     }
 }
 
@@ -373,7 +638,10 @@ fn build_provider(id: &str, file: &FileConfig) -> Result<Arc<dyn Provider>, Stri
         .clone()
         .unwrap_or_else(|| protocol.key_env().to_owned());
     let key = env_string(&key_env)
-        .ok_or_else(|| format!("{key_env} is required for the {id} provider"))?;
+        .or_else(|| section.api_key.clone().filter(|key| !key.is_empty()))
+        .ok_or_else(|| {
+            format!("{key_env} or [providers.{id}] api_key is required for the {id} provider")
+        })?;
     match protocol {
         Protocol::Anthropic => build_anthropic(id, key, &section),
         Protocol::OpenAi => build_openai(id, key, &section),
@@ -601,6 +869,8 @@ struct ProviderSection {
     base_url: Option<String>,
     /// Defaults to the protocol's own variable.
     api_key_env: Option<String>,
+    /// Used when the variable is unset (ADR-0050).
+    api_key: Option<String>,
     /// The instance default; absent fields are the adapter's newest rules.
     profile: Option<ProfileSection>,
     /// Model id prefix -> a complete profile. Absent fields are the adapter's
@@ -828,12 +1098,22 @@ impl Settings {
         self.file.sandbox.mode = mode;
     }
 
+    /// `[model] id`.
+    pub fn model_id(&self) -> Option<&str> {
+        self.file.model.id.as_deref()
+    }
+
     /// `[model] provider`.
     pub fn provider(&self) -> Result<&str, WorkspaceError> {
         self.file.model.provider.as_deref().ok_or_else(|| {
-            WorkspaceError::Config(
-                "a provider is required ([model] provider or -c model.provider=…)".to_owned(),
-            )
+            let file = self
+                .path
+                .as_ref()
+                .map(|path| format!(" in {}", path.display()))
+                .unwrap_or_default();
+            WorkspaceError::Config(format!(
+                "a provider is required ([model] provider{file} or -c model.provider=…)"
+            ))
         })
     }
 
@@ -1001,7 +1281,42 @@ mod tests {
     #[test]
     fn secret_fields_are_found_at_any_depth() {
         let value: toml::Value = toml::from_str("[a]\ntoken = \"x\"\n").unwrap();
-        assert_eq!(secret_field(&value).as_deref(), Some("token"));
+        assert_eq!(secret_field(&value, &[]).as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn api_key_is_allowed_only_in_a_provider_table() {
+        let secret = |text: &str| secret_field(&toml::from_str(text).unwrap(), &[]);
+        assert_eq!(secret("[providers.anthropic]\napi_key = \"k\"\n"), None);
+        assert_eq!(
+            secret("[model]\napi_key = \"k\"\n").as_deref(),
+            Some("api_key")
+        );
+        assert_eq!(
+            secret("[providers.a.profile]\napi_key = \"k\"\n").as_deref(),
+            Some("api_key")
+        );
+        assert_eq!(
+            secret("[providers.anthropic]\ntoken = \"k\"\n").as_deref(),
+            Some("token")
+        );
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_the_line() {
+        let text = "[providers.anthropic]\napi_key = sk-secret\n";
+        let error = toml::from_str::<toml::Table>(text).unwrap_err();
+        let message = parse_error(text, error.message(), error.span()).to_string();
+        assert!(message.starts_with("invalid config at line 2"), "{message}");
+        assert!(!message.contains("sk-secret"), "{message}");
+        let error = parse_override("providers.a b.api_key=sk-secret").unwrap_err();
+        assert!(!error.contains("sk-secret"), "{error}");
+    }
+
+    #[test]
+    fn the_template_parses_to_defaults() {
+        let table: toml::Table = toml::from_str(TEMPLATE).unwrap();
+        assert!(table.is_empty());
     }
 
     #[test]

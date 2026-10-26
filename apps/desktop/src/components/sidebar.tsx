@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { FolderPlus, Plus } from "lucide-react";
+import { FolderPlus, Plus, Settings } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import * as commands from "@/lib/commands";
@@ -19,9 +19,16 @@ export function Sidebar() {
     <nav className="flex w-72 shrink-0 flex-col border-r bg-muted/40">
       <div className="flex items-center justify-between p-3">
         <span className="text-sm font-semibold">Projects</span>
-        <Button variant="ghost" size="icon" aria-label="Add project" onClick={() => add.mutate()}>
-          <FolderPlus />
-        </Button>
+        <div className="flex">
+          <Button variant="ghost" size="icon" aria-label="Settings" asChild>
+            <Link to="/settings">
+              <Settings />
+            </Link>
+          </Button>
+          <Button variant="ghost" size="icon" aria-label="Add project" onClick={() => add.mutate()}>
+            <FolderPlus />
+          </Button>
+        </div>
       </div>
       {add.error && <p className="px-3 text-sm text-destructive">{String(add.error)}</p>}
       <div className="flex-1 overflow-y-auto px-2 pb-3">

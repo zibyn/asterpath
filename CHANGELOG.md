@@ -15,6 +15,7 @@
 - 参考 CLI 不再改变进程当前目录；工作根经会话环境交给工具、沙箱与技能根。没配 `cwd` 的 MCP stdio 服务仍在工作根启动。
 - **审批端点按会话树注册**（ADR-0039）：`ApprovalGate::register(root)` / `is_open(root)` 取根会话 id。某会话树没有端点时，`Ask` 按 `NO_APPROVAL_ENDPOINT` 拒绝，同进程其他会话树的端点不再让它挂起。嵌入方把原来的 `register()` 改成为自己照看的每棵会话树注册（根 id 取 `OwnedSession::owner().root` 或 `protocol::root_of`）。`DefaultApprovalPolicy` 改为单元结构体，不再持有审批门。
 - **多个进程可以共用一个数据库，驱动前要认领会话树**（ADR-0036）：`open_session` 等返回只读句柄，`claim()` 得到能 `drive` 的 `OwnedSession`，别的进程持有时得到 `OwnedElsewhere`。存活靠进程租约，`Asterpath` 在 tokio runtime 上定期续约（`lease_renew_interval`，默认 10 s；SQLite 的 TTL 是 `OpenOptions::lease_ttl`，默认 30 s）。正常退出立即释放；被 kill 的进程的会话树要等一个 TTL 才能在别处续跑。失去属主时驱动停止并调用新的 `Hooks::on_ownership_lost`。`SessionStore` 实现要加 `claim` / `owner` / `renew`；`StorageError::Conflict` 是可重试的冲突。
+- **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
 
 ### 新增
@@ -22,6 +23,7 @@
 - 桌面参考应用 `asterpath-desktop`（ADR-0035）骨架：侧栏按项目（工作根）列出会话，读 CLI 的 `config.toml` 与数据库，CLI 建的会话出现在对应项目下。窗口在非默认 feature `tauri` 之后。
 - 桌面端对话：在项目下新建会话（工具与技能按 CLI 新会话的规则），发送后由后台任务认领并驱动到空闲、空闲后释放认领；对话流显示流式文本与可折叠的推理；运行中继续输入即引导，可停止当前回合；被其他进程（如 CLI）驱动的会话只读显示。
 - 桌面端工具与审批：工具调用默认折叠，普通档展开显示文件改动的内联 diff 或输出开头，详细档显示完整参数与输出；本进程驱动的会话树注册审批端点，审批卡片可允许一次、本会话允许此工具（按会话树记，子代理同样适用；内存状态，重启失效）或附理由拒绝（理由发给模型），子代理的请求也会出现；输入框下可切换整棵会话树的审批模式：拒绝修改（修改类工具一律拒绝，含 bash，会话树只读）/ 修改前询问 / 全部允许，默认取 `[approval] default`。审批模式只改审批，不改沙箱。`config::assemble` 改为由调用方传入审批策略。
+- 桌面端设置页（ADR-0050）：缺 provider、模型或 key 时启动即显示，选择 provider（`anthropic` / `openai` 与配置里的实例）、填写模型 id 与 API key 后写回 `config.toml`（保留注释与顺序，权限 `0600`）并重启后端，不用重开窗口；侧栏齿轮按钮随时打开。key 来自环境变量时提示界面里填的不生效。
 - 桌面端多会话：多个会话同时在后台驱动，切换视图不中断；侧栏标出运行中 / 等待审批 / 空闲 / 被其他进程占用；状态栏可切换模型（配置的模型与模型别名；不需认领，被其他进程驱动时也可切换），显示会话及其子代理的累计 token 与最近一次驱动错误。
 - 应用 crate `asterpath-app`（`apps/asterpath`，ADR-0049）：CLI 二进制 `asterpath` 与桌面窗口二进制 `asterpath-desktop`（非默认 feature `tauri`）是它的两个入口，共用按工作根组装、会话元数据键与续会话规则和 `config.toml` 解析。桌面端开发仍在 `apps/desktop` 下运行 `pnpm tauri dev`。行为不变。
 - 会话环境适配器 `EnvironmentAdapter`（`AsterpathBuilder::environment`）：按会话的会话元数据解析该会话的工具、沙箱策略与子进程变量，子会话用根会话的；`ToolContext::spawn` 把策略与变量交给工具。

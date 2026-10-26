@@ -3,12 +3,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
 use asterpath_app::desktop::{
-    Access, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary, ViewEvent,
+    self, Access, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary, Setup,
+    ViewEvent,
 };
 use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
@@ -17,12 +18,37 @@ use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-/// The backend, or why it did not start (shown by every command).
-struct Backend(Result<Desktop, String>);
+/// The backend, or why it did not start (shown by every command); saving
+/// the settings replaces it.
+struct Backend {
+    desktop: RwLock<Result<Arc<Desktop>, String>>,
+    projects_file: PathBuf,
+}
 
 impl Backend {
-    fn get(&self) -> Result<&Desktop, String> {
-        self.0.as_ref().map_err(Clone::clone)
+    async fn open(projects_file: PathBuf) -> Self {
+        let backend = Self {
+            desktop: RwLock::new(Err(String::new())),
+            projects_file,
+        };
+        let _ = backend.reopen().await;
+        backend
+    }
+
+    /// Replace the backend from `config.toml`. Turns the old one drives run
+    /// to their end on it; their claims keep the new one from writing those
+    /// trees meanwhile (ADR-0036).
+    async fn reopen(&self) -> Result<(), String> {
+        let desktop = Desktop::open(None, self.projects_file.clone())
+            .await
+            .map(Arc::new);
+        let result = desktop.as_ref().map(|_| ()).map_err(Clone::clone);
+        *self.desktop.write().unwrap() = desktop;
+        result
+    }
+
+    fn get(&self) -> Result<Arc<Desktop>, String> {
+        self.desktop.read().unwrap().clone()
     }
 }
 
@@ -179,14 +205,32 @@ async fn set_model(
     backend.get()?.set_model(session, model).await
 }
 
+/// The settings page; `needed` when the backend cannot start without it.
+#[tauri::command]
+fn setup() -> Setup {
+    desktop::setup(None)
+}
+
+/// Write the settings and restart the backend; an empty key keeps the file's.
+#[tauri::command]
+async fn save_setup(
+    backend: State<'_, Backend>,
+    provider: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<Setup, String> {
+    desktop::save_setup(None, &provider, &model, api_key.as_deref())?;
+    backend.reopen().await?;
+    Ok(desktop::setup(None))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Views::default())
         .setup(|app| {
             let projects_file = app.path().app_data_dir()?.join("projects.json");
-            let desktop = tauri::async_runtime::block_on(Desktop::open(projects_file));
-            app.manage(Backend(desktop));
+            app.manage(tauri::async_runtime::block_on(Backend::open(projects_file)));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -205,7 +249,9 @@ fn main() {
             set_approval_mode,
             models,
             session_info,
-            set_model
+            set_model,
+            setup,
+            save_setup
         ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop app");

@@ -1,18 +1,26 @@
+import { useQuery } from "@tanstack/react-query";
 import { createRootRoute, createRoute, createRouter, Outlet } from "@tanstack/react-router";
 
 import { Conversation } from "@/components/conversation";
+import { Settings } from "@/components/settings";
 import { Sidebar } from "@/components/sidebar";
 import { StatusBar } from "@/components/status-bar";
+import * as commands from "@/lib/commands";
 
 const rootRoute = createRootRoute({
-  component: () => (
-    <div className="flex h-screen">
-      <Sidebar />
-      <main className="flex-1 overflow-hidden">
-        <Outlet />
-      </main>
-    </div>
-  ),
+  component: function Root() {
+    const setup = useQuery({ queryKey: ["setup"], queryFn: commands.setup });
+    // Nothing runs without a provider, model and key: settings first.
+    if (setup.data?.needed) return <Settings />;
+    return (
+      <div className="flex h-screen">
+        <Sidebar />
+        <main className="flex-1 overflow-hidden">
+          <Outlet />
+        </main>
+      </div>
+    );
+  },
 });
 
 const indexRoute = createRoute({
@@ -37,7 +45,15 @@ const sessionRoute = createRoute({
   },
 });
 
-export const router = createRouter({ routeTree: rootRoute.addChildren([indexRoute, sessionRoute]) });
+const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings",
+  component: Settings,
+});
+
+export const router = createRouter({
+  routeTree: rootRoute.addChildren([indexRoute, sessionRoute, settingsRoute]),
+});
 
 declare module "@tanstack/react-router" {
   interface Register {

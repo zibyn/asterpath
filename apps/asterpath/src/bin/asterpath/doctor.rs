@@ -11,6 +11,9 @@ use crate::{CliError, CliResult, GlobalArgs, config};
 pub async fn doctor(global: &GlobalArgs) -> CliResult<()> {
     let settings = global.settings()?;
     config::validate(&settings).map_err(CliError::config)?;
+    for (id, source) in config::key_sources(&settings) {
+        println!("provider {id}: key {source}");
+    }
     // The `enabled` switch only governs new sessions, so diagnostics are
     // always available here.
     let root = current_root()?;
