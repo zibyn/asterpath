@@ -32,7 +32,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0002](0002-log-topology-and-commit-semantics.md) | 每个会话一条 append-only 日志，只提交终态，不做工作流引擎 |
 | [0006](0006-agent-loop-execution-model.md) | Agent loop 以 step 为检查点，steering 不打断模型流 |
 | [0007](0007-approval-and-sandbox-layers.md) | 审批是框架管线，隔离与内容安全是扩展责任 |
-| [0008](0008-subagent-model.md) | 子智能体是工具调用拥有的独立子会话 |
+| [0008](0008-subagent-model.md) | 子智能体是工具调用拥有的独立子会话（「不能替换 system」由 0053 取代） |
 | [0010](0010-canonical-protocol-model.md) | 规范协议模型：扁平 item、不透明数据原样回放、能力标志 |
 | [0011](0011-native-tracing.md) | 追踪与用量是日志的确定性投影，成本不在内核 |
 | [0019](0019-sandbox-seam-and-policy.md) | 沙箱是进程启动点的变换，策略归宿主，fail closed |
@@ -61,5 +61,6 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0050](0050-user-config-holds-api-keys-and-is-created-on-first-run.md) | 用户配置在首次运行时创建，API key 可以存在里面（文件须只有属主可读） |
 | [0051](0051-agent-profiles-are-application-owned-prompt-files.md) | 智能体档案是应用的命名提示词文件，项目级优先、会话创建时解析一次，不能放宽审批与沙箱 |
 | [0052](0052-output-styles-are-orthogonal-appended-prompt-files.md) | 输出风格是与档案正交选择、追加在档案正文之后的提示词文件，只有正文与描述 |
+| [0053](0053-subagents-select-application-agent-profiles.md) | 子智能体可按名字选用应用提供的智能体档案，档案列表属于会话环境，只能收窄工具，不能放宽审批与沙箱 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。

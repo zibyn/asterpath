@@ -13,7 +13,7 @@
 - **默认全新上下文（fresh）**；`context: fork` 按次 opt-in，fork 是 spawn 时刻父投影的**物化快照**，不是活引用。
 - **父流只记 spawn 自身的管线记录与子生命周期**：spawn 的 `ToolCallRequested`、`ChildSessionSpawned`（含可选 timeout 截止时间）、审批 `ApprovalDecided`（仅策略为 `Ask` 时）、`ChildSessionCompleted`、spawn 的 `ToolResult`。子的 `TurnStarted` / `StepStarted` / `AssistantMessage` / `ToolCallRequested` / `ToolResult` 绝不进父流。
 - **结果 = 状态 + 任务总结**。子任务失败仍是成功的 spawn 工具结果；只有基础设施问题才是工具失败。
-- **配置在 spawn 时刻快照继承**，模型只能收窄（模型 alias 白名单、工具 allowlist），不能放宽审批或替换 system prompt。
+- **配置在 spawn 时刻快照继承**，模型只能收窄（模型 alias 白名单、工具 allowlist），不能放宽审批，也不能写 system 文本；可以按名字选用应用提供的智能体档案（[ADR-0053](../adr/0053-subagents-select-application-agent-profiles.md)）。
 - **默认深度 3、每父并发 8、调度器全局 32**；并发超限 FIFO 排队，深度超限直接失败。
 - **取消从父传播到子**；进入取消路径后一律记 `Cancelled{Parent}`（已落盘的 `ChildSessionCompleted` 除外）。父不写子流，子不写父流。
 - **孤儿 = 父已不再等待的子会话**；子恢复时发现即按取消收尾，不再开新 turn。
@@ -177,7 +177,7 @@ stateDiagram-v2
 
 ### 4.1 fresh（默认）
 
-- 子只看到：继承的 system prompt（来自配置快照）+ `InputRecorded{task}`。
+- 子只看到：继承的 system prompt（来自配置快照；选了档案时是档案给出的 system）+ `InputRecorded{task}`。
 - 不含父历史、父的 steering、父的工具输出。
 - 默认 fresh 的理由：成本可预测、父上下文不泄漏、与 Codex/Claude Code 的默认一致。
 
@@ -212,7 +212,8 @@ pub enum ForkSource {
 - 模型可见的 spawn 参数只能收窄：
   - `model_alias` 必须来自应用提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
-  - system prompt、审批策略、MCP 配置、limits **不能**由模型参数改写；应用可程序化收紧。
+  - `agent` 必须是会话环境 `agents` 里的档案名（[ADR-0053](../adr/0053-subagents-select-application-agent-profiles.md)）；未知名字 → `Failed{InvalidArgs}`。选中后：`system` 换成档案给出的 system（应用整份组装，不拼父 system）；档案固定的模型必须与父同 provider，与父模型不同时不继承 `context_window`；档案固定了模型时再给 `model_alias` → `Failed{InvalidArgs}`；`tools` 取父生效集合 ∩ 档案工具列表 ∩ `tool_allowlist`，档案里父没有的名字忽略。不给 `agent` 时继承父 system。
+  - system 文本、审批策略、MCP 配置、limits **不能**由模型参数改写；应用可程序化收紧。
 - 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；应用解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
 - 子的工具调用走自己的 session 与审批策略；父的审批不覆盖子。
 - 恢复一致性：物化子会话时断言 `SessionCreated.config == ChildSessionSpawned.config`；不一致是硬错误。
