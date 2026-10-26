@@ -24,6 +24,6 @@
   "bundle": {
     "active": false,
     "icon": ["icons/icon.png"],
-    "resources": { "agents/": "agents/" }
+    "resources": { "agents/": "agents/", "styles/": "styles/" }
   }
 }
