@@ -424,18 +424,25 @@ impl Desktop {
         let root = work_root(root).map_err(text)?;
         let mut spec = self.template.clone();
         // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
-        new_session_spec(&self.workspace, &root, name, &mut spec).map_err(text)?;
+        // shortcut: no builtin agent profiles until #185/#186 pass the bundled directory
+        new_session_spec(&self.workspace, None, &root, name, &mut spec).map_err(text)?;
         let fresh = WorkRoot {
             workspace: self.workspace.clone(),
             new_session: true,
             pinned: None,
         };
         let environment = fresh.resolve(&spec.metadata).await.map_err(text)?;
+        // The agent profile's whitelist narrows the environment's tools.
+        let profile = std::mem::replace(&mut spec.tools, ToolSelection::All);
         spec.tools = ToolSelection::Names(
             environment
                 .tools
                 .iter()
                 .map(|tool| tool.descriptor().name.clone())
+                .filter(|name| match &profile {
+                    ToolSelection::Names(names) => names.contains(name),
+                    _ => true,
+                })
                 .collect(),
         );
         let name = spec.metadata.get(NAME).cloned();

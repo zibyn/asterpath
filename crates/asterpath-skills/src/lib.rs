@@ -407,6 +407,54 @@ fn parse_skill(
     })
 }
 
+/// A frontmatter value of [`parse_frontmatter`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontmatterValue {
+    String(String),
+    List(Vec<String>),
+}
+
+/// A Markdown file's `---` YAML frontmatter, read as a mapping of strings
+/// and string lists, and the body after it; without frontmatter the whole
+/// file is the body.
+pub fn parse_frontmatter(
+    content: &str,
+) -> Result<(BTreeMap<String, FrontmatterValue>, &str), String> {
+    let Some((yaml, body)) = split_frontmatter(content) else {
+        return Ok((BTreeMap::new(), content));
+    };
+    if yaml.len() > MAX_FRONTMATTER_BYTES {
+        return Err(format!("frontmatter exceeds {MAX_FRONTMATTER_BYTES} bytes"));
+    }
+    let documents =
+        Yaml::load_from_str(yaml).map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
+    let Some(document) = documents.first() else {
+        return Ok((BTreeMap::new(), body));
+    };
+    let mapping = document
+        .as_mapping()
+        .ok_or("frontmatter must be a mapping")?;
+    let fields = mapping
+        .iter()
+        .map(|(key, value)| {
+            let key = key.as_str().ok_or("frontmatter keys must be strings")?;
+            let invalid = || format!("`{key}` must be a string or a list of strings");
+            let value = match (value.as_str(), value.as_vec()) {
+                (Some(text), _) => FrontmatterValue::String(text.to_owned()),
+                (_, Some(items)) => FrontmatterValue::List(
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => return Err(invalid()),
+            };
+            Ok((key.to_owned(), value))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok((fields, body))
+}
+
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let rest = content
         .strip_prefix("---\r\n")

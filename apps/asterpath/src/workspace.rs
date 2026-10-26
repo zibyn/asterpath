@@ -13,12 +13,13 @@ use std::sync::Arc;
 use asterpath::{AsterError, Asterpath};
 use asterpath_mcp::{McpError, McpServerConfig, McpServers, McpTransport};
 use asterpath_protocol::{
-    CatalogEntry, EnvironmentAdapter, EnvironmentError, ParentFilter, Part, SandboxPolicy,
-    SandboxProvider, SessionEnvironment, SessionId, SessionQuery, SessionSpec, SpawnEnv, Tool,
+    CatalogEntry, EnvironmentAdapter, EnvironmentError, ModelId, ModelSpec, ParentFilter, Part,
+    ProviderId, SandboxPolicy, SandboxProvider, SessionEnvironment, SessionId, SessionQuery,
+    SessionSpec, SpawnEnv, Tool, ToolName, ToolSelection,
 };
 use asterpath_skills::{
-    DEFAULT_INDEX_BUDGET, LoadSkillTool, SkillDiagnostic, SkillRoot, SkillRootLabel, discover,
-    render_index,
+    DEFAULT_INDEX_BUDGET, FrontmatterValue, LoadSkillTool, SkillDiagnostic, SkillRoot,
+    SkillRootLabel, discover, parse_frontmatter, render_index,
 };
 use futures_util::future::BoxFuture;
 
@@ -55,9 +56,11 @@ impl From<AsterError> for WorkspaceError {
     }
 }
 
-/// Session metadata keys (ADR-0032): the work root and the session name.
+/// Session metadata keys (ADR-0032): the work root, the session name and the
+/// agent profile it was created with (ADR-0051).
 pub const CWD: &str = "cwd";
 pub const NAME: &str = "name";
+pub const AGENT: &str = "agent";
 
 /// `[sandbox] mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
@@ -84,6 +87,10 @@ pub struct Workspace {
     /// Variables passed on to bash (ADR-0037).
     pub spawn_vars: BTreeMap<OsString, OsString>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// The agent profile of new sessions; `None` means no base prompt.
+    pub agent: Option<String>,
+    /// User-level agent profiles, between the builtin and project ones.
+    pub user_agents: Option<PathBuf>,
 }
 
 impl Default for Workspace {
@@ -96,6 +103,8 @@ impl Default for Workspace {
             user_skill_roots: Vec::new(),
             spawn_vars: BTreeMap::new(),
             mcp_servers: Vec::new(),
+            agent: None,
+            user_agents: None,
         }
     }
 }
@@ -122,16 +131,49 @@ pub fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
     metadata
 }
 
-/// A new session's spec from its work root: `AGENTS.md`, then the skill
-/// index, appended to `spec.system`, and the session metadata. Returns the
-/// skill diagnostics for the caller to show.
+/// A new session's spec from its work root: the selected agent profile's
+/// prompt, `AGENTS.md`, then the skill index, appended to `spec.system`; the
+/// profile's model and tools; and the session metadata. `builtin_agents` is
+/// the bundled profile directory, if any. Returns the skill diagnostics for
+/// the caller to show.
 pub fn new_session_spec(
     workspace: &Workspace,
+    builtin_agents: Option<&Path>,
     root: &Path,
     name: Option<&str>,
     spec: &mut SessionSpec,
 ) -> Result<Vec<SkillDiagnostic>, WorkspaceError> {
+    let agent = match &workspace.agent {
+        Some(name) => {
+            let file = agent_profiles(workspace, builtin_agents, root)?
+                .into_iter()
+                .find(|file| &file.name == name)
+                .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}")))?;
+            Some((name, load_agent(&file)?))
+        }
+        None => None,
+    };
     let (index, diagnostics) = skill_index(workspace, root);
+    if let Some((_, profile)) = &agent {
+        if !profile.prompt.is_empty() {
+            spec.system.push(Part::Text {
+                text: profile.prompt.clone(),
+            });
+        }
+        if let Some((provider, model)) = &profile.model {
+            // A different model does not inherit the configured context window.
+            let same =
+                spec.model.provider.as_str() == provider && spec.model.model.as_str() == model;
+            spec.model = ModelSpec {
+                provider: ProviderId::new(provider.clone()),
+                model: ModelId::new(model.clone()),
+                context_window: spec.model.context_window.filter(|_| same),
+            };
+        }
+        if let Some(tools) = &profile.tools {
+            spec.tools = ToolSelection::Names(tools.iter().cloned().map(ToolName::new).collect());
+        }
+    }
     if let Some(agents) = agents_md(root)? {
         spec.system.push(agents);
     }
@@ -139,7 +181,108 @@ pub fn new_session_spec(
         spec.system.push(index);
     }
     spec.metadata = metadata(root, name);
+    if let Some((name, _)) = agent {
+        spec.metadata.insert(AGENT.to_owned(), name.clone());
+    }
     Ok(diagnostics)
+}
+
+/// An agent profile file (ADR-0051): its name is the file name without `.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFile {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// An agent profile's frontmatter and body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub description: Option<String>,
+    /// `provider/model`, split.
+    pub model: Option<(String, String)>,
+    /// Tool whitelist; `None` means every tool.
+    pub tools: Option<Vec<String>>,
+    /// The base prompt, trimmed.
+    pub prompt: String,
+}
+
+/// The `*.md` profiles of `builtin_agents`, the user directory and
+/// `<root>/.asterpath/agents`, in name order; a later directory's profile
+/// replaces an earlier one of the same name. Missing directories are empty.
+pub fn agent_profiles(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<Vec<AgentFile>, WorkspaceError> {
+    let dirs = builtin_agents
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(workspace.user_agents.clone())
+        .chain([root.join(".asterpath/agents")]);
+    let mut found = BTreeMap::new();
+    for dir in dirs {
+        let io = |source| WorkspaceError::Io {
+            context: format!("cannot read {}", dir.display()),
+            source,
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io(error)),
+        };
+        for entry in entries {
+            let path = entry.map_err(io)?.path();
+            if path.extension().is_some_and(|ext| ext == "md")
+                && path.is_file()
+                && let Some(name) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                found.insert(name.to_owned(), path.clone());
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|(name, path)| AgentFile { name, path })
+        .collect())
+}
+
+/// Read and parse a profile; an unknown frontmatter field is an error.
+pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
+    let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
+        context: format!("cannot read {}", file.path.display()),
+        source,
+    })?;
+    let invalid = |message: String| {
+        WorkspaceError::Config(format!("agent {}: {message}", file.path.display()))
+    };
+    let (fields, body) = parse_frontmatter(&content).map_err(invalid)?;
+    let mut profile = AgentProfile {
+        description: None,
+        model: None,
+        tools: None,
+        prompt: body.trim().to_owned(),
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("description", FrontmatterValue::String(text)) => profile.description = Some(text),
+            ("model", FrontmatterValue::String(text)) => {
+                let (provider, model) = text
+                    .split_once('/')
+                    .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+                    .ok_or_else(|| {
+                        invalid(format!("`model` must be provider/model, not {text}"))
+                    })?;
+                profile.model = Some((provider.to_owned(), model.to_owned()));
+            }
+            ("tools", FrontmatterValue::List(names)) => profile.tools = Some(names),
+            ("description" | "model", _) => {
+                return Err(invalid(format!("`{key}` must be a string")));
+            }
+            ("tools", _) => return Err(invalid("`tools` must be a list".to_owned())),
+            _ => return Err(invalid(format!("unknown field `{key}`"))),
+        }
+    }
+    Ok(profile)
 }
 
 /// New-session skill policy: `skills_enabled`. The loader tool comes from

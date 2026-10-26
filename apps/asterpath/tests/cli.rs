@@ -816,6 +816,59 @@ fn a_new_session_reads_agents_md_from_the_work_root() {
 }
 
 #[test]
+fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("ok"))]);
+    let dir = TestDir::new("agent");
+    dir.config(&config_body(&server, &dir.db()));
+    let user = dir.sub("xdg/asterpath/agents");
+    let project = dir.sub("project/.asterpath/agents");
+    fs::write(
+        user.join("code.md"),
+        "---\ndescription: writes code\n---\nuser code",
+    )
+    .unwrap();
+    fs::write(user.join("review.md"), "user review").unwrap();
+    fs::write(project.join("review.md"), "Review in haiku.").unwrap();
+    let root = dir.path.join("project");
+    let xdg = dir.path.join("xdg");
+
+    ok(dir
+        .exec(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["--agent", "review", "hi"]));
+    let body = server.requests()[0].json_body();
+    assert!(
+        body["system"].to_string().contains("Review in haiku."),
+        "{body}"
+    );
+
+    assert_eq!(
+        code(
+            dir.exec(&root)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .args(["--agent", "missing", "hi"])
+        ),
+        Some(2)
+    );
+
+    let output = bin()
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["agents", "--config", dir.config_path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!(
+            "code\t{}\twrites code\nreview\t{}",
+            user.join("code.md").display(),
+            project.join("review.md").display()
+        )
+    );
+}
+
+#[test]
 fn continue_picks_the_last_active_session_of_the_work_root() {
     let server = MockServer::start(vec![
         Reply::sse(common::text_sse("one")),

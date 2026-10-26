@@ -105,6 +105,7 @@ fn new_session(args: &SessionArgs, model: Option<String>) -> SessionArgs {
         resume: None,
         fork_session: false,
         name: None,
+        agent: args.agent.clone(),
         images: Vec::new(),
     }
 }

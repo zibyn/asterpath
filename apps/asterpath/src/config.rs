@@ -124,6 +124,8 @@ fn from_table(table: toml::Table, path: Option<PathBuf>) -> Result<Settings, Wor
 /// The file written on first run: commented examples only, no chosen values.
 pub const TEMPLATE: &str = r#"# asterpath configuration. Uncomment and edit; `asterpath doctor` checks it.
 
+# default_agent = "default"       # an agent profile; `asterpath agents` lists them
+
 # [model]
 # provider = "anthropic"          # or "openai", or a [providers.<id>] instance
 # id = "claude-fable-5-1"
@@ -903,6 +905,8 @@ fn parse_effort(value: &str) -> Result<ReasoningEffort, String> {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
+    /// The agent profile of new sessions (ADR-0051).
+    default_agent: Option<String>,
     model: ModelSection,
     sandbox: SandboxSection,
     mcp_servers: BTreeMap<String, McpServerSection>,
@@ -1156,6 +1160,11 @@ impl Settings {
         self.file.model.provider = Some(provider);
     }
 
+    /// `--agent`: the agent profile of a new session.
+    pub fn set_agent(&mut self, agent: String) {
+        self.file.default_agent = Some(agent);
+    }
+
     /// `-s`.
     pub fn set_sandbox(&mut self, mode: SandboxMode) {
         self.file.sandbox.mode = mode;
@@ -1183,7 +1192,7 @@ impl Settings {
     /// The work-root values: `[sandbox]`, `[tools] enabled`, `[skills]`
     /// (absent `enabled` means enabled) with the user roots under
     /// `$XDG_CONFIG_HOME` and `$HOME`, the `[sandbox] env` variables this
-    /// process has, and `[mcp_servers]`.
+    /// process has, `[mcp_servers]`, `default_agent` and the user agent directory.
     pub fn workspace(&self) -> Result<Workspace, WorkspaceError> {
         let mut user_skill_roots = Vec::new();
         if let Some(home) = config_home() {
@@ -1212,6 +1221,8 @@ impl Settings {
                 .filter_map(|name| Some((OsString::from(name), env_os(name)?)))
                 .collect(),
             mcp_servers: self.mcp_servers()?,
+            agent: self.file.default_agent.clone(),
+            user_agents: config_home().map(|home| home.join("asterpath/agents")),
         })
     }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
 use asterpath_app::config;
 use asterpath_app::workspace::{
-    NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp, metadata,
+    AGENT, NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp, metadata,
     new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
@@ -86,6 +86,9 @@ pub struct SessionArgs {
     /// Name of a new session.
     #[arg(short = 'n', long)]
     pub name: Option<String>,
+    /// Agent profile of a new session; overrides `default_agent`.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
     /// Attach a file to the first input (repeatable).
     #[arg(short = 'i', long = "image", value_name = "FILE")]
     pub images: Vec<PathBuf>,
@@ -104,6 +107,11 @@ impl SessionArgs {
         if self.name.is_some() && self.continuing() && !self.fork_session {
             return Err(CliError::config(
                 "-n names a new session; it cannot rename one",
+            ));
+        }
+        if self.agent.is_some() && self.continuing() {
+            return Err(CliError::config(
+                "--agent picks the profile of a new session; a continued one keeps its own",
             ));
         }
         Ok(())
@@ -159,9 +167,12 @@ pub async fn open(
         if let Some(model) = &args.model {
             settings.set_model(model.clone());
         }
+        if let Some(agent) = &args.agent {
+            settings.set_agent(agent.clone());
+        }
         config::validate(&settings).map_err(CliError::config)?;
         let root = explicit_root.map_or_else(current_root, Ok)?;
-        return create(&settings, &root, args.name.as_deref(), output_format).await;
+        return create(settings, &root, args, output_format).await;
     }
 
     config::validate(&settings).map_err(CliError::config)?;
@@ -192,7 +203,11 @@ pub async fn open(
     .await
     .map_err(aster_error)?;
     let (handle, continued) = if args.fork_session {
-        let metadata = metadata(&root, args.name.as_deref());
+        let mut metadata = metadata(&root, args.name.as_deref());
+        // The fork keeps the parent's system, so it keeps its profile name.
+        if let Some(agent) = target.metadata.get(AGENT) {
+            metadata.insert(AGENT.to_owned(), agent.clone());
+        }
         let handle = asterpath
             .fork_session(target.session, metadata)
             .await
@@ -246,19 +261,32 @@ pub fn model_patch(snapshot: &ConfigSnapshot, model: &str) -> ConfigPatch {
     patch
 }
 
-/// A new session: workspace tools, skills, `AGENTS.md` and session metadata.
+/// A new session: the agent profile, workspace tools, skills, `AGENTS.md`
+/// and session metadata.
 async fn create(
-    settings: &config::Settings,
+    mut settings: config::Settings,
     root: &Path,
-    name: Option<&str>,
+    args: &SessionArgs,
     output_format: Option<OutputFormat>,
 ) -> CliResult<Opened> {
     let workspace = settings.workspace().map_err(CliError::config)?;
     // An unknown `[tools] enabled` name fails before anything starts.
     workspace_tools(&workspace, root, workspace.tools.as_deref()).map_err(CliError::config)?;
-    let mut spec = config::session_spec(settings).map_err(CliError::config)?;
-    let diagnostics =
-        new_session_spec(&workspace, root, name, &mut spec).map_err(CliError::config)?;
+    let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
+    let configured = spec.model.clone();
+    // shortcut: no builtin agent profiles until #186 resolves the bundled directory
+    let diagnostics = new_session_spec(&workspace, None, root, args.name.as_deref(), &mut spec)
+        .map_err(CliError::config)?;
+    // `-m` wins over the profile's model.
+    if args.model.is_some() {
+        spec.model = configured;
+    }
+    // A profile may pin another provider; the engine must have it.
+    if spec.model.provider.as_str() != settings.provider().map_err(CliError::config)? {
+        settings.set_provider(spec.model.provider.as_str().to_owned());
+        config::validate(&settings).map_err(CliError::config)?;
+    }
+    let settings = &settings;
     for diagnostic in diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.kind != SkillDiagnosticKind::AuthorityFieldIgnored)
