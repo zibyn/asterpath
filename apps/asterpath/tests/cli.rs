@@ -858,16 +858,25 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        // `default` comes from the repository's source directory in a dev build.
-        format!(
-            "code\t{}\twrites code\ndefault\t{}/agents/default.md\t{}\nreview\t{}",
-            user.join("code.md").display(),
-            env!("CARGO_MANIFEST_DIR"),
-            "Placeholder base prompt, pending #184",
-            project.join("review.md").display()
-        )
+        lines[0],
+        format!("code\t{}\twrites code", user.join("code.md").display())
+    );
+    // `default` comes from the repository's source directory in a dev build;
+    // its description is the builtin text, so only the prefix is fixed here.
+    assert!(
+        lines[1].starts_with(&format!(
+            "default\t{}/agents/default.md\t",
+            env!("CARGO_MANIFEST_DIR")
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[2],
+        format!("review\t{}", project.join("review.md").display())
     );
 }
 

@@ -16,7 +16,7 @@
 - **审批端点按会话树注册**（ADR-0039）：`ApprovalGate::register(root)` / `is_open(root)` 取根会话 id。某会话树没有端点时，`Ask` 按 `NO_APPROVAL_ENDPOINT` 拒绝，同进程其他会话树的端点不再让它挂起。嵌入方把原来的 `register()` 改成为自己照看的每棵会话树注册（根 id 取 `OwnedSession::owner().root` 或 `protocol::root_of`）。`DefaultApprovalPolicy` 改为单元结构体，不再持有审批门。
 - **多个进程可以共用一个数据库，驱动前要认领会话树**（ADR-0036）：`open_session` 等返回只读句柄，`claim()` 得到能 `drive` 的 `OwnedSession`，别的进程持有时得到 `OwnedElsewhere`。存活靠进程租约，`Asterpath` 在 tokio runtime 上定期续约（`lease_renew_interval`，默认 10 s；SQLite 的 TTL 是 `OpenOptions::lease_ttl`，默认 30 s）。正常退出立即释放；被 kill 的进程的会话树要等一个 TTL 才能在别处续跑。失去属主时驱动停止并调用新的 `Hooks::on_ownership_lost`。`SessionStore` 实现要加 `claim` / `owner` / `renew`；`StorageError::Conflict` 是可重试的冲突。
 - **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
-- **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。现在的内置正文是占位，待 #184 定稿。
+- **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
 
 ### 新增
