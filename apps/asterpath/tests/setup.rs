@@ -83,7 +83,7 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
     .unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("sk-secret"));
 
-    let desktop = Desktop::open(Some(path), dir.path().join("projects.json"))
+    let desktop = Desktop::open(Some(path), dir.path().join("projects.json"), None)
         .await
         .unwrap();
     desktop.create_session(dir.path(), None).await.unwrap();

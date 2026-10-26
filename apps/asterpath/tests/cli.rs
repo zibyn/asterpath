@@ -860,9 +860,12 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
+        // `default` comes from the repository's source directory in a dev build.
         format!(
-            "code\t{}\twrites code\nreview\t{}",
+            "code\t{}\twrites code\ndefault\t{}/agents/default.md\t{}\nreview\t{}",
             user.join("code.md").display(),
+            env!("CARGO_MANIFEST_DIR"),
+            "Placeholder base prompt, pending #184",
             project.join("review.md").display()
         )
     );

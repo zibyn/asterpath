@@ -3,7 +3,7 @@
 
 use asterpath_app::workspace::{agent_profiles, load_agent};
 
-use crate::session::current_root;
+use crate::session::{builtin_agents, current_root};
 use crate::{CliError, CliResult, GlobalArgs, config};
 
 pub fn agents(global: &GlobalArgs) -> CliResult<()> {
@@ -11,8 +11,9 @@ pub fn agents(global: &GlobalArgs) -> CliResult<()> {
     config::validate(&settings).map_err(CliError::config)?;
     let root = current_root()?;
     let workspace = settings.workspace().map_err(CliError::config)?;
-    // shortcut: no builtin agent profiles until #186 resolves the bundled directory
-    for file in agent_profiles(&workspace, None, &root).map_err(CliError::config)? {
+    for file in
+        agent_profiles(&workspace, builtin_agents().as_deref(), &root).map_err(CliError::config)?
+    {
         let mut line = format!("{}\t{}", file.name, file.path.display());
         match load_agent(&file) {
             Ok(profile) => {

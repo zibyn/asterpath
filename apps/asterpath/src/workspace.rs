@@ -61,6 +61,8 @@ impl From<AsterError> for WorkspaceError {
 pub const CWD: &str = "cwd";
 pub const NAME: &str = "name";
 pub const AGENT: &str = "agent";
+/// The agent profile of new sessions when none is configured (ADR-0051).
+pub const DEFAULT_AGENT: &str = "default";
 
 /// `[sandbox] mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
@@ -149,9 +151,16 @@ pub fn new_session_spec(
                 .into_iter()
                 .find(|file| &file.name == name)
                 .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}")))?;
-            Some((name, load_agent(&file)?))
+            Some((name.clone(), load_agent(&file)?))
         }
-        None => None,
+        // Unconfigured: the profile named `default`, from any layer, if there is one.
+        None => match agent_profiles(workspace, builtin_agents, root)?
+            .into_iter()
+            .find(|file| file.name == DEFAULT_AGENT)
+        {
+            Some(file) => Some((DEFAULT_AGENT.to_owned(), load_agent(&file)?)),
+            None => None,
+        },
     };
     let (index, diagnostics) = skill_index(workspace, root);
     if let Some((_, profile)) = &agent {
@@ -182,9 +191,28 @@ pub fn new_session_spec(
     }
     spec.metadata = metadata(root, name);
     if let Some((name, _)) = agent {
-        spec.metadata.insert(AGENT.to_owned(), name.clone());
+        spec.metadata.insert(AGENT.to_owned(), name);
     }
     Ok(diagnostics)
+}
+
+/// The builtin agent directory: the first of the application's `candidates`
+/// and this crate's source `agents/` that is a directory. A debug build tries
+/// the source first, since the Tauri build copies a snapshot of it beside the
+/// binary. `None`, with a line on stderr, when there is none.
+pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let source = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/agents"));
+    let mut dirs: Vec<_> = candidates.into_iter().collect();
+    if cfg!(debug_assertions) {
+        dirs.insert(0, source);
+    } else {
+        dirs.push(source);
+    }
+    let found = dirs.into_iter().find(|dir| dir.is_dir());
+    if found.is_none() {
+        eprintln!("asterpath: no builtin agent profiles found; continuing without them");
+    }
+    found
 }
 
 /// An agent profile file (ADR-0051): its name is the file name without `.md`.

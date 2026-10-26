@@ -24,13 +24,15 @@ use tauri_plugin_dialog::DialogExt;
 struct Backend {
     desktop: RwLock<Result<Arc<Desktop>, String>>,
     projects_file: PathBuf,
+    builtin_agents: Option<PathBuf>,
 }
 
 impl Backend {
-    async fn open(projects_file: PathBuf) -> Self {
+    async fn open(projects_file: PathBuf, builtin_agents: Option<PathBuf>) -> Self {
         let backend = Self {
             desktop: RwLock::new(Err(String::new())),
             projects_file,
+            builtin_agents,
         };
         let _ = backend.reopen().await;
         backend
@@ -40,9 +42,13 @@ impl Backend {
     /// to their end on it; their claims keep the new one from writing those
     /// trees meanwhile (ADR-0036).
     async fn reopen(&self) -> Result<(), String> {
-        let desktop = Desktop::open(None, self.projects_file.clone())
-            .await
-            .map(Arc::new);
+        let desktop = Desktop::open(
+            None,
+            self.projects_file.clone(),
+            self.builtin_agents.clone(),
+        )
+        .await
+        .map(Arc::new);
         let result = desktop.as_ref().map(|_| ()).map_err(Clone::clone);
         *self.desktop.write().unwrap() = desktop;
         result
@@ -226,7 +232,14 @@ fn main() {
         .manage(Views::default())
         .setup(|app| {
             let projects_file = app.path().app_data_dir()?.join("projects.json");
-            app.manage(tauri::async_runtime::block_on(Backend::open(projects_file)));
+            // `bundle.resources` puts the profiles in `<resource dir>/agents`.
+            let builtin_agents = asterpath_app::workspace::builtin_agents(
+                app.path().resource_dir().map(|dir| dir.join("agents")),
+            );
+            app.manage(tauri::async_runtime::block_on(Backend::open(
+                projects_file,
+                builtin_agents,
+            )));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

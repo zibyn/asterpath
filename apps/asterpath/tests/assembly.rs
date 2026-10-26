@@ -350,3 +350,61 @@ fn the_agent_flag_wins_over_default_agent() {
         Some("review")
     );
 }
+
+#[test]
+fn without_a_configured_agent_the_default_profile_is_used_from_any_layer() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(
+        &agents.builtin.join("default.md"),
+        "---\ndescription: builtin\n---\nbuiltin default",
+    );
+    let unconfigured = |agents: &Agents| {
+        let mut spec = base_spec();
+        new_session_spec(
+            &agents.workspace(None),
+            Some(&agents.builtin),
+            &agents.root,
+            None,
+            &mut spec,
+        )
+        .unwrap();
+        spec
+    };
+
+    let spec = unconfigured(&agents);
+    assert_eq!(spec.system, [text("builtin default"), text("be brief")]);
+    assert_eq!(
+        spec.metadata.get(AGENT).map(String::as_str),
+        Some("default")
+    );
+
+    write(&agents.user.join("default.md"), "user default");
+    let spec = unconfigured(&agents);
+    assert_eq!(spec.system, [text("user default"), text("be brief")]);
+}
+
+#[test]
+fn without_any_default_profile_or_builtin_directory_a_session_has_no_base_prompt() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.builtin.join("code.md"), "builtin code");
+    let missing = agents.root.join("no-such-dir");
+    for builtin in [
+        None,
+        Some(missing.as_path()),
+        Some(agents.builtin.as_path()),
+    ] {
+        let mut spec = base_spec();
+        new_session_spec(
+            &agents.workspace(None),
+            builtin,
+            &agents.root,
+            None,
+            &mut spec,
+        )
+        .unwrap();
+        assert_eq!(spec.system, [text("be brief")]);
+        assert_eq!(spec.metadata.get(AGENT), None);
+    }
+}

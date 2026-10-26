@@ -320,6 +320,8 @@ pub struct Desktop {
     projects_file: PathBuf,
     /// The model picker: the configured model, then the aliases' models.
     models: Vec<ModelSpec>,
+    /// The bundled agent profiles; `None` means no builtin layer.
+    builtin_agents: Option<PathBuf>,
     drivers: Drivers,
     errors: Errors,
 }
@@ -343,13 +345,19 @@ impl Desktop {
             models: vec![template.model.clone()],
             template,
             projects_file,
+            builtin_agents: None,
             drivers: Drivers::default(),
             errors: Errors::default(),
         }
     }
 
-    /// `config` (else `ASTERPATH_CONFIG`, else the default `config.toml`) and its database.
-    pub async fn open(config: Option<PathBuf>, projects_file: PathBuf) -> Result<Self, String> {
+    /// `config` (else `ASTERPATH_CONFIG`, else the default `config.toml`) and
+    /// its database; `builtin_agents` is the bundled profile directory.
+    pub async fn open(
+        config: Option<PathBuf>,
+        projects_file: PathBuf,
+        builtin_agents: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let settings: Settings = config::load(config, &[]).map_err(text)?;
         config::validate(&settings).map_err(text)?;
         let workspace = settings.workspace().map_err(text)?;
@@ -365,6 +373,7 @@ impl Desktop {
             .await
             .map_err(text)?;
         let mut desktop = Self::new(asterpath, modes, workspace, template, projects_file);
+        desktop.builtin_agents = builtin_agents;
         for model in config::model_aliases(&settings).into_values() {
             if !desktop.models.contains(&model) {
                 desktop.models.push(model);
@@ -424,8 +433,14 @@ impl Desktop {
         let root = work_root(root).map_err(text)?;
         let mut spec = self.template.clone();
         // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
-        // shortcut: no builtin agent profiles until #185/#186 pass the bundled directory
-        new_session_spec(&self.workspace, None, &root, name, &mut spec).map_err(text)?;
+        new_session_spec(
+            &self.workspace,
+            self.builtin_agents.as_deref(),
+            &root,
+            name,
+            &mut spec,
+        )
+        .map_err(text)?;
         let fresh = WorkRoot {
             workspace: self.workspace.clone(),
             new_session: true,

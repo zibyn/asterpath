@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
 use asterpath_app::config;
 use asterpath_app::workspace::{
-    AGENT, NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp, metadata,
-    new_session_spec, work_root, workspace_tools,
+    self, AGENT, NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
+    metadata, new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
@@ -274,9 +274,15 @@ async fn create(
     workspace_tools(&workspace, root, workspace.tools.as_deref()).map_err(CliError::config)?;
     let mut spec = config::session_spec(&settings).map_err(CliError::config)?;
     let configured = spec.model.clone();
-    // shortcut: no builtin agent profiles until #186 resolves the bundled directory
-    let diagnostics = new_session_spec(&workspace, None, root, args.name.as_deref(), &mut spec)
-        .map_err(CliError::config)?;
+    let builtin = builtin_agents();
+    let diagnostics = new_session_spec(
+        &workspace,
+        builtin.as_deref(),
+        root,
+        args.name.as_deref(),
+        &mut spec,
+    )
+    .map_err(CliError::config)?;
     // `-m` wins over the profile's model.
     if args.model.is_some() {
         spec.model = configured;
@@ -325,6 +331,19 @@ pub fn current_root() -> CliResult<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|error| CliError::config(format!("cannot read working directory: {error}")))?;
     work_root(&cwd).map_err(CliError::config)
+}
+
+/// The builtin agent directory: `agents/` beside the binary, else
+/// `<prefix>/share/asterpath/agents` for a binary in `<prefix>/bin/`.
+pub fn builtin_agents() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let bin = exe.as_deref().and_then(Path::parent);
+    workspace::builtin_agents(bin.into_iter().flat_map(|bin| {
+        [bin.join("agents")].into_iter().chain(
+            bin.parent()
+                .map(|prefix| prefix.join("share/asterpath/agents")),
+        )
+    }))
 }
 
 /// The session `--continue` or `-r` names, and its effective config.
