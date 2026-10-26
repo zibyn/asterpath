@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
-    AGENT, CWD, NAME, WorkRoot, Workspace, agent_profiles, in_root, load_agent, new_session_spec,
-    roots, selected_agent, work_root,
+    AGENT, CWD, NAME, STYLE, WorkRoot, Workspace, agent_profiles, in_root, load_agent, load_style,
+    new_session_spec, roots, selected_agent, style_files, work_root,
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
@@ -64,6 +64,14 @@ pub struct Agents {
     pub agents: Vec<AgentChoice>,
 }
 
+/// A project's output styles (ADR-0052) and the one preselected
+/// (`output_style`; `None` is "none").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Styles {
+    pub default: Option<String>,
+    pub styles: Vec<AgentChoice>,
+}
+
 /// A work root in the sidebar.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Project {
@@ -90,6 +98,8 @@ pub struct SessionSummary {
     pub last_activity: i64,
     pub status: Status,
     pub agent: Option<String>,
+    /// The output style it was created with (ADR-0052).
+    pub style: Option<String>,
 }
 
 impl SessionSummary {
@@ -101,6 +111,7 @@ impl SessionSummary {
             last_activity: entry.last_activity,
             status,
             agent: entry.metadata.get(AGENT).cloned(),
+            style: entry.metadata.get(STYLE).cloned(),
         }
     }
 }
@@ -465,14 +476,39 @@ impl Desktop {
         Ok(Agents { default, agents })
     }
 
+    /// The output styles a new session in `root` may use.
+    pub fn styles(&self, root: &Path) -> Result<Styles, String> {
+        let root = work_root(root).map_err(text)?;
+        let files =
+            style_files(&self.workspace, self.builtin_agents.as_deref(), &root).map_err(text)?;
+        let default = self.workspace.style.clone();
+        // An unknown `output_style` fails here, before the user picks anything.
+        if let Some(name) = &default
+            && !files.iter().any(|file| &file.name == name)
+        {
+            return Err(format!("unknown style {name}"));
+        }
+        let styles = files
+            .into_iter()
+            .map(|file| AgentChoice {
+                // A broken style is still listed; creating with it reports why.
+                description: load_style(&file).ok().and_then(|style| style.description),
+                name: file.name,
+            })
+            .collect();
+        Ok(Styles { default, styles })
+    }
+
     /// A session in `root` as the CLI creates one: the agent profile
-    /// (`agent`, else `default_agent`), `AGENTS.md`, the skill index,
+    /// (`agent`, else `default_agent`), the output style (`style` as picked;
+    /// the picker preselects `output_style`), `AGENTS.md`, the skill index,
     /// session metadata and the tools a new session gets there.
     pub async fn create_session(
         &self,
         root: &Path,
         name: Option<&str>,
         agent: Option<&str>,
+        style: Option<&str>,
     ) -> Result<SessionSummary, String> {
         let root = work_root(root).map_err(text)?;
         let mut spec = self.template.clone();
@@ -480,6 +516,7 @@ impl Desktop {
         if let Some(agent) = agent {
             workspace.agent = Some(agent.to_owned());
         }
+        workspace.style = style.map(str::to_owned);
         // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
         new_session_spec(
             &workspace,
@@ -511,6 +548,7 @@ impl Desktop {
         }
         let name = spec.metadata.get(NAME).cloned();
         let agent = spec.metadata.get(AGENT).cloned();
+        let style = spec.metadata.get(STYLE).cloned();
         // Providers are built once from config.toml; a profile cannot add one.
         let provider = spec.model.provider.clone();
         let id = self
@@ -535,6 +573,7 @@ impl Desktop {
             last_activity: created,
             status: Status::Idle,
             agent,
+            style,
         })
     }
 

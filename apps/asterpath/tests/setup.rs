@@ -87,7 +87,7 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
         .await
         .unwrap();
     desktop
-        .create_session(dir.path(), None, None)
+        .create_session(dir.path(), None, None, None)
         .await
         .unwrap();
 }
