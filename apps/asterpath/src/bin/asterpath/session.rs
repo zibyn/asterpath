@@ -313,10 +313,14 @@ async fn create(
     }
     let settings = &settings;
     for diagnostic in diagnostics
+        .skills
         .iter()
         .filter(|diagnostic| diagnostic.kind != SkillDiagnosticKind::AuthorityFieldIgnored)
     {
         eprintln!("skill: {diagnostic}");
+    }
+    for diagnostic in &diagnostics.agents {
+        eprintln!("agent: {diagnostic}; not offered to sub-agents");
     }
     let mcp = load_mcp(&workspace, root).await.map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);

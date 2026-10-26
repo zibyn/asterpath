@@ -518,7 +518,7 @@ impl Desktop {
             workspace.agent = Some(agent.to_owned());
         }
         workspace.style = style.map(str::to_owned);
-        // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
+        // shortcut: skill and profile diagnostics are dropped; show them once the view has a place for warnings
         new_session_spec(
             &workspace,
             self.builtin_agents.as_deref(),

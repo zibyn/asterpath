@@ -12,7 +12,7 @@ use asterpath::protocol::{
 };
 use asterpath_app::workspace::{
     AGENT, CWD, NAME, STYLE, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
-    new_session_spec, style_files, subagent_profiles,
+    new_session_spec, style_files,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
@@ -73,7 +73,7 @@ async fn a_new_session_reads_files_of_its_work_root_through_the_facade() {
 
     let mut spec = base_spec();
     let diagnostics = new_session_spec(&workspace(), None, &root, Some("fix"), &mut spec).unwrap();
-    assert!(diagnostics.is_empty());
+    assert!(diagnostics.skills.is_empty() && diagnostics.agents.is_empty());
     assert_eq!(spec.system, [text("be brief")]);
     assert_eq!(
         spec.metadata,
@@ -550,7 +550,10 @@ async fn an_output_style_follows_the_profile_and_project_overrides_user_override
         pinned: None,
         builtin_agents: Some(agents.builtin.clone()),
     };
-    let metadata = BTreeMap::from([(CWD.to_owned(), agents.root.display().to_string())]);
+    let metadata = BTreeMap::from([
+        (CWD.to_owned(), agents.root.display().to_string()),
+        (STYLE.to_owned(), "terse".to_owned()),
+    ]);
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
         .await
         .unwrap();
@@ -780,28 +783,48 @@ async fn the_environment_offers_every_loadable_profile_assembled_like_a_root_ses
     );
 }
 
-#[test]
-fn a_profile_that_fails_to_load_is_skipped_with_a_diagnostic() {
+#[tokio::test]
+async fn a_profile_that_fails_to_load_is_skipped_with_a_diagnostic_from_the_new_session() {
     let agents = layered_agents();
-    let (profiles, diagnostics) =
-        subagent_profiles(&agents.workspace(None), Some(&agents.builtin), &agents.root).unwrap();
-    let names: Vec<_> = profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect();
-    assert_eq!(names, ["code", "docs"]);
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let mut spec = base_spec();
+    let diagnostics = new_session_spec(
+        &agents.workspace(Some("code")),
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    assert!(diagnostics.skills.is_empty());
+    assert_eq!(diagnostics.agents.len(), 1, "{:?}", diagnostics.agents);
     assert!(
-        diagnostics[0].contains("broken.md") && diagnostics[0].contains("unknown field `mood`"),
-        "{diagnostics:?}"
+        diagnostics.agents[0].contains("broken.md")
+            && diagnostics.agents[0].contains("unknown field `mood`"),
+        "{:?}",
+        diagnostics.agents
     );
-
-    // The new session's index leaves it out too; selecting it is still an error.
-    let spec = agents.spec("code").unwrap();
+    // The index leaves it out.
     assert_eq!(
         spec.system.last(),
         Some(&index("- code: writes code\n- docs: writes docs\n"))
     );
+
+    // So does the environment; selecting it is still an error.
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &spec.metadata)
+        .await
+        .unwrap();
+    let names: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
+    assert_eq!(names, ["code", "docs"]);
     assert!(matches!(
         agents.spec("broken"),
         Err(WorkspaceError::Config(message)) if message.contains("unknown field `mood`")
@@ -843,6 +866,30 @@ async fn a_styled_root_offers_its_unstyled_system_to_its_children() {
     assert_eq!(
         resolve_child_system(&agents, &[(AGENT, "code")]).await,
         None
+    );
+    // A root profile that no longer loads still keeps the style from children.
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "gone")]).await,
+        Some(vec![text("be brief"), index("- code\n")])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_agents_md_does_not_stop_a_session_from_opening() {
+    use std::os::unix::fs::PermissionsExt;
+    let agents = Agents::new();
+    let path = agents.root.join("AGENTS.md");
+    write(&path, "be brief");
+    write(&agents.user.join("code.md"), "user code");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        return; // root reads anything
+    }
+
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "code")]).await,
+        Some(vec![text("user code"), index("- code\n")])
     );
 }
 

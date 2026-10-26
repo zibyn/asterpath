@@ -145,24 +145,23 @@ pub fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
 /// prompt, the output style, `AGENTS.md`, the skill index, then the profile
 /// index, appended to `spec.system`; the profile's model and tools; and the
 /// session metadata. `builtin_agents` is the bundled profile directory, if
-/// any; the bundled styles are its sibling `styles`. Returns the skill
-/// diagnostics for the caller to show.
+/// any; the bundled styles are its sibling `styles`. Returns the diagnostics
+/// for the caller to show.
 pub fn new_session_spec(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
     name: Option<&str>,
     spec: &mut SessionSpec,
-) -> Result<Vec<SkillDiagnostic>, WorkspaceError> {
+) -> Result<Diagnostics, WorkspaceError> {
     let files = agent_profiles(workspace, builtin_agents, root)?;
     let agent = match selected_agent(workspace, &files)? {
         Some(file) => Some((file.name.clone(), load_agent(file)?)),
         None => None,
     };
     let style = selected_style(workspace, builtin_agents, root)?;
-    // Profiles that fail to load are reported where the environment resolves.
-    let (loaded, _) = load_agents(&files);
-    let (context, diagnostics) = session_context(workspace, root, &loaded)?;
+    let (loaded, agents) = load_agents(&files);
+    let (context, skills) = session_context(workspace, root, agents_md(root)?, &loaded);
     let prompt = agent
         .as_ref()
         .map_or("", |(_, profile)| profile.prompt.as_str());
@@ -174,7 +173,7 @@ pub fn new_session_spec(
             text: format!("{STYLE_FRAMING}\n\n{}", style.prompt),
         });
     spec.system
-        .extend(profile_system(prompt, styled.as_ref(), &context));
+        .extend(assemble_system(prompt, styled.as_ref(), &context));
     if let Some((_, profile)) = &agent {
         if let Some((provider, model)) = &profile.model {
             // A different model does not inherit the configured context window.
@@ -197,56 +196,61 @@ pub fn new_session_spec(
     if let Some((name, _)) = style {
         spec.metadata.insert(STYLE.to_owned(), name);
     }
-    Ok(diagnostics)
+    Ok(Diagnostics { skills, agents })
 }
 
-/// The agent profiles sub-agents of `root`'s sessions can select (ADR-0053):
-/// every profile of [`agent_profiles`], its system assembled like a root
-/// session's, without an output style. A profile that fails to load is left
-/// out and described in the returned diagnostics.
-pub fn subagent_profiles(
-    workspace: &Workspace,
-    builtin_agents: Option<&Path>,
-    root: &Path,
-) -> Result<(Vec<asterpath_protocol::AgentProfile>, Vec<String>), WorkspaceError> {
-    subagent_profiles_in(workspace, builtin_agents, root, None)
-        .map(|(profiles, diagnostics, _)| (profiles, diagnostics))
+/// What a new session's assembly reports without failing.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub skills: Vec<SkillDiagnostic>,
+    /// Profiles that fail to load, left out of the profile index and of the
+    /// profiles sub-agents can select.
+    pub agents: Vec<String>,
 }
 
-/// Sub-agent profiles, their diagnostics, and the unstyled root system.
-type Subagents = (
-    Vec<asterpath_protocol::AgentProfile>,
-    Vec<String>,
-    Option<Vec<Part>>,
-);
+/// What a work root's sessions offer sub-agents: the profiles they can
+/// select (ADR-0053), each assembled like a root session without a style.
+struct Subagents {
+    profiles: Vec<asterpath_protocol::AgentProfile>,
+    /// The system of a root session created with the given profile, without
+    /// its style (ADR-0054).
+    root_system: Vec<Part>,
+    /// Files that could not be read and were left out.
+    unreadable: Vec<WorkspaceError>,
+}
 
-/// [`subagent_profiles`], plus the system of a root session created with
-/// `root_agent` (`None` = no profile), assembled without a style.
-fn subagent_profiles_in(
+/// [`Subagents`] of `root`, for a root session created with `root_agent`
+/// (`None` = no profile). Profiles that fail to load are left out silently:
+/// the new session reported them. A root profile that no longer loads gives
+/// a root system without one, so the style still stays out (ADR-0054).
+fn subagents(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
     root_agent: Option<&str>,
-) -> Result<Subagents, WorkspaceError> {
-    let files = agent_profiles(workspace, builtin_agents, root)?;
-    let (loaded, diagnostics) = load_agents(&files);
-    let (context, _) = session_context(workspace, root, &loaded)?;
-    // shortcut: a root profile that no longer loads gives no unstyled system,
-    // so its children copy the styled one; report it once that matters.
-    let root_system = match root_agent {
-        Some(name) => loaded
-            .iter()
-            .find(|(loaded, _)| loaded == name)
-            .map(|(_, profile)| profile_system(&profile.prompt, None, &context)),
-        None => Some(profile_system("", None, &context)),
-    };
+) -> Subagents {
+    let mut unreadable = Vec::new();
+    let files = agent_profiles(workspace, builtin_agents, root).unwrap_or_else(|error| {
+        unreadable.push(error);
+        Vec::new()
+    });
+    let agents_md = agents_md(root).unwrap_or_else(|error| {
+        unreadable.push(error);
+        None
+    });
+    let (loaded, _) = load_agents(&files);
+    let (context, _) = session_context(workspace, root, agents_md, &loaded);
+    let root_prompt = root_agent
+        .and_then(|name| loaded.iter().find(|(loaded, _)| loaded == name))
+        .map_or("", |(_, profile)| profile.prompt.as_str());
+    let root_system = assemble_system(root_prompt, None, &context);
     let profiles = loaded
         .into_iter()
         .map(|(name, profile)| {
             let mut agent = asterpath_protocol::AgentProfile::new(
                 name,
                 profile.description.unwrap_or_default(),
-                profile_system(&profile.prompt, None, &context),
+                assemble_system(&profile.prompt, None, &context),
             );
             agent.model = profile.model.map(|(provider, model)| ModelSpec {
                 provider: ProviderId::new(provider),
@@ -259,7 +263,11 @@ fn subagent_profiles_in(
             agent
         })
         .collect();
-    Ok((profiles, diagnostics, root_system))
+    Subagents {
+        profiles,
+        root_system,
+        unreadable,
+    }
 }
 
 /// The profiles of `files` that load, by name, and why the others did not.
@@ -276,25 +284,26 @@ fn load_agents(files: &[AgentFile]) -> (Vec<(String, AgentProfile)>, Vec<String>
 }
 
 /// What follows the profile prompt in every system of a work root's
-/// sessions: `AGENTS.md`, the skill index and the profile index of
+/// sessions: `agents_md`, the skill index and the profile index of
 /// `profiles`; with the skill diagnostics.
 fn session_context(
     workspace: &Workspace,
     root: &Path,
+    agents_md: Option<Part>,
     profiles: &[(String, AgentProfile)],
-) -> Result<(Vec<Part>, Vec<SkillDiagnostic>), WorkspaceError> {
+) -> (Vec<Part>, Vec<SkillDiagnostic>) {
     let (skills, diagnostics) = skill_index(workspace, root);
-    let context = agents_md(root)?
+    let context = agents_md
         .into_iter()
         .chain(skills)
         .chain(profile_index(profiles))
         .collect();
-    Ok((context, diagnostics))
+    (context, diagnostics)
 }
 
 /// A session's system: the profile prompt (if any), the framed output style
 /// (root sessions only), then `context`.
-fn profile_system(prompt: &str, style: Option<&Part>, context: &[Part]) -> Vec<Part> {
+fn assemble_system(prompt: &str, style: Option<&Part>, context: &[Part]) -> Vec<Part> {
     let prompt = (!prompt.is_empty()).then(|| Part::Text {
         text: prompt.to_owned(),
     });
@@ -722,23 +731,25 @@ impl EnvironmentAdapter for WorkRoot {
             let tools = self
                 .tools(&root)
                 .map_err(|error| EnvironmentError::new(error.to_string()))?;
-            let (agents, diagnostics, root_system) = subagent_profiles_in(
+            let subagents = subagents(
                 &self.workspace,
                 self.builtin_agents.as_deref(),
                 &root,
                 metadata.get(AGENT).map(String::as_str),
-            )
-            .map_err(|error| EnvironmentError::new(error.to_string()))?;
-            for diagnostic in diagnostics {
-                eprintln!("agent: {diagnostic}; not offered to sub-agents");
+            );
+            // An unreadable file must not stop an existing session from opening.
+            for error in subagents.unreadable {
+                eprintln!("asterpath: {error}; left out of sub-agent systems");
             }
             let mut spawn = SpawnEnv::default();
             spawn.vars = self.workspace.spawn_vars.clone();
             let mut environment = SessionEnvironment::new(tools, spawn);
-            environment.agents = agents;
+            environment.agents = subagents.profiles;
             // A styled root's fresh children take its system without the
             // style (ADR-0054).
-            environment.child_system = root_system.filter(|_| metadata.contains_key(STYLE));
+            environment.child_system = metadata
+                .contains_key(STYLE)
+                .then_some(subagents.root_system);
             Ok(environment)
         })
     }

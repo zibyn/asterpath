@@ -112,6 +112,23 @@ fn code(command: &mut Command) -> Option<i32> {
     command.output().expect("run asterpath").status.code()
 }
 
+/// The session metadata `session` was created with.
+fn created_metadata(db: &Path, session: &str) -> std::collections::BTreeMap<String, String> {
+    let id: asterpath_protocol::SessionId =
+        serde_json::from_value(serde_json::json!(session)).expect("session id");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let entries = runtime.block_on(async {
+        let store = asterpath_storage_sqlite::open(db).expect("open the database");
+        asterpath_protocol::scan_all(&*store, id)
+            .await
+            .expect("scan")
+    });
+    match asterpath_protocol::decode_entry(&entries[0]).expect("decode") {
+        SessionEvent::SessionCreated { metadata, .. } => metadata,
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Every text the model saw in request `index`, joined.
 fn seen(server: &MockServer, index: usize) -> String {
     server.requests()[index].body.clone()
@@ -881,6 +898,34 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
 }
 
 #[test]
+fn a_broken_profile_is_reported_when_a_session_is_created_not_when_it_continues() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+    ]);
+    let dir = TestDir::new("broken-agent");
+    dir.config(&config_body(&server, &dir.db()));
+    let project = dir.sub("project/.asterpath/agents");
+    fs::write(project.join("broken.md"), "---\nmood: grumpy\n---\nbody").unwrap();
+    let root = dir.path.join("project");
+    let stderr = |output: std::process::Output| {
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let created = stderr(dir.exec(&root).arg("hi").output().unwrap());
+    assert_eq!(created.matches("broken.md").count(), 1, "{created}");
+    let session = session_from_stderr(&created);
+    let continued = stderr(
+        dir.exec(&root)
+            .args(["-r", &session, "again"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!continued.contains("broken.md"), "{continued}");
+}
+
+#[test]
 fn styles_lists_the_builtin_styles() {
     let dir = TestDir::new("builtin-styles");
     dir.config("");
@@ -933,8 +978,9 @@ fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
     let framing = "The output style below takes precedence";
 
     // exec ignores `output_style`.
-    ok(dir.exec(&root).env("XDG_CONFIG_HOME", &xdg).arg("hi"));
+    let (_, plain) = ok(dir.exec(&root).env("XDG_CONFIG_HOME", &xdg).arg("hi"));
     assert!(!seen(&server, 0).contains(framing), "{}", seen(&server, 0));
+    assert_eq!(created_metadata(&dir.db(), &plain).get("style"), None);
 
     let (_, id) = ok(dir
         .exec(&root)
@@ -945,6 +991,12 @@ fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
         seen(&server, 1).contains("Be terse."),
         "{}",
         seen(&server, 1)
+    );
+    assert_eq!(
+        created_metadata(&dir.db(), &id)
+            .get("style")
+            .map(String::as_str),
+        Some("terse")
     );
 
     // Changing the file does not change the continued session's system.
