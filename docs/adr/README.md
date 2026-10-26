@@ -63,5 +63,6 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0052](0052-output-styles-are-orthogonal-appended-prompt-files.md) | 输出风格是与档案正交选择、追加在档案正文之后的提示词文件，只有正文与描述（子会话部分由 0054 取代） |
 | [0053](0053-subagents-select-application-agent-profiles.md) | 子智能体可按名字选用应用提供的智能体档案，档案列表属于会话环境，只能收窄工具，不能放宽审批与沙箱 |
 | [0054](0054-output-styles-do-not-reach-subagents.md) | 输出风格不进入子会话：应用在会话环境里提供不带风格的基础 system，fork 子会话例外 |
+| [0055](0055-sandbox-is-the-boundary-for-spawned-commands.md) | 起进程的工具以沙箱为边界，审批只问能否越出沙箱；审批模式只收紧沙箱，命令规则只改审批结论 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。
