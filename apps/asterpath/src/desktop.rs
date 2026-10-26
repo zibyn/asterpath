@@ -397,6 +397,7 @@ impl Desktop {
             workspace: workspace.clone(),
             new_session: false,
             pinned: None,
+            builtin_agents: builtin_agents.clone(),
         };
         // shortcut: no MCP servers yet; they are loaded per work root, which a multi-project process does not have
         let modes = Arc::new(ApprovalModes::new(settings.approval.into()));
@@ -530,6 +531,7 @@ impl Desktop {
             workspace: self.workspace.clone(),
             new_session: true,
             pinned: None,
+            builtin_agents: self.builtin_agents.clone(),
         };
         let environment = fresh.resolve(&spec.metadata).await.map_err(text)?;
         // The profile's whitelist, else every tool the environment gives a new session.

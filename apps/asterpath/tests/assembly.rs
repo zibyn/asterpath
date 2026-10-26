@@ -12,7 +12,7 @@ use asterpath::protocol::{
 };
 use asterpath_app::workspace::{
     AGENT, CWD, NAME, STYLE, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
-    new_session_spec, style_files,
+    new_session_spec, style_files, subagent_profiles,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
@@ -46,6 +46,14 @@ fn workspace() -> Workspace {
         skills_enabled: false,
         ..Workspace::default()
     }
+}
+
+/// The profile index that ends a session's system, with `lines` listing
+/// the profiles.
+fn index(lines: &str) -> Part {
+    text(&format!(
+        "## Sub-agents\n\nTo hand a task to one of these sub-agents, call `spawn_agent` with `agent` set to its name.\n\n{lines}"
+    ))
 }
 
 fn tool_names(environment: &asterpath::protocol::SessionEnvironment) -> Vec<String> {
@@ -103,6 +111,7 @@ async fn a_new_session_reads_files_of_its_work_root_through_the_facade() {
             workspace: workspace(),
             new_session: true,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -155,6 +164,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
         workspace: selected.clone(),
         new_session: true,
         pinned: None,
+        builtin_agents: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&new, &metadata)
         .await
@@ -165,6 +175,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
         workspace: selected,
         new_session: false,
         pinned: None,
+        builtin_agents: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&continued, &metadata)
         .await
@@ -181,6 +192,7 @@ async fn a_session_without_cwd_resolves_only_when_pinned() {
         workspace: workspace(),
         new_session: false,
         pinned: None,
+        builtin_agents: None,
     };
     assert!(
         asterpath::protocol::EnvironmentAdapter::resolve(&unpinned, &BTreeMap::new())
@@ -283,7 +295,14 @@ fn the_agent_profile_comes_first_and_project_overrides_user_overrides_builtin() 
         ("review", "project review"),
     ] {
         let spec = agents.spec(agent).unwrap();
-        assert_eq!(spec.system, [text(prompt), text("be brief")]);
+        assert_eq!(
+            spec.system,
+            [
+                text(prompt),
+                text("be brief"),
+                index("- code\n- docs\n- review\n")
+            ]
+        );
         assert_eq!(spec.metadata.get(AGENT).map(String::as_str), Some(agent));
     }
 }
@@ -301,7 +320,13 @@ fn an_agent_profile_sets_the_model_and_narrows_the_tools() {
     );
 
     let spec = agents.spec("review").unwrap();
-    assert_eq!(spec.system, [text("review only")]);
+    assert_eq!(
+        spec.system,
+        [
+            text("review only"),
+            index("- plain: plain\n- review: read-only review\n")
+        ]
+    );
     assert_eq!(
         spec.model,
         ModelSpec {
@@ -373,7 +398,14 @@ fn without_a_configured_agent_the_default_profile_is_used_from_any_layer() {
     };
 
     let spec = unconfigured(&agents);
-    assert_eq!(spec.system, [text("builtin default"), text("be brief")]);
+    assert_eq!(
+        spec.system,
+        [
+            text("builtin default"),
+            text("be brief"),
+            index("- default: builtin\n")
+        ]
+    );
     assert_eq!(
         spec.metadata.get(AGENT).map(String::as_str),
         Some("default")
@@ -381,7 +413,10 @@ fn without_a_configured_agent_the_default_profile_is_used_from_any_layer() {
 
     write(&agents.user.join("default.md"), "user default");
     let spec = unconfigured(&agents);
-    assert_eq!(spec.system, [text("user default"), text("be brief")]);
+    assert_eq!(
+        spec.system,
+        [text("user default"), text("be brief"), index("- default\n")]
+    );
 }
 
 #[test]
@@ -404,7 +439,11 @@ fn without_any_default_profile_or_builtin_directory_a_session_has_no_base_prompt
             &mut spec,
         )
         .unwrap();
-        assert_eq!(spec.system, [text("be brief")]);
+        let mut expected = vec![text("be brief")];
+        if builtin == Some(agents.builtin.as_path()) {
+            expected.push(index("- code\n"));
+        }
+        assert_eq!(spec.system, expected);
         assert_eq!(spec.metadata.get(AGENT), None);
         assert_eq!(spec.metadata.get(STYLE), None);
     }
@@ -441,8 +480,8 @@ fn framed(body: &str) -> Part {
     ))
 }
 
-#[test]
-fn an_output_style_follows_the_profile_and_project_overrides_user_overrides_builtin() {
+#[tokio::test]
+async fn an_output_style_follows_the_profile_and_project_overrides_user_overrides_builtin() {
     let agents = Agents::new();
     write(&agents.root.join("AGENTS.md"), "be brief");
     write(&agents.user.join("code.md"), "user code");
@@ -489,11 +528,41 @@ fn an_output_style_follows_the_profile_and_project_overrides_user_overrides_buil
         let spec = styled(&agents, Some("code"), style).unwrap();
         assert_eq!(
             spec.system,
-            [text("user code"), framed(body), text("be brief")]
+            [
+                text("user code"),
+                framed(body),
+                text("be brief"),
+                index("- code\n")
+            ]
         );
         assert_eq!(spec.metadata.get(STYLE).map(String::as_str), Some(style));
         assert_eq!(spec.metadata.get(AGENT).map(String::as_str), Some("code"));
     }
+
+    // The environment's profiles never take the style (ADR-0054).
+    let environment = WorkRoot {
+        workspace: Workspace {
+            style: Some("terse".to_owned()),
+            user_styles: Some(user.clone()),
+            ..agents.workspace(Some("code"))
+        },
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let metadata = BTreeMap::from([(CWD.to_owned(), agents.root.display().to_string())]);
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap();
+    let systems: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| profile.system.clone())
+        .collect();
+    assert_eq!(
+        systems,
+        [vec![text("user code"), text("be brief"), index("- code\n")]]
+    );
 }
 
 #[test]
@@ -550,4 +619,107 @@ fn the_style_flag_wins_over_output_style() {
     assert_eq!(settings.workspace().unwrap().style.as_deref(), Some("warm"));
     settings.set_style(None);
     assert_eq!(settings.workspace().unwrap().style, None);
+}
+
+/// Builtin `code` and `docs`, a user `docs` with model and tools, a project
+/// `code` and a project profile with a broken frontmatter.
+fn layered_agents() -> Agents {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.builtin.join("code.md"), "builtin code");
+    write(&agents.builtin.join("docs.md"), "builtin docs");
+    write(
+        &agents.user.join("docs.md"),
+        "---\ndescription: writes docs\nmodel: q/model-2\ntools: [read_file]\n---\nuser docs",
+    );
+    write(
+        &agents.project().join("code.md"),
+        "---\ndescription: writes code\n---\nproject code",
+    );
+    write(
+        &agents.project().join("broken.md"),
+        "---\nmood: grumpy\n---\nbody",
+    );
+    agents
+}
+
+#[tokio::test]
+async fn the_environment_offers_every_loadable_profile_assembled_like_a_root_session() {
+    let agents = layered_agents();
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let metadata = BTreeMap::from([(CWD.to_owned(), agents.root.display().to_string())]);
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap();
+
+    let listed = index("- code: writes code\n- docs: writes docs\n");
+    let profiles: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.as_str(),
+                profile.description.as_str(),
+                profile.system.clone(),
+                profile.model.clone(),
+                profile.tools.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        profiles,
+        [
+            (
+                "code",
+                "writes code",
+                vec![text("project code"), text("be brief"), listed.clone()],
+                None,
+                None,
+            ),
+            (
+                "docs",
+                "writes docs",
+                vec![text("user docs"), text("be brief"), listed],
+                Some(ModelSpec {
+                    provider: ProviderId::new("q"),
+                    model: ModelId::new("model-2"),
+                    context_window: None,
+                }),
+                Some(vec![ToolName::new("read_file")]),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_profile_that_fails_to_load_is_skipped_with_a_diagnostic() {
+    let agents = layered_agents();
+    let (profiles, diagnostics) =
+        subagent_profiles(&agents.workspace(None), Some(&agents.builtin), &agents.root).unwrap();
+    let names: Vec<_> = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
+    assert_eq!(names, ["code", "docs"]);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(
+        diagnostics[0].contains("broken.md") && diagnostics[0].contains("unknown field `mood`"),
+        "{diagnostics:?}"
+    );
+
+    // The new session's index leaves it out too; selecting it is still an error.
+    let spec = agents.spec("code").unwrap();
+    assert_eq!(
+        spec.system.last(),
+        Some(&index("- code: writes code\n- docs: writes docs\n"))
+    );
+    assert!(matches!(
+        agents.spec("broken"),
+        Err(WorkspaceError::Config(message)) if message.contains("unknown field `mood`")
+    ));
 }

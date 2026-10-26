@@ -22,6 +22,8 @@ struct SpawnArgs {
     model_alias: Option<String>,
     #[serde(default)]
     tool_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    agent: Option<String>,
     /// Per-call spawn deadline in milliseconds; overrides the config default.
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -104,6 +106,7 @@ impl Scheduler {
             request.tool_allowlist = args
                 .tool_allowlist
                 .map(|names| names.into_iter().map(ToolName::new).collect());
+            request.agent = args.agent;
             request.timeout = args.timeout_ms.map(Duration::from_millis);
 
             // Queued or admitted, the spawn observes the turn's token. A
@@ -206,7 +209,8 @@ fn descriptor() -> ToolDescriptor {
         "Run a sub-agent: starts an independent child session with a fresh \
                       context and returns its status and task summary once it finishes. \
                       The child inherits the session configuration; the model may only \
-                      narrow the model alias and the tool set."
+                      narrow the model alias and the tool set, and select a sub-agent \
+                      profile by name."
             .to_owned(),
         serde_json::json!({
             "type": "object",
@@ -223,6 +227,10 @@ fn descriptor() -> ToolDescriptor {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional subset of the parent's tools."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional sub-agent profile, chosen from those listed in the system prompt. The child then uses that profile's system prompt, model and tools."
                 },
                 "timeout_ms": {
                     "type": "integer",

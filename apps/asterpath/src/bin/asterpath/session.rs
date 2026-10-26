@@ -208,6 +208,7 @@ pub async fn open(
         workspace,
         new_session: false,
         pinned,
+        builtin_agents: builtin_agents(),
     };
     let asterpath = config::assemble(
         &settings,
@@ -324,6 +325,7 @@ async fn create(
         workspace,
         new_session: true,
         pinned: None,
+        builtin_agents: builtin,
     };
     let asterpath = config::assemble(
         settings,

@@ -44,6 +44,7 @@ async fn engine(db: &Path, provider: Arc<dyn Provider>) -> Asterpath {
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -490,6 +491,7 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -674,6 +676,7 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
