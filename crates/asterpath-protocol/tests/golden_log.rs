@@ -2,7 +2,7 @@
 //! projecting to its canonical expected result. Historical-version fixtures
 //! start with the first release (ADR-0004).
 
-use asterpath_protocol::{DedupKey, LogEntry, LogId, SessionId};
+use asterpath_protocol::{CancelReason, DedupKey, LogEntry, LogId, SessionId};
 use asterpath_protocol::{LOG_SCHEMA_VERSION, decode_entry, history};
 use serde_json::Value;
 
@@ -106,4 +106,14 @@ fn messages_without_raw_decode_with_raw_none() {
         .collect();
     assert!(!raws.is_empty());
     assert!(raws.iter().all(Option::is_none));
+}
+
+#[test]
+fn application_cancel_reason_keeps_its_logged_name() {
+    let logged = serde_json::to_value(CancelReason::Application).unwrap();
+    assert_eq!(logged, "Host");
+    assert_eq!(
+        serde_json::from_value::<CancelReason>(logged).unwrap(),
+        CancelReason::Application
+    );
 }

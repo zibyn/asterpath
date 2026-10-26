@@ -86,7 +86,7 @@ pub enum ContextPolicy {
 - **`timeout` = spawn 记录上的截止时间**（[ADR-0008](../adr/0008-subagent-model.md)）：`spawn` 用注入时钟算 `now + timeout`，写进同一次 append 的 `ChildSessionSpawned.deadline`（绝对时间）；`await_completion` sleep 到 deadline，到期时先查子流终态（R3），已有则用终态，否则取消子会话并写 `ChildSessionCompleted{Cancelled{Timeout}}`。`await_completion` 对 `Cancelled{Timeout}` 返回 `WaitError::Timeout`。
 - **排队是内存状态**：Queued/Running、每父与全局并发计数、wake 注册表都不落日志。**排队 = open 的 spawn `ToolCallRequested` 且无对应 `ChildSessionSpawned`**；FIFO 按 `ToolCallRequested.seq` 重建。已有 `ChildSessionSpawned` 的恢复项是已准入（Running），不重新排队；`ChildSessionSpawned` 只表示「已占槽」。没有 `spawn_many` / join：fan-out 靠 #7 的并行工具调用。
 - **`SpawnError` 才表示没有子会话**；任务失败是 `ChildOutcome::Failed`，仍是成功的 spawn 工具结果。
-- **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的应用取消返回 `Ok(Cancelled{Host})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
+- **`WaitError::Cancelled` / `Timeout`** 分别映射 `ToolResult{Interrupted}` / `Failed{Timeout}`；子被自己的应用取消返回 `Ok(Cancelled{Application})`，映射 `ToolResult{Completed}` 并在 output 标明 cancelled。
 
 持久等待（引擎内部的 `Waits`）见 [module-contracts.md](module-contracts.md) §3.4（[#17](https://github.com/zibyn/asterpath/issues/17)）；本文件只定调度语义：
 
@@ -237,9 +237,9 @@ pub enum ChildFailure {
 
 /// #17：取消必须带原因，恢复才能稳定还原 ToolResult 形态。
 pub enum CancelReason {
-    Parent,   // 父取消等待
-    Host,     // 子被自己的应用取消
-    Timeout,  // spawn timeout 到期
+    Parent,      // 父取消等待
+    Application, // 子被自己的应用取消；日志里记为 "Host"
+    Timeout,     // spawn timeout 到期
 }
 
 pub struct Summary {
@@ -262,7 +262,7 @@ pub struct Summary {
 | `TurnCommitted(MaxStepsExceeded)` | `Failed { reason: MaxStepsExceeded, summary }` | `Completed` |
 | `TurnCommitted(CompactionFailed)` | `Failed { reason: CompactionFailed, summary }` | `Completed` |
 | `TurnCommitted(Refused)` | `Failed { reason: Refused, summary: 空 }`（不回找更早的消息） | `Completed` |
-| 子被应用取消 | `Cancelled { reason: Host }` | `Completed`（output 标明 cancelled） |
+| 子被应用取消 | `Cancelled { reason: Application }` | `Completed`（output 标明 cancelled） |
 | 父取消 | `Cancelled { reason: Parent }` | `Interrupted`（#6 收尾） |
 | 超时 | `Cancelled { reason: Timeout }` | `Failed{Timeout}` |
 | 子状态不可读 | `Lost { reason }` | `Failed{Internal}` |

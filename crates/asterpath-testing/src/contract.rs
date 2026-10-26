@@ -170,7 +170,7 @@ fn child_completed(child: SessionId) -> SessionEvent {
     SessionEvent::ChildSessionCompleted {
         child,
         outcome: ChildOutcome::Cancelled {
-            reason: asterpath_protocol::CancelReason::Host,
+            reason: asterpath_protocol::CancelReason::Application,
         },
     }
 }

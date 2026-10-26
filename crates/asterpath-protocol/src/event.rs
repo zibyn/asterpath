@@ -319,7 +319,10 @@ pub enum ChildFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelReason {
     Parent,
-    Host,
+    /// Stopped by its own application. Logged as `Host`, its name before
+    /// ADR-0048.
+    #[serde(rename = "Host")]
+    Application,
     Timeout,
 }
 

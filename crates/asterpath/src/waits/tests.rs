@@ -117,7 +117,7 @@ async fn a_child_wait_resolves_once_the_completion_is_recorded() {
     let completed = SessionEvent::ChildSessionCompleted {
         child,
         outcome: ChildOutcome::Cancelled {
-            reason: CancelReason::Host,
+            reason: CancelReason::Application,
         },
     };
     fixture

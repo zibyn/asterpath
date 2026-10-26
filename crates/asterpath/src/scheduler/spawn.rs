@@ -612,7 +612,7 @@ impl Scheduler {
             .await
             .map_err(WaitError::from)?;
         if let Some(outcome) = child_outcome(&child_events)
-            // A `Cancelled{Host}` is the child reacting to our own drain, not a
+            // A `Cancelled{Application}` is the child reacting to our own drain, not a
             // terminal that beat the timeout.
             && !matches!(outcome, ChildOutcome::Cancelled { .. })
         {
@@ -999,7 +999,7 @@ fn child_outcome(events: &[(LogEntry, SessionEvent)]) -> Option<ChildOutcome> {
         },
         // The child was stopped by its own application, not by the parent's wait.
         TurnEndReason::Cancelled => ChildOutcome::Cancelled {
-            reason: CancelReason::Host,
+            reason: CancelReason::Application,
         },
         _ => ChildOutcome::Failed {
             reason: ChildFailure::TurnFailed,
