@@ -212,7 +212,7 @@ pub enum ForkSource {
 - 模型可见的 spawn 参数只能收窄：
   - `model_alias` 必须来自应用提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
   - `tool_allowlist` 只能是父工具集的子集；不能新增工具或把 `External` 工具提升为 `InProcess`。
-  - `agent` 必须是会话环境 `agents` 里的档案名（[ADR-0053](../adr/0053-subagents-select-application-agent-profiles.md)）；未知名字 → `Failed{InvalidArgs}`。选中后：`system` 换成档案给出的 system（应用整份组装，不拼父 system）；档案固定的模型必须与父同 provider，与父模型不同时不继承 `context_window`；档案固定了模型时再给 `model_alias` → `Failed{InvalidArgs}`；`tools` 取父生效集合 ∩ 档案工具列表 ∩ `tool_allowlist`，档案里父没有的名字忽略。不给 `agent` 时继承父 system。
+  - `agent` 必须是会话环境 `agents` 里的档案名（[ADR-0053](../adr/0053-subagents-select-application-agent-profiles.md)）；未知名字 → `Failed{InvalidArgs}`。选中后：`system` 换成档案给出的 system（应用整份组装，不拼父 system）；档案固定的模型必须与父同 provider，与父模型不同时不继承 `context_window`；档案固定了模型时再给 `model_alias` → `Failed{InvalidArgs}`；`tools` 取父生效集合 ∩ 档案工具列表 ∩ `tool_allowlist`，档案里父没有的名字忽略；上下文策略强制为 `Fresh`，不受 `default_context = Fork` 影响。不给 `agent` 时继承父 system。
   - system 文本、审批策略、MCP 配置、limits **不能**由模型参数改写；应用可程序化收紧。
 - 沙箱策略不落 `ConfigSnapshot`：子会话继承父的已解析策略，只能收窄；应用解析器按 `SessionStore::parent` 父边查找，spawn 参数不能设置或放宽（[sandbox.md](sandbox.md) §10）。
 - 子的工具调用走自己的 session 与审批策略；父的审批不覆盖子。
