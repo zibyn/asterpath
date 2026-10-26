@@ -48,8 +48,9 @@ fn noop(name: &str) -> Arc<dyn Tool> {
     )))
 }
 
-/// Tools `read` and `write`, and whatever profiles are set at resolve time.
-struct Profiles(Mutex<Vec<AgentProfile>>);
+/// Tools `read` and `write`, and whatever profiles and child system are set
+/// at resolve time.
+struct Profiles(Mutex<Vec<AgentProfile>>, Option<Vec<Part>>);
 
 impl EnvironmentAdapter for Profiles {
     fn resolve<'a>(
@@ -57,10 +58,12 @@ impl EnvironmentAdapter for Profiles {
         _metadata: &'a BTreeMap<String, String>,
     ) -> BoxFuture<'a, Result<SessionEnvironment, EnvironmentError>> {
         let agents = self.0.lock().unwrap().clone();
+        let child_system = self.1.clone();
         Box::pin(async move {
             let mut env =
                 SessionEnvironment::new(vec![noop("read"), noop("write")], SpawnEnv::default());
             env.agents = agents;
+            env.child_system = child_system;
             Ok(env)
         })
     }
@@ -185,8 +188,17 @@ async fn spawn_with(
     subagents: SubagentConfig,
     args: serde_json::Value,
 ) -> Spawned {
-    let adapter = Arc::new(Profiles(Mutex::new(agents)));
-    let asterpath = build(script(args), Arc::new(InMemoryEventLog::new()), adapter).await;
+    spawn_in(Profiles(Mutex::new(agents), None), subagents, script(args)).await
+}
+
+/// Runs a parent under `adapter` and `provider` and returns what its first
+/// `spawn_agent` call did.
+async fn spawn_in(
+    adapter: Profiles,
+    subagents: SubagentConfig,
+    provider: ScriptedProvider,
+) -> Spawned {
+    let asterpath = build(provider, Arc::new(InMemoryEventLog::new()), Arc::new(adapter)).await;
     let parent = asterpath.create_session(spec(subagents)).await.unwrap();
     run(&parent.claim().await.unwrap()).await;
     let parent = events(&asterpath, parent.id()).await;
@@ -410,7 +422,7 @@ async fn spawn_agent_has_one_description_whatever_the_profiles() {
     };
     let mut seen = Vec::new();
     for agents in [vec![], vec![profile("reviewer"), profile("writer")]] {
-        let adapter = Arc::new(Profiles(Mutex::new(agents)));
+        let adapter = Arc::new(Profiles(Mutex::new(agents), None));
         let asterpath = build(
             ScriptedProvider::new("p"),
             Arc::new(InMemoryEventLog::new()),
@@ -430,4 +442,85 @@ async fn spawn_agent_has_one_description_whatever_the_profiles() {
     }
     assert_eq!(seen[0], seen[1]);
     assert!(seen[0].schema["properties"]["agent"].is_object());
+}
+
+fn root_children() -> Profiles {
+    Profiles(
+        Mutex::new(vec![profile("reviewer")]),
+        Some(vec![text("root child system")]),
+    )
+}
+
+#[tokio::test]
+async fn a_fresh_child_of_the_root_takes_the_child_system() {
+    let config = child_config(
+        spawn_in(
+            root_children(),
+            SubagentConfig::default(),
+            script(serde_json::json!({"task": "t"})),
+        )
+        .await,
+    );
+    assert_eq!(config.system, vec![text("root child system")]);
+}
+
+#[tokio::test]
+async fn a_profile_child_ignores_the_child_system() {
+    let config = child_config(
+        spawn_in(
+            root_children(),
+            SubagentConfig::default(),
+            script(serde_json::json!({"task": "t", "agent": "reviewer"})),
+        )
+        .await,
+    );
+    assert_eq!(config.system, vec![text("reviewer system")]);
+}
+
+#[tokio::test]
+async fn a_forked_child_keeps_the_snapshot_system_despite_the_child_system() {
+    let mut subagents = SubagentConfig::default();
+    subagents.default_context = ContextPolicy::Fork {
+        at: LogId::from_i64(0),
+    };
+    let config = child_config(
+        spawn_in(
+            root_children(),
+            subagents,
+            script(serde_json::json!({"task": "t"})),
+        )
+        .await,
+    );
+    assert_eq!(config.system, vec![text("parent system")]);
+}
+
+#[tokio::test]
+async fn a_grandchild_copies_its_parent_not_the_child_system() {
+    let provider = ScriptedProvider::new("p")
+        .respond(
+            spawn(serde_json::json!({"task": "t", "agent": "reviewer"})),
+            StopReason::ToolUse,
+            Usage::default(),
+        )
+        .respond(
+            spawn(serde_json::json!({"task": "t"})),
+            StopReason::ToolUse,
+            Usage::default(),
+        )
+        .respond(say("grandchild done"), StopReason::EndTurn, Usage::default())
+        .respond(say("child done"), StopReason::EndTurn, Usage::default())
+        .respond(say("parent done"), StopReason::EndTurn, Usage::default());
+    let Spawned::Child { child, .. } =
+        spawn_in(root_children(), SubagentConfig::default(), provider).await
+    else {
+        panic!("profile spawn rejected");
+    };
+    let grandchild = child
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { config, .. } => Some(config.clone()),
+            _ => None,
+        })
+        .expect("the profile child spawns a grandchild");
+    assert_eq!(grandchild.system, vec![text("reviewer system")]);
 }

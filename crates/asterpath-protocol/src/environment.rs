@@ -24,6 +24,9 @@ pub struct SessionEnvironment {
     pub spawn: SpawnEnv,
     /// Agent profiles `spawn_agent` may select by name (ADR-0053).
     pub agents: Vec<AgentProfile>,
+    /// The system of a fresh child the root session spawns without a profile
+    /// (ADR-0054); `None` copies the parent's system.
+    pub child_system: Option<Vec<Part>>,
 }
 
 impl SessionEnvironment {
@@ -32,6 +35,7 @@ impl SessionEnvironment {
             tools,
             spawn,
             agents: Vec::new(),
+            child_system: None,
         }
     }
 }
@@ -75,6 +79,7 @@ impl std::fmt::Debug for SessionEnvironment {
             .field("tools", &tools)
             .field("spawn", &self.spawn)
             .field("agents", &self.agents)
+            .field("child_system", &self.child_system)
             .finish()
     }
 }
