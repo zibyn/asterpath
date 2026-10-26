@@ -881,6 +881,29 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
 }
 
 #[test]
+fn styles_lists_the_builtin_explanatory_style() {
+    let dir = TestDir::new("builtin-styles");
+    dir.config("");
+    let root = dir.sub("project");
+    let output = bin()
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", dir.sub("xdg"))
+        .args(["styles", "--config", dir.config_path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A dev build reads the repository's source directory.
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "explanatory\t{}/styles/explanatory.md\tExplains the reasoning behind its work as it goes",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    );
+}
+
+#[test]
 fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
     let server = MockServer::start(vec![
         Reply::sse(common::text_sse("one")),
@@ -957,7 +980,8 @@ fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.trim().lines().collect();
+    // The builtin `explanatory` comes first; its own test checks that line.
+    let lines: Vec<&str> = stdout.trim().lines().skip(1).collect();
     assert_eq!(
         lines,
         [
