@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath};
 use asterpath_mcp::{McpError, McpServerConfig, McpServers, McpTransport};
+use asterpath_protocol::AgentProfile as SubagentProfile;
 use asterpath_protocol::{
     CatalogEntry, EnvironmentAdapter, EnvironmentError, ModelId, ModelSpec, ParentFilter, Part,
     ProviderId, SandboxPolicy, SandboxProvider, SessionEnvironment, SessionId, SessionQuery,
@@ -61,6 +62,8 @@ impl From<AsterError> for WorkspaceError {
 pub const CWD: &str = "cwd";
 pub const NAME: &str = "name";
 pub const AGENT: &str = "agent";
+/// The output style a session was created with (ADR-0052).
+pub const STYLE: &str = "style";
 /// The agent profile of new sessions when none is configured (ADR-0051).
 pub const DEFAULT_AGENT: &str = "default";
 
@@ -93,6 +96,10 @@ pub struct Workspace {
     pub agent: Option<String>,
     /// User-level agent profiles, between the builtin and project ones.
     pub user_agents: Option<PathBuf>,
+    /// The output style of new sessions (ADR-0052); `None` adds none.
+    pub style: Option<String>,
+    /// User-level output styles, between the builtin and project ones.
+    pub user_styles: Option<PathBuf>,
 }
 
 impl Default for Workspace {
@@ -107,6 +114,8 @@ impl Default for Workspace {
             mcp_servers: Vec::new(),
             agent: None,
             user_agents: None,
+            style: None,
+            user_styles: None,
         }
     }
 }
@@ -134,29 +143,39 @@ pub fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
 }
 
 /// A new session's spec from its work root: the selected agent profile's
-/// prompt, `AGENTS.md`, then the skill index, appended to `spec.system`; the
-/// profile's model and tools; and the session metadata. `builtin_agents` is
-/// the bundled profile directory, if any. Returns the skill diagnostics for
-/// the caller to show.
+/// prompt, the output style, `AGENTS.md`, the skill index, then the profile
+/// index, appended to `spec.system`; the profile's model and tools; and the
+/// session metadata. `builtin_agents` is the bundled profile directory, if
+/// any; the bundled styles are its sibling `styles`. Returns the diagnostics
+/// for the caller to show.
 pub fn new_session_spec(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
     name: Option<&str>,
     spec: &mut SessionSpec,
-) -> Result<Vec<SkillDiagnostic>, WorkspaceError> {
-    let profiles = agent_profiles(workspace, builtin_agents, root)?;
-    let agent = match selected_agent(workspace, &profiles)? {
+) -> Result<Diagnostics, WorkspaceError> {
+    let files = agent_profiles(workspace, builtin_agents, root)?;
+    let agent = match selected_agent(workspace, &files)? {
         Some(file) => Some((file.name.clone(), load_agent(file)?)),
         None => None,
     };
-    let (index, diagnostics) = skill_index(workspace, root);
+    let style = selected_style(workspace, builtin_agents, root)?;
+    let (loaded, agents) = load_agents(&files);
+    let (context, skills) = session_context(workspace, root, agents_md(root)?, &loaded);
+    let prompt = agent
+        .as_ref()
+        .map_or("", |(_, profile)| profile.prompt.as_str());
+    // Only the root session's system takes the style (ADR-0054).
+    let styled = style
+        .as_ref()
+        .filter(|(_, style)| !style.prompt.is_empty())
+        .map(|(_, style)| Part::Text {
+            text: format!("{STYLE_FRAMING}\n\n{}", style.prompt),
+        });
+    spec.system
+        .extend(assemble_system(prompt, styled.as_ref(), &context));
     if let Some((_, profile)) = &agent {
-        if !profile.prompt.is_empty() {
-            spec.system.push(Part::Text {
-                text: profile.prompt.clone(),
-            });
-        }
         if let Some((provider, model)) = &profile.model {
             // A different model does not inherit the configured context window.
             let same =
@@ -171,25 +190,163 @@ pub fn new_session_spec(
             spec.tools = ToolSelection::Names(tools.iter().cloned().map(ToolName::new).collect());
         }
     }
-    if let Some(agents) = agents_md(root)? {
-        spec.system.push(agents);
-    }
-    if let Some(index) = index {
-        spec.system.push(index);
-    }
     spec.metadata = metadata(root, name);
     if let Some((name, _)) = agent {
         spec.metadata.insert(AGENT.to_owned(), name);
     }
-    Ok(diagnostics)
+    if let Some((name, _)) = style {
+        spec.metadata.insert(STYLE.to_owned(), name);
+    }
+    Ok(Diagnostics { skills, agents })
+}
+
+/// What a new session's assembly reports without failing.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub skills: Vec<SkillDiagnostic>,
+    /// Profiles that fail to load, left out of the profile index and of the
+    /// profiles sub-agents can select.
+    pub agents: Vec<String>,
+}
+
+/// What a work root's sessions offer sub-agents: the profiles they can
+/// select (ADR-0053), each assembled like a root session without a style.
+struct Subagents {
+    profiles: Vec<SubagentProfile>,
+    /// The system of a root session created with the given profile, without
+    /// its style (ADR-0054).
+    root_system: Vec<Part>,
+    /// Files that could not be read and were left out.
+    unreadable: Vec<WorkspaceError>,
+}
+
+/// [`Subagents`] of `root`, for a root session created with `root_agent`
+/// (`None` = no profile). Profiles that fail to load are left out silently:
+/// the new session reported them. A root profile that no longer loads gives
+/// a root system without one, so the style still stays out (ADR-0054).
+fn subagents(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+    root_agent: Option<&str>,
+) -> Subagents {
+    let mut unreadable = Vec::new();
+    let files = agent_profiles(workspace, builtin_agents, root).unwrap_or_else(|error| {
+        unreadable.push(error);
+        Vec::new()
+    });
+    let agents_md = agents_md(root).unwrap_or_else(|error| {
+        unreadable.push(error);
+        None
+    });
+    let (loaded, _) = load_agents(&files);
+    let (context, _) = session_context(workspace, root, agents_md, &loaded);
+    let root_prompt = root_agent
+        .and_then(|name| loaded.iter().find(|(loaded, _)| loaded == name))
+        .map_or("", |(_, profile)| profile.prompt.as_str());
+    let root_system = assemble_system(root_prompt, None, &context);
+    let profiles = loaded
+        .into_iter()
+        .map(|(name, profile)| {
+            let mut agent = SubagentProfile::new(
+                name,
+                profile.description.unwrap_or_default(),
+                assemble_system(&profile.prompt, None, &context),
+            );
+            agent.model = profile.model.map(|(provider, model)| ModelSpec {
+                provider: ProviderId::new(provider),
+                model: ModelId::new(model),
+                context_window: None,
+            });
+            agent.tools = profile
+                .tools
+                .map(|tools| tools.into_iter().map(ToolName::new).collect());
+            agent
+        })
+        .collect();
+    Subagents {
+        profiles,
+        root_system,
+        unreadable,
+    }
+}
+
+/// The profiles of `files` that load, by name, and why the others did not.
+fn load_agents(files: &[PromptFile]) -> (Vec<(String, AgentProfile)>, Vec<String>) {
+    let mut loaded = Vec::new();
+    let mut diagnostics = Vec::new();
+    for file in files {
+        match load_agent(file) {
+            Ok(profile) => loaded.push((file.name.clone(), profile)),
+            Err(error) => diagnostics.push(error.to_string()),
+        }
+    }
+    (loaded, diagnostics)
+}
+
+/// What follows the profile prompt in every system of a work root's
+/// sessions: `agents_md`, the skill index and the profile index of
+/// `profiles`; with the skill diagnostics.
+fn session_context(
+    workspace: &Workspace,
+    root: &Path,
+    agents_md: Option<Part>,
+    profiles: &[(String, AgentProfile)],
+) -> (Vec<Part>, Vec<SkillDiagnostic>) {
+    let (skills, diagnostics) = skill_index(workspace, root);
+    let context = agents_md
+        .into_iter()
+        .chain(skills)
+        .chain(profile_index(profiles))
+        .collect();
+    (context, diagnostics)
+}
+
+/// A session's system: the profile prompt (if any), the framed output style
+/// (root sessions only), then `context`.
+fn assemble_system(prompt: &str, style: Option<&Part>, context: &[Part]) -> Vec<Part> {
+    let prompt = (!prompt.is_empty()).then(|| Part::Text {
+        text: prompt.to_owned(),
+    });
+    prompt
+        .into_iter()
+        .chain(style.cloned())
+        .chain(context.iter().cloned())
+        .collect()
+}
+
+/// The profile index (ADR-0053): each profile's name and description, so the
+/// model knows what `spawn_agent`'s `agent` can be. `None` without profiles.
+fn profile_index(profiles: &[(String, AgentProfile)]) -> Option<Part> {
+    if profiles.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "## Sub-agents\n\nTo hand a task to one of these sub-agents, call `spawn_agent` with `agent` set to its name.\n\n",
+    );
+    for (name, profile) in profiles {
+        let description = profile
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if description.is_empty() {
+            text.push_str(&format!("- {name}\n"));
+        } else {
+            text.push_str(&format!("- {name}: {description}\n"));
+        }
+    }
+    Some(Part::Text { text })
 }
 
 /// The profile a new session takes from `profiles`: `workspace.agent`
 /// (unknown is an error), else the one named `default` if there is one.
 pub fn selected_agent<'a>(
     workspace: &Workspace,
-    profiles: &'a [AgentFile],
-) -> Result<Option<&'a AgentFile>, WorkspaceError> {
+    profiles: &'a [PromptFile],
+) -> Result<Option<&'a PromptFile>, WorkspaceError> {
     let find = |name: &str| profiles.iter().find(|file| file.name == name);
     match &workspace.agent {
         Some(name) => find(name)
@@ -197,6 +354,35 @@ pub fn selected_agent<'a>(
             .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}"))),
         None => Ok(find(DEFAULT_AGENT)),
     }
+}
+
+/// The framing line before an output style's body (ADR-0052).
+const STYLE_FRAMING: &str =
+    "The output style below takes precedence over any output requirements above.";
+
+/// `workspace.style`, loaded; an unknown name is an error.
+fn selected_style(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<Option<(String, OutputStyle)>, WorkspaceError> {
+    let Some(name) = &workspace.style else {
+        return Ok(None);
+    };
+    let files = style_files(workspace, builtin_agents, root)?;
+    let file = find_style(&files, name)?;
+    Ok(Some((name.clone(), load_style(file)?)))
+}
+
+/// The style `name` among `files`; an unknown name is an error.
+pub fn find_style<'a>(
+    files: &'a [PromptFile],
+    name: &str,
+) -> Result<&'a PromptFile, WorkspaceError> {
+    files
+        .iter()
+        .find(|file| file.name == name)
+        .ok_or_else(|| WorkspaceError::Config(format!("unknown style {name}")))
 }
 
 /// The builtin agent directory: the first of the application's `candidates`
@@ -217,9 +403,10 @@ pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<P
     found
 }
 
-/// An agent profile file (ADR-0051): its name is the file name without `.md`.
+/// An agent profile or output style file (ADR-0051, ADR-0052): its name is
+/// the file name without `.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFile {
+pub struct PromptFile {
     pub name: String,
     pub path: PathBuf,
 }
@@ -243,12 +430,37 @@ pub fn agent_profiles(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
-) -> Result<Vec<AgentFile>, WorkspaceError> {
-    let dirs = builtin_agents
-        .map(Path::to_path_buf)
-        .into_iter()
-        .chain(workspace.user_agents.clone())
-        .chain([root.join(".asterpath/agents")]);
+) -> Result<Vec<PromptFile>, WorkspaceError> {
+    named_files(
+        builtin_agents
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(workspace.user_agents.clone())
+            .chain([root.join(".asterpath/agents")]),
+    )
+}
+
+/// The `*.md` output styles of the `styles` directory beside
+/// `builtin_agents`, the user directory and `<root>/.asterpath/styles`, with
+/// the same precedence as [`agent_profiles`].
+pub fn style_files(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<Vec<PromptFile>, WorkspaceError> {
+    named_files(
+        builtin_agents
+            .and_then(Path::parent)
+            .map(|dir| dir.join("styles"))
+            .into_iter()
+            .chain(workspace.user_styles.clone())
+            .chain([root.join(".asterpath/styles")]),
+    )
+}
+
+/// The `*.md` files of `dirs` by name; a later directory's file replaces an
+/// earlier one of the same name. Missing directories are empty.
+fn named_files(dirs: impl Iterator<Item = PathBuf>) -> Result<Vec<PromptFile>, WorkspaceError> {
     let mut found = BTreeMap::new();
     for dir in dirs {
         let io = |source| WorkspaceError::Io {
@@ -272,20 +484,16 @@ pub fn agent_profiles(
     }
     Ok(found
         .into_iter()
-        .map(|(name, path)| AgentFile { name, path })
+        .map(|(name, path)| PromptFile { name, path })
         .collect())
 }
 
 /// Read and parse a profile; an unknown frontmatter field is an error.
-pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
-    let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
-        context: format!("cannot read {}", file.path.display()),
-        source,
-    })?;
+pub fn load_agent(file: &PromptFile) -> Result<AgentProfile, WorkspaceError> {
     let invalid = |message: String| {
         WorkspaceError::Config(format!("agent {}: {message}", file.path.display()))
     };
-    let (fields, body) = parse_frontmatter(&content).map_err(invalid)?;
+    let (fields, body) = read_frontmatter(file, invalid)?;
     let mut profile = AgentProfile {
         description: None,
         model: None,
@@ -313,6 +521,50 @@ pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
         }
     }
     Ok(profile)
+}
+
+/// An output style's description and body (ADR-0052).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputStyle {
+    pub description: Option<String>,
+    /// Appended after the profile's prompt, trimmed.
+    pub prompt: String,
+}
+
+/// Read and parse a style; any field but `description` is an error.
+pub fn load_style(file: &PromptFile) -> Result<OutputStyle, WorkspaceError> {
+    let invalid = |message: String| {
+        WorkspaceError::Config(format!("style {}: {message}", file.path.display()))
+    };
+    let (fields, body) = read_frontmatter(file, invalid)?;
+    let mut style = OutputStyle {
+        description: None,
+        prompt: body.trim().to_owned(),
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("description", FrontmatterValue::String(text)) => style.description = Some(text),
+            ("description", _) => {
+                return Err(invalid("`description` must be a string".to_owned()));
+            }
+            _ => return Err(invalid(format!("unknown field `{key}`"))),
+        }
+    }
+    Ok(style)
+}
+
+/// A profile or style file's frontmatter fields and body; `invalid` wraps a
+/// parse error.
+fn read_frontmatter(
+    file: &PromptFile,
+    invalid: impl Fn(String) -> WorkspaceError,
+) -> Result<(BTreeMap<String, FrontmatterValue>, String), WorkspaceError> {
+    let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
+        context: format!("cannot read {}", file.path.display()),
+        source,
+    })?;
+    let (fields, body) = parse_frontmatter(&content).map_err(invalid)?;
+    Ok((fields, body.to_owned()))
 }
 
 /// New-session skill policy: `skills_enabled`. The loader tool comes from
@@ -442,7 +694,8 @@ async fn every(
 
 /// The session environment of a work root (ADR-0037): workspace tools, the
 /// skill loader and the sandbox policy rooted at the root session's `cwd`,
-/// and the spawn variables for bash.
+/// the spawn variables for bash, and the profiles sub-agents can select
+/// (ADR-0053).
 pub struct WorkRoot {
     pub workspace: Workspace,
     /// New sessions get the tool selection and the skill switch; continued
@@ -451,6 +704,8 @@ pub struct WorkRoot {
     pub new_session: bool,
     /// Overrides the `cwd` metadata.
     pub pinned: Option<PathBuf>,
+    /// The bundled agent profile directory, if any.
+    pub builtin_agents: Option<PathBuf>,
 }
 
 impl WorkRoot {
@@ -485,9 +740,26 @@ impl EnvironmentAdapter for WorkRoot {
             let tools = self
                 .tools(&root)
                 .map_err(|error| EnvironmentError::new(error.to_string()))?;
+            let subagents = subagents(
+                &self.workspace,
+                self.builtin_agents.as_deref(),
+                &root,
+                metadata.get(AGENT).map(String::as_str),
+            );
+            // An unreadable file must not stop an existing session from opening.
+            for error in subagents.unreadable {
+                eprintln!("asterpath: {error}; left out of sub-agent systems");
+            }
             let mut spawn = SpawnEnv::default();
             spawn.vars = self.workspace.spawn_vars.clone();
-            Ok(SessionEnvironment::new(tools, spawn))
+            let mut environment = SessionEnvironment::new(tools, spawn);
+            environment.agents = subagents.profiles;
+            // A styled root's fresh children take its system without the
+            // style (ADR-0054).
+            environment.child_system = metadata
+                .contains_key(STYLE)
+                .then_some(subagents.root_system);
+            Ok(environment)
         })
     }
 }

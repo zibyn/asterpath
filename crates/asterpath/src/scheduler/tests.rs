@@ -360,6 +360,68 @@ async fn spawn_materializes_once_and_reuses_the_child_on_replay() {
     );
 }
 
+/// Polls `future` inside `env`, as a drive polls its tool calls.
+async fn in_env<T>(env: asterpath_protocol::SessionEnvironment, future: BoxFuture<'_, T>) -> T {
+    let env = Arc::new(env);
+    let mut future = future;
+    std::future::poll_fn(|cx| crate::environment::within(Some(&env), || future.as_mut().poll(cx)))
+        .await
+}
+
+/// An environment whose `reviewer` profile and child system both name `version`.
+fn spawn_env(version: &str) -> asterpath_protocol::SessionEnvironment {
+    let mut env = asterpath_protocol::SessionEnvironment::default();
+    env.agents = vec![asterpath_protocol::AgentProfile::new(
+        "reviewer",
+        "reviews",
+        vec![text(&format!("reviewer {version}"))],
+    )];
+    env.child_system = Some(vec![text(&format!("child {version}"))]);
+    env
+}
+
+#[tokio::test]
+async fn a_replayed_spawn_does_not_read_the_environment_again() {
+    for (agent, expected) in [
+        (Some("reviewer"), "reviewer system"),
+        (None, "child system"),
+    ] {
+        let log = Arc::new(InMemoryEventLog::new());
+        let (parent, reference, caused_by) = seed_parent(&log, 3).await;
+        let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
+
+        let mut request = SpawnRequest::new(reference, caused_by, vec![text("go")]);
+        request.agent = agent.map(str::to_owned);
+        let child = in_env(spawn_env("system"), scheduler.spawn(request.clone()))
+            .await
+            .expect("spawn");
+
+        // The environment changes; the recorded spawn replays as before.
+        for env in [
+            asterpath_protocol::SessionEnvironment::default(),
+            spawn_env("changed"),
+        ] {
+            let again = in_env(env, scheduler.spawn(request.clone()))
+                .await
+                .expect("replay spawn");
+            assert_eq!(again.child, child.child);
+        }
+        let created = events(&*log, child.child).await;
+        let SessionEvent::SessionCreated { config, .. } = &created[0] else {
+            unreachable!()
+        };
+        assert_eq!(config.system, vec![text(expected)], "{agent:?}");
+        assert_eq!(
+            events(&*log, parent)
+                .await
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ChildSessionSpawned { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
 #[tokio::test]
 async fn spawn_honours_model_alias_and_rejects_invalid_narrowing() {
     let log = Arc::new(InMemoryEventLog::new());

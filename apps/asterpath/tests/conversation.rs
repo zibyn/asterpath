@@ -44,6 +44,7 @@ async fn engine(db: &Path, provider: Arc<dyn Provider>) -> Asterpath {
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -128,7 +129,7 @@ async fn a_new_session_gets_the_new_session_tools_and_answers_in_the_background(
     let desktop = desktop(&fixture, provider.clone()).await;
 
     let created = desktop
-        .create_session(&fixture.root, Some("fix"), None)
+        .create_session(&fixture.root, Some("fix"), None, None)
         .await
         .unwrap();
     let listed = desktop.sessions(&fixture.root).await.unwrap();
@@ -234,7 +235,7 @@ async fn input_sent_during_a_turn_steers_it_and_streams_live() {
     );
     let desktop = desktop(&fixture, provider.clone()).await;
     let id = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id;
@@ -285,7 +286,7 @@ async fn stop_cancels_the_running_turn() {
     let (provider, _permits) = gated(ScriptedProvider::new("p"));
     let desktop = desktop(&fixture, provider).await;
     let id = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id;
@@ -439,12 +440,12 @@ async fn sessions_run_at_once_in_the_background_and_list_their_status() {
     );
     let desktop = desktop(&fixture, provider).await;
     let a = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap();
     assert_eq!(a.status, Status::Idle);
     let b = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap();
 
@@ -490,6 +491,7 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -502,7 +504,7 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
         fixture.root.join("projects.json"),
     );
     let id = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id;
@@ -534,7 +536,7 @@ async fn the_status_bar_shows_the_model_and_tokens_and_switches_the_model() {
     let desktop = desktop(&fixture, provider.clone()).await;
     assert_eq!(desktop.models(), [template().model]);
     let id = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id;
@@ -674,6 +676,7 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
             workspace: workspace(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -686,7 +689,7 @@ async fn input_sent_just_before_a_drive_error_still_gets_a_drive() {
         fixture.root.join("projects.json"),
     );
     let id = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id;
@@ -756,12 +759,12 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
     );
 
     let defaulted = desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap();
     assert_eq!(defaulted.agent.as_deref(), Some("coder"));
     let created = desktop
-        .create_session(&fixture.root, None, Some("reviewer"))
+        .create_session(&fixture.root, None, Some("reviewer"), None)
         .await
         .unwrap();
     assert_eq!(created.agent.as_deref(), Some("reviewer"));
@@ -770,13 +773,13 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
     let info = desktop.session_info(created.id).await.unwrap();
     assert_eq!(info.agent.as_deref(), Some("reviewer"));
     let unknown = desktop
-        .create_session(&fixture.root, None, Some("missing"))
+        .create_session(&fixture.root, None, Some("missing"), None)
         .await
         .unwrap_err();
     assert!(unknown.contains("unknown agent missing"), "{unknown}");
     // `glob` is whitelisted but not a tool of this work root: an error, as in the CLI.
     let untooled = desktop
-        .create_session(&fixture.root, None, Some("searcher"))
+        .create_session(&fixture.root, None, Some("searcher"), None)
         .await
         .unwrap_err();
     assert!(untooled.contains("unknown tool glob"), "{untooled}");
@@ -830,4 +833,64 @@ async fn a_default_agent_without_a_profile_is_an_error_up_front() {
     );
     let error = desktop.agents(&fixture.root).unwrap_err();
     assert!(error.contains("unknown agent missing"), "{error}");
+}
+
+#[tokio::test]
+async fn the_style_picker_preselects_output_style_and_a_new_session_takes_the_picked_one() {
+    let fixture = fixture();
+    let styles = fixture.root.join(".asterpath/styles");
+    std::fs::create_dir_all(&styles).unwrap();
+    std::fs::write(
+        styles.join("terse.md"),
+        "---\ndescription: Short answers\n---\nBe terse.\n",
+    )
+    .unwrap();
+    std::fs::write(styles.join("warm.md"), "Be warm.\n").unwrap();
+    let desktop = Desktop::new(
+        engine(&fixture.db, Arc::new(ScriptedProvider::new("p"))).await,
+        Arc::new(ApprovalModes::new(ApprovalMode::default())),
+        Workspace {
+            style: Some("warm".to_owned()),
+            ..workspace()
+        },
+        template(),
+        fixture.root.join("projects.json"),
+    );
+
+    let choices = desktop.styles(&fixture.root).unwrap();
+    assert_eq!(choices.default.as_deref(), Some("warm"));
+    let names: Vec<(&str, Option<&str>)> = choices
+        .styles
+        .iter()
+        .map(|style| (style.name.as_str(), style.description.as_deref()))
+        .collect();
+    assert_eq!(names, [("terse", Some("Short answers")), ("warm", None)]);
+
+    let created = desktop
+        .create_session(&fixture.root, None, None, Some("terse"))
+        .await
+        .unwrap();
+    assert_eq!(created.style.as_deref(), Some("terse"));
+    let listed = desktop.sessions(&fixture.root).await.unwrap();
+    assert!(listed.contains(&created), "{listed:?}");
+    // The picker's "none" wins over `output_style`.
+    let plain = desktop
+        .create_session(&fixture.root, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(plain.style, None);
+    let unknown = desktop
+        .create_session(&fixture.root, None, None, Some("missing"))
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("unknown style missing"), "{unknown}");
+}
+
+#[tokio::test]
+async fn a_project_without_styles_offers_none() {
+    let fixture = fixture();
+    let desktop = desktop(&fixture, Arc::new(ScriptedProvider::new("p"))).await;
+    let choices = desktop.styles(&fixture.root).unwrap();
+    assert_eq!(choices.default, None);
+    assert!(choices.styles.is_empty());
 }

@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use asterpath_protocol::{
-    AgentError, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome, ConfigSnapshot,
-    ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role, RunRequest,
-    RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason, dedup,
-    effective_config, encode_entry,
+    AgentError, AgentProfile, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
+    ConfigSnapshot, ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role,
+    RunRequest, RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason,
+    dedup, effective_config, encode_entry,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -169,13 +169,18 @@ impl Scheduler {
             // Per-call wins; otherwise the inherited default (None by default).
             let timeout = req.timeout.or(subagents.spawn_timeout);
             // The tool leaves context at `Fresh`; a `Fork` snapshot default
-            // wins and anchors at this spawn step's `StepStarted`.
-            let context = resolve_context(
-                &req.context,
-                &subagents.default_context,
-                &parent_events,
-                req.caused_by,
-            );
+            // wins and anchors at this spawn step's `StepStarted`. A profile
+            // child is always fresh (ADR-0053).
+            let context = if req.agent.is_some() {
+                ContextPolicy::Fresh
+            } else {
+                resolve_context(
+                    &req.context,
+                    &subagents.default_context,
+                    &parent_events,
+                    req.caused_by,
+                )
+            };
 
             // Rebuild this parent's queue and Running count from the log first;
             // a result that landed since then also closes its queue entry.
@@ -232,35 +237,66 @@ impl Scheduler {
                 });
             }
 
-            let model = match &req.model_alias {
-                Some(alias) => {
-                    let model = self
-                        .aliases
+            // Looked up only for a new child: a recorded spawn above never
+            // re-reads the environment's profiles.
+            let profile = match &req.agent {
+                Some(name) => Some(agent_profile(name)?),
+                None => None,
+            };
+            let profile_model = profile.as_ref().and_then(|p| p.model.as_ref());
+            let agent = || format!("agent {}", req.agent.as_deref().unwrap_or_default());
+            let pinned = match (profile_model, &req.model_alias) {
+                (Some(_), Some(_)) => {
+                    return Err(SpawnError::InvalidArgs {
+                        message: format!("{} pins its model; model_alias is not allowed", agent()),
+                    });
+                }
+                (Some(model), None) => Some((model, agent())),
+                (None, Some(alias)) => Some((
+                    self.aliases
                         .get(alias)
                         .ok_or_else(|| SpawnError::InvalidArgs {
                             message: format!("unknown model alias {}", alias.as_str()),
-                        })?;
+                        })?,
+                    format!("model alias {}", alias.as_str()),
+                )),
+                (None, None) => None,
+            };
+            let model = match pinned {
+                Some((model, source)) => {
                     if model.provider != parent_config.model.provider {
                         return Err(SpawnError::InvalidArgs {
                             message: format!(
-                                "model alias {} uses provider {}, parent uses {}",
-                                alias.as_str(),
-                                model.provider,
-                                parent_config.model.provider
+                                "{source} uses provider {}, parent uses {}",
+                                model.provider, parent_config.model.provider
                             ),
                         });
                     }
-                    model.clone()
+                    // A profile on the parent's own model keeps its context window.
+                    if profile_model.is_some() && model.model == parent_config.model.model {
+                        parent_config.model.clone()
+                    } else {
+                        model.clone()
+                    }
                 }
                 None => parent_config.model.clone(),
             };
 
-            let tools = narrow_tools(&parent_config.tools, req.tool_allowlist.as_deref())?;
-            let system = match &context {
-                ContextPolicy::Fork { at } => {
+            let mut tools = narrow_tools(&parent_config.tools, req.tool_allowlist.as_deref())?;
+            if let Some(names) = profile.as_ref().and_then(|p| p.tools.as_ref()) {
+                tools.retain(|tool| names.contains(&tool.name));
+            }
+            let system = match (&profile, &context) {
+                (Some(profile), _) => profile.system.clone(),
+                (None, ContextPolicy::Fork { at }) => {
                     fork_system(&parent_events, *at).map_err(SpawnError::Execution)?
                 }
-                ContextPolicy::Fresh => parent_config.system.clone(),
+                // Only the root's direct children take the environment's
+                // child system (ADR-0054).
+                (None, ContextPolicy::Fresh) => crate::environment::current()
+                    .and_then(|env| env.child_system.clone())
+                    .filter(|_| child_depth == 1)
+                    .unwrap_or_else(|| parent_config.system.clone()),
             };
 
             let config = ConfigSnapshot {
@@ -1045,6 +1081,20 @@ fn wait_outcome(outcome: &ChildOutcome) -> Result<ChildOutcome, WaitError> {
         } => Err(WaitError::Timeout),
         other => Ok(other.clone()),
     }
+}
+
+/// `name` among the agent profiles of the environment the spawn runs in.
+fn agent_profile(name: &str) -> Result<AgentProfile, SpawnError> {
+    crate::environment::current()
+        .and_then(|env| {
+            env.agents
+                .iter()
+                .find(|profile| profile.name == name)
+                .cloned()
+        })
+        .ok_or_else(|| SpawnError::InvalidArgs {
+            message: format!("unknown agent {name}"),
+        })
 }
 
 fn narrow_tools(

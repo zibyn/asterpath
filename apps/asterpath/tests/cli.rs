@@ -112,6 +112,23 @@ fn code(command: &mut Command) -> Option<i32> {
     command.output().expect("run asterpath").status.code()
 }
 
+/// The session metadata `session` was created with.
+fn created_metadata(db: &Path, session: &str) -> std::collections::BTreeMap<String, String> {
+    let id: asterpath_protocol::SessionId =
+        serde_json::from_value(serde_json::json!(session)).expect("session id");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let entries = runtime.block_on(async {
+        let store = asterpath_storage_sqlite::open(db).expect("open the database");
+        asterpath_protocol::scan_all(&*store, id)
+            .await
+            .expect("scan")
+    });
+    match asterpath_protocol::decode_entry(&entries[0]).expect("decode") {
+        SessionEvent::SessionCreated { metadata, .. } => metadata,
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Every text the model saw in request `index`, joined.
 fn seen(server: &MockServer, index: usize) -> String {
     server.requests()[index].body.clone()
@@ -877,6 +894,163 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
     assert_eq!(
         lines[2],
         format!("review\t{}", project.join("review.md").display())
+    );
+}
+
+#[test]
+fn a_broken_profile_is_reported_when_a_session_is_created_not_when_it_continues() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+    ]);
+    let dir = TestDir::new("broken-agent");
+    dir.config(&config_body(&server, &dir.db()));
+    let project = dir.sub("project/.asterpath/agents");
+    fs::write(project.join("broken.md"), "---\nmood: grumpy\n---\nbody").unwrap();
+    let root = dir.path.join("project");
+    let stderr = |output: std::process::Output| {
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let created = stderr(dir.exec(&root).arg("hi").output().unwrap());
+    assert_eq!(created.matches("broken.md").count(), 1, "{created}");
+    let session = session_from_stderr(&created);
+    let continued = stderr(
+        dir.exec(&root)
+            .args(["-r", &session, "again"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!continued.contains("broken.md"), "{continued}");
+}
+
+#[test]
+fn styles_lists_the_builtin_styles() {
+    let dir = TestDir::new("builtin-styles");
+    dir.config("");
+    let root = dir.sub("project");
+    let output = bin()
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", dir.sub("xdg"))
+        .args(["styles", "--config", dir.config_path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A dev build reads the repository's source directory.
+    let builtin = format!("{}/styles", env!("CARGO_MANIFEST_DIR"));
+    assert_eq!(
+        stdout.trim().lines().collect::<Vec<_>>(),
+        [
+            format!(
+                "explanatory\t{builtin}/explanatory.md\tExplains the reasoning behind its work as it goes"
+            ),
+            format!(
+                "learning\t{builtin}/learning.md\tLeaves small, meaningful pieces of code for you to write, and explains as it goes"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+        Reply::sse(common::text_sse("three")),
+    ]);
+    let dir = TestDir::new("style");
+    dir.config(&format!(
+        "output_style = \"warm\"\n{}",
+        config_body(&server, &dir.db())
+    ));
+    let user = dir.sub("xdg/asterpath/styles");
+    let project = dir.sub("project/.asterpath/styles");
+    fs::write(
+        user.join("warm.md"),
+        "---\ndescription: friendly\n---\nBe warm.",
+    )
+    .unwrap();
+    fs::write(project.join("terse.md"), "Be terse.").unwrap();
+    let root = dir.path.join("project");
+    let xdg = dir.path.join("xdg");
+    let framing = "The output style below takes precedence";
+
+    // exec ignores `output_style`.
+    let (_, plain) = ok(dir.exec(&root).env("XDG_CONFIG_HOME", &xdg).arg("hi"));
+    assert!(!seen(&server, 0).contains(framing), "{}", seen(&server, 0));
+    assert_eq!(created_metadata(&dir.db(), &plain).get("style"), None);
+
+    let (_, id) = ok(dir
+        .exec(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["--style", "terse", "hi"]));
+    assert!(seen(&server, 1).contains(framing), "{}", seen(&server, 1));
+    assert!(
+        seen(&server, 1).contains("Be terse."),
+        "{}",
+        seen(&server, 1)
+    );
+    assert_eq!(
+        created_metadata(&dir.db(), &id)
+            .get("style")
+            .map(String::as_str),
+        Some("terse")
+    );
+
+    // Changing the file does not change the continued session's system.
+    fs::write(project.join("terse.md"), "Be verbose.").unwrap();
+    ok(dir
+        .exec(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["-r", &id, "again"]));
+    assert!(
+        seen(&server, 2).contains("Be terse."),
+        "{}",
+        seen(&server, 2)
+    );
+    assert!(!seen(&server, 2).contains("Be verbose."));
+
+    assert_eq!(
+        code(
+            dir.exec(&root)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .args(["--style", "missing", "hi"])
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        code(
+            dir.exec(&root)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .args(["--style", "terse", "-r", &id, "hi"])
+        ),
+        Some(2)
+    );
+
+    let output = bin()
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["styles", "--config", dir.config_path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Builtin styles have their own test.
+    let builtin = format!("\t{}/styles/", env!("CARGO_MANIFEST_DIR"));
+    let lines: Vec<&str> = stdout
+        .trim()
+        .lines()
+        .filter(|line| !line.contains(&builtin))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            format!("terse\t{}", project.join("terse.md").display()),
+            format!("warm\t{}\tfriendly", user.join("warm.md").display()),
+        ],
+        "{stdout}"
     );
 }
 

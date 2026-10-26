@@ -47,6 +47,7 @@ async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
             workspace: workspace.clone(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .approval(modes.clone())
         .build()
@@ -150,7 +151,7 @@ fn tool_results(request: &ModelRequest) -> Vec<(String, bool)> {
 async fn session(fixture: &Fixture) -> SessionId {
     fixture
         .desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id

@@ -11,8 +11,8 @@ use asterpath::protocol::{
     ToolSelection, TurnConfig, Usage, UserInput, decode_entry, scan_all,
 };
 use asterpath_app::workspace::{
-    AGENT, CWD, NAME, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
-    new_session_spec,
+    AGENT, CWD, NAME, STYLE, SandboxMode, WorkRoot, Workspace, WorkspaceError, agent_profiles,
+    new_session_spec, style_files,
 };
 use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
@@ -48,6 +48,14 @@ fn workspace() -> Workspace {
     }
 }
 
+/// The profile index that ends a session's system, with `lines` listing
+/// the profiles.
+fn index(lines: &str) -> Part {
+    text(&format!(
+        "## Sub-agents\n\nTo hand a task to one of these sub-agents, call `spawn_agent` with `agent` set to its name.\n\n{lines}"
+    ))
+}
+
 fn tool_names(environment: &asterpath::protocol::SessionEnvironment) -> Vec<String> {
     environment
         .tools
@@ -65,7 +73,7 @@ async fn a_new_session_reads_files_of_its_work_root_through_the_facade() {
 
     let mut spec = base_spec();
     let diagnostics = new_session_spec(&workspace(), None, &root, Some("fix"), &mut spec).unwrap();
-    assert!(diagnostics.is_empty());
+    assert!(diagnostics.skills.is_empty() && diagnostics.agents.is_empty());
     assert_eq!(spec.system, [text("be brief")]);
     assert_eq!(
         spec.metadata,
@@ -103,6 +111,7 @@ async fn a_new_session_reads_files_of_its_work_root_through_the_facade() {
             workspace: workspace(),
             new_session: true,
             pinned: None,
+            builtin_agents: None,
         }))
         .build()
         .await
@@ -155,6 +164,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
         workspace: selected.clone(),
         new_session: true,
         pinned: None,
+        builtin_agents: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&new, &metadata)
         .await
@@ -165,6 +175,7 @@ async fn new_sessions_get_the_selected_tools_and_continued_ones_every_tool_and_t
         workspace: selected,
         new_session: false,
         pinned: None,
+        builtin_agents: None,
     };
     let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&continued, &metadata)
         .await
@@ -181,6 +192,7 @@ async fn a_session_without_cwd_resolves_only_when_pinned() {
         workspace: workspace(),
         new_session: false,
         pinned: None,
+        builtin_agents: None,
     };
     assert!(
         asterpath::protocol::EnvironmentAdapter::resolve(&unpinned, &BTreeMap::new())
@@ -283,7 +295,14 @@ fn the_agent_profile_comes_first_and_project_overrides_user_overrides_builtin() 
         ("review", "project review"),
     ] {
         let spec = agents.spec(agent).unwrap();
-        assert_eq!(spec.system, [text(prompt), text("be brief")]);
+        assert_eq!(
+            spec.system,
+            [
+                text(prompt),
+                text("be brief"),
+                index("- code\n- docs\n- review\n")
+            ]
+        );
         assert_eq!(spec.metadata.get(AGENT).map(String::as_str), Some(agent));
     }
 }
@@ -301,7 +320,13 @@ fn an_agent_profile_sets_the_model_and_narrows_the_tools() {
     );
 
     let spec = agents.spec("review").unwrap();
-    assert_eq!(spec.system, [text("review only")]);
+    assert_eq!(
+        spec.system,
+        [
+            text("review only"),
+            index("- plain: plain\n- review: read-only review\n")
+        ]
+    );
     assert_eq!(
         spec.model,
         ModelSpec {
@@ -373,7 +398,14 @@ fn without_a_configured_agent_the_default_profile_is_used_from_any_layer() {
     };
 
     let spec = unconfigured(&agents);
-    assert_eq!(spec.system, [text("builtin default"), text("be brief")]);
+    assert_eq!(
+        spec.system,
+        [
+            text("builtin default"),
+            text("be brief"),
+            index("- default: builtin\n")
+        ]
+    );
     assert_eq!(
         spec.metadata.get(AGENT).map(String::as_str),
         Some("default")
@@ -381,7 +413,10 @@ fn without_a_configured_agent_the_default_profile_is_used_from_any_layer() {
 
     write(&agents.user.join("default.md"), "user default");
     let spec = unconfigured(&agents);
-    assert_eq!(spec.system, [text("user default"), text("be brief")]);
+    assert_eq!(
+        spec.system,
+        [text("user default"), text("be brief"), index("- default\n")]
+    );
 }
 
 #[test]
@@ -404,7 +439,558 @@ fn without_any_default_profile_or_builtin_directory_a_session_has_no_base_prompt
             &mut spec,
         )
         .unwrap();
-        assert_eq!(spec.system, [text("be brief")]);
+        let mut expected = vec![text("be brief")];
+        if builtin == Some(agents.builtin.as_path()) {
+            expected.push(index("- code\n"));
+        }
+        assert_eq!(spec.system, expected);
         assert_eq!(spec.metadata.get(AGENT), None);
+        assert_eq!(spec.metadata.get(STYLE), None);
     }
+}
+
+/// The bundled style directory sits beside the bundled agent directory.
+fn builtin_styles(agents: &Agents) -> PathBuf {
+    agents.builtin.parent().unwrap().join("styles")
+}
+
+fn styled(
+    agents: &Agents,
+    agent: Option<&str>,
+    style: &str,
+) -> Result<SessionSpec, WorkspaceError> {
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some(style.to_owned()),
+            user_styles: Some(agents.user.join("styles")),
+            ..agents.workspace(agent)
+        },
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )?;
+    Ok(spec)
+}
+
+fn framed(body: &str) -> Part {
+    text(&format!(
+        "The output style below takes precedence over any output requirements above.\n\n{body}"
+    ))
+}
+
+#[tokio::test]
+async fn an_output_style_follows_the_profile_and_project_overrides_user_overrides_builtin() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.user.join("code.md"), "user code");
+    let builtin = builtin_styles(&agents);
+    let user = agents.user.join("styles");
+    let project = agents.root.join(".asterpath/styles");
+    write(&builtin.join("terse.md"), "builtin terse");
+    write(&builtin.join("warm.md"), "builtin warm");
+    write(&builtin.join("teach.md"), "builtin teach");
+    write(
+        &user.join("warm.md"),
+        "---\ndescription: friendly\n---\nuser warm\n",
+    );
+    write(&user.join("teach.md"), "user teach");
+    write(&project.join("teach.md"), "project teach");
+
+    let files = style_files(
+        &Workspace {
+            user_styles: Some(user.clone()),
+            ..workspace()
+        },
+        Some(&agents.builtin),
+        &agents.root,
+    )
+    .unwrap();
+    let sources: Vec<_> = files
+        .iter()
+        .map(|file| (file.name.as_str(), file.path.clone()))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            ("teach", project.join("teach.md")),
+            ("terse", builtin.join("terse.md")),
+            ("warm", user.join("warm.md")),
+        ]
+    );
+
+    for (style, body) in [
+        ("terse", "builtin terse"),
+        ("warm", "user warm"),
+        ("teach", "project teach"),
+    ] {
+        let spec = styled(&agents, Some("code"), style).unwrap();
+        assert_eq!(
+            spec.system,
+            [
+                text("user code"),
+                framed(body),
+                text("be brief"),
+                index("- code\n")
+            ]
+        );
+        assert_eq!(spec.metadata.get(STYLE).map(String::as_str), Some(style));
+        assert_eq!(spec.metadata.get(AGENT).map(String::as_str), Some("code"));
+    }
+
+    // The environment's profiles never take the style (ADR-0054).
+    let environment = WorkRoot {
+        workspace: Workspace {
+            style: Some("terse".to_owned()),
+            user_styles: Some(user.clone()),
+            ..agents.workspace(Some("code"))
+        },
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let metadata = BTreeMap::from([
+        (CWD.to_owned(), agents.root.display().to_string()),
+        (STYLE.to_owned(), "terse".to_owned()),
+    ]);
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap();
+    let systems: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| profile.system.clone())
+        .collect();
+    assert_eq!(
+        systems,
+        [vec![text("user code"), text("be brief"), index("- code\n")]]
+    );
+}
+
+#[test]
+fn a_style_works_without_a_profile_and_an_empty_style_adds_nothing() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    let user = agents.user.join("styles");
+    write(&user.join("terse.md"), "terse");
+    write(&user.join("empty.md"), "---\ndescription: nothing\n---\n\n");
+
+    let spec = styled(&agents, None, "terse").unwrap();
+    assert_eq!(spec.system, [framed("terse"), text("be brief")]);
+    assert_eq!(spec.metadata.get(AGENT), None);
+
+    let spec = styled(&agents, None, "empty").unwrap();
+    assert_eq!(spec.system, [text("be brief")]);
+    assert_eq!(spec.metadata.get(STYLE).map(String::as_str), Some("empty"));
+}
+
+#[test]
+fn an_unknown_style_or_a_field_other_than_description_is_a_config_error() {
+    let agents = Agents::new();
+    let user = agents.user.join("styles");
+    write(&user.join("fast.md"), "---\nmodel: q/fast\n---\nbody");
+    write(&user.join("narrow.md"), "---\ntools: [grep]\n---\nbody");
+    assert!(matches!(
+        styled(&agents, None, "missing"),
+        Err(WorkspaceError::Config(message)) if message.contains("unknown style missing")
+    ));
+    for (style, field) in [("fast", "model"), ("narrow", "tools")] {
+        let error = styled(&agents, None, style).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&user.join(format!("{style}.md")).display().to_string()),
+            "{error}"
+        );
+    }
+}
+
+/// The bundled `default` profile and `explanatory` style as shipped.
+#[test]
+fn the_shipped_explanatory_style_follows_the_shipped_default_profile() {
+    let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("agents");
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some("explanatory".to_owned()),
+            ..workspace()
+        },
+        Some(&builtin),
+        root.path(),
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    let texts: Vec<&str> = spec
+        .system
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let [profile, style, _index] = texts[..] else {
+        panic!("{texts:?}");
+    };
+
+    assert!(profile.starts_with("You are Asterpath"), "{profile}");
+    let headings: Vec<_> = profile.lines().filter(|l| l.starts_with("# ")).collect();
+    assert_eq!(
+        headings,
+        ["# How to work", "# Tool use", "# Safety and confirmation"]
+    );
+    let how_to_work = &profile[..profile.find("# Tool use").unwrap()];
+    assert!(
+        how_to_work.contains("Reply in the user's language"),
+        "{profile}"
+    );
+    assert!(how_to_work.contains("After making changes, summarize what changed"));
+    assert!(!profile.contains("Be concise"), "{profile}");
+    assert!(!profile.contains("Markdown"), "{profile}");
+
+    assert!(
+        style.starts_with(
+            "The output style below takes precedence over any output requirements above.\n\n"
+        ),
+        "{style}"
+    );
+    assert!(style.contains("> **Insight**"), "{style}");
+    assert!(!style.contains('★'), "{style}");
+}
+
+/// The bundled `learning` style carries `explanatory`'s explanation rules as they are.
+#[test]
+fn the_shipped_learning_style_explains_like_explanatory() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some("learning".to_owned()),
+            ..workspace()
+        },
+        Some(&dir.join("agents")),
+        root.path(),
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    let Part::Text { text: style } = &spec.system[1] else {
+        panic!("{:?}", spec.system);
+    };
+    let explanatory = std::fs::read_to_string(dir.join("styles/explanatory.md")).unwrap();
+    let rules = &explanatory[explanatory.find("# When to explain").unwrap()..];
+
+    assert!(style.contains(rules.trim_end()), "{style}");
+    assert!(style.contains("TODO(human)"), "{style}");
+    for word in ["profile", "sub-agent", "exec"] {
+        assert!(!style.to_lowercase().contains(word), "{word}: {style}");
+    }
+}
+
+#[test]
+fn the_style_flag_wins_over_output_style() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "output_style = \"terse\"\n").unwrap();
+    let mut settings = asterpath_app::config::load(Some(config), &[]).unwrap();
+    assert_eq!(
+        settings.workspace().unwrap().style.as_deref(),
+        Some("terse")
+    );
+    settings.set_style(Some("warm".to_owned()));
+    assert_eq!(settings.workspace().unwrap().style.as_deref(), Some("warm"));
+    settings.set_style(None);
+    assert_eq!(settings.workspace().unwrap().style, None);
+}
+
+/// Builtin `code` and `docs`, a user `docs` with model and tools, a project
+/// `code` and a project profile with a broken frontmatter.
+fn layered_agents() -> Agents {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.builtin.join("code.md"), "builtin code");
+    write(&agents.builtin.join("docs.md"), "builtin docs");
+    write(
+        &agents.user.join("docs.md"),
+        "---\ndescription: writes docs\nmodel: q/model-2\ntools: [read_file]\n---\nuser docs",
+    );
+    write(
+        &agents.project().join("code.md"),
+        "---\ndescription: writes code\n---\nproject code",
+    );
+    write(
+        &agents.project().join("broken.md"),
+        "---\nmood: grumpy\n---\nbody",
+    );
+    agents
+}
+
+#[tokio::test]
+async fn the_environment_offers_every_loadable_profile_assembled_like_a_root_session() {
+    let agents = layered_agents();
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let metadata = BTreeMap::from([(CWD.to_owned(), agents.root.display().to_string())]);
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap();
+
+    let listed = index("- code: writes code\n- docs: writes docs\n");
+    let profiles: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.as_str(),
+                profile.description.as_str(),
+                profile.system.clone(),
+                profile.model.clone(),
+                profile.tools.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        profiles,
+        [
+            (
+                "code",
+                "writes code",
+                vec![text("project code"), text("be brief"), listed.clone()],
+                None,
+                None,
+            ),
+            (
+                "docs",
+                "writes docs",
+                vec![text("user docs"), text("be brief"), listed],
+                Some(ModelSpec {
+                    provider: ProviderId::new("q"),
+                    model: ModelId::new("model-2"),
+                    context_window: None,
+                }),
+                Some(vec![ToolName::new("read_file")]),
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_profile_that_fails_to_load_is_skipped_with_a_diagnostic_from_the_new_session() {
+    let agents = layered_agents();
+    let mut spec = base_spec();
+    let diagnostics = new_session_spec(
+        &agents.workspace(Some("code")),
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    assert!(diagnostics.skills.is_empty());
+    assert_eq!(diagnostics.agents.len(), 1, "{:?}", diagnostics.agents);
+    assert!(
+        diagnostics.agents[0].contains("broken.md")
+            && diagnostics.agents[0].contains("unknown field `mood`"),
+        "{:?}",
+        diagnostics.agents
+    );
+    // The index leaves it out.
+    assert_eq!(
+        spec.system.last(),
+        Some(&index("- code: writes code\n- docs: writes docs\n"))
+    );
+
+    // So does the environment; selecting it is still an error.
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let resolved = asterpath::protocol::EnvironmentAdapter::resolve(&environment, &spec.metadata)
+        .await
+        .unwrap();
+    let names: Vec<_> = resolved
+        .agents
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
+    assert_eq!(names, ["code", "docs"]);
+    assert!(matches!(
+        agents.spec("broken"),
+        Err(WorkspaceError::Config(message)) if message.contains("unknown field `mood`")
+    ));
+}
+
+async fn resolve_child_system(agents: &Agents, metadata: &[(&str, &str)]) -> Option<Vec<Part>> {
+    let environment = WorkRoot {
+        workspace: agents.workspace(None),
+        new_session: false,
+        pinned: None,
+        builtin_agents: Some(agents.builtin.clone()),
+    };
+    let mut metadata: BTreeMap<String, String> = metadata
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    metadata.insert(CWD.to_owned(), agents.root.display().to_string());
+    asterpath::protocol::EnvironmentAdapter::resolve(&environment, &metadata)
+        .await
+        .unwrap()
+        .child_system
+}
+
+#[tokio::test]
+async fn a_styled_root_offers_its_unstyled_system_to_its_children() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    write(&agents.user.join("code.md"), "user code");
+
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "code")]).await,
+        Some(vec![text("user code"), text("be brief"), index("- code\n")])
+    );
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse")]).await,
+        Some(vec![text("be brief"), index("- code\n")])
+    );
+    assert_eq!(
+        resolve_child_system(&agents, &[(AGENT, "code")]).await,
+        None
+    );
+    // A root profile that no longer loads still keeps the style from children.
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "gone")]).await,
+        Some(vec![text("be brief"), index("- code\n")])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_agents_md_does_not_stop_a_session_from_opening() {
+    use std::os::unix::fs::PermissionsExt;
+    let agents = Agents::new();
+    let path = agents.root.join("AGENTS.md");
+    write(&path, "be brief");
+    write(&agents.user.join("code.md"), "user code");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        return; // root reads anything
+    }
+
+    assert_eq!(
+        resolve_child_system(&agents, &[(STYLE, "terse"), (AGENT, "code")]).await,
+        Some(vec![text("user code"), index("- code\n")])
+    );
+}
+
+#[tokio::test]
+async fn a_styled_roots_fresh_child_is_created_without_the_style() {
+    let agents = Agents::new();
+    write(&agents.root.join("AGENTS.md"), "be brief");
+    let user_styles = agents.user.join("styles");
+    write(&user_styles.join("terse.md"), "terse");
+    let workspace = Workspace {
+        style: Some("terse".to_owned()),
+        user_styles: Some(user_styles),
+        ..agents.workspace(None)
+    };
+    let mut spec = base_spec();
+    new_session_spec(
+        &workspace,
+        Some(&agents.builtin),
+        &agents.root,
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    assert_eq!(spec.system, [framed("terse"), text("be brief")]);
+
+    let say = |value: &str| {
+        vec![Item::Message {
+            role: Role::Assistant,
+            parts: vec![text(value)],
+            raw: None,
+        }]
+    };
+    let provider = ScriptedProvider::new("p")
+        .respond(
+            vec![Item::ToolCall {
+                call_id: "call-1".to_owned(),
+                provider_item_id: None,
+                name: ToolName::new("spawn_agent"),
+                raw_args: JsonString::new(r#"{"task":"t"}"#),
+                raw: None,
+            }],
+            StopReason::ToolUse,
+            Usage::default(),
+        )
+        .respond(say("child done"), StopReason::EndTurn, Usage::default())
+        .respond(say("parent done"), StopReason::EndTurn, Usage::default());
+    let asterpath = Asterpath::builder()
+        .store(Arc::new(InMemoryEventLog::new()))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .environment(Arc::new(WorkRoot {
+            workspace,
+            new_session: false,
+            pinned: None,
+            builtin_agents: Some(agents.builtin.clone()),
+        }))
+        .build()
+        .await
+        .unwrap();
+    let root = asterpath.create_session(spec).await.unwrap();
+    drive(&root.claim().await.unwrap()).await;
+    let (child, spawned) = events(&asterpath, root.id())
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::ChildSessionSpawned { child, config, .. } => Some((child, config)),
+            _ => None,
+        })
+        .expect("the root spawns a child");
+    let SessionEvent::SessionCreated {
+        config: created, ..
+    } = &events(&asterpath, child).await[0]
+    else {
+        panic!("the child starts with SessionCreated");
+    };
+    let unstyled = vec![text("be brief")];
+    assert_eq!(created.system, unstyled);
+    assert_eq!(spawned.system, unstyled);
+}
+
+async fn drive(owned: &asterpath::OwnedSession) {
+    owned
+        .submit_input(UserInput {
+            id: InputId::from_bytes([1; 16]),
+            parts: vec![text("go")],
+        })
+        .await
+        .unwrap();
+    let mut stream = owned.drive();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+}
+
+async fn events(
+    asterpath: &Asterpath,
+    session: asterpath::protocol::SessionId,
+) -> Vec<SessionEvent> {
+    scan_all(&*asterpath.store(), session)
+        .await
+        .unwrap()
+        .iter()
+        .map(|entry| decode_entry(entry).unwrap())
+        .collect()
 }

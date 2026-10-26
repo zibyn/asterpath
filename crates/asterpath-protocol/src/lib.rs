@@ -49,7 +49,7 @@ pub use contracts::{
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
-pub use environment::{EnvironmentAdapter, EnvironmentError, SessionEnvironment};
+pub use environment::{AgentProfile, EnvironmentAdapter, EnvironmentError, SessionEnvironment};
 pub use error::{ExecutionError, RetirementError, StorageError};
 pub use event::{
     AbortKind, CancelReason, ChildFailure, ChildOutcome, CompactionAbortReason, CompactionTrigger,

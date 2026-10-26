@@ -10,7 +10,7 @@ use asterpath::{LogId, SessionId};
 use asterpath_app::config::SetupChoice;
 use asterpath_app::desktop::{
     self, Access, Agents, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary,
-    Setup, ViewEvent,
+    Setup, Styles, ViewEvent,
 };
 use asterpath_protocol::{ApprovalRequest, ToolCallId};
 use futures_util::StreamExt;
@@ -101,16 +101,22 @@ async fn create_session(
     root: PathBuf,
     name: Option<String>,
     agent: Option<String>,
+    style: Option<String>,
 ) -> Result<SessionSummary, String> {
     backend
         .get()?
-        .create_session(&root, name.as_deref(), agent.as_deref())
+        .create_session(&root, name.as_deref(), agent.as_deref(), style.as_deref())
         .await
 }
 
 #[tauri::command]
 async fn agents(backend: State<'_, Backend>, root: PathBuf) -> Result<Agents, String> {
     backend.get()?.agents(&root)
+}
+
+#[tauri::command]
+async fn styles(backend: State<'_, Backend>, root: PathBuf) -> Result<Styles, String> {
+    backend.get()?.styles(&root)
 }
 
 #[tauri::command]
@@ -257,6 +263,7 @@ fn main() {
             sessions,
             create_session,
             agents,
+            styles,
             access,
             watch,
             unwatch,

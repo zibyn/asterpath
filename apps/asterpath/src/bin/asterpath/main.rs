@@ -1,4 +1,4 @@
-//! Reference CLI (packaging.md §4): `exec`, `doctor`, `agents` and `debug`, with the
+//! Reference CLI (packaging.md §4): `exec`, `doctor`, `agents`, `styles` and `debug`, with the
 //! interactive mode on the bare command.
 //!
 //! The binary owns application policy (exit codes, stdout/stderr, approval
@@ -7,7 +7,7 @@
 //! Layout: `config` (from the `asterpath_app` library) resolves the file and
 //! `-c`; `session` resolves the flags and opens a new, continued or forked
 //! session with the library's work-root assembly (ADR-0049); `drive`
-//! runs it to the end of a turn; `exec`, `doctor`, `agents` and `debug` are the
+//! runs it to the end of a turn; `exec`, `doctor`, `agents`, `styles` and `debug` are the
 //! commands; `interactive` is the bare command (`command: None`) and reuses
 //! `session::open` and `drive`.
 
@@ -49,6 +49,8 @@ enum Command {
     Doctor,
     /// List the agent profiles of the work root and the file each comes from.
     Agents,
+    /// List the output styles of the work root and the file each comes from.
+    Styles,
     /// Inspect a session's log.
     Debug(debug::DebugArgs),
 }
@@ -139,6 +141,7 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         Some(Command::Exec(args)) => exec::exec(&cli.global, args).await,
         Some(Command::Doctor) => doctor::doctor(&cli.global).await,
         Some(Command::Agents) => agents::agents(&cli.global),
+        Some(Command::Styles) => agents::styles(&cli.global),
         Some(Command::Debug(args)) => debug::debug(&cli.global, args).await,
         None => interactive::interactive(&cli.global, cli.session, cli.prompt).await,
     }
