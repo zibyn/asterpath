@@ -881,7 +881,7 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
 }
 
 #[test]
-fn styles_lists_the_builtin_explanatory_style() {
+fn styles_lists_the_builtin_styles() {
     let dir = TestDir::new("builtin-styles");
     dir.config("");
     let root = dir.sub("project");
@@ -894,12 +894,17 @@ fn styles_lists_the_builtin_explanatory_style() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // A dev build reads the repository's source directory.
+    let builtin = format!("{}/styles", env!("CARGO_MANIFEST_DIR"));
     assert_eq!(
-        stdout.trim(),
-        format!(
-            "explanatory\t{}/styles/explanatory.md\tExplains the reasoning behind its work as it goes",
-            env!("CARGO_MANIFEST_DIR")
-        )
+        stdout.trim().lines().collect::<Vec<_>>(),
+        [
+            format!(
+                "explanatory\t{builtin}/explanatory.md\tExplains the reasoning behind its work as it goes"
+            ),
+            format!(
+                "learning\t{builtin}/learning.md\tLeaves small, meaningful pieces of code for you to write, and explains as it goes"
+            ),
+        ]
     );
 }
 
@@ -980,8 +985,13 @@ fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The builtin `explanatory` comes first; its own test checks that line.
-    let lines: Vec<&str> = stdout.trim().lines().skip(1).collect();
+    // Builtin styles have their own test.
+    let builtin = format!("\t{}/styles/", env!("CARGO_MANIFEST_DIR"));
+    let lines: Vec<&str> = stdout
+        .trim()
+        .lines()
+        .filter(|line| !line.contains(&builtin))
+        .collect();
     assert_eq!(
         lines,
         [

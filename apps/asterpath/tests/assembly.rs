@@ -659,6 +659,36 @@ fn the_shipped_explanatory_style_follows_the_shipped_default_profile() {
     assert!(!style.contains('★'), "{style}");
 }
 
+/// The bundled `learning` style carries `explanatory`'s explanation rules as they are.
+#[test]
+fn the_shipped_learning_style_explains_like_explanatory() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some("learning".to_owned()),
+            ..workspace()
+        },
+        Some(&dir.join("agents")),
+        root.path(),
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    let Part::Text { text: style } = &spec.system[1] else {
+        panic!("{:?}", spec.system);
+    };
+    let explanatory = std::fs::read_to_string(dir.join("styles/explanatory.md")).unwrap();
+    let rules = &explanatory[explanatory.find("# When to explain").unwrap()..];
+
+    assert!(style.contains(rules.trim_end()), "{style}");
+    assert!(style.contains("TODO(human)"), "{style}");
+    for word in ["profile", "sub-agent", "exec"] {
+        assert!(!style.to_lowercase().contains(word), "{word}: {style}");
+    }
+}
+
 #[test]
 fn the_style_flag_wins_over_output_style() {
     let dir = tempfile::tempdir().unwrap();
