@@ -605,6 +605,60 @@ fn an_unknown_style_or_a_field_other_than_description_is_a_config_error() {
     }
 }
 
+/// The bundled `default` profile and `explanatory` style as shipped.
+#[test]
+fn the_shipped_explanatory_style_follows_the_shipped_default_profile() {
+    let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("agents");
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = base_spec();
+    new_session_spec(
+        &Workspace {
+            style: Some("explanatory".to_owned()),
+            ..workspace()
+        },
+        Some(&builtin),
+        root.path(),
+        None,
+        &mut spec,
+    )
+    .unwrap();
+    let texts: Vec<&str> = spec
+        .system
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let [profile, style, _index] = texts[..] else {
+        panic!("{texts:?}");
+    };
+
+    assert!(profile.starts_with("You are Asterpath"), "{profile}");
+    let headings: Vec<_> = profile.lines().filter(|l| l.starts_with("# ")).collect();
+    assert_eq!(
+        headings,
+        ["# How to work", "# Tool use", "# Safety and confirmation"]
+    );
+    let how_to_work = &profile[..profile.find("# Tool use").unwrap()];
+    assert!(
+        how_to_work.contains("Reply in the user's language"),
+        "{profile}"
+    );
+    assert!(how_to_work.contains("After making changes, summarize what changed"));
+    assert!(!profile.contains("Be concise"), "{profile}");
+    assert!(!profile.contains("Markdown"), "{profile}");
+
+    assert!(
+        style.starts_with(
+            "The output style below takes precedence over any output requirements above.\n\n"
+        ),
+        "{style}"
+    );
+    assert!(style.contains("> **Insight**"), "{style}");
+    assert!(!style.contains('★'), "{style}");
+}
+
 #[test]
 fn the_style_flag_wins_over_output_style() {
     let dir = tempfile::tempdir().unwrap();
