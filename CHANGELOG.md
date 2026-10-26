@@ -16,9 +16,13 @@
 - **审批端点按会话树注册**（ADR-0039）：`ApprovalGate::register(root)` / `is_open(root)` 取根会话 id。某会话树没有端点时，`Ask` 按 `NO_APPROVAL_ENDPOINT` 拒绝，同进程其他会话树的端点不再让它挂起。嵌入方把原来的 `register()` 改成为自己照看的每棵会话树注册（根 id 取 `OwnedSession::owner().root` 或 `protocol::root_of`）。`DefaultApprovalPolicy` 改为单元结构体，不再持有审批门。
 - **多个进程可以共用一个数据库，驱动前要认领会话树**（ADR-0036）：`open_session` 等返回只读句柄，`claim()` 得到能 `drive` 的 `OwnedSession`，别的进程持有时得到 `OwnedElsewhere`。存活靠进程租约，`Asterpath` 在 tokio runtime 上定期续约（`lease_renew_interval`，默认 10 s；SQLite 的 TTL 是 `OpenOptions::lease_ttl`，默认 30 s）。正常退出立即释放；被 kill 的进程的会话树要等一个 TTL 才能在别处续跑。失去属主时驱动停止并调用新的 `Hooks::on_ownership_lost`。`SessionStore` 实现要加 `claim` / `owner` / `renew`；`StorageError::Conflict` 是可重试的冲突。
 - **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
+- **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。现在的内置正文是占位，待 #184 定稿。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
 
 ### 新增
+
+- 智能体档案（ADR-0051）：`$XDG_CONFIG_HOME/asterpath/agents/` 与 `<root>/.asterpath/agents/` 下的 `<name>.md`，同名时项目级优先、都优先于内置档案。frontmatter 可写 `description`、`model`（`provider/model`）与 `tools`（工具白名单，不在可用工具里的名字是配置错误），正文是基础提示词。`config.toml` 新增顶层 `default_agent` 选新会话的档案，CLI 的 `--agent <name>` 覆盖它（续会话时给出是用法错误），`-m` 仍优先于档案的 `model`。档案在创建会话时读取一次，档案名记在会话元数据 `agent`，分叉会话沿用。新命令 `asterpath agents` 列出当前工作根的档案及其生效文件。
+- 桌面端新建会话可选智能体档案：侧栏项目旁的选择框列出该项目的档案，预选 `default_agent`（没配时是 `default`）；`default_agent` 指向不存在的档案时直接在侧栏报错。侧栏与状态栏显示会话的档案名。档案固定的 provider 必须是桌面端启动时已建好的（`[model] provider` 或模型别名用到的），否则建会话时报错。
 
 - 桌面参考应用 `asterpath-desktop`（ADR-0035）骨架：侧栏按项目（工作根）列出会话，读 CLI 的 `config.toml` 与数据库，CLI 建的会话出现在对应项目下。窗口在非默认 feature `tauri` 之后。
 - 桌面端对话：在项目下新建会话（工具与技能按 CLI 新会话的规则），发送后由后台任务认领并驱动到空闲、空闲后释放认领；对话流显示流式文本与可折叠的推理；运行中继续输入即引导，可停止当前回合；被其他进程（如 CLI）驱动的会话只读显示。

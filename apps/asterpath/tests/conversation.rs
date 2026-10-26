@@ -719,9 +719,10 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
     .unwrap();
     std::fs::write(
         agents.join("reviewer.md"),
-        "---\ntools: [glob]\n---\nYou review.\n",
+        "---\ntools: [read_file]\n---\nYou review.\n",
     )
     .unwrap();
+    std::fs::write(agents.join("searcher.md"), "---\ntools: [glob]\n---\n").unwrap();
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         reply("ok"),
         StopReason::EndTurn,
@@ -745,7 +746,14 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
         .iter()
         .map(|agent| (agent.name.as_str(), agent.description.as_deref()))
         .collect();
-    assert_eq!(names, [("coder", Some("Writes code")), ("reviewer", None)]);
+    assert_eq!(
+        names,
+        [
+            ("coder", Some("Writes code")),
+            ("reviewer", None),
+            ("searcher", None)
+        ]
+    );
 
     let defaulted = desktop
         .create_session(&fixture.root, None, None)
@@ -766,6 +774,12 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
         .await
         .unwrap_err();
     assert!(unknown.contains("unknown agent missing"), "{unknown}");
+    // `glob` is whitelisted but not a tool of this work root: an error, as in the CLI.
+    let untooled = desktop
+        .create_session(&fixture.root, None, Some("searcher"))
+        .await
+        .unwrap_err();
+    assert!(untooled.contains("unknown tool glob"), "{untooled}");
 
     let mut view = desktop.watch(created.id, None).await.unwrap();
     desktop.send(created.id, "hi".to_owned()).await.unwrap();
@@ -776,8 +790,12 @@ async fn a_session_created_with_a_chosen_profile_starts_with_its_prompt_and_tool
         "{:?}",
         request.system
     );
-    // `glob` is whitelisted but not a workspace tool; `read_file` is not whitelisted.
-    assert!(request.tools.is_empty(), "{:?}", request.tools);
+    let tools: Vec<_> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(tools, ["read_file"]);
 }
 
 #[tokio::test]
@@ -795,4 +813,21 @@ async fn without_default_agent_the_picker_preselects_the_default_profile() {
     );
     let choices = desktop.agents(&fixture.root).unwrap();
     assert_eq!(choices.default.as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn a_default_agent_without_a_profile_is_an_error_up_front() {
+    let fixture = fixture();
+    let desktop = Desktop::new(
+        engine(&fixture.db, Arc::new(ScriptedProvider::new("p"))).await,
+        Arc::new(ApprovalModes::new(ApprovalMode::default())),
+        Workspace {
+            agent: Some("missing".to_owned()),
+            ..workspace()
+        },
+        template(),
+        fixture.root.join("projects.json"),
+    );
+    let error = desktop.agents(&fixture.root).unwrap_err();
+    assert!(error.contains("unknown agent missing"), "{error}");
 }

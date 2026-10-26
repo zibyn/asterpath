@@ -69,12 +69,12 @@ function ProjectItem({ project }: { project: commands.Project }) {
         </h2>
         {!!agents.data?.agents.length && (
           <select
-            aria-label={`Agent of a new session in ${project.name}`}
+            aria-label={`Agent profile of a new session in ${project.name}`}
             className="ml-auto mr-1 max-w-28 rounded border bg-background px-1 py-0.5 text-xs"
             value={agent ?? ""}
             onChange={(event) => setPicked(event.target.value)}
           >
-            {!agent && <option value="">No agent</option>}
+            {!agent && <option value="">No profile</option>}
             {agents.data.agents.map((choice) => (
               <option key={choice.name} value={choice.name} title={choice.description ?? undefined}>
                 {choice.name}
@@ -93,7 +93,8 @@ function ProjectItem({ project }: { project: commands.Project }) {
           <Plus />
         </Button>
       </div>
-      {create.error && <p className="px-1 text-sm text-destructive">{String(create.error)}</p>}
+      {agents.error && <p className="px-1 text-sm text-destructive">{String(agents.error)}</p>}
+      {create.error &&<p className="px-1 text-sm text-destructive">{String(create.error)}</p>}
       {sessions.error && <p className="px-1 text-sm text-destructive">{String(sessions.error)}</p>}
       <ul>
         {sessions.data?.map((session) => (

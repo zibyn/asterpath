@@ -145,22 +145,10 @@ pub fn new_session_spec(
     name: Option<&str>,
     spec: &mut SessionSpec,
 ) -> Result<Vec<SkillDiagnostic>, WorkspaceError> {
-    let agent = match &workspace.agent {
-        Some(name) => {
-            let file = agent_profiles(workspace, builtin_agents, root)?
-                .into_iter()
-                .find(|file| &file.name == name)
-                .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}")))?;
-            Some((name.clone(), load_agent(&file)?))
-        }
-        // Unconfigured: the profile named `default`, from any layer, if there is one.
-        None => match agent_profiles(workspace, builtin_agents, root)?
-            .into_iter()
-            .find(|file| file.name == DEFAULT_AGENT)
-        {
-            Some(file) => Some((DEFAULT_AGENT.to_owned(), load_agent(&file)?)),
-            None => None,
-        },
+    let profiles = agent_profiles(workspace, builtin_agents, root)?;
+    let agent = match selected_agent(workspace, &profiles)? {
+        Some(file) => Some((file.name.clone(), load_agent(file)?)),
+        None => None,
     };
     let (index, diagnostics) = skill_index(workspace, root);
     if let Some((_, profile)) = &agent {
@@ -196,19 +184,33 @@ pub fn new_session_spec(
     Ok(diagnostics)
 }
 
-/// The builtin agent directory: the first of the application's `candidates`
-/// and this crate's source `agents/` that is a directory. A debug build tries
-/// the source first, since the Tauri build copies a snapshot of it beside the
-/// binary. `None`, with a line on stderr, when there is none.
-pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    let source = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/agents"));
-    let mut dirs: Vec<_> = candidates.into_iter().collect();
-    if cfg!(debug_assertions) {
-        dirs.insert(0, source);
-    } else {
-        dirs.push(source);
+/// The profile a new session takes from `profiles`: `workspace.agent`
+/// (unknown is an error), else the one named `default` if there is one.
+pub fn selected_agent<'a>(
+    workspace: &Workspace,
+    profiles: &'a [AgentFile],
+) -> Result<Option<&'a AgentFile>, WorkspaceError> {
+    let find = |name: &str| profiles.iter().find(|file| file.name == name);
+    match &workspace.agent {
+        Some(name) => find(name)
+            .map(Some)
+            .ok_or_else(|| WorkspaceError::Config(format!("unknown agent {name}"))),
+        None => Ok(find(DEFAULT_AGENT)),
     }
-    let found = dirs.into_iter().find(|dir| dir.is_dir());
+}
+
+/// The builtin agent directory: the first of the application's `candidates`
+/// that is a directory. A debug build tries this crate's source `agents/`
+/// first, since the Tauri build copies a snapshot of it beside the binary; a
+/// release build never looks at the build machine's path. `None`, with a
+/// line on stderr, when there is none.
+pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let source = cfg!(debug_assertions)
+        .then(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/agents")));
+    let found = source
+        .into_iter()
+        .chain(candidates)
+        .find(|dir| dir.is_dir());
     if found.is_none() {
         eprintln!("asterpath: no builtin agent profiles found; continuing without them");
     }

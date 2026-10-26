@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
-    AGENT, CWD, DEFAULT_AGENT, NAME, WorkRoot, Workspace, agent_profiles, in_root, load_agent,
-    new_session_spec, roots, work_root,
+    AGENT, CWD, NAME, WorkRoot, Workspace, agent_profiles, in_root, load_agent, new_session_spec,
+    roots, selected_agent, work_root,
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
@@ -446,8 +446,13 @@ impl Desktop {
     /// The agent profiles a new session in `root` may use.
     pub fn agents(&self, root: &Path) -> Result<Agents, String> {
         let root = work_root(root).map_err(text)?;
-        let agents: Vec<_> = agent_profiles(&self.workspace, self.builtin_agents.as_deref(), &root)
+        let profiles =
+            agent_profiles(&self.workspace, self.builtin_agents.as_deref(), &root).map_err(text)?;
+        // An unknown `default_agent` fails here, before the user picks anything.
+        let default = selected_agent(&self.workspace, &profiles)
             .map_err(text)?
+            .map(|file| file.name.clone());
+        let agents = profiles
             .into_iter()
             .map(|file| AgentChoice {
                 // A broken profile is still listed; creating with it reports why.
@@ -457,13 +462,6 @@ impl Desktop {
                 name: file.name,
             })
             .collect();
-        // Unconfigured, a new session takes the `default` profile if there is one.
-        let default = self.workspace.agent.clone().or_else(|| {
-            agents
-                .iter()
-                .any(|agent| agent.name == DEFAULT_AGENT)
-                .then(|| DEFAULT_AGENT.to_owned())
-        });
         Ok(Agents { default, agents })
     }
 
@@ -497,19 +495,20 @@ impl Desktop {
             pinned: None,
         };
         let environment = fresh.resolve(&spec.metadata).await.map_err(text)?;
-        // The agent profile's whitelist narrows the environment's tools.
-        let profile = std::mem::replace(&mut spec.tools, ToolSelection::All);
-        spec.tools = ToolSelection::Names(
-            environment
-                .tools
-                .iter()
-                .map(|tool| tool.descriptor().name.clone())
-                .filter(|name| match &profile {
-                    ToolSelection::Names(names) => names.contains(name),
-                    _ => true,
-                })
-                .collect(),
-        );
+        // The profile's whitelist, else every tool the environment gives a new session.
+        let available: Vec<_> = environment
+            .tools
+            .iter()
+            .map(|tool| tool.descriptor().name.clone())
+            .collect();
+        if let ToolSelection::Names(names) = &spec.tools {
+            // As in the CLI, a whitelisted name the work root lacks is an error.
+            if let Some(name) = names.iter().find(|name| !available.contains(name)) {
+                return Err(format!("unknown tool {}", name.as_str()));
+            }
+        } else {
+            spec.tools = ToolSelection::Names(available);
+        }
         let name = spec.metadata.get(NAME).cloned();
         let agent = spec.metadata.get(AGENT).cloned();
         // Providers are built once from config.toml; a profile cannot add one.
