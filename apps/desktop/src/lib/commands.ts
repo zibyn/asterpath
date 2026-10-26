@@ -18,6 +18,8 @@ export interface SessionSummary {
   status: Status;
   /** The agent profile it was created with; fixed for its life. */
   agent: string | null;
+  /** The output style it was created with; fixed for its life. */
+  style: string | null;
 }
 
 /** A session's sidebar badge; `elsewhere` = another process drives it. */
@@ -30,9 +32,9 @@ export const addProject = () => invoke<Project | null>("add_project");
 
 export const sessions = (root: string) => invoke<SessionSummary[]>("sessions", { root });
 
-/** `agent`: the profile; `null` uses `default_agent`. */
-export const createSession = (root: string, name?: string, agent?: string | null) =>
-  invoke<SessionSummary>("create_session", { root, name: name ?? null, agent: agent ?? null });
+/** `agent`: the profile; `null` uses `default_agent`. `style`: the output style as picked; `null` is none. */
+export const createSession = (root: string, name?: string, agent?: string | null, style?: string | null) =>
+  invoke<SessionSummary>("create_session", { root, name: name ?? null, agent: agent ?? null, style: style ?? null });
 
 export interface AgentChoice {
   name: string;
@@ -46,6 +48,14 @@ export interface Agents {
 }
 
 export const agents = (root: string) => invoke<Agents>("agents", { root });
+
+/** A project's output styles; `default` (`output_style`) is preselected, `null` is none. */
+export interface Styles {
+  default: string | null;
+  styles: AgentChoice[];
+}
+
+export const styles = (root: string) => invoke<Styles>("styles", { root });
 
 /** Who may drive a session: this app, nobody, or another process (read-only here). */
 export type Access = "here" | "free" | "elsewhere";

@@ -338,6 +338,7 @@ pub enum AsterError {
 | `asterpath exec [OPTIONS] [PROMPT]` | 无头运行一个回合；没有 `PROMPT` 或为 `-` 时读 stdin；同时给了 `PROMPT` 且 stdin 是管道时，stdin 作为 `<stdin>` 块追加 |
 | `asterpath doctor [OPTIONS]` | 解析与校验配置，不打开数据库、不初始化引擎；加载 `[mcp_servers]` 并逐个打印状态后关闭（`mcp: <id> loaded: <tools>` / `mcp: <id> failed at <stage>: <message>`）；扫描技能并打印诊断；成功退出 0，配置错误或 `required` 服务失败退出 2 |
 | `asterpath agents [OPTIONS]` | 列出当前工作根可用的智能体档案（ADR-0051），每行 `名字\t生效文件\t描述`，同名时取优先的那份；解析失败的档案照样列出，描述位置是 `error: …`；配置错误退出 2 |
+| `asterpath styles [OPTIONS]` | 列出当前工作根可用的输出风格（ADR-0052），格式与 `asterpath agents` 相同 |
 | `asterpath debug prompt-input <SESSION>` | 打印投影（模型可见输入）与未闭合意图，JSON |
 | `asterpath debug trace <SESSION>` | 打印 span 树（`Asterpath::trace`），JSON |
 
@@ -351,6 +352,7 @@ pub enum AsterError {
 | `-c, --config-override <key=value>` | 全部 | 覆盖配置文件任意键；点分路径，值按 TOML 解析，解析失败按字符串；可重复 |
 | `-m, --model <id>` | 交互、`exec` | 新会话的模型 id（provider 取 `[model] provider`），优先于档案固定的 `model`；续会话时等价于一次 `update_config` 换模型 |
 | `--agent <name>` | 新会话 | 新会话的智能体档案（ADR-0051），覆盖 `default_agent`；未知档案名是配置错误（退出 2），续会话时给出是用法错误（档案随会话创建固定）。准入：Claude Code 有 `--agent`，Codex 的对应物是选配置档的 `-p, --profile` |
+| `--style <name>` | 新会话 | 新会话的输出风格（ADR-0052），覆盖 `output_style`；`exec` 只认此参数、不读 `output_style`；未知风格名是配置错误（退出 2），续会话时给出是用法错误 |
 | `-a, --ask-for-approval <untrusted\|never>` | 交互、`exec` | 审批策略，见 §4.4 |
 | `-s, --sandbox <read-only\|workspace-write\|full-access>` | 交互、`exec` | 覆盖 `[sandbox] mode` |
 | `-C, --cd <dir>` | 交互、`exec` | 工作根目录（工具根、沙箱可写根、`AGENTS.md` 位置、会话 `cwd` 元数据），默认进程 cwd |
@@ -400,6 +402,7 @@ pub enum AsterError {
 
 - 新会话：会话元数据写 `cwd`（规范化后的绝对路径）与可选 `name`；读取工作根目录下的 `AGENTS.md`（只此一个文件，不做多级合并、不读用户级文件）放进 `SessionSpec.system`，续会话时不重读。
 - 智能体档案（ADR-0051）：新会话取 `--agent`，否则 `default_agent`，都没有时取名为 `default` 的档案（有的话）。档案来自三层目录，同名时后者优先：随安装包分发的内置目录（CLI 在二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端在资源目录的 `agents/`；debug 构建先找源码里的 `apps/asterpath/agents`）、`$XDG_CONFIG_HOME/asterpath/agents/`、`<root>/.asterpath/agents/`。档案正文放在 `system` 最前，`AGENTS.md` 与技能索引在其后；frontmatter 的 `model`（`provider/model`）换掉配置的模型，`-m` 仍优先；`tools` 收窄新会话的工具，不在可用工具里的名字是配置错误。档案名写进会话元数据 `agent`，分叉会话沿用；续会话不重读档案。找不到内置目录时 stderr 提示一行，没有内置层照常运行。
+- 输出风格（ADR-0052）：新会话取 `--style`，交互模式与桌面端没给时取 `output_style`，`exec` 不读 `output_style`；不选就不叠加。风格同样三层：内置档案目录旁的 `styles/`、`$XDG_CONFIG_HOME/asterpath/styles/`、`<root>/.asterpath/styles/`，同名时后者优先。frontmatter 只接受 `description`。正文加一句框定语后放在档案正文与 `AGENTS.md` 之间，正文为空时不加。风格名写进会话元数据 `style`，分叉会话沿用；续会话不重读。
 - MCP（ADR-0027）：交互与 `exec` 在建会话前 `McpServers::load`，工具交给 builder；非 `required` 的失败服务打印到 stderr 后跳过，`required` 失败按配置错误退出 2。退出时先 `Asterpath::shutdown()` 再 `McpServers::shutdown()`。
 - 工作根（ADR-0037）：CLI 不改进程当前目录。它注册一个按元数据 `cwd`（续会话时显式 `-C` 优先）解析的会话环境，工作区工具、技能加载工具与 `workspace-write` 的可写根都以工作根为根；没配 `cwd` 的 MCP stdio 服务在工作根启动。
 - 工作区工具（#83，`asterpath-tools`；不同于供应商的服务端工具）：新会话以工作根目录为根、按沙箱策略调用 `asterpath_tools::coding(...)` 解析出六个工具；`[tools] enabled = [...]` 选子集，未知工具名是配置错误（退出 2）。续会话总是解析全部六个，模型可见的子集由日志里的生效配置决定。
@@ -413,6 +416,7 @@ pub enum AsterError {
 
 ```toml
 default_agent = "default"     # 新会话的智能体档案（ADR-0051）；--agent 覆盖；省略 = 名为 default 的档案（有的话）
+output_style = "explanatory"  # 新会话的输出风格（ADR-0052）；--style 覆盖；exec 不读；省略 = 不叠加
 
 [model]
 provider = "anthropic"        # 新会话的 provider id；-c model.provider=… 覆盖

@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
 use asterpath_app::config;
 use asterpath_app::workspace::{
-    self, AGENT, NAME, WorkRoot, Workspace, by_id_or_name, continued_root, in_root, load_mcp,
-    metadata, new_session_spec, work_root, workspace_tools,
+    self, AGENT, NAME, STYLE, WorkRoot, Workspace, by_id_or_name, continued_root, in_root,
+    load_mcp, metadata, new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
@@ -89,6 +89,13 @@ pub struct SessionArgs {
     /// Agent profile of a new session; overrides `default_agent`.
     #[arg(long, value_name = "NAME")]
     pub agent: Option<String>,
+    /// Output style of a new session; overrides `output_style`.
+    #[arg(long, value_name = "NAME")]
+    pub style: Option<String>,
+    /// Whether `output_style` applies: set by the interactive CLI, not
+    /// `exec`, where nobody takes over what a style leaves to the user.
+    #[arg(skip)]
+    pub config_style: bool,
     /// Attach a file to the first input (repeatable).
     #[arg(short = 'i', long = "image", value_name = "FILE")]
     pub images: Vec<PathBuf>,
@@ -112,6 +119,11 @@ impl SessionArgs {
         if self.agent.is_some() && self.continuing() {
             return Err(CliError::config(
                 "--agent picks the profile of a new session; a continued one keeps its own",
+            ));
+        }
+        if self.style.is_some() && self.continuing() {
+            return Err(CliError::config(
+                "--style picks the output style of a new session; a continued one keeps its own",
             ));
         }
         Ok(())
@@ -170,6 +182,9 @@ pub async fn open(
         if let Some(agent) = &args.agent {
             settings.set_agent(agent.clone());
         }
+        if args.style.is_some() || !args.config_style {
+            settings.set_style(args.style.clone());
+        }
         config::validate(&settings).map_err(CliError::config)?;
         let root = explicit_root.map_or_else(current_root, Ok)?;
         return create(settings, &root, args, output_format).await;
@@ -205,9 +220,12 @@ pub async fn open(
     .map_err(aster_error)?;
     let (handle, continued) = if args.fork_session {
         let mut metadata = metadata(&root, args.name.as_deref());
-        // The fork keeps the parent's system, so it keeps its profile name.
-        if let Some(agent) = target.metadata.get(AGENT) {
-            metadata.insert(AGENT.to_owned(), agent.clone());
+        // The fork keeps the parent's system, so it keeps its profile and
+        // style names.
+        for key in [AGENT, STYLE] {
+            if let Some(value) = target.metadata.get(key) {
+                metadata.insert(key.to_owned(), value.clone());
+            }
         }
         let handle = asterpath
             .fork_session(target.session, metadata)

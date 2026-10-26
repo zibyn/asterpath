@@ -53,8 +53,12 @@ function ProjectItem({ project }: { project: commands.Project }) {
   // `null` until picked: the configured default.
   const [picked, setPicked] = useState<string | null>(null);
   const agent = picked ?? agents.data?.default ?? null;
+  const styles = useQuery({ queryKey: ["styles", project.root], queryFn: () => commands.styles(project.root) });
+  // `undefined` until picked: the configured default; `null` picks none.
+  const [pickedStyle, setPickedStyle] = useState<string | null | undefined>(undefined);
+  const style = pickedStyle === undefined ? (styles.data?.default ?? null) : pickedStyle;
   const create = useMutation({
-    mutationFn: () => commands.createSession(project.root, undefined, agent),
+    mutationFn: () => commands.createSession(project.root, undefined, agent, style),
     onSuccess: (session) => {
       void queryClient.invalidateQueries({ queryKey: ["sessions", project.root] });
       void navigate({ to: "/sessions/$sessionId", params: { sessionId: session.id } });
@@ -82,6 +86,21 @@ function ProjectItem({ project }: { project: commands.Project }) {
             ))}
           </select>
         )}
+        {!!styles.data?.styles.length && (
+          <select
+            aria-label={`Output style of a new session in ${project.name}`}
+            className="mr-1 max-w-28 rounded border bg-background px-1 py-0.5 text-xs"
+            value={style ?? ""}
+            onChange={(event) => setPickedStyle(event.target.value || null)}
+          >
+            <option value="">No style</option>
+            {styles.data.styles.map((choice) => (
+              <option key={choice.name} value={choice.name} title={choice.description ?? undefined}>
+                {choice.name}
+              </option>
+            ))}
+          </select>
+        )}
         <Button
           variant="ghost"
           size="icon"
@@ -94,6 +113,7 @@ function ProjectItem({ project }: { project: commands.Project }) {
         </Button>
       </div>
       {agents.error && <p className="px-1 text-sm text-destructive">{String(agents.error)}</p>}
+      {styles.error && <p className="px-1 text-sm text-destructive">{String(styles.error)}</p>}
       {create.error &&<p className="px-1 text-sm text-destructive">{String(create.error)}</p>}
       {sessions.error && <p className="px-1 text-sm text-destructive">{String(sessions.error)}</p>}
       <ul>
@@ -106,6 +126,11 @@ function ProjectItem({ project }: { project: commands.Project }) {
             >
               <span className="flex-1 truncate">{session.name ?? session.id.slice(0, 8)}</span>
               {session.agent && <span className="shrink-0 text-xs text-muted-foreground">{session.agent}</span>}
+              {session.style && (
+                <span className="shrink-0 text-xs text-muted-foreground" title="Output style">
+                  {session.style}
+                </span>
+              )}
               <StatusBadge status={session.status} />
             </Link>
           </li>

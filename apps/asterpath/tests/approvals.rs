@@ -151,7 +151,7 @@ fn tool_results(request: &ModelRequest) -> Vec<(String, bool)> {
 async fn session(fixture: &Fixture) -> SessionId {
     fixture
         .desktop
-        .create_session(&fixture.root, None, None)
+        .create_session(&fixture.root, None, None, None)
         .await
         .unwrap()
         .id

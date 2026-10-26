@@ -881,6 +881,94 @@ fn agent_selects_a_profile_and_agents_lists_where_each_comes_from() {
 }
 
 #[test]
+fn exec_takes_only_an_explicit_style_and_a_continued_session_keeps_its_own() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::text_sse("one")),
+        Reply::sse(common::text_sse("two")),
+        Reply::sse(common::text_sse("three")),
+    ]);
+    let dir = TestDir::new("style");
+    dir.config(&format!(
+        "output_style = \"warm\"\n{}",
+        config_body(&server, &dir.db())
+    ));
+    let user = dir.sub("xdg/asterpath/styles");
+    let project = dir.sub("project/.asterpath/styles");
+    fs::write(
+        user.join("warm.md"),
+        "---\ndescription: friendly\n---\nBe warm.",
+    )
+    .unwrap();
+    fs::write(project.join("terse.md"), "Be terse.").unwrap();
+    let root = dir.path.join("project");
+    let xdg = dir.path.join("xdg");
+    let framing = "The output style below takes precedence";
+
+    // exec ignores `output_style`.
+    ok(dir.exec(&root).env("XDG_CONFIG_HOME", &xdg).arg("hi"));
+    assert!(!seen(&server, 0).contains(framing), "{}", seen(&server, 0));
+
+    let (_, id) = ok(dir
+        .exec(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["--style", "terse", "hi"]));
+    assert!(seen(&server, 1).contains(framing), "{}", seen(&server, 1));
+    assert!(
+        seen(&server, 1).contains("Be terse."),
+        "{}",
+        seen(&server, 1)
+    );
+
+    // Changing the file does not change the continued session's system.
+    fs::write(project.join("terse.md"), "Be verbose.").unwrap();
+    ok(dir
+        .exec(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["-r", &id, "again"]));
+    assert!(
+        seen(&server, 2).contains("Be terse."),
+        "{}",
+        seen(&server, 2)
+    );
+    assert!(!seen(&server, 2).contains("Be verbose."));
+
+    assert_eq!(
+        code(
+            dir.exec(&root)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .args(["--style", "missing", "hi"])
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        code(
+            dir.exec(&root)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .args(["--style", "terse", "-r", &id, "hi"])
+        ),
+        Some(2)
+    );
+
+    let output = bin()
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["styles", "--config", dir.config_path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            format!("terse\t{}", project.join("terse.md").display()),
+            format!("warm\t{}\tfriendly", user.join("warm.md").display()),
+        ],
+        "{stdout}"
+    );
+}
+
+#[test]
 fn continue_picks_the_last_active_session_of_the_work_root() {
     let server = MockServer::start(vec![
         Reply::sse(common::text_sse("one")),
