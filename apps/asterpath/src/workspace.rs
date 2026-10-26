@@ -134,10 +134,10 @@ pub fn metadata(root: &Path, name: Option<&str>) -> BTreeMap<String, String> {
 }
 
 /// A new session's spec from its work root: the selected agent profile's
-/// prompt, `AGENTS.md`, then the skill index, appended to `spec.system`; the
-/// profile's model and tools; and the session metadata. `builtin_agents` is
-/// the bundled profile directory, if any. Returns the skill diagnostics for
-/// the caller to show.
+/// prompt, `AGENTS.md`, the skill index, then the profile index, appended to
+/// `spec.system`; the profile's model and tools; and the session metadata.
+/// `builtin_agents` is the bundled profile directory, if any. Returns the
+/// skill diagnostics for the caller to show.
 pub fn new_session_spec(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
@@ -145,18 +145,19 @@ pub fn new_session_spec(
     name: Option<&str>,
     spec: &mut SessionSpec,
 ) -> Result<Vec<SkillDiagnostic>, WorkspaceError> {
-    let profiles = agent_profiles(workspace, builtin_agents, root)?;
-    let agent = match selected_agent(workspace, &profiles)? {
+    let files = agent_profiles(workspace, builtin_agents, root)?;
+    let agent = match selected_agent(workspace, &files)? {
         Some(file) => Some((file.name.clone(), load_agent(file)?)),
         None => None,
     };
-    let (index, diagnostics) = skill_index(workspace, root);
+    // Profiles that fail to load are reported where the environment resolves.
+    let (loaded, _) = load_agents(&files);
+    let (context, diagnostics) = session_context(workspace, root, &loaded)?;
+    let prompt = agent
+        .as_ref()
+        .map_or("", |(_, profile)| profile.prompt.as_str());
+    spec.system.extend(profile_system(prompt, &context));
     if let Some((_, profile)) = &agent {
-        if !profile.prompt.is_empty() {
-            spec.system.push(Part::Text {
-                text: profile.prompt.clone(),
-            });
-        }
         if let Some((provider, model)) = &profile.model {
             // A different model does not inherit the configured context window.
             let same =
@@ -171,17 +172,109 @@ pub fn new_session_spec(
             spec.tools = ToolSelection::Names(tools.iter().cloned().map(ToolName::new).collect());
         }
     }
-    if let Some(agents) = agents_md(root)? {
-        spec.system.push(agents);
-    }
-    if let Some(index) = index {
-        spec.system.push(index);
-    }
     spec.metadata = metadata(root, name);
     if let Some((name, _)) = agent {
         spec.metadata.insert(AGENT.to_owned(), name);
     }
     Ok(diagnostics)
+}
+
+/// The agent profiles sub-agents of `root`'s sessions can select (ADR-0053):
+/// every profile of [`agent_profiles`], its system assembled like a root
+/// session's, without an output style. A profile that fails to load is left
+/// out and described in the returned diagnostics.
+pub fn subagent_profiles(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+) -> Result<(Vec<asterpath_protocol::AgentProfile>, Vec<String>), WorkspaceError> {
+    let files = agent_profiles(workspace, builtin_agents, root)?;
+    let (loaded, diagnostics) = load_agents(&files);
+    let (context, _) = session_context(workspace, root, &loaded)?;
+    let profiles = loaded
+        .into_iter()
+        .map(|(name, profile)| {
+            let mut agent = asterpath_protocol::AgentProfile::new(
+                name,
+                profile.description.unwrap_or_default(),
+                profile_system(&profile.prompt, &context),
+            );
+            agent.model = profile.model.map(|(provider, model)| ModelSpec {
+                provider: ProviderId::new(provider),
+                model: ModelId::new(model),
+                context_window: None,
+            });
+            agent.tools = profile
+                .tools
+                .map(|tools| tools.into_iter().map(ToolName::new).collect());
+            agent
+        })
+        .collect();
+    Ok((profiles, diagnostics))
+}
+
+/// The profiles of `files` that load, by name, and why the others did not.
+fn load_agents(files: &[AgentFile]) -> (Vec<(String, AgentProfile)>, Vec<String>) {
+    let mut loaded = Vec::new();
+    let mut diagnostics = Vec::new();
+    for file in files {
+        match load_agent(file) {
+            Ok(profile) => loaded.push((file.name.clone(), profile)),
+            Err(error) => diagnostics.push(error.to_string()),
+        }
+    }
+    (loaded, diagnostics)
+}
+
+/// What follows the profile prompt in every system of a work root's
+/// sessions: `AGENTS.md`, the skill index and the profile index of
+/// `profiles`; with the skill diagnostics.
+fn session_context(
+    workspace: &Workspace,
+    root: &Path,
+    profiles: &[(String, AgentProfile)],
+) -> Result<(Vec<Part>, Vec<SkillDiagnostic>), WorkspaceError> {
+    let (skills, diagnostics) = skill_index(workspace, root);
+    let context = agents_md(root)?
+        .into_iter()
+        .chain(skills)
+        .chain(profile_index(profiles))
+        .collect();
+    Ok((context, diagnostics))
+}
+
+/// A session's system: the profile prompt (if any), then `context`.
+fn profile_system(prompt: &str, context: &[Part]) -> Vec<Part> {
+    let prompt = (!prompt.is_empty()).then(|| Part::Text {
+        text: prompt.to_owned(),
+    });
+    prompt.into_iter().chain(context.iter().cloned()).collect()
+}
+
+/// The profile index (ADR-0053): each profile's name and description, so the
+/// model knows what `spawn_agent`'s `agent` can be. `None` without profiles.
+fn profile_index(profiles: &[(String, AgentProfile)]) -> Option<Part> {
+    if profiles.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "## Sub-agents\n\nTo hand a task to one of these sub-agents, call `spawn_agent` with `agent` set to its name.\n\n",
+    );
+    for (name, profile) in profiles {
+        let description = profile
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if description.is_empty() {
+            text.push_str(&format!("- {name}\n"));
+        } else {
+            text.push_str(&format!("- {name}: {description}\n"));
+        }
+    }
+    Some(Part::Text { text })
 }
 
 /// The profile a new session takes from `profiles`: `workspace.agent`
@@ -442,7 +535,8 @@ async fn every(
 
 /// The session environment of a work root (ADR-0037): workspace tools, the
 /// skill loader and the sandbox policy rooted at the root session's `cwd`,
-/// and the spawn variables for bash.
+/// the spawn variables for bash, and the profiles sub-agents can select
+/// (ADR-0053).
 pub struct WorkRoot {
     pub workspace: Workspace,
     /// New sessions get the tool selection and the skill switch; continued
@@ -451,6 +545,8 @@ pub struct WorkRoot {
     pub new_session: bool,
     /// Overrides the `cwd` metadata.
     pub pinned: Option<PathBuf>,
+    /// The bundled agent profile directory, if any.
+    pub builtin_agents: Option<PathBuf>,
 }
 
 impl WorkRoot {
@@ -485,9 +581,17 @@ impl EnvironmentAdapter for WorkRoot {
             let tools = self
                 .tools(&root)
                 .map_err(|error| EnvironmentError::new(error.to_string()))?;
+            let (agents, diagnostics) =
+                subagent_profiles(&self.workspace, self.builtin_agents.as_deref(), &root)
+                    .map_err(|error| EnvironmentError::new(error.to_string()))?;
+            for diagnostic in diagnostics {
+                eprintln!("agent: {diagnostic}; not offered to sub-agents");
+            }
             let mut spawn = SpawnEnv::default();
             spawn.vars = self.workspace.spawn_vars.clone();
-            Ok(SessionEnvironment::new(tools, spawn))
+            let mut environment = SessionEnvironment::new(tools, spawn);
+            environment.agents = agents;
+            Ok(environment)
         })
     }
 }

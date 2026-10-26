@@ -47,6 +47,7 @@ async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
             workspace: workspace.clone(),
             new_session: false,
             pinned: None,
+            builtin_agents: None,
         }))
         .approval(modes.clone())
         .build()

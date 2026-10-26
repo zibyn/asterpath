@@ -22,6 +22,7 @@
 ### 新增
 
 - 智能体档案（ADR-0051）：`$XDG_CONFIG_HOME/asterpath/agents/` 与 `<root>/.asterpath/agents/` 下的 `<name>.md`，同名时项目级优先、都优先于内置档案。frontmatter 可写 `description`、`model`（`provider/model`）与 `tools`（工具白名单，不在可用工具里的名字是配置错误），正文是基础提示词。`config.toml` 新增顶层 `default_agent` 选新会话的档案，CLI 的 `--agent <name>` 覆盖它（续会话时给出是用法错误），`-m` 仍优先于档案的 `model`。档案在创建会话时读取一次，档案名记在会话元数据 `agent`，分叉会话沿用。新命令 `asterpath agents` 列出当前工作根的档案及其生效文件。
+- 子智能体按名字选用智能体档案（ADR-0053）：`spawn_agent` 新增可选参数 `agent`，从会话环境的 `SessionEnvironment.agents`（`AgentProfile`：名字、描述、整份 system、可选固定模型、可选工具列表）里选。选中后子会话的 system 换成档案的，模型取档案固定的（须与父会话同 provider，此时不能再给 `model_alias`），工具取父会话 ∩ 档案 ∩ `tool_allowlist`，总是全新上下文；不给 `agent` 时行为不变。本地应用把根会话可见的全部档案放进 `agents`，每份 system 按根会话的规则组装（档案正文、`AGENTS.md`、技能索引、档案索引）；新会话的 system 末尾多一段档案索引。frontmatter 写坏的档案不提供给子智能体，stderr 提示一行。
 - 桌面端新建会话可选智能体档案：侧栏项目旁的选择框列出该项目的档案，预选 `default_agent`（没配时是 `default`）；`default_agent` 指向不存在的档案时直接在侧栏报错。侧栏与状态栏显示会话的档案名。档案固定的 provider 必须是桌面端启动时已建好的（`[model] provider` 或模型别名用到的），否则建会话时报错。
 
 - 桌面参考应用 `asterpath-desktop`（ADR-0035）骨架：侧栏按项目（工作根）列出会话，读 CLI 的 `config.toml` 与数据库，CLI 建的会话出现在对应项目下。窗口在非默认 feature `tauri` 之后。

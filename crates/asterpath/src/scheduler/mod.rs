@@ -30,6 +30,8 @@ pub(crate) struct SpawnRequest {
     pub(crate) context: ContextPolicy,
     pub(crate) model_alias: Option<ModelAlias>,
     pub(crate) tool_allowlist: Option<Vec<ToolName>>,
+    /// An agent profile of the session environment (ADR-0053).
+    pub(crate) agent: Option<String>,
     pub(crate) timeout: Option<Duration>,
 }
 
@@ -42,6 +44,7 @@ impl SpawnRequest {
             context: ContextPolicy::Fresh,
             model_alias: None,
             tool_allowlist: None,
+            agent: None,
             timeout: None,
         }
     }
