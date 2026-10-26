@@ -473,6 +473,7 @@ pub async fn assemble(
     // Sessions without a context window still report `NotConfigured`.
     let catalog =
         ProviderCatalog::new(providers.clone()).map_err(|error| config_error(error.to_string()))?;
+    create_db_dir(settings)?;
     let config = AsterpathConfig::default();
     AsterpathBuilder::from_config(config)
         .compactor(Arc::new(DefaultCompactor::new(Arc::new(catalog))))
@@ -486,6 +487,17 @@ pub async fn assemble(
         .approval(approval)
         .build()
         .await
+}
+
+/// The database's missing directories, `0700` (Unix); the storage adapter
+/// only opens the file.
+pub fn create_db_dir(settings: &Settings) -> Result<(), AsterError> {
+    create_parent(&settings.db).map_err(|error| {
+        AsterError::Storage(asterpath_protocol::StorageError::Backend(format!(
+            "cannot create the directory of {}: {error}",
+            settings.db.display()
+        )))
+    })
 }
 
 /// `untrusted` asks for every `Mutating` tool and otherwise keeps the

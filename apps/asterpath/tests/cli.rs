@@ -1186,6 +1186,16 @@ fn config_flag_beats_the_environment_which_beats_the_default_path() {
 }
 
 #[test]
+fn a_missing_database_directory_is_created() {
+    let server = MockServer::start(vec![Reply::sse(common::text_sse("hi"))]);
+    let dir = TestDir::new("db-dir");
+    let db = dir.path.join("data/asterpath/sessions.db");
+    dir.config(&config_body(&server, &db));
+    ok(dir.exec(&dir.path).arg("hello"));
+    assert!(db.exists());
+}
+
+#[test]
 fn first_run_writes_an_owner_only_template() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TestDir::new("first-run");

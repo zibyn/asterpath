@@ -417,6 +417,7 @@ fn report_mcp_failures(workspace: &Workspace, mcp: &McpServers) {
 
 /// No providers and no drive: enough for the catalog and log-derived views.
 pub async fn bare(settings: &config::Settings) -> CliResult<Asterpath> {
+    config::create_db_dir(settings).map_err(aster_error)?;
     Asterpath::builder()
         .database(&settings.db)
         .build()
