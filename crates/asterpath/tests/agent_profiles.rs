@@ -198,7 +198,12 @@ async fn spawn_in(
     subagents: SubagentConfig,
     provider: ScriptedProvider,
 ) -> Spawned {
-    let asterpath = build(provider, Arc::new(InMemoryEventLog::new()), Arc::new(adapter)).await;
+    let asterpath = build(
+        provider,
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(adapter),
+    )
+    .await;
     let parent = asterpath.create_session(spec(subagents)).await.unwrap();
     run(&parent.claim().await.unwrap()).await;
     let parent = events(&asterpath, parent.id()).await;
@@ -507,7 +512,11 @@ async fn a_grandchild_copies_its_parent_not_the_child_system() {
             StopReason::ToolUse,
             Usage::default(),
         )
-        .respond(say("grandchild done"), StopReason::EndTurn, Usage::default())
+        .respond(
+            say("grandchild done"),
+            StopReason::EndTurn,
+            Usage::default(),
+        )
         .respond(say("child done"), StopReason::EndTurn, Usage::default())
         .respond(say("parent done"), StopReason::EndTurn, Usage::default());
     let Spawned::Child { child, .. } =

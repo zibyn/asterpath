@@ -209,9 +209,37 @@ pub fn subagent_profiles(
     builtin_agents: Option<&Path>,
     root: &Path,
 ) -> Result<(Vec<asterpath_protocol::AgentProfile>, Vec<String>), WorkspaceError> {
+    subagent_profiles_in(workspace, builtin_agents, root, None)
+        .map(|(profiles, diagnostics, _)| (profiles, diagnostics))
+}
+
+/// Sub-agent profiles, their diagnostics, and the unstyled root system.
+type Subagents = (
+    Vec<asterpath_protocol::AgentProfile>,
+    Vec<String>,
+    Option<Vec<Part>>,
+);
+
+/// [`subagent_profiles`], plus the system of a root session created with
+/// `root_agent` (`None` = no profile), assembled without a style.
+fn subagent_profiles_in(
+    workspace: &Workspace,
+    builtin_agents: Option<&Path>,
+    root: &Path,
+    root_agent: Option<&str>,
+) -> Result<Subagents, WorkspaceError> {
     let files = agent_profiles(workspace, builtin_agents, root)?;
     let (loaded, diagnostics) = load_agents(&files);
     let (context, _) = session_context(workspace, root, &loaded)?;
+    // shortcut: a root profile that no longer loads gives no unstyled system,
+    // so its children copy the styled one; report it once that matters.
+    let root_system = match root_agent {
+        Some(name) => loaded
+            .iter()
+            .find(|(loaded, _)| loaded == name)
+            .map(|(_, profile)| profile_system(&profile.prompt, None, &context)),
+        None => Some(profile_system("", None, &context)),
+    };
     let profiles = loaded
         .into_iter()
         .map(|(name, profile)| {
@@ -231,7 +259,7 @@ pub fn subagent_profiles(
             agent
         })
         .collect();
-    Ok((profiles, diagnostics))
+    Ok((profiles, diagnostics, root_system))
 }
 
 /// The profiles of `files` that load, by name, and why the others did not.
@@ -694,9 +722,13 @@ impl EnvironmentAdapter for WorkRoot {
             let tools = self
                 .tools(&root)
                 .map_err(|error| EnvironmentError::new(error.to_string()))?;
-            let (agents, diagnostics) =
-                subagent_profiles(&self.workspace, self.builtin_agents.as_deref(), &root)
-                    .map_err(|error| EnvironmentError::new(error.to_string()))?;
+            let (agents, diagnostics, root_system) = subagent_profiles_in(
+                &self.workspace,
+                self.builtin_agents.as_deref(),
+                &root,
+                metadata.get(AGENT).map(String::as_str),
+            )
+            .map_err(|error| EnvironmentError::new(error.to_string()))?;
             for diagnostic in diagnostics {
                 eprintln!("agent: {diagnostic}; not offered to sub-agents");
             }
@@ -704,6 +736,9 @@ impl EnvironmentAdapter for WorkRoot {
             spawn.vars = self.workspace.spawn_vars.clone();
             let mut environment = SessionEnvironment::new(tools, spawn);
             environment.agents = agents;
+            // A styled root's fresh children take its system without the
+            // style (ADR-0054).
+            environment.child_system = root_system.filter(|_| metadata.contains_key(STYLE));
             Ok(environment)
         })
     }
