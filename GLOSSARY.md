@@ -104,6 +104,10 @@ _Avoid_: 技能路径、搜索目录
 应用的一个命名 Markdown 文件，frontmatter 是元数据，正文是会话的基础提示词；有用户级与项目级两级，同名时项目级优先，在会话创建时解析一次（ADR-0051）。与「模型规则」无关。
 _Avoid_: agent 配置、提示词预设、persona、Model Profile
 
+**输出风格（Output Style）**：
+应用的一个命名 Markdown 文件，正文追加在智能体档案正文之后，只调整语气与输出形式；与智能体档案正交选择，不能固定模型或收窄工具，在会话创建时解析一次（ADR-0052）。
+_Avoid_: 叠加档案、语气档案、persona、style profile
+
 ## 交互与生命周期
 
 **实时事件（Agent Event）**：
