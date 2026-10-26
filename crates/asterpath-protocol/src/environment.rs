@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 use futures_core::future::BoxFuture;
 
+use crate::config::ModelSpec;
+use crate::ids::ToolName;
+use crate::item::Part;
 use crate::sandbox::SpawnEnv;
 use crate::tool::Tool;
 
@@ -19,11 +22,45 @@ pub struct SessionEnvironment {
     pub tools: Vec<Arc<dyn Tool>>,
     /// Handed to every tool call in `ToolContext::spawn`.
     pub spawn: SpawnEnv,
+    /// Agent profiles `spawn_agent` may select by name (ADR-0053).
+    pub agents: Vec<AgentProfile>,
 }
 
 impl SessionEnvironment {
     pub fn new(tools: Vec<Arc<dyn Tool>>, spawn: SpawnEnv) -> Self {
-        Self { tools, spawn }
+        Self {
+            tools,
+            spawn,
+            agents: Vec::new(),
+        }
+    }
+}
+
+/// An application agent profile a child session can be spawned with
+/// (ADR-0053): the child's whole system, and optionally a pinned model and a
+/// tool list that narrows the parent's tools.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentProfile {
+    pub name: String,
+    pub description: String,
+    /// Taken as is; the parent's system is not prepended.
+    pub system: Vec<Part>,
+    /// Must share the parent's provider.
+    pub model: Option<ModelSpec>,
+    /// Names the parent lacks are ignored; `None` keeps the parent's tools.
+    pub tools: Option<Vec<ToolName>>,
+}
+
+impl AgentProfile {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, system: Vec<Part>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            system,
+            model: None,
+            tools: None,
+        }
     }
 }
 
@@ -37,6 +74,7 @@ impl std::fmt::Debug for SessionEnvironment {
         f.debug_struct("SessionEnvironment")
             .field("tools", &tools)
             .field("spawn", &self.spawn)
+            .field("agents", &self.agents)
             .finish()
     }
 }
