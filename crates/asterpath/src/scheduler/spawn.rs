@@ -243,22 +243,15 @@ impl Scheduler {
                 Some(name) => Some(agent_profile(name)?),
                 None => None,
             };
-            let pinned = match (
-                profile.as_ref().and_then(|p| p.model.as_ref()),
-                &req.model_alias,
-            ) {
+            let profile_model = profile.as_ref().and_then(|p| p.model.as_ref());
+            let agent = || format!("agent {}", req.agent.as_deref().unwrap_or_default());
+            let pinned = match (profile_model, &req.model_alias) {
                 (Some(_), Some(_)) => {
                     return Err(SpawnError::InvalidArgs {
-                        message: format!(
-                            "agent {} pins its model; model_alias is not allowed",
-                            req.agent.as_deref().unwrap_or_default()
-                        ),
+                        message: format!("{} pins its model; model_alias is not allowed", agent()),
                     });
                 }
-                (Some(model), None) => Some((
-                    model,
-                    format!("agent {}", req.agent.as_deref().unwrap_or_default()),
-                )),
+                (Some(model), None) => Some((model, agent())),
                 (None, Some(alias)) => Some((
                     self.aliases
                         .get(alias)
@@ -280,8 +273,7 @@ impl Scheduler {
                         });
                     }
                     // A profile on the parent's own model keeps its context window.
-                    let profile_model = profile.as_ref().is_some_and(|p| p.model.is_some());
-                    if profile_model && model.model == parent_config.model.model {
+                    if profile_model.is_some() && model.model == parent_config.model.model {
                         parent_config.model.clone()
                     } else {
                         model.clone()

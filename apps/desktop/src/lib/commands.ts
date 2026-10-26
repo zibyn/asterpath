@@ -36,7 +36,7 @@ export const sessions = (root: string) => invoke<SessionSummary[]>("sessions", {
 export const createSession = (root: string, name?: string, agent?: string | null, style?: string | null) =>
   invoke<SessionSummary>("create_session", { root, name: name ?? null, agent: agent ?? null, style: style ?? null });
 
-export interface AgentChoice {
+export interface Choice {
   name: string;
   description: string | null;
 }
@@ -44,7 +44,7 @@ export interface AgentChoice {
 /** A project's agent profiles; `default` (`default_agent`) is preselected. */
 export interface Agents {
   default: string | null;
-  agents: AgentChoice[];
+  agents: Choice[];
 }
 
 export const agents = (root: string) => invoke<Agents>("agents", { root });
@@ -52,7 +52,7 @@ export const agents = (root: string) => invoke<Agents>("agents", { root });
 /** A project's output styles; `default` (`output_style`) is preselected, `null` is none. */
 export interface Styles {
   default: string | null;
-  styles: AgentChoice[];
+  styles: Choice[];
 }
 
 export const styles = (root: string) => invoke<Styles>("styles", { root });

@@ -3,7 +3,7 @@
 //! that wins for its name.
 
 use asterpath_app::workspace::{
-    AgentFile, WorkspaceError, agent_profiles, load_agent, load_style, style_files,
+    PromptFile, WorkspaceError, agent_profiles, load_agent, load_style, style_files,
 };
 
 use crate::session::{builtin_agents, current_root};
@@ -31,8 +31,8 @@ fn list(
         &asterpath_app::workspace::Workspace,
         Option<&std::path::Path>,
         &std::path::Path,
-    ) -> Result<Vec<AgentFile>, WorkspaceError>,
-    description: impl Fn(&AgentFile) -> Result<Option<String>, WorkspaceError>,
+    ) -> Result<Vec<PromptFile>, WorkspaceError>,
+    description: impl Fn(&PromptFile) -> Result<Option<String>, WorkspaceError>,
 ) -> CliResult<()> {
     let settings = global.settings()?;
     config::validate(&settings).map_err(CliError::config)?;

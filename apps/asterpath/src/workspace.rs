@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath};
 use asterpath_mcp::{McpError, McpServerConfig, McpServers, McpTransport};
+use asterpath_protocol::AgentProfile as SubagentProfile;
 use asterpath_protocol::{
     CatalogEntry, EnvironmentAdapter, EnvironmentError, ModelId, ModelSpec, ParentFilter, Part,
     ProviderId, SandboxPolicy, SandboxProvider, SessionEnvironment, SessionId, SessionQuery,
@@ -211,7 +212,7 @@ pub struct Diagnostics {
 /// What a work root's sessions offer sub-agents: the profiles they can
 /// select (ADR-0053), each assembled like a root session without a style.
 struct Subagents {
-    profiles: Vec<asterpath_protocol::AgentProfile>,
+    profiles: Vec<SubagentProfile>,
     /// The system of a root session created with the given profile, without
     /// its style (ADR-0054).
     root_system: Vec<Part>,
@@ -247,7 +248,7 @@ fn subagents(
     let profiles = loaded
         .into_iter()
         .map(|(name, profile)| {
-            let mut agent = asterpath_protocol::AgentProfile::new(
+            let mut agent = SubagentProfile::new(
                 name,
                 profile.description.unwrap_or_default(),
                 assemble_system(&profile.prompt, None, &context),
@@ -271,7 +272,7 @@ fn subagents(
 }
 
 /// The profiles of `files` that load, by name, and why the others did not.
-fn load_agents(files: &[AgentFile]) -> (Vec<(String, AgentProfile)>, Vec<String>) {
+fn load_agents(files: &[PromptFile]) -> (Vec<(String, AgentProfile)>, Vec<String>) {
     let mut loaded = Vec::new();
     let mut diagnostics = Vec::new();
     for file in files {
@@ -344,8 +345,8 @@ fn profile_index(profiles: &[(String, AgentProfile)]) -> Option<Part> {
 /// (unknown is an error), else the one named `default` if there is one.
 pub fn selected_agent<'a>(
     workspace: &Workspace,
-    profiles: &'a [AgentFile],
-) -> Result<Option<&'a AgentFile>, WorkspaceError> {
+    profiles: &'a [PromptFile],
+) -> Result<Option<&'a PromptFile>, WorkspaceError> {
     let find = |name: &str| profiles.iter().find(|file| file.name == name);
     match &workspace.agent {
         Some(name) => find(name)
@@ -369,11 +370,19 @@ fn selected_style(
         return Ok(None);
     };
     let files = style_files(workspace, builtin_agents, root)?;
-    let file = files
-        .iter()
-        .find(|file| &file.name == name)
-        .ok_or_else(|| WorkspaceError::Config(format!("unknown style {name}")))?;
+    let file = find_style(&files, name)?;
     Ok(Some((name.clone(), load_style(file)?)))
+}
+
+/// The style `name` among `files`; an unknown name is an error.
+pub fn find_style<'a>(
+    files: &'a [PromptFile],
+    name: &str,
+) -> Result<&'a PromptFile, WorkspaceError> {
+    files
+        .iter()
+        .find(|file| file.name == name)
+        .ok_or_else(|| WorkspaceError::Config(format!("unknown style {name}")))
 }
 
 /// The builtin agent directory: the first of the application's `candidates`
@@ -397,7 +406,7 @@ pub fn builtin_agents(candidates: impl IntoIterator<Item = PathBuf>) -> Option<P
 /// An agent profile or output style file (ADR-0051, ADR-0052): its name is
 /// the file name without `.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFile {
+pub struct PromptFile {
     pub name: String,
     pub path: PathBuf,
 }
@@ -421,7 +430,7 @@ pub fn agent_profiles(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
-) -> Result<Vec<AgentFile>, WorkspaceError> {
+) -> Result<Vec<PromptFile>, WorkspaceError> {
     named_files(
         builtin_agents
             .map(Path::to_path_buf)
@@ -438,7 +447,7 @@ pub fn style_files(
     workspace: &Workspace,
     builtin_agents: Option<&Path>,
     root: &Path,
-) -> Result<Vec<AgentFile>, WorkspaceError> {
+) -> Result<Vec<PromptFile>, WorkspaceError> {
     named_files(
         builtin_agents
             .and_then(Path::parent)
@@ -451,7 +460,7 @@ pub fn style_files(
 
 /// The `*.md` files of `dirs` by name; a later directory's file replaces an
 /// earlier one of the same name. Missing directories are empty.
-fn named_files(dirs: impl Iterator<Item = PathBuf>) -> Result<Vec<AgentFile>, WorkspaceError> {
+fn named_files(dirs: impl Iterator<Item = PathBuf>) -> Result<Vec<PromptFile>, WorkspaceError> {
     let mut found = BTreeMap::new();
     for dir in dirs {
         let io = |source| WorkspaceError::Io {
@@ -475,12 +484,12 @@ fn named_files(dirs: impl Iterator<Item = PathBuf>) -> Result<Vec<AgentFile>, Wo
     }
     Ok(found
         .into_iter()
-        .map(|(name, path)| AgentFile { name, path })
+        .map(|(name, path)| PromptFile { name, path })
         .collect())
 }
 
 /// Read and parse a profile; an unknown frontmatter field is an error.
-pub fn load_agent(file: &AgentFile) -> Result<AgentProfile, WorkspaceError> {
+pub fn load_agent(file: &PromptFile) -> Result<AgentProfile, WorkspaceError> {
     let invalid = |message: String| {
         WorkspaceError::Config(format!("agent {}: {message}", file.path.display()))
     };
@@ -523,7 +532,7 @@ pub struct OutputStyle {
 }
 
 /// Read and parse a style; any field but `description` is an error.
-pub fn load_style(file: &AgentFile) -> Result<OutputStyle, WorkspaceError> {
+pub fn load_style(file: &PromptFile) -> Result<OutputStyle, WorkspaceError> {
     let invalid = |message: String| {
         WorkspaceError::Config(format!("style {}: {message}", file.path.display()))
     };
@@ -547,7 +556,7 @@ pub fn load_style(file: &AgentFile) -> Result<OutputStyle, WorkspaceError> {
 /// A profile or style file's frontmatter fields and body; `invalid` wraps a
 /// parse error.
 fn read_frontmatter(
-    file: &AgentFile,
+    file: &PromptFile,
     invalid: impl Fn(String) -> WorkspaceError,
 ) -> Result<(BTreeMap<String, FrontmatterValue>, String), WorkspaceError> {
     let content = std::fs::read_to_string(&file.path).map_err(|source| WorkspaceError::Io {
