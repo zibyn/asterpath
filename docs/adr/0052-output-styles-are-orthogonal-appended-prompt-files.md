@@ -1,6 +1,6 @@
 # 输出风格是与智能体档案正交选择、追加在档案正文之后的提示词文件
 
-**Status**: accepted (2026-10-26)
+**Status**: accepted (2026-10-26)；「子智能体继承父会话的风格」部分取代 by [ADR-0054](0054-output-styles-do-not-reach-subagents.md)（风格不进入子会话）
 **来源**: [#188](https://github.com/zibyn/asterpath/issues/188)
 
 ## Context
