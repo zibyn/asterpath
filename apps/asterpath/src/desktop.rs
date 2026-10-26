@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
-    AGENT, CWD, NAME, STYLE, WorkRoot, Workspace, agent_profiles, in_root, load_agent, load_style,
-    new_session_spec, roots, selected_agent, style_files, work_root,
+    AGENT, CWD, NAME, STYLE, WorkRoot, Workspace, agent_profiles, find_style, in_root, load_agent,
+    load_style, new_session_spec, roots, selected_agent, style_files, work_root,
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
@@ -49,9 +49,9 @@ pub struct SessionInfo {
     pub agent: Option<String>,
 }
 
-/// An agent profile the new-session picker offers.
+/// An agent profile or output style the new-session picker offers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AgentChoice {
+pub struct Choice {
     pub name: String,
     pub description: Option<String>,
 }
@@ -61,7 +61,7 @@ pub struct AgentChoice {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Agents {
     pub default: Option<String>,
-    pub agents: Vec<AgentChoice>,
+    pub agents: Vec<Choice>,
 }
 
 /// A project's output styles (ADR-0052) and the one preselected
@@ -69,7 +69,7 @@ pub struct Agents {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Styles {
     pub default: Option<String>,
-    pub styles: Vec<AgentChoice>,
+    pub styles: Vec<Choice>,
 }
 
 /// A work root in the sidebar.
@@ -466,7 +466,7 @@ impl Desktop {
             .map(|file| file.name.clone());
         let agents = profiles
             .into_iter()
-            .map(|file| AgentChoice {
+            .map(|file| Choice {
                 // A broken profile is still listed; creating with it reports why.
                 description: load_agent(&file)
                     .ok()
@@ -484,14 +484,12 @@ impl Desktop {
             style_files(&self.workspace, self.builtin_agents.as_deref(), &root).map_err(text)?;
         let default = self.workspace.style.clone();
         // An unknown `output_style` fails here, before the user picks anything.
-        if let Some(name) = &default
-            && !files.iter().any(|file| &file.name == name)
-        {
-            return Err(format!("unknown style {name}"));
+        if let Some(name) = &default {
+            find_style(&files, name).map_err(text)?;
         }
         let styles = files
             .into_iter()
-            .map(|file| AgentChoice {
+            .map(|file| Choice {
                 // A broken style is still listed; creating with it reports why.
                 description: load_style(&file).ok().and_then(|style| style.description),
                 name: file.name,
@@ -518,7 +516,7 @@ impl Desktop {
             workspace.agent = Some(agent.to_owned());
         }
         workspace.style = style.map(str::to_owned);
-        // shortcut: skill diagnostics are dropped; show them once the view has a place for warnings
+        // shortcut: skill and profile diagnostics are dropped; show them once the view has a place for warnings
         new_session_spec(
             &workspace,
             self.builtin_agents.as_deref(),

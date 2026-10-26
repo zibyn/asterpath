@@ -1168,7 +1168,7 @@ impl Settings {
         self.file.default_agent = Some(agent);
     }
 
-    /// `--style`, or `None` to drop `output_style` (exec ignores it).
+    /// `--style`; `None` drops `output_style`, as `exec` does.
     pub fn set_style(&mut self, style: Option<String>) {
         self.file.output_style = style;
     }

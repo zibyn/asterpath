@@ -92,10 +92,6 @@ pub struct SessionArgs {
     /// Output style of a new session; overrides `output_style`.
     #[arg(long, value_name = "NAME")]
     pub style: Option<String>,
-    /// Whether `output_style` applies: set by the interactive CLI, not
-    /// `exec`, where nobody takes over what a style leaves to the user.
-    #[arg(skip)]
-    pub config_style: bool,
     /// Attach a file to the first input (repeatable).
     #[arg(short = 'i', long = "image", value_name = "FILE")]
     pub images: Vec<PathBuf>,
@@ -153,11 +149,21 @@ impl Opened {
     }
 }
 
+/// Which front end opens a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frontend {
+    /// `output_style` does not apply: nobody takes over what a style leaves
+    /// to the user.
+    Exec,
+    Interactive,
+}
+
 /// Resolve the work root, assemble the engine and open the session.
 /// `output_format` is the `--output-schema` request constraint.
 pub async fn open(
     global: &GlobalArgs,
     args: &SessionArgs,
+    frontend: Frontend,
     output_format: Option<OutputFormat>,
 ) -> CliResult<Opened> {
     args.check()?;
@@ -182,7 +188,7 @@ pub async fn open(
         if let Some(agent) = &args.agent {
             settings.set_agent(agent.clone());
         }
-        if args.style.is_some() || !args.config_style {
+        if args.style.is_some() || frontend == Frontend::Exec {
             settings.set_style(args.style.clone());
         }
         config::validate(&settings).map_err(CliError::config)?;
@@ -313,10 +319,14 @@ async fn create(
     }
     let settings = &settings;
     for diagnostic in diagnostics
+        .skills
         .iter()
         .filter(|diagnostic| diagnostic.kind != SkillDiagnosticKind::AuthorityFieldIgnored)
     {
         eprintln!("skill: {diagnostic}");
+    }
+    for diagnostic in &diagnostics.agents {
+        eprintln!("agent: {diagnostic}; not offered to sub-agents");
     }
     let mcp = load_mcp(&workspace, root).await.map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);

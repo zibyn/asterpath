@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::drive::{self, scan, turn_result};
 use crate::exec::attachment;
-use crate::session::{self, SessionArgs};
+use crate::session::{self, Frontend, SessionArgs};
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
 
 /// How long a tool result may be on screen.
@@ -39,15 +39,14 @@ pub enum Next {
 
 pub async fn interactive(
     global: &GlobalArgs,
-    mut args: SessionArgs,
+    args: SessionArgs,
     prompt: Option<String>,
 ) -> CliResult<()> {
     let mut first: Vec<Part> = prompt.map(|text| Part::Text { text }).into_iter().collect();
     for path in &args.images {
         first.push(attachment(path)?);
     }
-    args.config_style = true;
-    let mut opened = session::open(global, &args, None).await?;
+    let mut opened = session::open(global, &args, Frontend::Interactive, None).await?;
     // After `open`: the `-r` picker reads stdin itself.
     let mut lines = stdin_lines();
     let mut interrupts = interrupts();
@@ -89,7 +88,7 @@ pub async fn interactive(
             Next::Exit => return Ok(()),
             Next::New => {
                 let args = new_session(&args, model);
-                opened = session::open(global, &args, None).await?;
+                opened = session::open(global, &args, Frontend::Interactive, None).await?;
             }
         }
     }
@@ -108,7 +107,6 @@ fn new_session(args: &SessionArgs, model: Option<String>) -> SessionArgs {
         name: None,
         agent: args.agent.clone(),
         style: args.style.clone(),
-        config_style: args.config_style,
         images: Vec::new(),
     }
 }

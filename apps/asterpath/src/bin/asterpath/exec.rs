@@ -12,7 +12,7 @@ use asterpath_protocol::{
 use clap::{Args, ValueEnum};
 
 use crate::drive::{self, final_assistant_text, output_result, scan, turn_result};
-use crate::session::{self, SessionArgs};
+use crate::session::{self, Frontend, SessionArgs};
 use crate::stream;
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
 
@@ -109,7 +109,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         ));
     }
 
-    let opened = session::open(global, &args.session, schema).await?;
+    let opened = session::open(global, &args.session, Frontend::Exec, schema).await?;
     let outcome = match &opened.owned {
         // Viewing only: the latest result as it stands, nothing driven.
         None if parts.is_empty() && !commands => drive::DriveOutcome {
