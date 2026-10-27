@@ -45,6 +45,11 @@ export function StatusBar({ session }: { session: string }) {
       </select>
       {info.data?.agent && <span title="Agent profile">{info.data.agent}</span>}
       {info.data && <span>{info.data.tokens.toLocaleString()} tokens</span>}
+      {info.data?.no_sandbox && (
+        <span className="text-destructive" title={info.data.no_sandbox}>
+          无沙箱: {info.data.no_sandbox}
+        </span>
+      )}
       {error && (
         <span className="truncate text-destructive" title={String(error)}>
           {String(error)}
