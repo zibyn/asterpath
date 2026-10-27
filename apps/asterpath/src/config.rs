@@ -18,25 +18,29 @@ use asterpath_mcp::{
     ADAPTER_PROTOCOL_VERSIONS, McpServerConfig, McpTimeouts, McpTransport, ServerId,
 };
 use asterpath_protocol::{
-    ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, ContextPolicy,
-    DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderCatalog, ProviderId,
-    ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SideEffect, SubagentConfig,
+    CompactionConfig, ContextPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderCatalog,
+    ProviderId, ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SubagentConfig,
     Tool, ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
 use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
-use crate::workspace::{SandboxMode, WorkRoot, Workspace, WorkspaceError};
+use crate::approval::ApprovalModes;
+use crate::approval::rules::CommandRules;
+use crate::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace, WorkspaceError};
 
 /// `-a` and `[approval] default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
-    /// Read-only in-process tools run; mutating and external tools ask.
+    /// Calls outside the sandbox and external tools ask (ADR-0055).
     #[default]
     Untrusted,
-    /// Never ask; the sandbox is the only guard.
+    /// Never ask; the sandbox, if any, is the only guard.
     Never,
+    /// `bash` runs in a read-only sandbox; calls outside it are denied.
+    #[serde(rename = "read-only")]
+    ReadOnly,
 }
 
 /// The file with `-c` overrides merged in, then the dedicated flags.
@@ -44,6 +48,8 @@ pub enum ApprovalMode {
 pub struct Settings {
     pub db: PathBuf,
     pub approval: ApprovalMode,
+    /// `[approval]`'s `allow` / `ask` / `deny` (#197).
+    pub rules: CommandRules,
     pub file: FileConfig,
     /// The file read, or the default path; `None` without a home directory.
     pub path: Option<PathBuf>,
@@ -110,12 +116,16 @@ fn from_table(table: toml::Table, path: Option<PathBuf>) -> Result<Settings, Wor
         .try_into()
         .map_err(|error| WorkspaceError::Config(format!("invalid config: {error}")))?;
 
+    let section = &file.approval;
+    let rules = CommandRules::new(&section.allow, &section.ask, &section.deny)
+        .map_err(|error| WorkspaceError::Config(format!("invalid config: {error}")))?;
     let db = expand_tilde(file.storage.path.clone().unwrap_or_else(default_db));
     // Absolute now: the work root may change the process directory later.
     let db = std::path::absolute(&db).unwrap_or(db);
     Ok(Settings {
         db,
         approval: file.approval.default.unwrap_or_default(),
+        rules,
         file,
         path,
     })
@@ -141,6 +151,17 @@ pub const TEMPLATE: &str = r#"# asterpath configuration. Uncomment and edit; `as
 
 # [sandbox]
 # mode = "workspace-write"        # read-only | workspace-write | full-access
+
+# [approval]
+# untrusted: calls outside the sandbox and MCP tools ask
+# never:     nothing asks; the sandbox is the only guard
+# read-only: bash runs in a read-only sandbox; calls outside it are denied
+# default = "untrusted"           # untrusted | never | read-only
+# Command rules: `tool` or `bash(command prefix)`; deny > ask > allow.
+# Deny and ask hold inside the sandbox too; allow only skips a question.
+# deny = ["bash(git push --force)"]
+# ask = ["bash(git push)"]        # the sandbox does not stop the network
+# allow = ["bash(cargo test)"]
 "#;
 
 /// Write [`TEMPLATE`] at `path`: the directory `0700`, the file `0600` (Unix).
@@ -461,15 +482,15 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
 }
 
 /// The composition root: providers, storage and limits from `settings`,
-/// `tools` for every session, `environment` per session and `approval` (the
-/// CLI's is [`approval_policy`] of `settings.approval`). No approval
+/// `tools` for every session, `environment` per session with its `bash`
+/// capped by `approval`, and `approval` as the policy. No approval
 /// endpoint is registered here: an application that can ask registers one around
 /// its drive.
 pub async fn assemble(
     settings: &Settings,
     tools: Vec<Arc<dyn Tool>>,
     environment: WorkRoot,
-    approval: Arc<dyn ApprovalPolicy>,
+    approval: Arc<ApprovalModes>,
 ) -> Result<Asterpath, AsterError> {
     let config_error = |message: String| AsterError::Config { message };
     let providers = providers(settings).map_err(|error| config_error(error.to_string()))?;
@@ -483,7 +504,7 @@ pub async fn assemble(
         .database(&settings.db)
         .providers(providers)
         .tools(tools)
-        .environment(Arc::new(environment))
+        .environment(approval.environment(Arc::new(environment)))
         .tool(tool_config(settings))
         .max_live_children(max_live_children(settings))
         .model_aliases(model_aliases(settings))
@@ -501,35 +522,6 @@ pub fn create_db_dir(settings: &Settings) -> Result<(), AsterError> {
             settings.db.display()
         )))
     })
-}
-
-/// `untrusted` asks for every `Mutating` tool and otherwise keeps the
-/// framework default (in-process allowed, external asked); the pipeline
-/// denies `Ask` when no endpoint is open. `never` allows everything.
-pub fn approval_policy(mode: ApprovalMode) -> Arc<dyn ApprovalPolicy> {
-    match mode {
-        ApprovalMode::Untrusted => Arc::new(AskMutating(DefaultApprovalPolicy)),
-        ApprovalMode::Never => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
-    }
-}
-
-struct AskMutating(DefaultApprovalPolicy);
-
-impl ApprovalPolicy for AskMutating {
-    fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        match request.side_effect {
-            SideEffect::Mutating => ApprovalVerdict::Ask,
-            _ => self.0.classify(request),
-        }
-    }
-}
-
-struct FixedApproval(ApprovalVerdict);
-
-impl ApprovalPolicy for FixedApproval {
-    fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
-        self.0.clone()
-    }
 }
 
 /// A secret-looking field anywhere but `providers.<id>.api_key`.
@@ -1109,6 +1101,9 @@ struct SubagentSection {
 #[serde(default, deny_unknown_fields)]
 struct ApprovalSection {
     default: Option<ApprovalMode>,
+    allow: Vec<String>,
+    ask: Vec<String>,
+    deny: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1218,6 +1213,7 @@ impl Settings {
         }
         Ok(Workspace {
             sandbox: self.file.sandbox.mode,
+            sandbox_backend: SandboxBackend::probe(),
             tools: self.file.tools.enabled.clone(),
             skills_enabled: self.file.skills.enabled.unwrap_or(true),
             skill_paths: self.file.skills.paths.clone(),

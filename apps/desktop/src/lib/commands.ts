@@ -76,6 +76,8 @@ export interface ApprovalRequest {
   /** The arguments as a JSON string. */
   args: string;
   side_effect: "ReadOnly" | "Mutating";
+  /** What "allow for session" allows: the tool, or bash command prefixes; null when not offered. */
+  session_rules: string[] | null;
 }
 
 /** The waiting requests of a session's tree. */
@@ -107,6 +109,8 @@ export interface SessionInfo {
   tokens: number;
   error: string | null;
   agent: string | null;
+  /** Why spawned commands run without a sandbox (ADR-0055); null when sandboxed. */
+  no_sandbox: string | null;
 }
 
 /** The configured model and the model aliases' models. */

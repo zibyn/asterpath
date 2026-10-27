@@ -81,6 +81,9 @@ pub enum SandboxMode {
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub sandbox: SandboxMode,
+    /// Probed once at startup (not by `Default`); without one the effective
+    /// policy is `FullAccess` (ADR-0055).
+    pub sandbox_backend: SandboxBackend,
     /// Workspace tools of new sessions, in order; `None` means all of them.
     pub tools: Option<Vec<String>>,
     /// Skills of new sessions; continued ones always get the loader.
@@ -106,6 +109,8 @@ impl Default for Workspace {
     fn default() -> Self {
         Self {
             sandbox: SandboxMode::default(),
+            // Probing spawns bwrap; `Settings::workspace` does it.
+            sandbox_backend: SandboxBackend::Unavailable("not probed".to_owned()),
             tools: None,
             skills_enabled: true,
             skill_paths: Vec::new(),
@@ -120,9 +125,83 @@ impl Default for Workspace {
     }
 }
 
+/// Whether this process can confine spawned commands (ADR-0055).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxBackend {
+    /// bwrap, run as this program, confined a probe command.
+    Bwrap(PathBuf),
+    /// Why there is none.
+    Unavailable(String),
+}
+
+impl SandboxBackend {
+    /// The `bwrap` on `PATH`; no backend elsewhere than Linux.
+    pub fn probe() -> Self {
+        Self::probe_bwrap("bwrap")
+    }
+
+    /// Run `true` under `bwrap` the way a `ReadOnly` call would be confined;
+    /// the backend is usable only if that succeeds.
+    pub fn probe_bwrap(program: impl Into<PathBuf>) -> Self {
+        let program = program.into();
+        #[cfg(target_os = "linux")]
+        {
+            use asterpath_protocol::{SandboxError, SpawnRequest};
+            let sandbox = asterpath_sandbox_linux::LinuxSandbox::with_bwrap_program(&program);
+            let env = BTreeMap::new();
+            let request =
+                SpawnRequest::new("true".as_ref(), &[], None, &env, &SandboxPolicy::ReadOnly);
+            let confined = match sandbox.confine(&request) {
+                Ok(confined) => confined,
+                Err(SandboxError::Setup { message }) => return Self::Unavailable(message),
+                Err(error) => return Self::Unavailable(error.to_string()),
+            };
+            let output = std::process::Command::new(&confined.program)
+                .args(&confined.args)
+                .stdin(std::process::Stdio::null())
+                .output();
+            match output {
+                Ok(output) if output.status.success() => Self::Bwrap(program),
+                Ok(output) => Self::Unavailable(format!(
+                    "bwrap cannot create namespaces: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => Self::Unavailable(format!("bwrap cannot run: {error}")),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = program;
+            Self::Unavailable("no sandbox backend on this platform".to_owned())
+        }
+    }
+
+    /// Why there is no backend, if there is none.
+    pub fn unavailable(&self) -> Option<&str> {
+        match self {
+            Self::Bwrap(_) => None,
+            Self::Unavailable(reason) => Some(reason),
+        }
+    }
+
+    fn provider(&self) -> Option<Arc<dyn SandboxProvider>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Bwrap(program) => Some(Arc::new(
+                asterpath_sandbox_linux::LinuxSandbox::with_bwrap_program(program),
+            )),
+            _ => None,
+        }
+    }
+}
+
 impl Workspace {
-    /// `workspace-write` makes the work root the only writable root.
+    /// `workspace-write` makes the work root the only writable root; without
+    /// a backend every mode is `FullAccess` (ADR-0055).
     pub fn sandbox_policy(&self, root: &Path) -> SandboxPolicy {
+        if self.sandbox_backend.unavailable().is_some() {
+            return SandboxPolicy::FullAccess;
+        }
         match self.sandbox {
             SandboxMode::ReadOnly => SandboxPolicy::ReadOnly,
             SandboxMode::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
@@ -796,7 +875,7 @@ pub fn workspace_tools(
     let policy = workspace.sandbox_policy(root);
     let all = asterpath_tools::coding(
         root.to_path_buf(),
-        sandbox_provider(&policy),
+        workspace.sandbox_backend.provider(),
         policy,
         asterpath_tools::DEFAULT_BASH_TIMEOUT,
     )
@@ -828,18 +907,7 @@ pub async fn load_mcp(workspace: &Workspace, root: &Path) -> Result<McpServers, 
         }
     }
     let policy = workspace.sandbox_policy(root);
-    Ok(McpServers::load(configs, sandbox_provider(&policy), policy).await?)
-}
-
-/// bwrap on Linux. Elsewhere a restricted policy has no backend, so stdio
-/// servers fail closed at the sandbox stage unless the mode is `full-access`.
-fn sandbox_provider(policy: &SandboxPolicy) -> Option<Arc<dyn SandboxProvider>> {
-    #[cfg(target_os = "linux")]
-    if !matches!(policy, SandboxPolicy::FullAccess) {
-        return Some(Arc::new(asterpath_sandbox_linux::LinuxSandbox::new()));
-    }
-    let _ = policy;
-    None
+    Ok(McpServers::load(configs, workspace.sandbox_backend.provider(), policy).await?)
 }
 
 #[cfg(test)]

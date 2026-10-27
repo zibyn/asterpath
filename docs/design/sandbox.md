@@ -163,6 +163,7 @@ pub enum SandboxError {
 - 沙箱拒绝发生在审批之后、`invoke` 之内；它不是审批决定，不写 `ApprovalDecided`，也不会反向触发 `Ask`。
 - **v1 不做 escalation**：没有「被沙箱拒绝 → 提权审批 → 自动重试」。Codex 的一次升级重试不在 v1。
 - `ApprovalRequest` 不增加 sandbox 字段；`ApprovalPolicy` 是应用代码，和沙箱解析器共享配置即可。
+- 参考应用（ADR-0055）：起进程的工具以沙箱为边界，调用会在受限沙箱内执行时审批默认允许，审批只决定沙箱外的调用。审批模式只收紧沙箱：只读模式在启动 `bash` 时把 `ctx.spawn.sandbox` 设为 `ReadOnly`，`/tmp` 也随之不可写，需要临时文件的命令会自己报错。配置为 `full-access` 时，只读模式下因收紧才放行的调用按调用 id 记下，之后切换模式也照样以 `ReadOnly` 启动（ADR-0056）；记录只在内存中，审批后、启动前重启则按重启后的模式启动。表见 [packaging.md](packaging.md) §4.4。
 - 应用若要「先问再放宽」，只能在自己的 pre-execute 里换用更宽的已解析策略；框架不提供这条流程，也不记录它。
 
 ## 9. 外部工具（MCP 服务）
@@ -198,6 +199,13 @@ pub enum SandboxError {
 - **不加 `--unshare-net`、不加 `--unshare-pid`**：网络与进程可见性未建模；加了会暗示不存在的保证。
 - bwrap 缺失或无法建命名空间 → `Setup` → fail closed。
 - bwrap 在 exec 前失败可能只表现为子进程异常退出；调用方按 `Internal` 处理。
+
+**参考应用的启动检测（[#196](https://github.com/zibyn/asterpath/issues/196)，ADR-0055）**：
+
+- CLI 与桌面端共享的组装代码（`Settings::workspace()` → `SandboxBackend::probe()`）在启动时检测一次后端：Linux 上用 `LinuxSandbox` 按 `ReadOnly` 约束空命令 `true`，实际跑一次 bwrap，退出成功才算可用；非 Linux 一律不可用。
+- 可用：总是构造后端，即使配置是 `full-access`，以便审批模式能把单次调用收紧到 `ReadOnly`（`ctx.spawn.sandbox`）。
+- 不可用：有效沙箱策略明确为 `FullAccess`，bash 与 MCP stdio 服务都按它启动，审批据此把调用视为「沙箱外」。这是应用的明确选择，后端本身的 fail closed（`Setup`）不变。
+- 原因三类：找不到 bwrap（`bwrap not found: …`）、bwrap 不能创建命名空间（`bwrap cannot create namespaces: <stderr>`）、平台不支持。`asterpath doctor` 打印 `sandbox: bwrap (<program>)` 或 `sandbox: none, <原因>`；桌面端状态栏显示「无沙箱」与原因（`SessionInfo.no_sandbox`）。
 
 **macOS**：`sandbox-exec -p <profile>` 的形态记录为第二后端，v1 不实现、不验收。**Windows**：出界。
 

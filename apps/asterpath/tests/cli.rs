@@ -1289,6 +1289,57 @@ fn untrusted_denies_mutating_tools_in_exec_and_never_runs_them() {
     }
 }
 
+/// `-a read-only` runs bash in a read-only sandbox (ADR-0055): reads
+/// succeed, writes leave nothing behind.
+#[test]
+fn read_only_runs_bash_in_a_read_only_sandbox() {
+    if let Some(reason) = asterpath_app::workspace::SandboxBackend::probe().unavailable() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"ls"}"#)),
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch x"}"#)),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("read-only");
+    dir.config(&config_body(&server, &dir.db()));
+
+    let (stdout, _) =
+        ok(dir
+            .exec(&dir.path)
+            .args(["-a", "read-only", "--output-format", "stream-json", "go"]));
+
+    let finished: Vec<_> = stream_json_events(&stdout)
+        .into_iter()
+        .filter(|event| event["type"] == "tool_finished")
+        .collect();
+    assert_eq!(finished.len(), 2, "{stdout}");
+    assert_eq!(finished[0]["status"], "Completed", "{stdout}");
+    assert!(!dir.path.join("x").exists());
+}
+
+#[test]
+fn a_bad_approval_mode_lists_the_three_modes() {
+    let dir = TestDir::new("bad-approval");
+    dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+    for flags in [&["-a", "bogus"][..], &["-c", "approval.default=\"bogus\""]] {
+        let output = dir.exec(&dir.path).args(flags).arg("go").output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flags:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for mode in ["untrusted", "never", "read-only"] {
+            assert!(stderr.contains(mode), "{flags:?}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn help_lists_read_only() {
+    let output = bin().args(["exec", "--help"]).output().unwrap();
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("read-only: "), "{help}");
+}
+
 /// `-C` roots bash in the work root without moving the process, and bash
 /// sees only the minimal inherited environment plus `[sandbox] env`
 /// (ADR-0037).
@@ -1340,6 +1391,30 @@ fn doctor_validates_without_initialising_modules() {
         .success();
 
     assert!(!db.exists(), "doctor must not open the database");
+}
+
+#[test]
+fn doctor_reports_a_missing_sandbox_backend_with_its_reason() {
+    let dir = TestDir::new("doctor-sandbox");
+    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+
+    let output = bin()
+        .env("PATH", "")
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .expect("doctor");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("sandbox: "))
+        .unwrap_or_else(|| panic!("no sandbox line in {stdout}"));
+    if cfg!(target_os = "linux") {
+        assert_eq!(line, "sandbox: none, bwrap not found: bwrap");
+    } else {
+        assert!(line.starts_with("sandbox: none, "), "{line}");
+    }
 }
 
 #[test]

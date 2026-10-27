@@ -353,7 +353,7 @@ pub enum AsterError {
 | `-m, --model <id>` | 交互、`exec` | 新会话的模型 id（provider 取 `[model] provider`），优先于档案固定的 `model`；续会话时等价于一次 `update_config` 换模型 |
 | `--agent <name>` | 新会话 | 新会话的智能体档案（ADR-0051），覆盖 `default_agent`；未知档案名是配置错误（退出 2），续会话时给出是用法错误（档案随会话创建固定）。准入：Claude Code 有 `--agent`，Codex 的对应物是选配置档的 `-p, --profile` |
 | `--style <name>` | 新会话 | 新会话的输出风格（ADR-0052），覆盖 `output_style`；`exec` 只认此参数、不读 `output_style`；未知风格名是配置错误（退出 2），续会话时给出是用法错误 |
-| `-a, --ask-for-approval <untrusted\|never>` | 交互、`exec` | 审批策略，见 §4.4 |
+| `-a, --ask-for-approval <untrusted\|never\|read-only>` | 交互、`exec` | 审批模式，覆盖 `[approval] default`，见 §4.4 |
 | `-s, --sandbox <read-only\|workspace-write\|full-access>` | 交互、`exec` | 覆盖 `[sandbox] mode` |
 | `-C, --cd <dir>` | 交互、`exec` | 工作根目录（工具根、沙箱可写根、`AGENTS.md` 位置、会话 `cwd` 元数据），默认进程 cwd |
 | `--continue` | 交互、`exec` | 续当前工作根目录下最后活动的会话 |
@@ -385,9 +385,26 @@ pub enum AsterError {
 
 ### 4.4 审批
 
-- `-a untrusted`（默认）：进程内只读工具放行；`SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）与外部工具（MCP，`<id>__<tool>`）执行前问人。`-a never`：从不问人，靠沙箱兜底。优先级 `-a` > `[approval] default` > `untrusted`。
+- 审批模式（ADR-0055）由 CLI 与桌面端共享的 `approval::ApprovalModes` 判断，按会话树记录，切换立即生效：
+
+  | 模式 | `bash` 的沙箱 | 沙箱内的 `bash` | 沙箱外的 `bash` / `write_file` / `edit_file` | MCP 工具 |
+  |---|---|---|---|---|
+  | 只读（`read-only`，桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
+  | 询问（`untrusted`，桌面端 `ask`） | 配置的沙箱 | 允许 | 询问 | 询问 |
+  | 放行（`never`，桌面端 `allow`） | 配置的沙箱 | 允许 | 允许 | 允许 |
+
+  「沙箱外」指没有可用后端，或有效策略为 `FullAccess`（只读模式有后端时总能收紧，所以不算沙箱外）。进程内只读工具（`read_file` / `list_dir` / `grep` / `load_skill`）在各模式下都放行；其他进程内的 `Mutating` 工具（如 `spawn_agent`）与写文件工具同列。收紧在启动 `bash` 时按当前模式写进 `ctx.spawn.sandbox`（`ApprovalModes::environment` 包装会话环境里的 `bash`），所以切到只读时已批准、尚未启动的调用也会收紧；反过来，只读模式下因收紧才放行的调用按调用 id 记下，放宽模式后仍以 `ReadOnly` 启动（ADR-0056，记录只在内存中，重启后按当时的模式）；没有后端时 `ReadOnly` fail closed。MCP stdio 服务按配置的沙箱在加载时启动，模式收紧不到它们。
+- 命令规则（#197，GLOSSARY「命令规则」）：`[approval]` 的 `allow` / `ask` / `deny` 三个字符串列表，CLI 与桌面端共用，在上表的结论之上再判一层（`approval::rules::CommandRules`，可脱离审批模式单独测试）：
+  - 语法：`工具名`（如 `"write_file"`、MCP 工具名）匹配该工具的每次调用；`bash(命令前缀)`（如 `"bash(git push)"`）按命令前缀匹配。只有 `bash` 能带说明，别的工具带说明、括号不配对或说明为空都是配置错误，报出 `approval.<列表>[<序号>]` 与原文（退出码 2）。
+  - 优先级：拒绝 > 询问 > 允许 > 上表结论。拒绝规则把任何结论变成拒绝；询问规则把「允许」变成「询问」（沙箱内也生效，也压过「本会话不再询问」生成的会话级规则），但不把「拒绝」放宽成询问；允许规则只把「询问」变成「允许」，不放宽沙箱，也不改变只读模式下的拒绝。
+  - shell 匹配：命令用 [`brush-parser`](https://crates.io/crates/brush-parser) 按 bash 语法解析，`&&`、`||`、`;`、`|`、子 shell、`{ }`、`if` / `while` 等拆成简单命令；简单命令去掉引号后的词以说明的词为前缀才算命中，以词为单位（`git push` 不匹配 `git pushx`，也不匹配 `git 'push x'`）。拒绝 / 询问对命令词按文件名比较（`/usr/bin/git push` 也命中），并且看得到命令替换 `$(…)` / 反引号里的命令；任一简单命令命中拒绝则拒绝，否则任一命中询问则询问。
+  - 允许要求整条命令每个简单命令都命中允许，并且：能解析、不超过 4096 字节、不含命令替换、进程替换、here-doc / here-string、函数定义、`for` / `case` / `[[ ]]` / 算术等不逐词检查的结构，简单命令不带变量赋值（`PATH=… ls`、`X=1; ls`），不写文件（`>`、`>>` 等重定向到 `/dev/null` 以外的目标）。否则不算命中允许，回到上表结论。
+  - 内置只读命令（不可修改的允许规则）：`cat`、`echo`、`find`、`grep`、`head`、`ls`、`pwd`、`rg`、`tail`、`wc`。不含 `git`（仓库配置能让它执行外部程序）。另外要求每个词都不在运行时展开（`$VAR` 等），不含未加引号的 glob / 花括号（`*`、`?`、`[`、`{`）；`find` 带 `-delete`、`-exec`、`-execdir`、`-ok`、`-okdir`、`-fls`、`-fprint`、`-fprint0`、`-fprintf`，`rg` 带 `--pre`、`--search-zip` 或含 `z` 的短选项时不算命中。用户的拒绝 / 询问规则压过内置允许。内置命令只在结论本来是「询问」时起作用，也就是沙箱外的询问模式。
+  - 会话级规则（#198）：桌面端审批卡片的「本会话不再询问」（`Answer::AllowForSession`，`ApprovalModes::allow_for_session`）给该会话树加允许规则，优先级与配置里的允许规则相同（拒绝 / 询问规则仍压过它）。非 `bash` 工具按工具名允许；`bash` 每个简单命令生成一条前缀规则：命令词起、到第一个不以 `-` 开头的参数为止的词（`npm run test -- --watch` → `bash(npm run)`，`cargo test -p foo` → `bash(cargo test)`，`rm -rf build` → `bash(rm -rf build)`，没有参数时只取命令词），复合命令各取各的、去重。命令不够「平」（无法解析、含命令替换、here-doc 等上文允许规则不逐词检查的结构），或前缀里有运行时展开的词时不生成：卡片上不提供这个按钮，只有允许一次与拒绝。`approvals` 给每个请求附 `session_rules`（要显示的前缀或工具名，不可生成时为 `null`），卡片按它写出「Don't ask again for `npm run …`」。会话级规则只在内存里，按会话树根保存，重启即失；CLI 交互审批没有这一项。
+  - 规则不是安全边界（ADR-0055）：`env git push`、`bash -c "git push"`、`xargs` 等间接执行不会被前缀命中；边界是沙箱。
+- CLI 的 `-a` 与 `[approval] default` 取 `untrusted`（默认）、`never`、`read-only`，桌面端从配置读默认模式时分别对应 `ask` / `allow` / `deny`；优先级 `-a` > `[approval] default` > `untrusted`。CLI 不能中途切换模式。
 - 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
-- "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
+- "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与调用是否在受限沙箱内执行判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
 ### 4.5 交互模式
@@ -493,7 +510,10 @@ model = "claude-fable-5-1"
 # max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
-default = "untrusted"         # untrusted | never
+default = "untrusted"         # untrusted | never | read-only
+deny = ["bash(git push --force)"]   # 命令规则，见 §4.4
+ask = ["bash(git push)"]
+allow = ["bash(cargo test)", "fs__read"]
 ```
 
 - `max_steps_per_turn = 0` 是配置错误（退出码 2）；不设上限靠省略该字段。
