@@ -37,6 +37,9 @@ pub trait Tool: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session: SessionId,
+    /// The root of `session`'s tree, the same as the call's
+    /// `ApprovalRequest::root` (ADR-0039); `session` itself for a root session.
+    pub root: SessionId,
     pub turn: TurnId,
     pub step: StepId,
     pub tool_call_id: ToolCallId,
@@ -53,6 +56,13 @@ impl ToolContext {
         self
     }
 
+    /// The context of a subagent call in the tree rooted at `root`.
+    #[must_use]
+    pub fn with_root(mut self, root: SessionId) -> Self {
+        self.root = root;
+        self
+    }
+
     pub fn new(
         session: SessionId,
         turn: TurnId,
@@ -62,6 +72,7 @@ impl ToolContext {
     ) -> Self {
         Self {
             session,
+            root: session,
             turn,
             step,
             tool_call_id,
