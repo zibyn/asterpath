@@ -393,7 +393,7 @@ pub enum AsterError {
   | 询问（`untrusted`，桌面端 `ask`） | 配置的沙箱 | 允许 | 询问 | 询问 |
   | 放行（`never`，桌面端 `allow`） | 配置的沙箱 | 允许 | 允许 | 允许 |
 
-  「沙箱外」指没有可用后端，或有效策略为 `FullAccess`（只读模式有后端时总能收紧，所以不算沙箱外）。进程内只读工具（`read_file` / `list_dir` / `grep` / `load_skill`）在各模式下都放行；其他进程内的 `Mutating` 工具（如 `spawn_agent`）与写文件工具同列。收紧在启动 `bash` 时按当前模式写进 `ctx.spawn.sandbox`（`ApprovalModes::environment` 包装会话环境里的 `bash`），所以已批准、尚未启动的调用也按切换后的模式执行；没有后端时 `ReadOnly` fail closed。MCP stdio 服务按配置的沙箱在加载时启动，模式收紧不到它们。
+  「沙箱外」指没有可用后端，或有效策略为 `FullAccess`（只读模式有后端时总能收紧，所以不算沙箱外）。进程内只读工具（`read_file` / `list_dir` / `grep` / `load_skill`）在各模式下都放行；其他进程内的 `Mutating` 工具（如 `spawn_agent`）与写文件工具同列。收紧在启动 `bash` 时按当前模式写进 `ctx.spawn.sandbox`（`ApprovalModes::environment` 包装会话环境里的 `bash`），所以切到只读时已批准、尚未启动的调用也会收紧；反过来，只读模式下因收紧才放行的调用按调用 id 记下，放宽模式后仍以 `ReadOnly` 启动（ADR-0056，记录只在内存中，重启后按当时的模式）；没有后端时 `ReadOnly` fail closed。MCP stdio 服务按配置的沙箱在加载时启动，模式收紧不到它们。
 - 命令规则（#197，GLOSSARY「命令规则」）：`[approval]` 的 `allow` / `ask` / `deny` 三个字符串列表，CLI 与桌面端共用，在上表的结论之上再判一层（`approval::rules::CommandRules`，可脱离审批模式单独测试）：
   - 语法：`工具名`（如 `"write_file"`、MCP 工具名）匹配该工具的每次调用；`bash(命令前缀)`（如 `"bash(git push)"`）按命令前缀匹配。只有 `bash` 能带说明，别的工具带说明、括号不配对或说明为空都是配置错误，报出 `approval.<列表>[<序号>]` 与原文（退出码 2）。
   - 优先级：拒绝 > 询问 > 允许 > 上表结论。拒绝规则把任何结论变成拒绝；询问规则把「允许」变成「询问」（沙箱内也生效，也压过「本会话不再询问」生成的会话级规则），但不把「拒绝」放宽成询问；允许规则只把「询问」变成「允许」，不放宽沙箱，也不改变只读模式下的拒绝。

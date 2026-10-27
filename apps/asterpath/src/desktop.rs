@@ -323,11 +323,7 @@ impl Desktop {
             builtin_agents: builtin_agents.clone(),
         };
         // shortcut: no MCP servers yet; they are loaded per work root, which a multi-project process does not have
-        let modes = Arc::new(
-            ApprovalModes::new(settings.approval.into())
-                .with_sandbox(&workspace)
-                .with_rules(settings.rules.clone()),
-        );
+        let modes = Arc::new(ApprovalModes::from_settings(&settings, &workspace));
         let asterpath = config::assemble(&settings, Vec::new(), environment, modes.clone())
             .await
             .map_err(text)?;

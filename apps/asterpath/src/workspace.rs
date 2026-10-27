@@ -81,8 +81,8 @@ pub enum SandboxMode {
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub sandbox: SandboxMode,
-    /// Probed once at startup; without one the effective policy is
-    /// `FullAccess` (ADR-0055).
+    /// Probed once at startup (not by `Default`); without one the effective
+    /// policy is `FullAccess` (ADR-0055).
     pub sandbox_backend: SandboxBackend,
     /// Workspace tools of new sessions, in order; `None` means all of them.
     pub tools: Option<Vec<String>>,
@@ -109,7 +109,8 @@ impl Default for Workspace {
     fn default() -> Self {
         Self {
             sandbox: SandboxMode::default(),
-            sandbox_backend: SandboxBackend::probe(),
+            // Probing spawns bwrap; `Settings::workspace` does it.
+            sandbox_backend: SandboxBackend::Unavailable("not probed".to_owned()),
             tools: None,
             skills_enabled: true,
             skill_paths: Vec::new(),

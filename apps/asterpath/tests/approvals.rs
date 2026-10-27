@@ -391,7 +391,8 @@ async fn a_command_without_a_prefix_cannot_be_allowed_for_the_session() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
-    if let Some(reason) = asterpath_app::workspace::SandboxBackend::probe().unavailable() {
+    let backend = SandboxBackend::probe();
+    if let Some(reason) = backend.unavailable() {
         eprintln!("skipping: {reason}");
         return;
     }
@@ -399,7 +400,11 @@ async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
         ScriptedProvider::new("p"),
         bash("c1", "ls >/dev/null && echo listed; echo hi > c.txt"),
     ));
-    let fixture = fixture(provider, ApprovalMode::Ask).await;
+    let workspace = Workspace {
+        sandbox_backend: backend,
+        ..Workspace::default()
+    };
+    let fixture = fixture_in(provider, ApprovalMode::Ask, workspace).await;
     let id = session(&fixture).await;
     // Switched after the session's environment was resolved: takes effect at once.
     fixture
@@ -656,6 +661,11 @@ fn allow_for_session_offers_a_prefix_per_simple_command() {
     assert_eq!(offer("echo $(rm x)"), None);
     assert_eq!(offer("$CMD run"), None);
     assert_eq!(offer("if"), None);
+    // No prefix rule could match these again (#198).
+    assert_eq!(offer("ls > out.txt"), None);
+    assert_eq!(offer("FOO=1 npm test"), None);
+    assert_eq!(offer("rm *.o"), None);
+    assert_eq!(offer("cargo fmt *.rs"), words(&["cargo fmt"]));
     assert_eq!(
         ApprovalModes::session_rules(&request(root, root, "write_file")),
         words(&["write_file"])
@@ -682,4 +692,84 @@ fn allowing_a_command_for_the_session_allows_its_prefix() {
         ApprovalVerdict::Ask
     );
     assert!(!modes.allow_for_session(&bash_request(root, "echo $(npm run x)")));
+}
+
+/// The sandbox policy `bash` gets when `modes`' environment runs call `call`
+/// in the tree rooted at `root`.
+async fn spawned_with(
+    modes: &Arc<ApprovalModes>,
+    root: SessionId,
+    call: ToolCallId,
+) -> Option<asterpath_protocol::SandboxPolicy> {
+    use asterpath_protocol::{
+        CancelToken, EnvironmentAdapter, EnvironmentError, SessionEnvironment, SpawnEnv, ToolArgs,
+        ToolContext, ToolDescriptor, ToolOutput,
+    };
+    use futures_util::future::BoxFuture;
+    use std::sync::Mutex;
+
+    struct Bash(Arc<dyn asterpath_protocol::Tool>);
+    impl EnvironmentAdapter for Bash {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a std::collections::BTreeMap<String, String>,
+        ) -> BoxFuture<'a, Result<SessionEnvironment, EnvironmentError>> {
+            let tool = self.0.clone();
+            Box::pin(async move { Ok(SessionEnvironment::new(vec![tool], SpawnEnv::default())) })
+        }
+    }
+    let seen = Arc::new(Mutex::new(None));
+    let record = seen.clone();
+    let descriptor = ToolDescriptor::new(
+        ToolName::new("bash"),
+        String::new(),
+        serde_json::json!({"type": "object"}),
+    );
+    let tool = asterpath_testing::TestTool::new(descriptor, Arc::default(), move |_, ctx| {
+        *record.lock().unwrap() = ctx.spawn.sandbox;
+        Box::pin(async { Ok(ToolOutput::new(Vec::new())) })
+    });
+    let environment = modes
+        .environment(Arc::new(Bash(tool)))
+        .resolve(&Default::default())
+        .await
+        .unwrap();
+    let ctx = ToolContext::new(
+        root,
+        TurnId::from_bytes([3; 16]),
+        StepId::from_bytes([4; 16]),
+        call,
+        CancelToken::new(),
+    );
+    environment.tools[0]
+        .invoke(ToolArgs::new("{}"), ctx)
+        .await
+        .unwrap();
+    seen.lock().unwrap().take()
+}
+
+/// A `full-access` bash call allowed only because read-only mode confines
+/// it stays confined when the mode is loosened before it spawns (#193).
+#[tokio::test]
+async fn a_call_allowed_for_the_read_only_cap_stays_confined_after_a_switch() {
+    use asterpath_protocol::SandboxPolicy;
+    let root = SessionId::from_bytes([1; 16]);
+    let modes = Arc::new(
+        ApprovalModes::new(ApprovalMode::Ask)
+            .with_sandbox(&workspace(SandboxMode::FullAccess, true)),
+    );
+    modes.set_mode(root, ApprovalMode::Deny);
+    let approved = request(root, root, "bash");
+    assert_eq!(modes.classify(&approved), ApprovalVerdict::Allow);
+
+    modes.set_mode(root, ApprovalMode::Ask);
+    assert_eq!(
+        spawned_with(&modes, root, approved.tool_call_id).await,
+        Some(SandboxPolicy::ReadOnly)
+    );
+    // Only that call: the next one runs as the mode now says.
+    assert_eq!(
+        spawned_with(&modes, root, approved.tool_call_id).await,
+        None
+    );
 }
