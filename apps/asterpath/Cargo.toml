@@ -39,6 +39,7 @@ asterpath-mcp = { path = "../../crates/asterpath-mcp" }
 asterpath-protocol = { path = "../../crates/asterpath-protocol" }
 asterpath-skills = { path = "../../crates/asterpath-skills" }
 asterpath-tools = { path = "../../crates/asterpath-tools" }
+brush-parser = "0.4"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

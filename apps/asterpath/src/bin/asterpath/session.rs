@@ -217,7 +217,9 @@ pub async fn open(
         .await
         .map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);
-    let approval = ApprovalModes::new(settings.approval.into()).with_sandbox(&workspace);
+    let approval = ApprovalModes::new(settings.approval.into())
+        .with_sandbox(&workspace)
+        .with_rules(settings.rules.clone());
     let environment = WorkRoot {
         workspace,
         new_session: false,
@@ -334,7 +336,9 @@ async fn create(
     let mcp = load_mcp(&workspace, root).await.map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);
     spec.request.output_format = output_format;
-    let approval = ApprovalModes::new(settings.approval.into()).with_sandbox(&workspace);
+    let approval = ApprovalModes::new(settings.approval.into())
+        .with_sandbox(&workspace)
+        .with_rules(settings.rules.clone());
     let environment = WorkRoot {
         workspace,
         new_session: true,

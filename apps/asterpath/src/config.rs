@@ -26,6 +26,7 @@ use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
 use crate::approval::ApprovalModes;
+use crate::approval::rules::CommandRules;
 use crate::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace, WorkspaceError};
 
 /// `-a` and `[approval] default`.
@@ -47,6 +48,8 @@ pub enum ApprovalMode {
 pub struct Settings {
     pub db: PathBuf,
     pub approval: ApprovalMode,
+    /// `[approval]`'s `allow` / `ask` / `deny` (#197).
+    pub rules: CommandRules,
     pub file: FileConfig,
     /// The file read, or the default path; `None` without a home directory.
     pub path: Option<PathBuf>,
@@ -113,12 +116,16 @@ fn from_table(table: toml::Table, path: Option<PathBuf>) -> Result<Settings, Wor
         .try_into()
         .map_err(|error| WorkspaceError::Config(format!("invalid config: {error}")))?;
 
+    let section = &file.approval;
+    let rules = CommandRules::new(&section.allow, &section.ask, &section.deny)
+        .map_err(|error| WorkspaceError::Config(format!("invalid config: {error}")))?;
     let db = expand_tilde(file.storage.path.clone().unwrap_or_else(default_db));
     // Absolute now: the work root may change the process directory later.
     let db = std::path::absolute(&db).unwrap_or(db);
     Ok(Settings {
         db,
         approval: file.approval.default.unwrap_or_default(),
+        rules,
         file,
         path,
     })
@@ -150,6 +157,11 @@ pub const TEMPLATE: &str = r#"# asterpath configuration. Uncomment and edit; `as
 # never:     nothing asks; the sandbox is the only guard
 # read-only: bash runs in a read-only sandbox; calls outside it are denied
 # default = "untrusted"           # untrusted | never | read-only
+# Command rules: `tool` or `bash(command prefix)`; deny > ask > allow.
+# Deny and ask hold inside the sandbox too; allow only skips a question.
+# deny = ["bash(git push --force)"]
+# ask = ["bash(git push)"]        # the sandbox does not stop the network
+# allow = ["bash(cargo test)"]
 "#;
 
 /// Write [`TEMPLATE`] at `path`: the directory `0700`, the file `0600` (Unix).
@@ -1089,6 +1101,9 @@ struct SubagentSection {
 #[serde(default, deny_unknown_fields)]
 struct ApprovalSection {
     default: Option<ApprovalMode>,
+    allow: Vec<String>,
+    ask: Vec<String>,
+    deny: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
