@@ -3,13 +3,13 @@
 //! what may run outside it; the mode also caps the sandbox, read-only
 //! tightening `bash` to `ReadOnly`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, EnvironmentAdapter, EnvironmentError,
     Provenance, SandboxPolicy, SessionEnvironment, SessionId, SideEffect, Tool, ToolArgs,
-    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    ToolContext, ToolDescriptor, ToolError, ToolOutput,
 };
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -52,11 +52,13 @@ impl From<config::ApprovalMode> for ApprovalMode {
 #[derive(Default)]
 struct TreeApprovals {
     mode: Option<ApprovalMode>,
-    allowed: BTreeSet<ToolName>,
+    /// The configured rules plus what was allowed for the session, once
+    /// something was.
+    rules: Option<CommandRules>,
 }
 
-/// The application's approval policy: each session tree's mode and the
-/// tools allowed for it, keyed by the root so subagents follow their tree;
+/// The application's approval policy: each session tree's mode and what
+/// was allowed for it, keyed by the root so subagents follow their tree;
 /// in memory only (ADR-0035), so a restart asks again.
 pub struct ApprovalModes {
     default: ApprovalMode,
@@ -108,13 +110,22 @@ impl ApprovalModes {
         lock(&self.trees).entry(root).or_default().mode = Some(mode);
     }
 
-    /// Stop asking for `tool` anywhere in the tree rooted at `root`.
-    pub fn allow(&self, root: SessionId, tool: ToolName) {
+    /// What [`Self::allow_for_session`] would allow for `request`, as
+    /// [`rules::session_rules`] shows it; `None` when it cannot.
+    pub fn session_rules(request: &ApprovalRequest) -> Option<Vec<String>> {
+        rules::session_rules(request.tool.as_str(), request.args.as_str())
+    }
+
+    /// Stop asking anywhere in `request`'s tree for its tool, or for `bash`
+    /// its commands' prefixes; ranked as configured allow rules, so deny and
+    /// ask rules still win. False when there is nothing to allow.
+    pub fn allow_for_session(&self, request: &ApprovalRequest) -> bool {
         lock(&self.trees)
-            .entry(root)
+            .entry(request.root)
             .or_default()
-            .allowed
-            .insert(tool);
+            .rules
+            .get_or_insert_with(|| self.rules.clone())
+            .allow_for_session(request.tool.as_str(), request.args.as_str())
     }
 
     /// `inner` with its `bash` started under the tree's mode: `ReadOnly` in
@@ -137,22 +148,18 @@ impl ApprovalModes {
 
 impl ApprovalPolicy for ApprovalModes {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        let mode = self.mode(request.root);
-        let rule = self
-            .rules
-            .matches(request.tool.as_str(), request.args.as_str());
-        match verdict(mode, self.sandboxed(mode), rule, request) {
-            // An ask rule outranks what the session allowed.
-            ApprovalVerdict::Ask
-                if rule != Some(RuleKind::Ask)
-                    && lock(&self.trees)
-                        .get(&request.root)
-                        .is_some_and(|tree| tree.allowed.contains(&request.tool)) =>
-            {
-                ApprovalVerdict::Allow
-            }
-            verdict => verdict,
-        }
+        let (mode, rule) = {
+            let trees = lock(&self.trees);
+            let tree = trees.get(&request.root);
+            let rules = tree
+                .and_then(|tree| tree.rules.as_ref())
+                .unwrap_or(&self.rules);
+            (
+                tree.and_then(|tree| tree.mode).unwrap_or(self.default),
+                rules.matches(request.tool.as_str(), request.args.as_str()),
+            )
+        };
+        verdict(mode, self.sandboxed(mode), rule, request)
     }
 }
 

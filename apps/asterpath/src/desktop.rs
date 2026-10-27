@@ -143,12 +143,23 @@ pub enum Access {
     Elsewhere,
 }
 
+/// A waiting approval request and what its card offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingApproval {
+    #[serde(flatten)]
+    pub request: ApprovalRequest,
+    /// What [`Answer::AllowForSession`] allows ([`ApprovalModes::session_rules`]);
+    /// `None`: the card does not offer it.
+    pub session_rules: Option<Vec<String>>,
+}
+
 /// The user's answer on an approval card.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Answer {
     AllowOnce,
-    /// Allow, and stop asking for this tool in this session.
+    /// Allow, and stop asking in this session tree for the tool, or for
+    /// `bash` the command's prefixes.
     AllowForSession,
     /// The reason is sent to the model.
     Deny {
@@ -642,8 +653,16 @@ impl Desktop {
 
     /// The approval requests waiting in `session`'s tree, its subagents'
     /// included; each names the session to answer it on.
-    pub fn approvals(&self, session: SessionId) -> Vec<ApprovalRequest> {
-        self.asterpath.approval_gate().pending_in(session)
+    pub fn approvals(&self, session: SessionId) -> Vec<PendingApproval> {
+        self.asterpath
+            .approval_gate()
+            .pending_in(session)
+            .into_iter()
+            .map(|request| PendingApproval {
+                session_rules: ApprovalModes::session_rules(&request),
+                request,
+            })
+            .collect()
     }
 
     /// Answer the request `call` of `session` (the request's own session).
@@ -663,7 +682,9 @@ impl Desktop {
                     .into_iter()
                     .find(|request| request.session == session && request.tool_call_id == call)
                     .ok_or("the request is no longer waiting")?;
-                self.modes.allow(request.root, request.tool);
+                if !self.modes.allow_for_session(&request) {
+                    return Err("this command cannot be allowed for the session".to_owned());
+                }
                 ApprovalDecision::Allow
             }
             Answer::Deny { reason } => ApprovalDecision::Deny { reason },

@@ -76,6 +76,8 @@ export interface ApprovalRequest {
   /** The arguments as a JSON string. */
   args: string;
   side_effect: "ReadOnly" | "Mutating";
+  /** What "allow for session" allows: the tool, or bash command prefixes; null when not offered. */
+  session_rules: string[] | null;
 }
 
 /** The waiting requests of a session's tree. */

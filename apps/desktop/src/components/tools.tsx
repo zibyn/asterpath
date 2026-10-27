@@ -92,7 +92,7 @@ export function ToolCallView({ call, detail }: { call: ToolCall; detail: Detail 
   );
 }
 
-/** Allow once, allow the tool for the session, or deny with a reason the model sees. */
+/** Allow once, allow the tool (bash: the command prefixes) for the session when offered, or deny with a reason the model sees. */
 export function ApprovalCard({
   request,
   onAnswer,
@@ -137,9 +137,19 @@ export function ApprovalCard({
           <Button size="sm" disabled={pending} onClick={() => onAnswer({ kind: "allow_once" })}>
             Allow once
           </Button>
-          <Button size="sm" variant="outline" disabled={pending} onClick={() => onAnswer({ kind: "allow_for_session" })}>
-            Allow {request.tool} for this session
-          </Button>
+          {request.session_rules && (
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => onAnswer({ kind: "allow_for_session" })}>
+              {request.tool === "bash" ? (
+                <>
+                  Don't ask again for{" "}
+                  <span className="font-mono">{request.session_rules.map((prefix) => `${prefix} …`).join(", ")}</span> this
+                  session
+                </>
+              ) : (
+                <>Allow {request.tool} for this session</>
+              )}
+            </Button>
+          )}
           <Button size="sm" variant="ghost" disabled={pending} onClick={() => setDenying(true)}>
             Deny…
           </Button>

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asterpath::Asterpath;
-use asterpath_app::desktop::{Answer, ApprovalMode, ApprovalModes, Desktop};
+use asterpath_app::desktop::{Answer, ApprovalMode, ApprovalModes, Desktop, PendingApproval};
 use asterpath_app::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace};
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, JsonString, ModelRequest, Part,
@@ -27,6 +27,15 @@ struct Fixture {
 /// A desktop whose sessions have `read_file`, `write_file` and `bash`, the scripted
 /// replies on `p`, and `default` as every session's starting mode.
 async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
+    fixture_in(provider, default, Workspace::default()).await
+}
+
+/// [`fixture`] with `workspace`'s sandbox.
+async fn fixture_in(
+    provider: ScriptedProvider,
+    default: ApprovalMode,
+    workspace: Workspace,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let workspace = Workspace {
@@ -36,7 +45,7 @@ async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
             "bash".to_owned(),
         ]),
         skills_enabled: false,
-        ..Workspace::default()
+        ..workspace
     };
     let provider = Arc::new(provider);
     let modes = Arc::new(ApprovalModes::new(default).with_sandbox(&workspace));
@@ -97,7 +106,7 @@ fn end(provider: ScriptedProvider) -> ScriptedProvider {
 }
 
 /// The session's waiting approvals, once there is one.
-async fn asked(desktop: &Desktop, session: SessionId) -> Vec<ApprovalRequest> {
+async fn asked(desktop: &Desktop, session: SessionId) -> Vec<PendingApproval> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let pending = desktop.approvals(session);
@@ -169,12 +178,12 @@ async fn a_file_write_waits_for_the_card_and_runs_once_allowed() {
     fixture.desktop.send(id, "write".to_owned()).await.unwrap();
     let pending = asked(&fixture.desktop, id).await;
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].tool.as_str(), "write_file");
+    assert_eq!(pending[0].request.tool.as_str(), "write_file");
     fixture
         .desktop
         .approve(
-            pending[0].session,
-            pending[0].tool_call_id,
+            pending[0].request.session,
+            pending[0].request.tool_call_id,
             Answer::AllowOnce,
         )
         .await
@@ -204,8 +213,8 @@ async fn a_denial_s_reason_reaches_the_model() {
     fixture
         .desktop
         .approve(
-            pending[0].session,
-            pending[0].tool_call_id,
+            pending[0].request.session,
+            pending[0].request.tool_call_id,
             Answer::Deny {
                 reason: Some("use b.txt instead".to_owned()),
             },
@@ -233,8 +242,8 @@ async fn allowing_a_tool_for_the_session_stops_asking_for_it() {
     fixture
         .desktop
         .approve(
-            pending[0].session,
-            pending[0].tool_call_id,
+            pending[0].request.session,
+            pending[0].request.tool_call_id,
             Answer::AllowForSession,
         )
         .await
@@ -299,6 +308,82 @@ fn bash(call: &str, command: &str) -> Vec<Item> {
         raw_args: JsonString::new(serde_json::json!({ "command": command }).to_string()),
         raw: None,
     }]
+}
+
+/// Allowing a command for the session offers and allows its prefix:
+/// `true run test` stops asking for `true run lint`, not for `true x`.
+#[tokio::test]
+async fn allowing_a_command_for_the_session_stops_asking_for_its_prefix() {
+    let provider = ScriptedProvider::new("p");
+    let provider = tool_use(provider, bash("c1", "true run test"));
+    let provider = tool_use(provider, bash("c2", "true run lint"));
+    let provider = end(tool_use(provider, bash("c3", "true x")));
+    let fixture = fixture_in(
+        provider,
+        ApprovalMode::Ask,
+        workspace(SandboxMode::WorkspaceWrite, false),
+    )
+    .await;
+    let id = session(&fixture).await;
+
+    fixture.desktop.send(id, "run".to_owned()).await.unwrap();
+    let pending = asked(&fixture.desktop, id).await;
+    assert_eq!(pending[0].session_rules, Some(vec!["true run".to_owned()]));
+    fixture
+        .desktop
+        .approve(
+            pending[0].request.session,
+            pending[0].request.tool_call_id,
+            Answer::AllowForSession,
+        )
+        .await
+        .unwrap();
+
+    // The next card is the third call's: the second ran without asking.
+    let next = loop {
+        let pending = asked(&fixture.desktop, id).await;
+        if pending[0].request.args.as_str() != bash_args("true run test") {
+            break pending;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(next[0].request.args.as_str(), bash_args("true x"));
+}
+
+fn bash_args(command: &str) -> String {
+    serde_json::json!({ "command": command }).to_string()
+}
+
+/// A command with a substitution gives no prefix, so the card offers no
+/// "allow for session" and the answer is refused.
+#[tokio::test]
+async fn a_command_without_a_prefix_cannot_be_allowed_for_the_session() {
+    let provider = end(tool_use(
+        ScriptedProvider::new("p"),
+        bash("c1", "echo $(true)"),
+    ));
+    let fixture = fixture_in(
+        provider,
+        ApprovalMode::Ask,
+        workspace(SandboxMode::WorkspaceWrite, false),
+    )
+    .await;
+    let id = session(&fixture).await;
+
+    fixture.desktop.send(id, "run".to_owned()).await.unwrap();
+    let pending = asked(&fixture.desktop, id).await;
+    assert_eq!(pending[0].session_rules, None);
+    assert!(
+        fixture
+            .desktop
+            .approve(
+                pending[0].request.session,
+                pending[0].request.tool_call_id,
+                Answer::AllowForSession,
+            )
+            .await
+            .is_err()
+    );
 }
 
 /// Read-only mode runs bash in a `ReadOnly` sandbox instead of denying it
@@ -421,7 +506,7 @@ fn a_subagent_follows_its_tree_s_mode_and_allowances() {
     let child = SessionId::from_bytes([2; 16]);
     let modes = ApprovalModes::new(ApprovalMode::Ask);
 
-    modes.allow(root, ToolName::new("write_file"));
+    assert!(modes.allow_for_session(&request(child, root, "write_file")));
     assert_eq!(
         modes.classify(&request(child, root, "write_file")),
         ApprovalVerdict::Allow
@@ -538,9 +623,63 @@ fn allow_rules_turn_ask_into_allow_outside_the_sandbox() {
 fn an_ask_rule_beats_a_session_allowance() {
     let root = SessionId::from_bytes([1; 16]);
     let modes = with_rules(true, &[], &["bash(git push)"], &[]);
-    modes.allow(root, ToolName::new("bash"));
+    assert!(modes.allow_for_session(&bash_request(root, "git push")));
     assert_eq!(command(&modes, ApprovalMode::Ask, "git push"), "ask");
 
     let none = with_rules(false, &[], &["bash(git push)"], &[]);
+    assert!(none.allow_for_session(&bash_request(root, "git push")));
     assert_eq!(command(&none, ApprovalMode::Deny, "git push"), "deny");
+}
+
+fn bash_request(root: SessionId, command: &str) -> ApprovalRequest {
+    let mut request = request(root, root, "bash");
+    request.args = JsonString::new(serde_json::json!({ "command": command }).to_string());
+    request
+}
+
+/// What "allow for session" offers: each simple command's words up to its
+/// first non-option argument; the tool for other tools; nothing for a
+/// command it cannot read.
+#[test]
+fn allow_for_session_offers_a_prefix_per_simple_command() {
+    let root = SessionId::from_bytes([1; 16]);
+    let offer = |command: &str| ApprovalModes::session_rules(&bash_request(root, command));
+    let words = |list: &[&str]| Some(list.iter().map(|word| (*word).to_owned()).collect());
+    assert_eq!(offer("npm run test -- --watch"), words(&["npm run"]));
+    assert_eq!(offer("cargo test -p foo"), words(&["cargo test"]));
+    assert_eq!(offer("rm -rf build"), words(&["rm -rf build"]));
+    assert_eq!(offer("make"), words(&["make"]));
+    assert_eq!(
+        offer("cargo build && npm run lint | tee; npm run x"),
+        words(&["cargo build", "npm run", "tee"])
+    );
+    assert_eq!(offer("echo $(rm x)"), None);
+    assert_eq!(offer("$CMD run"), None);
+    assert_eq!(offer("if"), None);
+    assert_eq!(
+        ApprovalModes::session_rules(&request(root, root, "write_file")),
+        words(&["write_file"])
+    );
+}
+
+/// A command allowed for the session stops asking for its prefix only, in
+/// its tree only; an ask rule still wins.
+#[test]
+fn allowing_a_command_for_the_session_allows_its_prefix() {
+    use ApprovalMode::Ask;
+    let root = SessionId::from_bytes([1; 16]);
+    let modes = with_rules(false, &["bash(cargo test)"], &["bash(npm run deploy)"], &[]);
+    assert!(modes.allow_for_session(&bash_request(root, "npm run test")));
+    assert_eq!(command(&modes, Ask, "npm run lint"), "allow");
+    assert_eq!(command(&modes, Ask, "npm run lint && cargo test"), "allow");
+    assert_eq!(command(&modes, Ask, "rm -rf build"), "ask");
+    assert_eq!(command(&modes, Ask, "npm run lint; rm x"), "ask");
+    assert_eq!(command(&modes, Ask, "npm run deploy"), "ask");
+
+    let other = SessionId::from_bytes([9; 16]);
+    assert_eq!(
+        modes.classify(&bash_request(other, "npm run lint")),
+        ApprovalVerdict::Ask
+    );
+    assert!(!modes.allow_for_session(&bash_request(root, "echo $(npm run x)")));
 }
