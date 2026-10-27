@@ -385,9 +385,18 @@ pub enum AsterError {
 
 ### 4.4 审批
 
-- `-a untrusted`（默认）：进程内只读工具放行；`SideEffect::Mutating` 工具（`write_file` / `edit_file` / `bash`）与外部工具（MCP，`<id>__<tool>`）执行前问人。`-a never`：从不问人，靠沙箱兜底。优先级 `-a` > `[approval] default` > `untrusted`。
+- 审批模式（ADR-0055）由 CLI 与桌面端共享的 `approval::ApprovalModes` 判断，按会话树记录，切换立即生效：
+
+  | 模式 | `bash` 的沙箱 | 沙箱内的 `bash` | 沙箱外的 `bash` / `write_file` / `edit_file` | MCP 工具 |
+  |---|---|---|---|---|
+  | 只读（桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
+  | 询问（`untrusted`，桌面端 `ask`） | 配置的沙箱 | 允许 | 询问 | 询问 |
+  | 放行（`never`，桌面端 `allow`） | 配置的沙箱 | 允许 | 允许 | 允许 |
+
+  「沙箱外」指没有可用后端，或有效策略为 `FullAccess`（只读模式有后端时总能收紧，所以不算沙箱外）。进程内只读工具（`read_file` / `list_dir` / `grep` / `load_skill`）在各模式下都放行；其他进程内的 `Mutating` 工具（如 `spawn_agent`）与写文件工具同列。收紧在启动 `bash` 时按当前模式写进 `ctx.spawn.sandbox`（`ApprovalModes::environment` 包装会话环境里的 `bash`），所以已批准、尚未启动的调用也按切换后的模式执行；没有后端时 `ReadOnly` fail closed。MCP stdio 服务按配置的沙箱在加载时启动，模式收紧不到它们。
+- CLI 现在只有 `-a untrusted`（默认）与 `-a never`；优先级 `-a` > `[approval] default` > `untrusted`。
 - 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
-- "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与重放类别判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
+- "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与调用是否在受限沙箱内执行判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
 ### 4.5 交互模式

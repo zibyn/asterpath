@@ -18,24 +18,24 @@ use asterpath_mcp::{
     ADAPTER_PROTOCOL_VERSIONS, McpServerConfig, McpTimeouts, McpTransport, ServerId,
 };
 use asterpath_protocol::{
-    ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, ContextPolicy,
-    DefaultApprovalPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderCatalog, ProviderId,
-    ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SideEffect, SubagentConfig,
+    CompactionConfig, ContextPolicy, ModelAlias, ModelId, ModelSpec, Provider, ProviderCatalog,
+    ProviderId, ReasoningEffort, ReasoningParams, RequestConfig, SamplingParams, SubagentConfig,
     Tool, ToolChoice, ToolConfig, ToolName, TurnConfig,
 };
 use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
+use crate::approval::ApprovalModes;
 use crate::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace, WorkspaceError};
 
 /// `-a` and `[approval] default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
-    /// Read-only in-process tools run; mutating and external tools ask.
+    /// Calls outside the sandbox and external tools ask (ADR-0055).
     #[default]
     Untrusted,
-    /// Never ask; the sandbox is the only guard.
+    /// Never ask; the sandbox, if any, is the only guard.
     Never,
 }
 
@@ -461,15 +461,15 @@ pub fn tool_config(settings: &Settings) -> ToolConfig {
 }
 
 /// The composition root: providers, storage and limits from `settings`,
-/// `tools` for every session, `environment` per session and `approval` (the
-/// CLI's is [`approval_policy`] of `settings.approval`). No approval
+/// `tools` for every session, `environment` per session with its `bash`
+/// capped by `approval`, and `approval` as the policy. No approval
 /// endpoint is registered here: an application that can ask registers one around
 /// its drive.
 pub async fn assemble(
     settings: &Settings,
     tools: Vec<Arc<dyn Tool>>,
     environment: WorkRoot,
-    approval: Arc<dyn ApprovalPolicy>,
+    approval: Arc<ApprovalModes>,
 ) -> Result<Asterpath, AsterError> {
     let config_error = |message: String| AsterError::Config { message };
     let providers = providers(settings).map_err(|error| config_error(error.to_string()))?;
@@ -483,7 +483,7 @@ pub async fn assemble(
         .database(&settings.db)
         .providers(providers)
         .tools(tools)
-        .environment(Arc::new(environment))
+        .environment(approval.environment(Arc::new(environment)))
         .tool(tool_config(settings))
         .max_live_children(max_live_children(settings))
         .model_aliases(model_aliases(settings))
@@ -501,35 +501,6 @@ pub fn create_db_dir(settings: &Settings) -> Result<(), AsterError> {
             settings.db.display()
         )))
     })
-}
-
-/// `untrusted` asks for every `Mutating` tool and otherwise keeps the
-/// framework default (in-process allowed, external asked); the pipeline
-/// denies `Ask` when no endpoint is open. `never` allows everything.
-pub fn approval_policy(mode: ApprovalMode) -> Arc<dyn ApprovalPolicy> {
-    match mode {
-        ApprovalMode::Untrusted => Arc::new(AskMutating(DefaultApprovalPolicy)),
-        ApprovalMode::Never => Arc::new(FixedApproval(ApprovalVerdict::Allow)),
-    }
-}
-
-struct AskMutating(DefaultApprovalPolicy);
-
-impl ApprovalPolicy for AskMutating {
-    fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        match request.side_effect {
-            SideEffect::Mutating => ApprovalVerdict::Ask,
-            _ => self.0.classify(request),
-        }
-    }
-}
-
-struct FixedApproval(ApprovalVerdict);
-
-impl ApprovalPolicy for FixedApproval {
-    fn classify(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
-        self.0.clone()
-    }
 }
 
 /// A secret-looking field anywhere but `providers.<id>.api_key`.

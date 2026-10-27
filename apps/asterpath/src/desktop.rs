@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub use crate::approval::{ApprovalMode, ApprovalModes};
 use crate::config::{self, KeySource, Settings, SetupChoice};
 use crate::workspace::{
     AGENT, CWD, NAME, STYLE, WorkRoot, Workspace, agent_profiles, find_style, in_root, load_agent,
@@ -14,10 +15,10 @@ use crate::workspace::{
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalVerdict,
-    CatalogEntry, Clock, ConfigPatch, EnvironmentAdapter, InputId, ModelSpec, Part, SessionEvent,
-    SessionSpec, SideEffect, StorageError, SystemClock, ToolCallId, ToolName, ToolSelection,
-    UsageScope, UserInput, decode_entry, effective_config, root_of, scan_all, unique_bytes,
+    AgentEvent, ApprovalDecision, ApprovalGate, ApprovalRequest, CatalogEntry, Clock, ConfigPatch,
+    EnvironmentAdapter, InputId, ModelSpec, Part, SessionEvent, SessionSpec, StorageError,
+    SystemClock, ToolCallId, ToolSelection, UsageScope, UserInput, decode_entry, effective_config,
+    root_of, scan_all, unique_bytes,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -142,31 +143,6 @@ pub enum Access {
     Elsewhere,
 }
 
-/// The composer's approval mode: what a session tree's mutating tool calls
-/// get from the approval policy. The sandbox is `config.toml`'s in every
-/// mode; `Deny` keeps a tree read-only because every in-process tool that
-/// writes or runs a process (`bash` included) declares itself mutating.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalMode {
-    /// Mutating tools are denied; external tools still ask.
-    Deny,
-    /// Mutating and external tools ask (`config.toml`'s `untrusted`).
-    #[default]
-    Ask,
-    /// Nothing asks (`never`).
-    Allow,
-}
-
-impl From<config::ApprovalMode> for ApprovalMode {
-    fn from(mode: config::ApprovalMode) -> Self {
-        match mode {
-            config::ApprovalMode::Untrusted => Self::Ask,
-            config::ApprovalMode::Never => Self::Allow,
-        }
-    }
-}
-
 /// The user's answer on an approval card.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -178,72 +154,6 @@ pub enum Answer {
     Deny {
         reason: Option<String>,
     },
-}
-
-#[derive(Default)]
-struct TreeApprovals {
-    mode: Option<ApprovalMode>,
-    allowed: BTreeSet<ToolName>,
-}
-
-/// The desktop's approval policy: each session tree's mode and the tools
-/// allowed for it, keyed by the root so subagents follow their tree; in
-/// memory only (ADR-0035), so a restart asks again.
-pub struct ApprovalModes {
-    default: ApprovalMode,
-    asks_mutating: Arc<dyn ApprovalPolicy>,
-    trees: Mutex<HashMap<SessionId, TreeApprovals>>,
-}
-
-impl ApprovalModes {
-    pub fn new(default: ApprovalMode) -> Self {
-        Self {
-            default,
-            asks_mutating: config::approval_policy(config::ApprovalMode::Untrusted),
-            trees: Mutex::default(),
-        }
-    }
-
-    /// The mode of the tree rooted at `root`.
-    pub fn mode(&self, root: SessionId) -> ApprovalMode {
-        lock(&self.trees)
-            .get(&root)
-            .and_then(|tree| tree.mode)
-            .unwrap_or(self.default)
-    }
-
-    pub fn set_mode(&self, root: SessionId, mode: ApprovalMode) {
-        lock(&self.trees).entry(root).or_default().mode = Some(mode);
-    }
-
-    /// Stop asking for `tool` anywhere in the tree rooted at `root`.
-    pub fn allow(&self, root: SessionId, tool: ToolName) {
-        lock(&self.trees)
-            .entry(root)
-            .or_default()
-            .allowed
-            .insert(tool);
-    }
-}
-
-impl ApprovalPolicy for ApprovalModes {
-    fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        let allowed = lock(&self.trees)
-            .get(&request.root)
-            .is_some_and(|tree| tree.allowed.contains(&request.tool));
-        match self.mode(request.root) {
-            ApprovalMode::Allow => ApprovalVerdict::Allow,
-            ApprovalMode::Deny if matches!(request.side_effect, SideEffect::Mutating) => {
-                ApprovalVerdict::Deny {
-                    reason: Some("the session is read-only".to_owned()),
-                }
-            }
-            _ => match self.asks_mutating.classify(request) {
-                ApprovalVerdict::Ask if allowed => ApprovalVerdict::Allow,
-                verdict => verdict,
-            },
-        }
-    }
 }
 
 /// A provider the settings page offers, with where its key comes from.
@@ -402,7 +312,7 @@ impl Desktop {
             builtin_agents: builtin_agents.clone(),
         };
         // shortcut: no MCP servers yet; they are loaded per work root, which a multi-project process does not have
-        let modes = Arc::new(ApprovalModes::new(settings.approval.into()));
+        let modes = Arc::new(ApprovalModes::new(settings.approval.into()).with_sandbox(&workspace));
         let asterpath = config::assemble(&settings, Vec::new(), environment, modes.clone())
             .await
             .map_err(text)?;

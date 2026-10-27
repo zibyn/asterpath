@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use asterpath::Asterpath;
 use asterpath_app::desktop::{Answer, ApprovalMode, ApprovalModes, Desktop};
-use asterpath_app::workspace::{WorkRoot, Workspace};
+use asterpath_app::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace};
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, Item, JsonString, ModelRequest, Part,
     Provenance, Provider, ReplaySafety, Role, SessionId, SideEffect, StepId, StopReason,
-    ToolCallId, ToolName, TurnId, Usage,
+    ToolCallId, ToolName, TransportKind, TurnId, Usage,
 };
 use asterpath_testing::ScriptedProvider;
 use common::template;
@@ -39,16 +39,16 @@ async fn fixture(provider: ScriptedProvider, default: ApprovalMode) -> Fixture {
         ..Workspace::default()
     };
     let provider = Arc::new(provider);
-    let modes = Arc::new(ApprovalModes::new(default));
+    let modes = Arc::new(ApprovalModes::new(default).with_sandbox(&workspace));
     let asterpath = Asterpath::builder()
         .database(root.join("asterpath.db"))
         .providers(vec![provider.clone() as Arc<dyn Provider>])
-        .environment(Arc::new(WorkRoot {
+        .environment(modes.environment(Arc::new(WorkRoot {
             workspace: workspace.clone(),
             new_session: false,
             pinned: None,
             builtin_agents: None,
-        }))
+        })))
         .approval(modes.clone())
         .build()
         .await
@@ -301,22 +301,32 @@ fn bash(call: &str, command: &str) -> Vec<Item> {
     }]
 }
 
+/// Read-only mode runs bash in a `ReadOnly` sandbox instead of denying it
+/// (ADR-0055): reads work, writes fail inside the command.
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn deny_mode_denies_bash_too() {
+async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
+    if let Some(reason) = asterpath_app::workspace::SandboxBackend::probe().unavailable() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
     let provider = end(tool_use(
         ScriptedProvider::new("p"),
-        bash("c1", "echo hi > c.txt"),
+        bash("c1", "ls >/dev/null && echo listed; echo hi > c.txt"),
     ));
-    let fixture = fixture(provider, ApprovalMode::Deny).await;
+    let fixture = fixture(provider, ApprovalMode::Ask).await;
     let id = session(&fixture).await;
-
+    // Switched after the session's environment was resolved: takes effect at once.
     fixture
         .desktop
-        .send(id, "write c".to_owned())
+        .set_approval_mode(id, ApprovalMode::Deny)
         .await
         .unwrap();
+
+    fixture.desktop.send(id, "ls".to_owned()).await.unwrap();
     let requests = settled(&fixture, id, 2).await;
-    assert!(tool_results(&requests[1])[0].1, "denied");
+    let results = tool_results(&requests[1]);
+    assert!(results[0].0.contains("listed"), "{results:?}");
     assert!(!fixture.root.join("c.txt").exists());
 }
 
@@ -333,6 +343,74 @@ fn request(session: SessionId, root: SessionId, tool: &str) -> ApprovalRequest {
         Provenance::InProcess,
     )
     .with_root(root)
+}
+
+/// One row of ADR-0055's table: the verdicts of `bash`, `write_file`,
+/// `read_file`, an MCP tool with `readOnlyHint` and one without.
+fn row(modes: &ApprovalModes, mode: ApprovalMode) -> [&'static str; 5] {
+    let root = SessionId::from_bytes([1; 16]);
+    modes.set_mode(root, mode);
+    let mcp = Provenance::External {
+        transport: TransportKind::Stdio,
+    };
+    [
+        ("bash", SideEffect::Mutating, Provenance::InProcess),
+        ("write_file", SideEffect::Mutating, Provenance::InProcess),
+        ("read_file", SideEffect::ReadOnly, Provenance::InProcess),
+        ("fs__read", SideEffect::ReadOnly, mcp),
+        ("fs__write", SideEffect::Mutating, mcp),
+    ]
+    .map(|(tool, side_effect, provenance)| {
+        let mut request = request(root, root, tool);
+        request.side_effect = side_effect;
+        request.provenance = provenance;
+        match modes.classify(&request) {
+            ApprovalVerdict::Allow => "allow",
+            ApprovalVerdict::Ask => "ask",
+            ApprovalVerdict::Deny { .. } => "deny",
+            other => panic!("{other:?}"),
+        }
+    })
+}
+
+fn workspace(sandbox: SandboxMode, backend: bool) -> Workspace {
+    Workspace {
+        sandbox,
+        sandbox_backend: if backend {
+            SandboxBackend::Bwrap("bwrap".into())
+        } else {
+            SandboxBackend::Unavailable("none".to_owned())
+        },
+        ..Workspace::default()
+    }
+}
+
+/// Inside the sandbox bash is allowed in every mode; the mode decides what
+/// runs outside it, and read-only mode tightens even `full-access`.
+#[test]
+fn the_mode_decides_only_calls_outside_the_sandbox() {
+    use ApprovalMode::{Allow, Ask, Deny};
+    let sandboxed =
+        ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::WorkspaceWrite, true));
+    assert_eq!(
+        row(&sandboxed, Deny),
+        ["allow", "deny", "allow", "ask", "deny"]
+    );
+    assert_eq!(
+        row(&sandboxed, Ask),
+        ["allow", "ask", "allow", "ask", "ask"]
+    );
+    assert_eq!(row(&sandboxed, Allow), ["allow"; 5]);
+
+    let full = ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::FullAccess, true));
+    assert_eq!(row(&full, Deny)[0], "allow", "tightened to ReadOnly");
+    assert_eq!(row(&full, Ask)[0], "ask");
+    assert_eq!(row(&full, Allow)[0], "allow");
+
+    let none = ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::WorkspaceWrite, false));
+    assert_eq!(row(&none, Deny), ["deny", "deny", "allow", "ask", "deny"]);
+    assert_eq!(row(&none, Ask), ["ask", "ask", "allow", "ask", "ask"]);
+    assert_eq!(row(&none, Allow), ["allow"; 5]);
 }
 
 /// A subagent's calls follow its tree's mode and allowances, not defaults

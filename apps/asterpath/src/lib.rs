@@ -2,6 +2,7 @@
 //! window (`asterpath-desktop`, behind the `tauri` feature) share these
 //! modules. Not a stable surface.
 
+pub mod approval;
 pub mod config;
 pub mod desktop;
 pub mod workspace;

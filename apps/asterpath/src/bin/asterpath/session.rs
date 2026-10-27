@@ -4,8 +4,10 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
+use asterpath_app::approval::ApprovalModes;
 use asterpath_app::config;
 use asterpath_app::workspace::{
     self, AGENT, NAME, STYLE, WorkRoot, Workspace, by_id_or_name, continued_root, in_root,
@@ -210,20 +212,16 @@ pub async fn open(
         .await
         .map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);
+    let approval = ApprovalModes::new(settings.approval.into()).with_sandbox(&workspace);
     let environment = WorkRoot {
         workspace,
         new_session: false,
         pinned,
         builtin_agents: builtin_agents(),
     };
-    let asterpath = config::assemble(
-        &settings,
-        mcp.tools(),
-        environment,
-        config::approval_policy(settings.approval),
-    )
-    .await
-    .map_err(aster_error)?;
+    let asterpath = config::assemble(&settings, mcp.tools(), environment, Arc::new(approval))
+        .await
+        .map_err(aster_error)?;
     let (handle, continued) = if args.fork_session {
         let mut metadata = metadata(&root, args.name.as_deref());
         // The fork keeps the parent's system, so it keeps its profile and
@@ -331,20 +329,16 @@ async fn create(
     let mcp = load_mcp(&workspace, root).await.map_err(CliError::config)?;
     report_mcp_failures(&workspace, &mcp);
     spec.request.output_format = output_format;
+    let approval = ApprovalModes::new(settings.approval.into()).with_sandbox(&workspace);
     let environment = WorkRoot {
         workspace,
         new_session: true,
         pinned: None,
         builtin_agents: builtin,
     };
-    let asterpath = config::assemble(
-        settings,
-        mcp.tools(),
-        environment,
-        config::approval_policy(settings.approval),
-    )
-    .await
-    .map_err(aster_error)?;
+    let asterpath = config::assemble(settings, mcp.tools(), environment, Arc::new(approval))
+        .await
+        .map_err(aster_error)?;
     let handle = asterpath.create_session(spec).await.map_err(aster_error)?;
     eprintln!("session: {}", handle.id().to_hex());
     let owned = Some(handle.claim().await.map_err(aster_error)?);
