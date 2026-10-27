@@ -656,6 +656,11 @@ fn allow_for_session_offers_a_prefix_per_simple_command() {
     assert_eq!(offer("echo $(rm x)"), None);
     assert_eq!(offer("$CMD run"), None);
     assert_eq!(offer("if"), None);
+    // No prefix rule could match these again (#198).
+    assert_eq!(offer("ls > out.txt"), None);
+    assert_eq!(offer("FOO=1 npm test"), None);
+    assert_eq!(offer("rm *.o"), None);
+    assert_eq!(offer("cargo fmt *.rs"), words(&["cargo fmt"]));
     assert_eq!(
         ApprovalModes::session_rules(&request(root, root, "write_file")),
         words(&["write_file"])

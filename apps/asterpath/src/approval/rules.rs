@@ -175,7 +175,8 @@ fn session(tool: &str, args: &str) -> Option<Vec<Rule>> {
         }]);
     }
     let parsed = parse(&command(args)?);
-    if !parsed.plain || parsed.commands.is_empty() {
+    // Allow rules skip assignments and write redirects, so no rule would match.
+    if !parsed.plain || parsed.commands.is_empty() || !parsed.commands.iter().all(Simple::plain) {
         return None;
     }
     let mut rules: Vec<Rule> = Vec::new();
@@ -189,6 +190,10 @@ fn session(tool: &str, args: &str) -> Option<Vec<Rule>> {
             if !option {
                 break;
             }
+        }
+        // A glob would be compared literally, never matching.
+        if simple.glob.is_some_and(|glob| glob < prefix.len()) {
+            return None;
         }
         if !rules
             .iter()
@@ -214,8 +219,8 @@ fn command(args: &str) -> Option<String> {
 struct Simple {
     /// Each word unquoted; `None` for one that expands at run time.
     words: Vec<Option<String>>,
-    /// A word holds an unquoted glob or brace pattern.
-    glob: bool,
+    /// The first word holding an unquoted glob or brace pattern.
+    glob: Option<usize>,
     /// A variable assignment (`PATH=…`) comes first.
     assigns: bool,
     /// A redirection writes a file other than `/dev/null`.
@@ -262,7 +267,7 @@ fn read_only(simple: &Simple) -> bool {
     let Some((name, args)) = words.split_first() else {
         return false;
     };
-    !simple.glob
+    simple.glob.is_none()
         && READ_ONLY.contains(name)
         && match *name {
             "find" => !args.iter().any(|arg| FIND_UNSAFE.contains(arg)),
@@ -404,7 +409,9 @@ fn simple_command(command: &SimpleCommand, parsed: &mut Parsed) {
 
 fn read(word: &brush_parser::ast::Word, simple: &mut Simple, parsed: &mut Parsed) {
     let (text, glob) = unquote(&word.value, parsed);
-    simple.glob |= glob;
+    if glob && simple.glob.is_none() {
+        simple.glob = Some(simple.words.len());
+    }
     simple.words.push(text);
 }
 
