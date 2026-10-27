@@ -473,3 +473,74 @@ fn modes_and_answers_have_the_frontend_s_json() {
         ]
     );
 }
+
+/// The verdict of `command` run by `bash` under `rules` in `mode`.
+fn command(modes: &ApprovalModes, mode: ApprovalMode, command: &str) -> &'static str {
+    let root = SessionId::from_bytes([1; 16]);
+    modes.set_mode(root, mode);
+    let mut request = request(root, root, "bash");
+    request.args = JsonString::new(serde_json::json!({ "command": command }).to_string());
+    match modes.classify(&request) {
+        ApprovalVerdict::Allow => "allow",
+        ApprovalVerdict::Ask => "ask",
+        ApprovalVerdict::Deny { .. } => "deny",
+        other => panic!("{other:?}"),
+    }
+}
+
+fn with_rules(backend: bool, allow: &[&str], ask: &[&str], deny: &[&str]) -> ApprovalModes {
+    let owned = |list: &[&str]| {
+        list.iter()
+            .map(|rule| (*rule).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let rules =
+        asterpath_app::approval::rules::CommandRules::new(&owned(allow), &owned(ask), &owned(deny))
+            .unwrap();
+    ApprovalModes::new(ApprovalMode::Ask)
+        .with_sandbox(&workspace(SandboxMode::WorkspaceWrite, backend))
+        .with_rules(rules)
+}
+
+/// Deny and ask rules hold inside the sandbox too.
+#[test]
+fn deny_and_ask_rules_hold_inside_the_sandbox() {
+    use ApprovalMode::{Allow, Ask};
+    let deny = with_rules(true, &[], &[], &["bash(git push)"]);
+    assert_eq!(command(&deny, Ask, "git push origin main"), "deny");
+    assert_eq!(command(&deny, Ask, "ls && git push"), "deny");
+    assert_eq!(command(&deny, Allow, "git push"), "deny");
+
+    let ask = with_rules(true, &[], &["bash(git push)"], &[]);
+    assert_eq!(command(&ask, Ask, "git push"), "ask");
+    assert_eq!(command(&ask, Ask, "git status"), "allow");
+}
+
+/// Without a backend, builtin and allowed commands stop asking; the rest
+/// fall back to the mode.
+#[test]
+fn allow_rules_turn_ask_into_allow_outside_the_sandbox() {
+    use ApprovalMode::{Ask, Deny};
+    let none = with_rules(false, &["bash(cargo test)"], &[], &[]);
+    assert_eq!(command(&none, Ask, "ls -la"), "allow");
+    assert_eq!(command(&none, Ask, "find . -delete"), "ask");
+    assert_eq!(command(&none, Ask, "ls; rm x"), "ask");
+    assert_eq!(command(&none, Ask, "echo $(rm x)"), "ask");
+    assert_eq!(command(&none, Ask, "git status"), "ask");
+    assert_eq!(command(&none, Ask, "cargo test -p foo"), "allow");
+    // Allow rules never loosen read-only mode.
+    assert_eq!(command(&none, Deny, "cargo test -p foo"), "deny");
+    assert_eq!(command(&none, Deny, "ls"), "deny");
+}
+
+/// An ask rule beats a tool allowed for the session, and never loosens a deny.
+#[test]
+fn an_ask_rule_beats_a_session_allowance() {
+    let root = SessionId::from_bytes([1; 16]);
+    let modes = with_rules(true, &[], &["bash(git push)"], &[]);
+    modes.allow(root, ToolName::new("bash"));
+    assert_eq!(command(&modes, ApprovalMode::Ask, "git push"), "ask");
+
+    let none = with_rules(false, &[], &["bash(git push)"], &[]);
+    assert_eq!(command(&none, ApprovalMode::Deny, "git push"), "deny");
+}

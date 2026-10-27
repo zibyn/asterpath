@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::workspace::{SandboxMode, Workspace};
 
+pub mod rules;
+
+use rules::{CommandRules, RuleKind};
+
 /// The one in-process tool that spawns a process.
 const BASH: &str = "bash";
 
@@ -59,6 +63,7 @@ pub struct ApprovalModes {
     backend: bool,
     /// The configured sandbox is `full-access`.
     full_access: bool,
+    rules: CommandRules,
     trees: Mutex<HashMap<SessionId, TreeApprovals>>,
 }
 
@@ -69,6 +74,7 @@ impl ApprovalModes {
             default,
             backend: false,
             full_access: true,
+            rules: CommandRules::default(),
             trees: Mutex::default(),
         }
     }
@@ -78,6 +84,13 @@ impl ApprovalModes {
     pub fn with_sandbox(mut self, workspace: &Workspace) -> Self {
         self.backend = workspace.sandbox_backend.unavailable().is_none();
         self.full_access = workspace.sandbox == SandboxMode::FullAccess;
+        self
+    }
+
+    /// The command rules of `[approval]`; only the builtin ones until then.
+    #[must_use]
+    pub fn with_rules(mut self, rules: CommandRules) -> Self {
+        self.rules = rules;
         self
     }
 
@@ -124,11 +137,16 @@ impl ApprovalModes {
 impl ApprovalPolicy for ApprovalModes {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
         let mode = self.mode(request.root);
-        match verdict(mode, self.sandboxed(mode), request) {
+        let rule = self
+            .rules
+            .matches(request.tool.as_str(), request.args.as_str());
+        match verdict(mode, self.sandboxed(mode), rule, request) {
+            // An ask rule outranks what the session allowed.
             ApprovalVerdict::Ask
-                if lock(&self.trees)
-                    .get(&request.root)
-                    .is_some_and(|tree| tree.allowed.contains(&request.tool)) =>
+                if rule != Some(RuleKind::Ask)
+                    && lock(&self.trees)
+                        .get(&request.root)
+                        .is_some_and(|tree| tree.allowed.contains(&request.tool)) =>
             {
                 ApprovalVerdict::Allow
             }
@@ -137,9 +155,26 @@ impl ApprovalPolicy for ApprovalModes {
     }
 }
 
-/// ADR-0055's table; `sandboxed` says whether `bash` runs in a restricted
-/// sandbox. Command rules (#197) narrow this default.
-fn verdict(mode: ApprovalMode, sandboxed: bool, request: &ApprovalRequest) -> ApprovalVerdict {
+/// ADR-0055's table, then the matched command rule: deny wins, ask turns an
+/// allow into ask, allow turns only ask into allow; no rule loosens a deny.
+fn verdict(
+    mode: ApprovalMode,
+    sandboxed: bool,
+    rule: Option<RuleKind>,
+    request: &ApprovalRequest,
+) -> ApprovalVerdict {
+    match (rule, table(mode, sandboxed, request)) {
+        (Some(RuleKind::Deny), _) => ApprovalVerdict::Deny {
+            reason: Some("denied by a command rule".to_owned()),
+        },
+        (Some(RuleKind::Ask), ApprovalVerdict::Allow) => ApprovalVerdict::Ask,
+        (Some(RuleKind::Allow), ApprovalVerdict::Ask) => ApprovalVerdict::Allow,
+        (_, verdict) => verdict,
+    }
+}
+
+/// ADR-0055's table; `sandboxed` says whether `bash` runs in a restricted sandbox.
+fn table(mode: ApprovalMode, sandboxed: bool, request: &ApprovalRequest) -> ApprovalVerdict {
     let read_only = |reason: &str| ApprovalVerdict::Deny {
         reason: Some(reason.to_owned()),
     };
