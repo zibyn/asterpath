@@ -19,10 +19,7 @@ use crate::workspace::{SandboxMode, Workspace};
 
 pub mod rules;
 
-use rules::{CommandRules, RuleKind};
-
-/// The one in-process tool that spawns a process.
-const BASH: &str = "bash";
+use rules::{BASH, CommandRules, RuleKind};
 
 /// A session tree's approval mode (GLOSSARY「审批模式」): what a call
 /// outside the sandbox gets, and a cap on the sandbox.
@@ -83,6 +80,13 @@ impl ApprovalModes {
             rules: CommandRules::default(),
             trees: Mutex::default(),
         }
+    }
+
+    /// The mode, sandbox and command rules the application runs with.
+    pub fn from_settings(settings: &config::Settings, workspace: &Workspace) -> Self {
+        Self::new(settings.approval.into())
+            .with_sandbox(workspace)
+            .with_rules(settings.rules.clone())
     }
 
     /// The sandbox `workspace` gives `bash`.

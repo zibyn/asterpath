@@ -15,8 +15,9 @@ use brush_parser::ast::{
 use brush_parser::word::{WordPiece, WordPieceWithSource};
 use brush_parser::{Parser, ParserOptions};
 
-/// The one tool that takes a command prefix.
-const BASH: &str = "bash";
+/// The one in-process tool that spawns a process, and the one that takes
+/// a command prefix.
+pub(super) const BASH: &str = "bash";
 
 /// Longer commands match no allow rule.
 const MAX_ALLOWED_LEN: usize = 4096;

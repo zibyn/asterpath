@@ -745,8 +745,7 @@ async fn spawned_with(
         .invoke(ToolArgs::new("{}"), ctx)
         .await
         .unwrap();
-    let policy = seen.lock().unwrap().clone();
-    policy
+    seen.lock().unwrap().take()
 }
 
 /// A `full-access` bash call allowed only because read-only mode confines

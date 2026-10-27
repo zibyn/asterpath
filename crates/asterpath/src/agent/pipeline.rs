@@ -126,6 +126,8 @@ impl ToolPipeline {
         cancel: &CancelToken,
     ) -> Result<ToolOutcome, AgentError> {
         let recorded = self.recorded(step).await?;
+        // Endpoints and policies attend a whole tree (ADR-0039).
+        let root = root_of(&*self.log, step.session).await?;
         let lock = Arc::new(tokio::sync::RwLock::new(()));
         let semaphore = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_parallel_calls.get(),
@@ -175,7 +177,7 @@ impl ToolPipeline {
             };
             let descriptor = tool.descriptor().clone();
             match self
-                .decide_approval(step, &admitted, &descriptor, cancel)
+                .decide_approval(step, root, &admitted, &descriptor, cancel)
                 .await?
             {
                 ToolDecision::Allow if cancel.is_cancelled() => {
@@ -224,6 +226,7 @@ impl ToolPipeline {
         for item in runnable {
             futures.push(self.execute(
                 step,
+                root,
                 item,
                 Arc::clone(&semaphore),
                 Arc::clone(&lock),
@@ -584,6 +587,7 @@ impl ToolPipeline {
     fn execute<'a, 'b: 'a>(
         &'a self,
         step: &'a ToolStep<'b>,
+        root: SessionId,
         item: Runnable,
         semaphore: Arc<tokio::sync::Semaphore>,
         lock: Arc<tokio::sync::RwLock<()>>,
@@ -617,7 +621,7 @@ impl ToolPipeline {
                 item.tool_call_id,
                 cancel.clone(),
             )
-            .with_root(root_of(&*self.log, step.session).await?)
+            .with_root(root)
             .with_spawn(
                 crate::environment::current()
                     .map(|env| env.spawn.clone())
@@ -774,6 +778,7 @@ impl ToolPipeline {
     async fn decide_approval(
         &self,
         step: &ToolStep<'_>,
+        root: SessionId,
         call: &Admitted,
         descriptor: &ToolDescriptor,
         cancel: &CancelToken,
@@ -788,8 +793,6 @@ impl ToolPipeline {
             return approval_decision(step.session, decision);
         }
 
-        // Endpoints and policies attend a whole tree (ADR-0039).
-        let root = root_of(&*self.log, step.session).await?;
         let request = ApprovalRequest::new(
             step.session,
             step.turn,
