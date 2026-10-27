@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use asterpath_app::config::{KeySource, SetupChoice};
-use asterpath_app::desktop::{Desktop, save_setup, setup};
+use asterpath_app::desktop::{ApprovalMode, Desktop, save_setup, setup};
 
 fn choice(provider: &str, model: &str, api_key: Option<&str>) -> SetupChoice {
     SetupChoice {
@@ -90,6 +90,32 @@ async fn saved_settings_keep_comments_are_owner_only_and_open_a_backend() {
         .create_session(dir.path(), None, None, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn read_only_in_the_config_is_the_new_session_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path());
+    save_setup(
+        Some(path.clone()),
+        &choice("deepseek", "ds-pro", Some("sk")),
+    )
+    .unwrap();
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[approval]\ndefault = \"read-only\"\n");
+    fs::write(&path, text).unwrap();
+
+    let desktop = Desktop::open(Some(path), dir.path().join("projects.json"), None)
+        .await
+        .unwrap();
+    let session = desktop
+        .create_session(dir.path(), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        desktop.approval_mode(session.id).await.unwrap(),
+        ApprovalMode::Deny
+    );
 }
 
 #[test]

@@ -30,8 +30,12 @@ const PICKER_SIZE: usize = 20;
 /// `-a`: the library's `config::ApprovalMode`, kept free of clap.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum ApprovalMode {
+    /// Calls outside the sandbox and MCP tools ask
     Untrusted,
+    /// Nothing asks; the sandbox is the only guard
     Never,
+    /// Bash runs in a read-only sandbox; calls outside it are denied
+    ReadOnly,
 }
 
 impl From<ApprovalMode> for config::ApprovalMode {
@@ -39,6 +43,7 @@ impl From<ApprovalMode> for config::ApprovalMode {
         match mode {
             ApprovalMode::Untrusted => Self::Untrusted,
             ApprovalMode::Never => Self::Never,
+            ApprovalMode::ReadOnly => Self::ReadOnly,
         }
     }
 }
@@ -67,7 +72,7 @@ pub struct SessionArgs {
     /// Model id for a new session; on a continued one, switches the model.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
-    /// Approval policy.
+    /// Approval mode; overrides `[approval] default`.
     #[arg(short = 'a', long = "ask-for-approval", value_enum)]
     pub approval: Option<ApprovalMode>,
     /// Sandbox mode; overrides `[sandbox] mode`.
