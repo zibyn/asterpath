@@ -258,6 +258,7 @@ mod tests {
     use super::*;
     use crate::config;
     use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig};
+    use asterpath_app::approval::ApprovalModes;
     use asterpath_protocol::{InputId, SandboxPolicy, UserInput};
     use std::io::Cursor;
     use std::path::Path;
@@ -681,7 +682,7 @@ mod tests {
         )
         .expect("absolute root");
         let config = AsterpathConfig::default();
-        let policy = config::approval_policy(config::ApprovalMode::Untrusted);
+        let policy = Arc::new(ApprovalModes::new(config::ApprovalMode::Untrusted.into()));
         AsterpathBuilder::from_config(config)
             .database(db)
             .providers(vec![provider as Arc<dyn Provider>])
