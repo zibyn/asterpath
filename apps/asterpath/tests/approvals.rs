@@ -391,7 +391,8 @@ async fn a_command_without_a_prefix_cannot_be_allowed_for_the_session() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
-    if let Some(reason) = asterpath_app::workspace::SandboxBackend::probe().unavailable() {
+    let backend = SandboxBackend::probe();
+    if let Some(reason) = backend.unavailable() {
         eprintln!("skipping: {reason}");
         return;
     }
@@ -399,7 +400,11 @@ async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
         ScriptedProvider::new("p"),
         bash("c1", "ls >/dev/null && echo listed; echo hi > c.txt"),
     ));
-    let fixture = fixture(provider, ApprovalMode::Ask).await;
+    let workspace = Workspace {
+        sandbox_backend: backend,
+        ..Workspace::default()
+    };
+    let fixture = fixture_in(provider, ApprovalMode::Ask, workspace).await;
     let id = session(&fixture).await;
     // Switched after the session's environment was resolved: takes effect at once.
     fixture
