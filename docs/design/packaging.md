@@ -353,7 +353,7 @@ pub enum AsterError {
 | `-m, --model <id>` | 交互、`exec` | 新会话的模型 id（provider 取 `[model] provider`），优先于档案固定的 `model`；续会话时等价于一次 `update_config` 换模型 |
 | `--agent <name>` | 新会话 | 新会话的智能体档案（ADR-0051），覆盖 `default_agent`；未知档案名是配置错误（退出 2），续会话时给出是用法错误（档案随会话创建固定）。准入：Claude Code 有 `--agent`，Codex 的对应物是选配置档的 `-p, --profile` |
 | `--style <name>` | 新会话 | 新会话的输出风格（ADR-0052），覆盖 `output_style`；`exec` 只认此参数、不读 `output_style`；未知风格名是配置错误（退出 2），续会话时给出是用法错误 |
-| `-a, --ask-for-approval <untrusted\|never>` | 交互、`exec` | 审批策略，见 §4.4 |
+| `-a, --ask-for-approval <untrusted\|never\|read-only>` | 交互、`exec` | 审批模式，覆盖 `[approval] default`，见 §4.4 |
 | `-s, --sandbox <read-only\|workspace-write\|full-access>` | 交互、`exec` | 覆盖 `[sandbox] mode` |
 | `-C, --cd <dir>` | 交互、`exec` | 工作根目录（工具根、沙箱可写根、`AGENTS.md` 位置、会话 `cwd` 元数据），默认进程 cwd |
 | `--continue` | 交互、`exec` | 续当前工作根目录下最后活动的会话 |
@@ -389,7 +389,7 @@ pub enum AsterError {
 
   | 模式 | `bash` 的沙箱 | 沙箱内的 `bash` | 沙箱外的 `bash` / `write_file` / `edit_file` | MCP 工具 |
   |---|---|---|---|---|
-  | 只读（桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
+  | 只读（`read-only`，桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
   | 询问（`untrusted`，桌面端 `ask`） | 配置的沙箱 | 允许 | 询问 | 询问 |
   | 放行（`never`，桌面端 `allow`） | 配置的沙箱 | 允许 | 允许 | 允许 |
 
@@ -401,7 +401,7 @@ pub enum AsterError {
   - 允许要求整条命令每个简单命令都命中允许，并且：能解析、不超过 4096 字节、不含命令替换、进程替换、here-doc / here-string、函数定义、`for` / `case` / `[[ ]]` / 算术等不逐词检查的结构，简单命令不带变量赋值（`PATH=… ls`、`X=1; ls`），不写文件（`>`、`>>` 等重定向到 `/dev/null` 以外的目标）。否则不算命中允许，回到上表结论。
   - 内置只读命令（不可修改的允许规则）：`cat`、`echo`、`find`、`grep`、`head`、`ls`、`pwd`、`rg`、`tail`、`wc`。不含 `git`（仓库配置能让它执行外部程序）。另外要求每个词都不在运行时展开（`$VAR` 等），不含未加引号的 glob / 花括号（`*`、`?`、`[`、`{`）；`find` 带 `-delete`、`-exec`、`-execdir`、`-ok`、`-okdir`、`-fls`、`-fprint`、`-fprint0`、`-fprintf`，`rg` 带 `--pre`、`--search-zip` 或含 `z` 的短选项时不算命中。用户的拒绝 / 询问规则压过内置允许。内置命令只在结论本来是「询问」时起作用，也就是沙箱外的询问模式。
   - 规则不是安全边界（ADR-0055）：`env git push`、`bash -c "git push"`、`xargs` 等间接执行不会被前缀命中；边界是沙箱。
-- CLI 现在只有 `-a untrusted`（默认）与 `-a never`；优先级 `-a` > `[approval] default` > `untrusted`。
+- CLI 的 `-a` 与 `[approval] default` 取 `untrusted`（默认）、`never`、`read-only`，桌面端从配置读默认模式时分别对应 `ask` / `allow` / `deny`；优先级 `-a` > `[approval] default` > `untrusted`。CLI 不能中途切换模式。
 - 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
 - "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与调用是否在受限沙箱内执行判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
@@ -509,7 +509,7 @@ model = "claude-fable-5-1"
 # max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
-default = "untrusted"         # untrusted | never
+default = "untrusted"         # untrusted | never | read-only
 deny = ["bash(git push --force)"]   # 命令规则，见 §4.4
 ask = ["bash(git push)"]
 allow = ["bash(cargo test)", "fs__read"]

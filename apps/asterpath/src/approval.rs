@@ -44,6 +44,7 @@ impl From<config::ApprovalMode> for ApprovalMode {
         match mode {
             config::ApprovalMode::Untrusted => Self::Ask,
             config::ApprovalMode::Never => Self::Allow,
+            config::ApprovalMode::ReadOnly => Self::Deny,
         }
     }
 }
