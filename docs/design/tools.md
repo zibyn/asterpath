@@ -46,10 +46,12 @@ pub struct ToolDescriptor {
 
 pub struct ToolContext {           // #[non_exhaustive]
     pub session: SessionId,
+    pub root: SessionId,            // 会话树的根，与同一调用的 ApprovalRequest.root 相同；根会话即 session
     pub turn: TurnId,
     pub step: StepId,
     pub tool_call_id: ToolCallId,
     pub cancel: CancelToken,
+    pub spawn: SpawnEnv,            // 会话环境的起进程设置（ADR-0037）
 }
 
 pub struct ToolOutput {
