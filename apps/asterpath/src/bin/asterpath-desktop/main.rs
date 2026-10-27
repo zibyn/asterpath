@@ -9,10 +9,10 @@ use asterpath::protocol::ModelSpec;
 use asterpath::{LogId, SessionId};
 use asterpath_app::config::SetupChoice;
 use asterpath_app::desktop::{
-    self, Access, Agents, Answer, ApprovalMode, Desktop, Project, SessionInfo, SessionSummary,
-    Setup, Styles, ViewEvent,
+    self, Access, Agents, Answer, ApprovalMode, Desktop, PendingApproval, Project, SessionInfo,
+    SessionSummary, Setup, Styles, ViewEvent,
 };
-use asterpath_protocol::{ApprovalRequest, ToolCallId};
+use asterpath_protocol::ToolCallId;
 use futures_util::StreamExt;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
@@ -174,7 +174,7 @@ async fn cancel(backend: State<'_, Backend>, session: SessionId) -> Result<(), S
 fn approvals(
     backend: State<'_, Backend>,
     session: SessionId,
-) -> Result<Vec<ApprovalRequest>, String> {
+) -> Result<Vec<PendingApproval>, String> {
     Ok(backend.get()?.approvals(session))
 }
 

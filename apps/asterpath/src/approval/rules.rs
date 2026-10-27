@@ -141,6 +141,66 @@ impl CommandRules {
             });
         allowed.then_some(RuleKind::Allow)
     }
+
+    /// Adds the allow rules of [`session_rules`] for a call of `tool` with
+    /// JSON `args`; false, adding none, when there are none.
+    pub fn allow_for_session(&mut self, tool: &str, args: &str) -> bool {
+        let Some(rules) = session(tool, args) else {
+            return false;
+        };
+        self.allow.extend(rules);
+        true
+    }
+}
+
+/// What "allow for session" allows for a call of `tool` with JSON `args`:
+/// the tool, or for `bash` each simple command's words up to its first
+/// non-option argument (`npm run test -- --watch` gives `npm run`), shown
+/// as those words; `None` for a command not plain enough to give them.
+pub fn session_rules(tool: &str, args: &str) -> Option<Vec<String>> {
+    let rules = session(tool, args)?;
+    Some(
+        rules
+            .into_iter()
+            .map(|rule| rule.prefix.map_or(rule.tool, |words| words.join(" ")))
+            .collect(),
+    )
+}
+
+fn session(tool: &str, args: &str) -> Option<Vec<Rule>> {
+    if tool != BASH {
+        return Some(vec![Rule {
+            tool: tool.to_owned(),
+            prefix: None,
+        }]);
+    }
+    let parsed = parse(&command(args)?);
+    if !parsed.plain || parsed.commands.is_empty() {
+        return None;
+    }
+    let mut rules: Vec<Rule> = Vec::new();
+    for simple in &parsed.commands {
+        let (name, rest) = simple.words.split_first()?;
+        let mut prefix = vec![name.clone()?];
+        for word in rest {
+            let word = word.clone()?;
+            let option = word.starts_with('-');
+            prefix.push(word);
+            if !option {
+                break;
+            }
+        }
+        if !rules
+            .iter()
+            .any(|rule| rule.prefix.as_ref() == Some(&prefix))
+        {
+            rules.push(Rule {
+                tool: BASH.to_owned(),
+                prefix: Some(prefix),
+            });
+        }
+    }
+    Some(rules)
 }
 
 /// `bash`'s `command` argument.
