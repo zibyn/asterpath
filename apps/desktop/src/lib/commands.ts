@@ -107,6 +107,8 @@ export interface SessionInfo {
   tokens: number;
   error: string | null;
   agent: string | null;
+  /** Why spawned commands run without a sandbox (ADR-0055); null when sandboxed. */
+  no_sandbox: string | null;
 }
 
 /** The configured model and the model aliases' models. */

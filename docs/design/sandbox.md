@@ -199,6 +199,13 @@ pub enum SandboxError {
 - bwrap 缺失或无法建命名空间 → `Setup` → fail closed。
 - bwrap 在 exec 前失败可能只表现为子进程异常退出；调用方按 `Internal` 处理。
 
+**参考应用的启动检测（[#196](https://github.com/zibyn/asterpath/issues/196)，ADR-0055）**：
+
+- CLI 与桌面端共享的组装代码（`Settings::workspace()` → `SandboxBackend::probe()`）在启动时检测一次后端：Linux 上用 `LinuxSandbox` 按 `ReadOnly` 约束空命令 `true`，实际跑一次 bwrap，退出成功才算可用；非 Linux 一律不可用。
+- 可用：总是构造后端，即使配置是 `full-access`，以便审批模式能把单次调用收紧到 `ReadOnly`（`ctx.spawn.sandbox`）。
+- 不可用：有效沙箱策略明确为 `FullAccess`，bash 与 MCP stdio 服务都按它启动，审批据此把调用视为「沙箱外」。这是应用的明确选择，后端本身的 fail closed（`Setup`）不变。
+- 原因三类：找不到 bwrap（`bwrap not found: …`）、bwrap 不能创建命名空间（`bwrap cannot create namespaces: <stderr>`）、平台不支持。`asterpath doctor` 打印 `sandbox: bwrap (<program>)` 或 `sandbox: none, <原因>`；桌面端状态栏显示「无沙箱」与原因（`SessionInfo.no_sandbox`）。
+
 **macOS**：`sandbox-exec -p <profile>` 的形态记录为第二后端，v1 不实现、不验收。**Windows**：出界。
 
 **v1 交付（历史）**：

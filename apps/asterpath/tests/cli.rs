@@ -1343,6 +1343,30 @@ fn doctor_validates_without_initialising_modules() {
 }
 
 #[test]
+fn doctor_reports_a_missing_sandbox_backend_with_its_reason() {
+    let dir = TestDir::new("doctor-sandbox");
+    let config = dir.config(&format!("[storage]\npath = \"{}\"\n", dir.db().display()));
+
+    let output = bin()
+        .env("PATH", "")
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .expect("doctor");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("sandbox: "))
+        .unwrap_or_else(|| panic!("no sandbox line in {stdout}"));
+    if cfg!(target_os = "linux") {
+        assert_eq!(line, "sandbox: none, bwrap not found: bwrap");
+    } else {
+        assert!(line.starts_with("sandbox: none, "), "{line}");
+    }
+}
+
+#[test]
 fn doctor_rejects_bad_configs_with_two() {
     for (body, overrides) in [
         ("[turn]\nmax_steps_per_turn = 0\n", &[][..]),

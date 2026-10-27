@@ -3,7 +3,7 @@
 
 use asterpath_skills::{DEFAULT_INDEX_BUDGET, discover, render_index};
 
-use asterpath_app::workspace::{load_mcp, skill_roots, workspace_tools};
+use asterpath_app::workspace::{SandboxBackend, load_mcp, skill_roots, workspace_tools};
 
 use crate::session::{current_root, mcp_status_lines};
 use crate::{CliError, CliResult, GlobalArgs, config};
@@ -18,6 +18,10 @@ pub async fn doctor(global: &GlobalArgs) -> CliResult<()> {
     // always available here.
     let root = current_root()?;
     let workspace = settings.workspace().map_err(CliError::config)?;
+    match &workspace.sandbox_backend {
+        SandboxBackend::Bwrap(program) => println!("sandbox: bwrap ({})", program.display()),
+        SandboxBackend::Unavailable(reason) => println!("sandbox: none, {reason}"),
+    }
     let discovery = discover(&skill_roots(&workspace, &root));
     let (_, budget) = render_index(&discovery.skills, DEFAULT_INDEX_BUDGET);
     for diagnostic in discovery.diagnostics.iter().chain(&budget) {

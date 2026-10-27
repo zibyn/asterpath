@@ -26,7 +26,7 @@ use asterpath_protocol::{
 use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
-use crate::workspace::{SandboxMode, WorkRoot, Workspace, WorkspaceError};
+use crate::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace, WorkspaceError};
 
 /// `-a` and `[approval] default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -1218,6 +1218,7 @@ impl Settings {
         }
         Ok(Workspace {
             sandbox: self.file.sandbox.mode,
+            sandbox_backend: SandboxBackend::probe(),
             tools: self.file.tools.enabled.clone(),
             skills_enabled: self.file.skills.enabled.unwrap_or(true),
             skill_paths: self.file.skills.paths.clone(),

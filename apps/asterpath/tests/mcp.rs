@@ -211,38 +211,24 @@ fn an_mcp_server_needs_exactly_one_transport() {
     }
 }
 
-/// Without bwrap (or off Linux), a restricted mode has no backend and stdio
-/// servers fail closed; `full-access` runs them unconfined.
+/// Without bwrap (or off Linux) the effective policy is `full-access`
+/// whatever the mode (ADR-0055), so stdio servers run unconfined.
 #[test]
-fn full_access_runs_stdio_servers_without_a_sandbox_backend() {
+fn without_a_sandbox_backend_stdio_servers_run_under_full_access() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let config = write(
-        dir.path(),
-        &(stdio_server("fixture", "") + "\n[sandbox]\nmode = \"full-access\"\n"),
-    );
-
-    let output = bin()
-        .current_dir(dir.path())
-        .env("PATH", "/nonexistent")
-        .args(["doctor", "--config", config.to_str().unwrap()])
-        .output()
-        .expect("run doctor");
-    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(text(&output.stdout).contains("mcp: fixture loaded"));
-
-    let config = write(dir.path(), &stdio_server("fixture", ""));
-    let output = bin()
-        .current_dir(dir.path())
-        .env("PATH", "/nonexistent")
-        .args(["doctor", "--config", config.to_str().unwrap()])
-        .output()
-        .expect("run doctor");
-    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(
-        text(&output.stdout).contains("mcp: fixture failed at Sandbox"),
-        "default workspace-write fails closed: {}",
-        text(&output.stdout)
-    );
+    for sandbox in ["\n[sandbox]\nmode = \"full-access\"\n", ""] {
+        let config = write(dir.path(), &(stdio_server("fixture", "") + sandbox));
+        let output = bin()
+            .current_dir(dir.path())
+            .env("PATH", "/nonexistent")
+            .args(["doctor", "--config", config.to_str().unwrap()])
+            .output()
+            .expect("run doctor");
+        assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains("sandbox: none, "), "{stdout}");
+        assert!(stdout.contains("mcp: fixture loaded"), "{stdout}");
+    }
 }
 
 /// Two tool steps, the second reporting 500 input tokens; the threshold check

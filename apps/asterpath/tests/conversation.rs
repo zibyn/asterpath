@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use asterpath::Asterpath;
 use asterpath_app::desktop::{Access, ApprovalMode, ApprovalModes, Desktop, Status, ViewEvent};
-use asterpath_app::workspace::{WorkRoot, Workspace};
+use asterpath_app::workspace::{SandboxBackend, WorkRoot, Workspace};
 use asterpath_protocol::{
     AgentEvent, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, InputId, InputTokens, Item,
     JsonString, LogId, ModelId, ModelRequest, ModelSpec, OutputTokens, Part, PartDelta, Provider,
@@ -512,6 +512,29 @@ async fn a_tool_call_waiting_for_approval_lists_the_session_as_awaiting_approval
     desktop.send(id, "read".to_owned()).await.unwrap();
     wait_for_status(&desktop, &fixture.root, id, Status::AwaitingApproval).await;
     desktop.cancel(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_status_bar_says_why_there_is_no_sandbox() {
+    let fixture = fixture();
+    let desktop = Desktop::new(
+        engine(&fixture.db, Arc::new(ScriptedProvider::new("p"))).await,
+        Arc::new(ApprovalModes::new(ApprovalMode::default())),
+        Workspace {
+            sandbox_backend: SandboxBackend::Unavailable("bwrap not found: bwrap".to_owned()),
+            ..workspace()
+        },
+        template(),
+        fixture.root.join("projects.json"),
+    );
+    let id = desktop
+        .create_session(&fixture.root, None, None, None)
+        .await
+        .unwrap()
+        .id;
+
+    let info = desktop.session_info(id).await.unwrap();
+    assert_eq!(info.no_sandbox.as_deref(), Some("bwrap not found: bwrap"));
 }
 
 #[tokio::test]

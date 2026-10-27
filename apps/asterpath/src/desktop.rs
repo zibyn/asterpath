@@ -47,6 +47,8 @@ pub struct SessionInfo {
     pub error: Option<String>,
     /// The agent profile it was created with; fixed for its life (ADR-0051).
     pub agent: Option<String>,
+    /// Why spawned commands run without a sandbox here (ADR-0055).
+    pub no_sandbox: Option<String>,
 }
 
 /// An agent profile or output style the new-session picker offers.
@@ -637,6 +639,11 @@ impl Desktop {
             tokens: usage.own.total() + usage.descendants.total(),
             error: lock(&self.errors).get(&session).cloned(),
             agent,
+            no_sandbox: self
+                .workspace
+                .sandbox_backend
+                .unavailable()
+                .map(str::to_owned),
         })
     }
 
