@@ -353,7 +353,7 @@ pub enum AsterError {
 | `-m, --model <id>` | 交互、`exec` | 新会话的模型 id（provider 取 `[model] provider`），优先于档案固定的 `model`；续会话时等价于一次 `update_config` 换模型 |
 | `--agent <name>` | 新会话 | 新会话的智能体档案（ADR-0051），覆盖 `default_agent`；未知档案名是配置错误（退出 2），续会话时给出是用法错误（档案随会话创建固定）。准入：Claude Code 有 `--agent`，Codex 的对应物是选配置档的 `-p, --profile` |
 | `--style <name>` | 新会话 | 新会话的输出风格（ADR-0052），覆盖 `output_style`；`exec` 只认此参数、不读 `output_style`；未知风格名是配置错误（退出 2），续会话时给出是用法错误 |
-| `-a, --ask-for-approval <untrusted\|never>` | 交互、`exec` | 审批策略，见 §4.4 |
+| `-a, --ask-for-approval <untrusted\|never\|read-only>` | 交互、`exec` | 审批模式，覆盖 `[approval] default`，见 §4.4 |
 | `-s, --sandbox <read-only\|workspace-write\|full-access>` | 交互、`exec` | 覆盖 `[sandbox] mode` |
 | `-C, --cd <dir>` | 交互、`exec` | 工作根目录（工具根、沙箱可写根、`AGENTS.md` 位置、会话 `cwd` 元数据），默认进程 cwd |
 | `--continue` | 交互、`exec` | 续当前工作根目录下最后活动的会话 |
@@ -389,12 +389,12 @@ pub enum AsterError {
 
   | 模式 | `bash` 的沙箱 | 沙箱内的 `bash` | 沙箱外的 `bash` / `write_file` / `edit_file` | MCP 工具 |
   |---|---|---|---|---|
-  | 只读（桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
+  | 只读（`read-only`，桌面端 `deny`） | 收紧到 `ReadOnly` | 允许 | 拒绝 | 声明 `readOnlyHint` 的询问，其余拒绝 |
   | 询问（`untrusted`，桌面端 `ask`） | 配置的沙箱 | 允许 | 询问 | 询问 |
   | 放行（`never`，桌面端 `allow`） | 配置的沙箱 | 允许 | 允许 | 允许 |
 
   「沙箱外」指没有可用后端，或有效策略为 `FullAccess`（只读模式有后端时总能收紧，所以不算沙箱外）。进程内只读工具（`read_file` / `list_dir` / `grep` / `load_skill`）在各模式下都放行；其他进程内的 `Mutating` 工具（如 `spawn_agent`）与写文件工具同列。收紧在启动 `bash` 时按当前模式写进 `ctx.spawn.sandbox`（`ApprovalModes::environment` 包装会话环境里的 `bash`），所以已批准、尚未启动的调用也按切换后的模式执行；没有后端时 `ReadOnly` fail closed。MCP stdio 服务按配置的沙箱在加载时启动，模式收紧不到它们。
-- CLI 现在只有 `-a untrusted`（默认）与 `-a never`；优先级 `-a` > `[approval] default` > `untrusted`。
+- CLI 的 `-a` 与 `[approval] default` 取 `untrusted`（默认）、`never`、`read-only`，桌面端从配置读默认模式时分别对应 `ask` / `allow` / `deny`；优先级 `-a` > `[approval] default` > `untrusted`。CLI 不能中途切换模式。
 - 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
 - "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与调用是否在受限沙箱内执行判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
@@ -502,7 +502,7 @@ model = "claude-fable-5-1"
 # max_live_children = 32      # 例外：调度器全局上限，映射到 AsterpathConfig.max_live_children
 
 [approval]
-default = "untrusted"         # untrusted | never
+default = "untrusted"         # untrusted | never | read-only
 ```
 
 - `max_steps_per_turn = 0` 是配置错误（退出码 2）；不设上限靠省略该字段。
