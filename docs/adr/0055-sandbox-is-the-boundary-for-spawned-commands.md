@@ -1,6 +1,6 @@
 # 起进程的工具以沙箱为边界，审批只问能否越出沙箱
 
-**Status**: accepted (2026-10-26)
+**Status**: accepted (2026-10-26)；「模式切换立即生效；启动进程时总按当前模式收紧」与否决「按回合快照模式」的理由部分取代 by [ADR-0056](0056-read-only-cap-sticks-to-the-calls-it-allowed.md)（因只读上限而放行的调用保留上限）
 **来源**: [#193](https://github.com/zibyn/asterpath/issues/193)、[#194](https://github.com/zibyn/asterpath/issues/194)
 **相关**: [ADR-0007](0007-approval-and-sandbox-layers.md)、[ADR-0019](0019-sandbox-seam-and-policy.md)、[ADR-0037](0037-session-environment.md)
 

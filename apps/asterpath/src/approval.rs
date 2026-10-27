@@ -3,13 +3,13 @@
 //! what may run outside it; the mode also caps the sandbox, read-only
 //! tightening `bash` to `ReadOnly`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use asterpath_protocol::{
     ApprovalPolicy, ApprovalRequest, ApprovalVerdict, EnvironmentAdapter, EnvironmentError,
     Provenance, SandboxPolicy, SessionEnvironment, SessionId, SideEffect, Tool, ToolArgs,
-    ToolContext, ToolDescriptor, ToolError, ToolOutput,
+    ToolCallId, ToolContext, ToolDescriptor, ToolError, ToolOutput,
 };
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,9 @@ struct TreeApprovals {
     /// The configured rules plus what was allowed for the session, once
     /// something was.
     rules: Option<CommandRules>,
+    /// `bash` calls allowed only because read-only mode confines them: they
+    /// stay `ReadOnly` even if the mode is loosened before they spawn.
+    capped: HashSet<ToolCallId>,
 }
 
 /// The application's approval policy: each session tree's mode and what
@@ -105,7 +108,8 @@ impl ApprovalModes {
             .unwrap_or(self.default)
     }
 
-    /// Takes effect at once, also for a call already approved.
+    /// Takes effect at once, also for a call already approved, except that a
+    /// call allowed only for the read-only cap keeps it (ADR-0056).
     pub fn set_mode(&self, root: SessionId, mode: ApprovalMode) {
         lock(&self.trees).entry(root).or_default().mode = Some(mode);
     }
@@ -140,6 +144,19 @@ impl ApprovalModes {
         })
     }
 
+    /// Whether `call` must spawn `ReadOnly`: the tree is read-only now, or
+    /// was when the call was allowed only for that. In memory, like the mode.
+    fn capped(&self, root: SessionId, call: ToolCallId) -> bool {
+        let mut trees = lock(&self.trees);
+        let tree = trees.get_mut(&root);
+        let mode = tree
+            .as_ref()
+            .and_then(|tree| tree.mode)
+            .unwrap_or(self.default);
+        let recorded = tree.is_some_and(|tree| tree.capped.remove(&call));
+        recorded || mode == ApprovalMode::Deny
+    }
+
     /// Whether `bash` runs in a restricted sandbox under `mode`.
     fn sandboxed(&self, mode: ApprovalMode) -> bool {
         self.backend && (mode == ApprovalMode::Deny || !self.full_access)
@@ -148,18 +165,28 @@ impl ApprovalModes {
 
 impl ApprovalPolicy for ApprovalModes {
     fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
-        let (mode, rule) = {
-            let trees = lock(&self.trees);
-            let tree = trees.get(&request.root);
-            let rules = tree
-                .and_then(|tree| tree.rules.as_ref())
-                .unwrap_or(&self.rules);
-            (
-                tree.and_then(|tree| tree.mode).unwrap_or(self.default),
-                rules.matches(request.tool.as_str(), request.args.as_str()),
-            )
-        };
-        verdict(mode, self.sandboxed(mode), rule, request)
+        let mut trees = lock(&self.trees);
+        let tree = trees.get(&request.root);
+        let rules = tree
+            .and_then(|tree| tree.rules.as_ref())
+            .unwrap_or(&self.rules);
+        let mode = tree.and_then(|tree| tree.mode).unwrap_or(self.default);
+        let rule = rules.matches(request.tool.as_str(), request.args.as_str());
+        let verdict = verdict(mode, self.sandboxed(mode), rule, request);
+        if verdict == ApprovalVerdict::Allow
+            && mode == ApprovalMode::Deny
+            && self.backend
+            && self.full_access
+            && request.provenance == Provenance::InProcess
+            && request.tool.as_str() == BASH
+        {
+            trees
+                .entry(request.root)
+                .or_default()
+                .capped
+                .insert(request.tool_call_id);
+        }
+        verdict
     }
 }
 
@@ -256,7 +283,7 @@ impl Tool for CappedBash {
     ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
         // Read at spawn time, so a switch to read-only reaches approved calls;
         // without a backend `ReadOnly` fails closed.
-        if self.modes.mode(ctx.root) == ApprovalMode::Deny {
+        if self.modes.capped(ctx.root, ctx.tool_call_id) {
             ctx.spawn.sandbox = Some(SandboxPolicy::ReadOnly);
         }
         self.inner.invoke(args, ctx)
