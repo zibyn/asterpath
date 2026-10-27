@@ -617,6 +617,7 @@ impl ToolPipeline {
                 item.tool_call_id,
                 cancel.clone(),
             )
+            .with_root(root_of(&*self.log, step.session).await?)
             .with_spawn(
                 crate::environment::current()
                     .map(|env| env.spawn.clone())

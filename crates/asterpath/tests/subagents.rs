@@ -5,8 +5,8 @@
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asterpath::protocol::{
@@ -110,6 +110,39 @@ impl Tool for EchoTool {
     ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
         let name = self.descriptor.name.as_str().to_owned();
         Box::pin(async move { Ok(ToolOutput::new(vec![text(&format!("{name} output"))])) })
+    }
+}
+
+/// The `(session, root)` pairs a probe saw, in call order.
+type Seen = Arc<Mutex<Vec<(SessionId, SessionId)>>>;
+
+/// Records the session and tree root of every call it serves.
+struct ProbeTool {
+    descriptor: ToolDescriptor,
+    seen: Seen,
+}
+
+impl ProbeTool {
+    fn new(name: &str, seen: Seen) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: descriptor(name),
+            seen,
+        })
+    }
+}
+
+impl Tool for ProbeTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke(
+        &self,
+        _args: ToolArgs,
+        ctx: ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        self.seen.lock().unwrap().push((ctx.session, ctx.root));
+        Box::pin(async { Ok(ToolOutput::new(vec![text("probed")])) })
     }
 }
 
@@ -512,11 +545,12 @@ async fn approval_fixture(
     db: &Path,
     provider: Arc<ScriptedProvider>,
     gate: Arc<ApprovalGate>,
+    seen: Seen,
 ) -> Asterpath {
     let config = AsterpathConfig {
         database: db.to_path_buf(),
         providers: vec![provider],
-        tools: vec![EchoTool::new("gated")],
+        tools: vec![ProbeTool::new("gated", seen)],
         gate,
         approval: Arc::new(AllowSpawnAskGated),
         ..AsterpathConfig::default()
@@ -544,7 +578,13 @@ fn approval_script() -> ScriptedProvider {
 async fn child_approval_is_scoped_to_the_child_session() {
     let db = temp_db("approval");
     let gate = Arc::new(ApprovalGate::new());
-    let asterpath = approval_fixture(&db, Arc::new(approval_script()), Arc::clone(&gate)).await;
+    let asterpath = approval_fixture(
+        &db,
+        Arc::new(approval_script()),
+        Arc::clone(&gate),
+        Seen::default(),
+    )
+    .await;
     let handle = asterpath
         .create_session(spec(None))
         .await
@@ -628,7 +668,8 @@ async fn child_approval_wait_survives_a_restart() {
     let db = temp_db("durable-approval");
     let gate = Arc::new(ApprovalGate::new());
     let provider = Arc::new(approval_script());
-    let asterpath = approval_fixture(&db, provider.clone(), gate.clone()).await;
+    let seen = Seen::default();
+    let asterpath = approval_fixture(&db, provider.clone(), gate.clone(), seen.clone()).await;
     let handle = asterpath
         .create_session(spec(None))
         .await
@@ -654,7 +695,7 @@ async fn child_approval_wait_survives_a_restart() {
     asterpath.shutdown().await.unwrap();
 
     // The same logs, a new process.
-    let reopened = approval_fixture(&db, provider, gate).await;
+    let reopened = approval_fixture(&db, provider, gate, seen.clone()).await;
     let handle = reopened
         .open_session(parent)
         .await
@@ -695,8 +736,82 @@ async fn child_approval_wait_survives_a_restart() {
     let (status, output) = spawn_result(&parent_entries);
     assert_eq!(status, ToolResultStatus::Completed);
     assert_eq!(output, vec![text("child done")]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(child, parent)],
+        "the call run after recovery names the tree's root"
+    );
 
     reopened.shutdown().await.unwrap();
+    cleanup(&db);
+}
+
+/// Records the `(session, root)` of every approval request for `probe`.
+struct RecordingPolicy(Seen);
+
+impl ApprovalPolicy for RecordingPolicy {
+    fn classify(&self, request: &ApprovalRequest) -> ApprovalVerdict {
+        if request.tool.as_str() == "probe" {
+            self.0.lock().unwrap().push((request.session, request.root));
+        }
+        ApprovalVerdict::Allow
+    }
+}
+
+#[tokio::test]
+async fn tool_calls_name_their_trees_root_two_levels_down() {
+    let db = temp_db("root");
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(vec![tool_call("probe", "{}")], StopReason::ToolUse, usage())
+            .respond(
+                vec![tool_call("spawn_agent", r#"{"task":"spawn again"}"#)],
+                StopReason::ToolUse,
+                usage(),
+            )
+            .respond(
+                vec![tool_call("spawn_agent", r#"{"task":"probe"}"#)],
+                StopReason::ToolUse,
+                usage(),
+            )
+            .respond(vec![tool_call("probe", "{}")], StopReason::ToolUse, usage())
+            .respond(assistant("grandchild done"), StopReason::EndTurn, usage())
+            .respond(assistant("child done"), StopReason::EndTurn, usage())
+            .respond(assistant("root done"), StopReason::EndTurn, usage()),
+    );
+    let seen = Seen::default();
+    let requested = Seen::default();
+    let asterpath = open(AsterpathConfig {
+        approval: Arc::new(RecordingPolicy(requested.clone())),
+        ..simple_config(
+            &db,
+            vec![provider],
+            vec![ProbeTool::new("probe", seen.clone())],
+        )
+    })
+    .await;
+    let handle = asterpath
+        .create_session(spec(None))
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
+    let root = handle.id();
+    handle.submit_input(input("go")).await.unwrap();
+    drive_all(&handle).await;
+
+    let child = spawn_event(&scan(asterpath.store(), root).await).0;
+    let grandchild = spawn_event(&scan(asterpath.store(), child).await).0;
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, [(root, root), (grandchild, root)]);
+    assert_eq!(
+        *requested.lock().unwrap(),
+        seen,
+        "the context's root is the approval request's root"
+    );
+
+    asterpath.shutdown().await.unwrap();
     cleanup(&db);
 }
 
