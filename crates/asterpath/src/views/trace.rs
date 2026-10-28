@@ -1,30 +1,26 @@
 //! Native execution tracing: a deterministic projection of the event log.
 //!
 //! There is no trace sink, no trace table and no push channel: [`TracingQuery`]
-//! folds the injected [`SessionStore`] on demand. Live export is the application's own
+//! folds the session's log on demand. Live export is the application's own
 //! incremental fold over `Hooks::on_record`. `recorded_at` only feeds timings
 //! and statuses here, never recovery or projection.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AbortKind, AttemptEvent, ChildOutcome, CompactionAttrs, ConfigSnapshot, ErrorType,
     ModelCallAttrs, ResumeEvent, SessionAttrs, SessionEvent, SideEffect, Span, SpanAttributes,
     SpanFilter, SpanId, SpanKind, SpanStatus, SubagentAttrs, ToolCallAttrs, ToolErrorKind,
     ToolResultStatus, TraceError, TraceId, TurnAttrs, TurnEndReason, WaitAttrs, WaitKind,
-    decode_entry, effective_config,
 };
 use asterpath_protocol::{
-    Fnv, LogEntry, LogId, LogIdRange, SessionId, SessionStore, StepId, Timestamp, ToolCallId,
-    TurnId,
+    Fnv, LogEntry, LogId, LogIdRange, SessionId, StepId, Timestamp, ToolCallId, TurnId,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
 use crate::commit::CommitLog;
-use crate::scan::scan_decoded;
 
 /// Pull seam: folds one session's log per request.
 pub(crate) struct TracingQuery {
@@ -73,8 +69,8 @@ fn matches_filter(span: &Span, filter: &SpanFilter) -> bool {
         && (!filter.open_only || span.ended_at.is_none())
 }
 
-async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<Span>, TraceError> {
-    let decoded = scan_decoded(log, session).await?;
+async fn fold_session(log: &CommitLog, session: SessionId) -> Result<Vec<Span>, TraceError> {
+    let decoded = log.read(session).await?;
     if decoded.is_empty() {
         return Err(TraceError::NotFound { session });
     }
@@ -100,7 +96,7 @@ async fn fold_session(log: &dyn SessionStore, session: SessionId) -> Result<Vec<
         if matches!(
             event,
             SessionEvent::StepStarted { .. } | SessionEvent::CompactionStarted { .. }
-        ) && let Some(effective) = effective_config(&decoded, entry.seq)
+        ) && let Some(effective) = decoded.config_at(entry.log_id)
         {
             folder.config = effective;
         }
@@ -722,19 +718,19 @@ impl Folder {
             .find(|index| self.spans[*index].ended_at.is_none())
     }
 
-    async fn resolve_child_root(&mut self, log: &dyn SessionStore) {
+    async fn resolve_child_root(&mut self, log: &CommitLog) {
         let Some(parent) = self.parent_session else {
             return;
         };
         self.spans[self.session_span].parent_trace = Some(TraceId::from_session(parent));
-        let Ok(entries) = scan_all(log, parent).await else {
+        let Ok(decoded) = log.read(parent).await else {
             return;
         };
-        for entry in entries {
-            let Ok(SessionEvent::ChildSessionSpawned { child, .. }) = decode_entry(&entry) else {
+        for (entry, event) in &decoded {
+            let SessionEvent::ChildSessionSpawned { child, .. } = event else {
                 continue;
             };
-            if child == self.session {
+            if *child == self.session {
                 self.spans[self.session_span].parent_span =
                     Some(span_id(parent, entry.log_id, SpanKind::Subagent));
                 break;
