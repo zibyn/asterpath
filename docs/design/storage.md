@@ -202,7 +202,7 @@ BEGIN IMMEDIATE
       if 命中: ROLLBACK; return 原 log_id        -- 不写
   if event 是 MetadataChanged:
       SELECT metadata FROM sessions WHERE session_id=?   -- 没有行 = InvalidEntry
-      合并 patch，超出上限 = InvalidEntry（ROLLBACK，不写日志）
+      先合并 set、再删 remove，超出上限 = InvalidEntry（ROLLBACK，不写日志）
       UPDATE sessions SET metadata=? WHERE session_id=?  -- 同一事务
   seq = COALESCE((SELECT MAX(seq) FROM log WHERE session_id=?), 0) + 1
   recorded_at = now_ms()                        -- 存储层本地时钟
@@ -213,7 +213,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 ```
 
 - 解码在查重之前，同时给出 `event_kind` 与目录行；未知事件变体在追加时就报 `InvalidEntry`（与 ADR-0002 的硬错误一致）。
-- 派生动作只有两个：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`，`metadata` 取 `SessionCreated.metadata`）；`MetadataChanged` 把 patch 合并进该行的 `metadata`（值为 `Some` 设置该键，`None` 删除该键；同一键以后写者为准，ADR-0044）。其余事件只写日志。
+- 派生动作只有两个：`SessionCreated` 插入 `sessions` 行（`parent_id` 取 `SessionCreated.parent`，`metadata` 取 `SessionCreated.metadata`）；`MetadataChanged` 合并进该行的 `metadata`（先设置 `set` 的键，再删除 `remove` 的键；同一键以后写者为准，ADR-0044）。其余事件只写日志。
 - **会话元数据上限**（ADR-0032）：至多 64 个键；键至多 128 字节，值至多 4096 字节（UTF-8），由 `asterpath_protocol::check_metadata` 定义。创建时超限由 `create_session` 报 `AsterError::Config`，不落日志；`MetadataChanged` 由存储适配器在追加事务里按合并结果校验（`patched_metadata`），超限报 `InvalidEntry`，不落日志（ADR-0044）。子会话创建时元数据为空，之后同样可以修改。
 - **元数据过滤**（ADR-0039）：`SessionQuery.metadata` 的每个键值都要与目录项相等（AND，等值，区分大小写，不做前缀或范围）。SQLite 用 `json_each` 在查询里比对，没有索引，按目录大小线性扫描；需要时再按常用键加表达式索引。
 - 未闭合意图、空闲与待处理输入不落表：需要时由 `SessionFacts::fold` 从该会话日志算出（`is_idle()`、`is_wakeable()`）。`ApprovalDecided` 不关闭工具意图；steering 的 `InputRecorded` 在下一个 `StepStarted` 前保持待处理，因此 `submit_input` 后崩溃仍可唤醒（S18）。

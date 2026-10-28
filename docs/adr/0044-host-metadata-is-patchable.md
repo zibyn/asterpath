@@ -20,6 +20,7 @@ ADR-0032 让宿主元数据在创建时写入、之后不可变，否决可变�
 - 改名、自动标题、归档标记都是宿主约定的键，内核不需要为它们各加功能。
 - 每个存储后端在 append 时多处理一种记录；契约套件随之扩展。
 - 元数据的变化历史留在日志里。
+- 新记录种类没有升 `LOG_SCHEMA_VERSION`（仍为 1）：发布前日志不承诺兼容，[ADR-0004](0004-log-schema-version-and-upcasting.md) 的版本与 upcast 规则已退役。
 
 ## Considered alternatives
 

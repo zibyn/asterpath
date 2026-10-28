@@ -787,11 +787,12 @@ async fn metadata_changes(log: &dyn SessionStore) {
     let (root, kid) = (session(0xb1), session(0xb2));
     create(log, root, None).await;
     create(log, kid, Some(root)).await;
-    let change = |pairs: &[(&str, Option<&str>)]| SessionEvent::MetadataChanged {
-        patch: pairs
+    let change = |set: &[(&str, &str)], remove: &[&str]| SessionEvent::MetadataChanged {
+        set: set
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
+        remove: remove.iter().map(|k| (*k).to_owned()).collect(),
     };
     let metadata_of = |session| async move {
         list(log, SessionQuery::default())
@@ -802,27 +803,33 @@ async fn metadata_changes(log: &dyn SessionStore) {
             .metadata
     };
 
-    append(log, root, &change(&[("title", Some("first"))]), None).await;
-    append(
-        log,
-        root,
-        &change(&[("title", Some("second")), ("name", None)]),
-        None,
-    )
-    .await;
+    append(log, root, &change(&[("title", "first")], &[]), None).await;
+    append(log, root, &change(&[("title", "second")], &["name"]), None).await;
     assert_eq!(
         metadata_of(root).await,
         BTreeMap::from([
             ("cwd".to_owned(), "/work/项目".to_owned()),
             ("title".to_owned(), "second".to_owned()),
         ]),
-        "set keys merge, later writes win, a null value removes the key"
+        "set keys merge, later writes win, remove drops the key"
     );
-    append(log, kid, &change(&[("archived", Some("1"))]), None).await;
+    let parent_before = metadata_of(root).await;
+    append(log, kid, &change(&[("archived", "1")], &[]), None).await;
     assert_eq!(
         metadata_of(kid).await,
         BTreeMap::from([("archived".to_owned(), "1".to_owned())]),
         "children can be changed too"
+    );
+    assert_eq!(
+        metadata_of(root).await,
+        parent_before,
+        "a child's change leaves its parent alone"
+    );
+    append(log, kid, &change(&[("gone", "1")], &[]), None).await;
+    append(log, kid, &change(&[], &["gone"]), None).await;
+    assert!(
+        !metadata_of(kid).await.contains_key("gone"),
+        "set then remove leaves no key"
     );
     assert_eq!(
         list(
@@ -841,12 +848,10 @@ async fn metadata_changes(log: &dyn SessionStore) {
     );
 
     let frontier = log.frontier(root).await.expect("frontier");
-    let too_many: Vec<(String, Option<&str>)> =
-        (0..64).map(|i| (format!("k{i}"), Some("v"))).collect();
-    let too_many: Vec<(&str, Option<&str>)> =
-        too_many.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let too_many: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let too_many: Vec<(&str, &str)> = too_many.iter().map(|k| (k.as_str(), "v")).collect();
     let long = "v".repeat(4097);
-    for event in [change(&too_many), change(&[("title", Some(&long))])] {
+    for event in [change(&too_many, &[]), change(&[("title", &long)], &[])] {
         let error = append_raw(log, entry_for(root, LOG_SCHEMA_VERSION, &event, None))
             .await
             .expect_err("a merge over the limits is rejected");
@@ -864,7 +869,7 @@ async fn metadata_changes(log: &dyn SessionStore) {
         entry_for(
             session(0xb3),
             LOG_SCHEMA_VERSION,
-            &change(&[("a", Some("b"))]),
+            &change(&[("a", "b")], &[]),
             None,
         ),
     )
