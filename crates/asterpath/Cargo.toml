@@ -9,12 +9,14 @@ default = ["anthropic", "openai", "sqlite"]
 anthropic = ["dep:asterpath-provider-anthropic"]
 openai = ["dep:asterpath-provider-openai"]
 sqlite = ["dep:asterpath-storage-sqlite"]
+postgres = ["dep:asterpath-storage-postgres"]
 
 [dependencies]
 asterpath-protocol = { path = "../asterpath-protocol" }
 asterpath-provider-anthropic = { path = "../asterpath-provider-anthropic", optional = true }
 asterpath-provider-openai = { path = "../asterpath-provider-openai", optional = true }
 asterpath-storage-sqlite = { path = "../asterpath-storage-sqlite", optional = true }
+asterpath-storage-postgres = { path = "../asterpath-storage-postgres", optional = true }
 futures-core = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

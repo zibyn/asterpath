@@ -21,6 +21,7 @@
 
 ### 新增
 
+- Postgres 存储后端（#162）：新 crate `asterpath-storage-postgres`，`from_pool(pool, OpenOptions)` 接收应用建好的 `deadpool-postgres` 连接池，实现 `SessionStore` 全部契约（含会话树属主、租约与纪元、退役）。`synchronous_commit=off` 时默认拒绝打开（`OpenOptions::allow_async_commit` 放宽）。facade 新增可选 feature `postgres`（默认关），再导出为 `asterpath::postgres`。设计见 `docs/design/storage-postgres.md`。
 - 只读句柄新增 `SessionHandle::config()`（日志折叠出的生效配置，含别的进程写入的变更）与 `context_usage()`（`ContextUsage { used, window }`：最近一次模型请求的输入 token 与 `ModelSpec.context_window`，压缩后不刷新），不需要认领。
 - 会话元数据可按键修改（#165，ADR-0044）：`SessionHandle::update_metadata(patch)`，`patch: MetadataPatch { set, remove }`（`asterpath_protocol`）：先设置 `set` 的键、再删除 `remove` 的键，未提到的键不变；不需要认领，子会话也可以改；已退役的会话 = `NotFound`。新事件 `MetadataChanged { set, remove }`，存储在追加事务里合并进目录行，合并结果超出上限 = `AsterError::Config`，不落日志。自建 `SessionStore` 要在 append 时处理它（`asterpath_protocol::patched_metadata`），契约套件已覆盖。会话环境与 `SessionContext.metadata` 仍读创建时的元数据。
 - 从指定已提交回合分叉（#167，ADR-0045）：`Asterpath::fork_session_at(source, metadata, at)` 在 `source` 的已提交回合 `at` 的末尾分叉，历史与配置取当时的（之后压缩或改配置都不影响）。`at` 不存在、未提交或属于别的会话 = 新错误 `AsterError::InvalidForkPoint { session, turn }`。`fork_session` 不变，仍取最后一个已提交回合。
