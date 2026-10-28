@@ -286,6 +286,9 @@ fn ddl(error: tokio_postgres::Error) -> StorageError {
     }
 }
 
+// shortcut: statements are passed as text, so each is prepared per call (one
+// extra round trip each); switch to `prepare_cached` when append latency matters.
+
 /// Retries of a conflicting control transaction, 1 ms apart.
 const CONFLICT_RETRIES: usize = 1_000;
 
@@ -308,8 +311,6 @@ where
     }
 }
 
-// shortcut: every statement is prepared per call (one extra round trip each);
-// switch to `prepare_cached` when append latency matters.
 async fn connect(pool: &Pool) -> Result<deadpool_postgres::Object, StorageError> {
     pool.get().await.map_err(backend)
 }

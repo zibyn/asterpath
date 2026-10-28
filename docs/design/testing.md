@@ -12,7 +12,7 @@
 - 装饰器命中后的动作只有两档：`Halt`（写 marker 后永久挂起，由父进程 `SIGKILL`）与 `Panic`（进程内测试）。
 - **不用 panic / `abort` / `exit` / 注入异常冒充崩溃**；进程级验收一律真 `SIGKILL`（[acceptance.md](../spec/acceptance.md) §1）。
 - protocol 提供最小 `Clock { now() }` + `SystemClock`；存储契约不收时间（#73）；`ManualClock` 在 `asterpath-testing`。
-- 后端中立契约套件：**G2–G7 在 in-memory 与 SQLite 上都跑**；G1、G8、`Corrupt`、WAL、迁移只测 SQLite。G9 属主在两个后端上都跑（第二个存储句柄代表第二个进程），真进程间的属主锁与 `SIGKILL` 释放只测 SQLite。
+- 后端中立契约套件：**G2–G7 在 in-memory、SQLite 与 Postgres 上都跑**（Postgres 需要 `ASTERPATH_TEST_POSTGRES_URL`，没设时跳过，见 [storage-postgres.md](storage-postgres.md) §8）；G1、G8、`Corrupt`、WAL、迁移只测 SQLite。G9 属主在三个后端上都跑（第二个存储句柄代表第二个进程），真进程间的属主锁与 `SIGKILL` 释放只测 SQLite。
 - CI 分三层：单测+契约（5 分钟）、进程级验收（Linux，整套 5 分钟，单 marker 等待 15 秒）、feature 矩阵。
 - 验收 fixture 单一来源：`asterpath-acceptance/fixtures/*.json`；#6 的 L 场景与 #17 的 R 场景复用，不另建。
 
@@ -122,7 +122,7 @@ impl Clock for ManualClock { /* 读 AtomicI64 */ }
 
 ## 4. 后端中立契约套件
 
-`asterpath-testing` 提供共享套件；套件代码只依赖 protocol。套件是 async 的，由调用方的 `#[tokio::test]` 驱动。in-memory 后端在 `asterpath-testing` 自己的测试里经 `MemoryBackend`（实现 `StoreFactory`）运行共享套件；SQLite 在 `asterpath-storage-sqlite/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入依赖规则（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
+`asterpath-testing` 提供共享套件；套件代码只依赖 protocol。套件是 async 的，由调用方的 `#[tokio::test]` 驱动。in-memory 后端在 `asterpath-testing` 自己的测试里经 `MemoryBackend`（实现 `StoreFactory`）运行共享套件；SQLite 与 Postgres 分别在 `asterpath-storage-sqlite/tests/`、`asterpath-storage-postgres/tests/` 里以 `[dev-dependencies] asterpath-testing` 运行同一套件。dev 边不计入依赖规则（[module-contracts.md](module-contracts.md) §7、[packaging.md](packaging.md) §2）。
 
 ```rust
 pub trait StoreFactory {
@@ -183,7 +183,7 @@ in-memory 后端在文档与代码中显式标注 **不满足 G1**；它实现�
 
 | 层 | 命令 | 平台 | 预算 | 内容 |
 | --- | --- | --- | --- | --- |
-| 单测 + 契约 | `cargo test --workspace` | Linux（契约测试本身平台中立） | 5 分钟 | crate 单测、G2–G7 双后端、SQLite 专项 |
+| 单测 + 契约 | `cargo test --workspace` | Linux（契约测试本身平台中立） | 5 分钟 | crate 单测、G2–G7 各后端（Postgres 需设数据库 URL）、SQLite 专项 |
 | 进程级验收 | `cargo test -p asterpath-acceptance --test acceptance` | 仅 Linux（`cfg(unix)`） | 整套 5 分钟；单 marker 15 秒 | A1–A3、(b)、(c)、S1/S2/S3/S6 |
 | feature 矩阵 | `cargo check -p asterpath --no-default-features` 及 `anthropic` / `openai` / `sqlite` 组合 | Linux | 5 分钟 | 编译面 |
 
