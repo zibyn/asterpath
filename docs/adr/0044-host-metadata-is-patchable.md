@@ -1,6 +1,6 @@
 # 宿主元数据可按键修改：外部写入的 patch，目录行同事务合并
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-28)
 **部分取代**: [ADR-0032](0032-sessions-carry-opaque-host-metadata.md) 的「之后不可变」
 **来源**: [#165](https://github.com/zibyn/asterpath/issues/165)（拆自 [#157](https://github.com/zibyn/asterpath/issues/157)）
 
@@ -13,13 +13,14 @@ ADR-0032 让宿主元数据在创建时写入、之后不可变，否决可变�
 - **元数据修改是外部写入**：新记录携带 patch（设置若干键、删除若干键），任何进程都可以写，不要求认领。同一键以日志中后写者为准；不同进程改不同的键互不覆盖。
 - **目录行在 append 同事务内合并**：与 `SessionCreated` 一样由后端维护，目录项始终等于创建时的元数据依次合并之后的全部 patch。数量与长度上限按合并结果校验，超限拒绝该次写入。
 - **子会话与根会话一样可以修改**。
-- 其余不变：框架只保存和列出，不解释；不进入模型可见的配置或请求；分叉不继承。
+- 其余不变：框架只保存和列出，不解释；不进入模型可见的配置或请求；分叉不继承。会话环境解析（ADR-0037）与 `SessionContext.metadata`（ADR-0039）仍读创建时的元数据，修改只影响目录与过滤。
 
 ## Consequences
 
 - 改名、自动标题、归档标记都是宿主约定的键，内核不需要为它们各加功能。
 - 每个存储后端在 append 时多处理一种记录；契约套件随之扩展。
 - 元数据的变化历史留在日志里。
+- 新记录种类没有升 `LOG_SCHEMA_VERSION`（仍为 1）：发布前日志不承诺兼容，[ADR-0004](0004-log-schema-version-and-upcasting.md) 的版本与 upcast 规则已退役。
 
 ## Considered alternatives
 

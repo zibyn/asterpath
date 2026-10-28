@@ -83,6 +83,7 @@ pub enum SessionEvent {
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
     ApprovalDecided { tool_call_id: ToolCallId, decision: ApprovalDecision },
     ConfigChanged { patch: ConfigPatch },                         // 下一个 StepStarted 生效；append_system / 工具增删投影为 Instruction / ToolsChanged 条目
+    MetadataChanged { set: BTreeMap<String, String>, remove: Vec<String> },  // 外部写入：先设置 set 的键、再删除 remove 的键，目录行同事务合并；非模型可见（ADR-0044）
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }

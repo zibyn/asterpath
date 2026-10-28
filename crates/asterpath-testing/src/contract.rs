@@ -51,6 +51,7 @@ pub async fn session_store_contract<F: StoreFactory>(factory: &F) {
     let clock = Arc::new(ManualClock::new());
     catalog(&*factory.open_with_clock(clock.clone()), &clock).await;
     metadata_filter(store).await;
+    metadata_changes(store).await;
     retirement(store).await;
     let clock = Arc::new(ManualClock::new());
     let [here, elsewhere] = factory.open_processes(clock.clone());
@@ -777,6 +778,105 @@ async fn catalog(log: &dyn SessionStore, clock: &ManualClock) {
     assert_eq!(parent(log, root).await, None);
     assert_eq!(parent(log, kid).await, Some(root));
     assert_eq!(parent(log, unknown).await, None);
+}
+
+/// `MetadataChanged` merges into the catalog entry in the append's own
+/// transaction, key by key, later writes winning; a merge over the limits
+/// is rejected and logs nothing (ADR-0044).
+async fn metadata_changes(log: &dyn SessionStore) {
+    let (root, kid) = (session(0xb1), session(0xb2));
+    create(log, root, None).await;
+    create(log, kid, Some(root)).await;
+    let change = |set: &[(&str, &str)], remove: &[&str]| SessionEvent::MetadataChanged {
+        set: set
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        remove: remove.iter().map(|k| (*k).to_owned()).collect(),
+    };
+    let metadata_of = |session| async move {
+        list(log, SessionQuery::default())
+            .await
+            .into_iter()
+            .find(|entry| entry.session == session)
+            .expect("listed")
+            .metadata
+    };
+
+    append(log, root, &change(&[("title", "first")], &[]), None).await;
+    append(log, root, &change(&[("title", "second")], &["name"]), None).await;
+    assert_eq!(
+        metadata_of(root).await,
+        BTreeMap::from([
+            ("cwd".to_owned(), "/work/项目".to_owned()),
+            ("title".to_owned(), "second".to_owned()),
+        ]),
+        "set keys merge, later writes win, remove drops the key"
+    );
+    let parent_before = metadata_of(root).await;
+    append(log, kid, &change(&[("archived", "1")], &[]), None).await;
+    assert_eq!(
+        metadata_of(kid).await,
+        BTreeMap::from([("archived".to_owned(), "1".to_owned())]),
+        "children can be changed too"
+    );
+    assert_eq!(
+        metadata_of(root).await,
+        parent_before,
+        "a child's change leaves its parent alone"
+    );
+    append(log, kid, &change(&[("gone", "1")], &[]), None).await;
+    append(log, kid, &change(&[], &["gone"]), None).await;
+    assert!(
+        !metadata_of(kid).await.contains_key("gone"),
+        "set then remove leaves no key"
+    );
+    assert_eq!(
+        list(
+            log,
+            SessionQuery {
+                metadata: BTreeMap::from([("title".to_owned(), "second".to_owned())]),
+                ..SessionQuery::default()
+            }
+        )
+        .await
+        .iter()
+        .map(|entry| entry.session)
+        .collect::<Vec<_>>(),
+        vec![root],
+        "filters see merged metadata"
+    );
+
+    let frontier = log.frontier(root).await.expect("frontier");
+    let too_many: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let too_many: Vec<(&str, &str)> = too_many.iter().map(|k| (k.as_str(), "v")).collect();
+    let long = "v".repeat(4097);
+    for event in [change(&too_many, &[]), change(&[("title", &long)], &[])] {
+        let error = append_raw(log, entry_for(root, LOG_SCHEMA_VERSION, &event, None))
+            .await
+            .expect_err("a merge over the limits is rejected");
+        assert!(matches!(error, StorageError::InvalidEntry(_)), "{error:?}");
+    }
+    assert_eq!(
+        log.frontier(root).await.expect("frontier"),
+        frontier,
+        "nothing logged"
+    );
+    assert_eq!(metadata_of(root).await.len(), 2);
+
+    let error = append_raw(
+        log,
+        entry_for(
+            session(0xb3),
+            LOG_SCHEMA_VERSION,
+            &change(&[("a", "b")], &[]),
+            None,
+        ),
+    )
+    .await
+    .expect_err("no session to change");
+    assert!(matches!(error, StorageError::InvalidEntry(_)), "{error:?}");
+    assert_eq!(log.frontier(session(0xb3)).await.expect("frontier"), None);
 }
 
 /// Metadata filters match every pair by equality, ANDed, with parent

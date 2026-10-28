@@ -148,7 +148,8 @@ pub struct CatalogEntry {
     /// `recorded_at` of the session's last committed record; display only,
     /// recovery and wake never read it.
     pub last_activity: Timestamp,
-    /// The session metadata recorded in `SessionCreated` (ADR-0032).
+    /// The session metadata of `SessionCreated` with every later
+    /// `MetadataChanged` merged in (ADR-0032, ADR-0044).
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -176,6 +177,48 @@ impl CatalogEntry {
             session: self.session,
         }
     }
+}
+
+/// Session metadata limits (storage.md §5): at most 64 entries, keys up to
+/// 128 bytes and values up to 4096 bytes.
+pub fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), String> {
+    if metadata.len() > 64
+        || metadata
+            .iter()
+            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+    {
+        return Err(
+            "metadata allows at most 64 entries, keys up to 128 bytes and values \
+                    up to 4096 bytes"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// A keyed change to session metadata (ADR-0044), recorded as one
+/// `MetadataChanged`: `set` sets its keys, then `remove` removes its keys;
+/// keys named in neither keep their value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetadataPatch {
+    pub set: BTreeMap<String, String>,
+    pub remove: Vec<String>,
+}
+
+/// `metadata` with a `MetadataChanged` merged in (`set`, then `remove`),
+/// checked against the limits as a whole (ADR-0044); over the limits is
+/// `InvalidEntry`. Store adapters call it in the append's transaction.
+pub fn patched_metadata(
+    mut metadata: BTreeMap<String, String>,
+    set: &BTreeMap<String, String>,
+    remove: &[String],
+) -> Result<BTreeMap<String, String>, StorageError> {
+    metadata.extend(set.iter().map(|(key, value)| (key.clone(), value.clone())));
+    for key in remove {
+        metadata.remove(key);
+    }
+    check_metadata(&metadata).map_err(StorageError::InvalidEntry)?;
+    Ok(metadata)
 }
 
 /// The one storage adapter (ADR-0023): the append-only per-session event log

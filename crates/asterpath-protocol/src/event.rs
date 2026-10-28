@@ -22,7 +22,8 @@ pub enum SessionEvent {
     SessionCreated {
         config: ConfigSnapshot,
         parent: Option<ParentRef>,
-        /// Opaque, immutable session metadata (ADR-0032); empty for children.
+        /// Opaque session metadata as created (ADR-0032); empty for children.
+        /// Later `MetadataChanged` records patch it (ADR-0044).
         metadata: BTreeMap<String, String>,
     },
     ContextForked {
@@ -136,6 +137,13 @@ pub enum SessionEvent {
     ConfigChanged {
         patch: ConfigPatch,
     },
+    /// An external, keyed change to the session metadata (ADR-0044): `set`
+    /// sets its keys, then `remove` removes its keys. The catalog entry
+    /// merges it in the append's own transaction.
+    MetadataChanged {
+        set: BTreeMap<String, String>,
+        remove: Vec<String>,
+    },
 }
 
 impl SessionEvent {
@@ -162,6 +170,7 @@ impl SessionEvent {
             Self::ChildSessionCompleted { .. } => "ChildSessionCompleted",
             Self::ApprovalDecided { .. } => "ApprovalDecided",
             Self::ConfigChanged { .. } => "ConfigChanged",
+            Self::MetadataChanged { .. } => "MetadataChanged",
         }
     }
 }

@@ -472,6 +472,35 @@ fn append_in(
         }
     }
 
+    if let SessionEvent::MetadataChanged { set, remove } = &event {
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT metadata FROM sessions WHERE session_id = ?1",
+                [entry.session.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(current) = current else {
+            return Err(StorageError::InvalidEntry(
+                "MetadataChanged for a session without SessionCreated".to_owned(),
+            ));
+        };
+        let current = serde_json::from_str(&current).map_err(|error| StorageError::Corrupt {
+            session: Some(entry.session),
+            detail: format!("catalog metadata: {error}"),
+        })?;
+        let merged = asterpath_protocol::patched_metadata(current, set, remove)?;
+        tx.execute(
+            "UPDATE sessions SET metadata = ?2 WHERE session_id = ?1",
+            params![
+                entry.session.as_bytes(),
+                serde_json::to_string(&merged).map_err(backend)?
+            ],
+        )
+        .map_err(backend)?;
+    }
+
     let seq: i64 = tx
         .query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM log WHERE session_id = ?1",

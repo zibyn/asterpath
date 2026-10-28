@@ -50,13 +50,15 @@ use crate::watch::Watchers;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ForkSource, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
-    SessionFacts, SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError,
-    UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
+    ConfigSnapshot, ContextUsage, ForkSource, MetadataPatch, ProjectedEntry, ProviderCatalog,
+    RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span,
+    SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
+    UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken,
-    SessionEnvironment, SessionQuery, SessionStore, Tool, root_of, unique_bytes,
+    ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken, ParentFilter,
+    RetirementError, SessionEnvironment, SessionQuery, SessionStore, StorageError, Tool, root_of,
+    unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -286,6 +288,28 @@ impl Asterpath {
         source: SessionId,
         metadata: BTreeMap<String, String>,
     ) -> Result<SessionHandle, AsterError> {
+        self.fork(source, metadata, None).await
+    }
+
+    /// [`Self::fork_session`] at the end of `source`'s committed turn `at`
+    /// rather than its last one (ADR-0045): history and config are the
+    /// source's there, even if it compacted or changed config since. An `at`
+    /// that is unknown, uncommitted or another session's = `InvalidForkPoint`.
+    pub async fn fork_session_at(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+        at: TurnId,
+    ) -> Result<SessionHandle, AsterError> {
+        self.fork(source, metadata, Some(at)).await
+    }
+
+    async fn fork(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+        at: Option<TurnId>,
+    ) -> Result<SessionHandle, AsterError> {
         check_metadata(&metadata)?;
         let env = self.resolve(&metadata).await?;
         let records = scan::scan_decoded(&*self.store, source)
@@ -298,7 +322,16 @@ impl Asterpath {
                 detail,
             })
         };
-        let (waterline, prefix) = fork::session_prefix(&records).ok_or_else(not_found)?;
+        if records.is_empty() {
+            return Err(not_found());
+        }
+        let (waterline, prefix) = fork::session_prefix(&records, at).ok_or_else(|| match at {
+            Some(turn) => AsterError::InvalidForkPoint {
+                session: source,
+                turn,
+            },
+            None => not_found(),
+        })?;
         let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
         let mut config =
             asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
@@ -393,9 +426,11 @@ impl Asterpath {
         Ok(())
     }
 
-    /// The session store. Appends made here reach the `on_record` hooks;
-    /// retirement is `store().retire(...)` (`Unsupported` when the injected
-    /// store has none).
+    /// The session store. Appends made here reach the `on_record` hooks.
+    /// `store().retire(...)` retires one session without checking the
+    /// claim; applications should use [`OwnedSession::retire`], which retires
+    /// the claimed tree in order (`Unsupported` when the injected store has
+    /// no retirement).
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
     }
@@ -529,18 +564,7 @@ fn check_tool_names(tools: &[Arc<dyn Tool>]) -> Result<(), AsterError> {
 
 /// Session metadata limits (storage.md §5).
 fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
-    if metadata.len() > 64
-        || metadata
-            .iter()
-            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
-    {
-        return Err(AsterError::Config {
-            message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
-                      up to 4096 bytes"
-                .to_owned(),
-        });
-    }
-    Ok(())
+    asterpath_protocol::check_metadata(metadata).map_err(|message| AsterError::Config { message })
 }
 
 /// Totals over `scope` with no further narrowing.
@@ -690,6 +714,39 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Set (`patch.set`), then remove (`patch.remove`) session metadata keys
+    /// (ADR-0044): an external write any process may make, root or child.
+    /// Keys not named keep their value; the same key written twice keeps the
+    /// later write. The catalog merges it in the append's own transaction; a
+    /// merge over the limits is a `Config` error and nothing is logged; a
+    /// retired session is `NotFound`. The
+    /// environment and `SessionContext` keep reading the metadata the
+    /// session was created with.
+    pub async fn update_metadata(&self, patch: MetadataPatch) -> Result<(), AsterError> {
+        let MetadataPatch { set, remove } = patch;
+        let entry = asterpath_protocol::encode_entry(
+            self.session,
+            None,
+            &SessionEvent::MetadataChanged { set, remove },
+        )
+        .map_err(corrupt(self.session))?;
+        let not_found = AsterError::Agent(AgentError::NotFound {
+            session: self.session,
+        });
+        match self.store.append(entry).await {
+            Ok(_) => Ok(()),
+            Err(StorageError::Retired { .. }) => Err(not_found),
+            // A store that forgets retired sessions rejects them as entries.
+            Err(StorageError::InvalidEntry(_))
+                if self.store.frontier(self.session).await?.is_none() =>
+            {
+                Err(not_found)
+            }
+            Err(StorageError::InvalidEntry(message)) => Err(AsterError::Config { message }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Added tools must be registered with this exact descriptor and not yet
     /// effective; removed tools must be effective.
     fn check_tool_change(
@@ -749,6 +806,33 @@ impl SessionHandle {
         Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
     }
 
+    /// The effective config folded from the log at its frontier (ADR-0030):
+    /// what the next step runs with, whichever process changed it.
+    pub async fn config(&self) -> Result<ConfigSnapshot, AsterError> {
+        self.fold_log(|records| asterpath_protocol::effective_config(records, u64::MAX))
+            .await
+    }
+
+    /// The latest model request's input tokens against the effective
+    /// context window, folded from the log.
+    pub async fn context_usage(&self) -> Result<ContextUsage, AsterError> {
+        self.fold_log(ContextUsage::of).await
+    }
+
+    /// The decoded log folded by `fold`; `NotFound` when the fold finds no
+    /// `SessionCreated` (an unknown or retired session).
+    async fn fold_log<T>(
+        &self,
+        fold: impl FnOnce(&[(asterpath_protocol::LogEntry, SessionEvent)]) -> Option<T>,
+    ) -> Result<T, AsterError> {
+        let records = scan::scan_decoded(&*self.store, self.session)
+            .await
+            .map_err(AgentError::from)?;
+        fold(&records).ok_or(AsterError::Agent(AgentError::NotFound {
+            session: self.session,
+        }))
+    }
+
     /// Observe the session without driving it (ADR-0038): every committed
     /// record after `after` (the whole log for `None`), then
     /// [`WatchEvent::Synced`], then each new commit as it lands. A drive in
@@ -806,14 +890,7 @@ impl OwnedSession {
         if self.env.is_none() {
             return Ok(());
         }
-        let records = scan::scan_decoded(&*self.store, self.session)
-            .await
-            .map_err(AgentError::from)?;
-        let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
-            AsterError::Agent(AgentError::NotFound {
-                session: self.session,
-            }),
-        )?;
+        let effective = self.config().await?;
         let mut patch = ConfigPatch::default();
         for recorded in &effective.tools {
             match self.tool(&recorded.name) {
@@ -974,6 +1051,58 @@ impl OwnedSession {
             future: self.agent.compact_now(self.session),
         };
         Ok(compaction.await?)
+    }
+
+    /// Retire this session's whole tree, from any session of it (retention.md
+    /// §3). Every session must be idle first, or nothing is retired and the
+    /// result is `NotIdle`; nothing is cancelled for the application. Then
+    /// each session is one store retirement, deepest first and the root last,
+    /// so a crash midway leaves the rest of the tree whole and a second call
+    /// finishes it. A frontier that moved meanwhile is `FrontierMoved`; a
+    /// store without retirement is `Unsupported`; a claim lost to another
+    /// process is `Storage(OwnedElsewhere)`. Afterwards the tree's reads
+    /// report `NotFound`.
+    pub async fn retire(self) -> Result<(), RetirementError> {
+        let owner = self.owner();
+        // Breadth-first: every session comes after its parent.
+        let mut tree = vec![owner.root];
+        let mut next = 0;
+        while let Some(&session) = tree.get(next) {
+            let children = self
+                .store
+                .sessions(SessionQuery {
+                    parent: ParentFilter::ChildrenOf(session),
+                    ..SessionQuery::default()
+                })
+                .await?;
+            tree.extend(children.iter().map(|entry| entry.session));
+            next += 1;
+        }
+        // Each session's frontier as checked idle; retiring at it makes a
+        // write landing after the check `FrontierMoved`.
+        let mut frontiers = Vec::with_capacity(tree.len());
+        for &session in &tree {
+            let entries = scan_all(&*self.store, session).await?;
+            let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
+                session: Some(session),
+                detail: error.to_string(),
+            })?;
+            if !facts.is_idle() {
+                return Err(RetirementError::NotIdle);
+            }
+            frontiers.push((session, entries.last().map(|entry| entry.log_id)));
+        }
+        for (session, frontier) in frontiers.into_iter().rev() {
+            // The store does not check the claim; refuse once it is gone.
+            if self.held.is_lost() || self.store.owner(owner.root).await? != Some(owner) {
+                return Err(StorageError::OwnedElsewhere { root: owner.root }.into());
+            }
+            let Some(frontier) = frontier else {
+                continue;
+            };
+            self.store.retire(session, frontier).await?;
+        }
+        Ok(())
     }
 }
 

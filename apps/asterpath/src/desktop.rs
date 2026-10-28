@@ -17,8 +17,8 @@ use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEven
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalGate, ApprovalRequest, CatalogEntry, Clock, ConfigPatch,
     EnvironmentAdapter, InputId, ModelSpec, Part, SessionEvent, SessionSpec, StorageError,
-    SystemClock, ToolCallId, ToolSelection, UsageScope, UserInput, decode_entry, effective_config,
-    root_of, scan_all, unique_bytes,
+    SystemClock, ToolCallId, ToolSelection, UsageScope, UserInput, decode_entry, root_of, scan_all,
+    unique_bytes,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -547,9 +547,8 @@ impl Desktop {
             SessionEvent::SessionCreated { metadata, .. } => metadata.get(AGENT).cloned(),
             _ => None,
         });
-        let model = effective_config(&records, u64::MAX)
-            .ok_or_else(|| format!("session {} does not exist", session.to_hex()))?
-            .model;
+        let handle = self.asterpath.open_session(session).await.map_err(text)?;
+        let model = handle.config().await.map_err(text)?.model;
         let usage = self
             .asterpath
             .usage(UsageScope::SessionSubtree(session))

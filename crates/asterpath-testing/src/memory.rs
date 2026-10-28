@@ -282,6 +282,15 @@ impl InMemoryEventLog {
             return Ok(*log_id);
         }
 
+        if let SessionEvent::MetadataChanged { set, remove } = &event {
+            let Some((.., metadata)) = state.sessions.get_mut(&entry.session) else {
+                return Err(StorageError::InvalidEntry(
+                    "MetadataChanged for a session without SessionCreated".to_owned(),
+                ));
+            };
+            *metadata = asterpath_protocol::patched_metadata(metadata.clone(), set, remove)?;
+        }
+
         let log_id = LogId::from_i64(state.next_log_id + 1);
         state.next_log_id += 1;
         let seq = state.session_seq.entry(entry.session).or_insert(0);
