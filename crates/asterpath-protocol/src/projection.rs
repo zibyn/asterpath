@@ -94,13 +94,46 @@ impl Baseline {
 /// Tool results are emitted in `ToolCallRequested` order, not log-completion
 /// order, so parallel calls reconstruct identically whatever order they finish.
 pub fn project(entries: &[LogEntry]) -> Result<Vec<ProjectedEntry>, ProjectionError> {
-    Ok(fold(entries)?.0)
+    Ok(fold(decode_all(entries)?)?.0)
+}
+
+/// [`project`] over records already decoded, so none is decoded again.
+pub fn project_decoded<'a>(
+    decoded: impl IntoIterator<Item = (&'a LogEntry, &'a SessionEvent)>,
+) -> Result<Vec<ProjectedEntry>, ProjectionError> {
+    Ok(fold(cloned(decoded))?.0)
 }
 
 /// The baseline system and the flattened history a model request carries.
 pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, ProjectionError> {
-    let (history, baseline) = fold(entries)?;
-    Ok(RequestHistory {
+    Ok(rendered(fold(decode_all(entries)?)?))
+}
+
+/// [`request_history`] over records already decoded, so none is decoded again.
+pub fn request_history_decoded<'a>(
+    decoded: impl IntoIterator<Item = (&'a LogEntry, &'a SessionEvent)>,
+) -> Result<RequestHistory, ProjectionError> {
+    Ok(rendered(fold(cloned(decoded))?))
+}
+
+fn decode_all(entries: &[LogEntry]) -> Result<Vec<(&LogEntry, SessionEvent)>, LogDecodeError> {
+    entries
+        .iter()
+        .map(|entry| Ok((entry, decode_entry(entry)?)))
+        .collect()
+}
+
+fn cloned<'a>(
+    decoded: impl IntoIterator<Item = (&'a LogEntry, &'a SessionEvent)>,
+) -> Vec<(&'a LogEntry, SessionEvent)> {
+    decoded
+        .into_iter()
+        .map(|(entry, event)| (entry, event.clone()))
+        .collect()
+}
+
+fn rendered((history, baseline): (Vec<ProjectedEntry>, Baseline)) -> RequestHistory {
+    RequestHistory {
         system: baseline.system,
         system_sections: baseline.sections,
         tools: baseline.tools,
@@ -109,12 +142,13 @@ pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, Projectio
             .into_iter()
             .flat_map(|projected| projected.items)
             .collect(),
-    })
+    }
 }
 
-fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), ProjectionError> {
-    let mut ordered: Vec<&LogEntry> = entries.iter().collect();
-    ordered.sort_by_key(|entry| entry.seq);
+fn fold(
+    mut ordered: Vec<(&LogEntry, SessionEvent)>,
+) -> Result<(Vec<ProjectedEntry>, Baseline), ProjectionError> {
+    ordered.sort_by_key(|(entry, _)| entry.seq);
 
     let mut history: Vec<ProjectedEntry> = Vec::new();
     let mut intents: HashMap<ToolCallId, (String, u64)> = HashMap::new();
@@ -124,8 +158,8 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
     // The effective reasoning, to tell which request patches change it.
     let mut reasoning: Option<ReasoningParams> = None;
 
-    for entry in ordered {
-        match decode_entry(entry)? {
+    for (entry, event) in ordered {
+        match event {
             SessionEvent::SessionCreated { config, .. } if baseline.is_none() => {
                 reasoning.clone_from(&config.request.reasoning);
                 baseline = Some(Baseline {

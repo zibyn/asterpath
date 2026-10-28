@@ -39,7 +39,7 @@ use asterpath_protocol::{
 use futures_core::Stream;
 
 use crate::commit::CommitLog;
-use crate::scan::DecodedLog;
+use crate::scan::{Decoded, DecodedLog};
 use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
 use crate::views::usage;
@@ -1034,11 +1034,12 @@ impl Agent {
             .count() as u32;
         // The baseline system, not `config.system`: appended instructions sit
         // in `items` at their place until a compaction rebases them (ADR-0030).
-        let history =
-            asterpath_protocol::request_history(&visible).map_err(|error| AgentError::Corrupt {
+        let history = asterpath_protocol::request_history_decoded(visible).map_err(|error| {
+            AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         let mut system = history.system;
         system
             .extend(asterpath_protocol::SystemSection::flatten(&history.system_sections).cloned());
@@ -1261,12 +1262,13 @@ impl Agent {
                 _ => {}
             }
         }
-        let history = asterpath_protocol::project(&visible(log, watermark)?).map_err(|error| {
-            AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            }
-        })?;
+        let history =
+            asterpath_protocol::project_decoded(visible(log, watermark)?).map_err(|error| {
+                AgentError::Corrupt {
+                    session,
+                    detail: error.to_string(),
+                }
+            })?;
         let live: HashSet<LogId> = history
             .iter()
             .filter_map(|entry| match entry.origin {
@@ -1598,10 +1600,10 @@ fn config_at(log: &DecodedLog, watermark: Option<LogId>) -> Result<ConfigSnapsho
 
 /// The records a step at `watermark` sees: its step prefix, or with `None`
 /// the whole log.
-fn visible(log: &DecodedLog, watermark: Option<LogId>) -> Result<Vec<LogEntry>, AgentError> {
+fn visible(log: &DecodedLog, watermark: Option<LogId>) -> Result<Decoded<'_>, AgentError> {
     match watermark {
         Some(at) => log.step_prefix(at).ok_or_else(|| missing_step(log)),
-        None => Ok(log.entries()),
+        None => Ok(log.decoded()),
     }
 }
 

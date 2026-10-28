@@ -910,7 +910,7 @@ fn fork_snapshot_at(entries: &DecodedLog, at: LogId) -> Result<fork::Snapshot, E
             at.as_i64()
         ))
     })?;
-    fork::snapshot(&prefix).map_err(backend)
+    fork::snapshot(prefix).map_err(backend)
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.

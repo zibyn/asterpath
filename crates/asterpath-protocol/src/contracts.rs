@@ -116,9 +116,14 @@ pub struct ClaimTable {
 }
 
 struct ClaimShared {
-    /// Root -> (epoch, live claims).
-    held: Mutex<BTreeMap<SessionId, (u64, usize)>>,
+    held: Mutex<BTreeMap<SessionId, Held>>,
     rows: Box<dyn ClaimRows>,
+}
+
+/// A root's epoch and its live claims at that epoch.
+struct Held {
+    epoch: u64,
+    claims: usize,
 }
 
 impl ClaimTable {
@@ -135,9 +140,9 @@ impl ClaimTable {
     pub async fn claim(&self, root: SessionId) -> Result<Claim, StorageError> {
         let response = {
             let mut held = lock(&self.shared.held);
-            if let Some((epoch, claims)) = held.get_mut(&root) {
-                *claims += 1;
-                let epoch = *epoch;
+            if let Some(h) = held.get_mut(&root) {
+                h.claims += 1;
+                let epoch = h.epoch;
                 return Ok(self.claim_of(OwnerToken { root, epoch }));
             }
             self.shared.rows.claim(root)
@@ -145,11 +150,11 @@ impl ClaimTable {
         let epoch = response.await?;
         {
             let mut held = lock(&self.shared.held);
-            let entry = held.entry(root).or_insert((epoch, 0));
-            if entry.0 != epoch {
-                *entry = (epoch, 0);
+            let entry = held.entry(root).or_insert(Held { epoch, claims: 0 });
+            if entry.epoch != epoch {
+                *entry = Held { epoch, claims: 0 };
             }
-            entry.1 += 1;
+            entry.claims += 1;
         }
         Ok(self.claim_of(OwnerToken { root, epoch }))
     }
@@ -159,9 +164,9 @@ impl ClaimTable {
     pub async fn renew(&self) -> Result<Vec<OwnerToken>, StorageError> {
         let held = lock(&self.shared.held)
             .iter()
-            .map(|(root, (epoch, _))| OwnerToken {
+            .map(|(root, h)| OwnerToken {
                 root: *root,
-                epoch: *epoch,
+                epoch: h.epoch,
             })
             .collect();
         let lost = self.shared.rows.renew(held).await?;
@@ -169,7 +174,7 @@ impl ClaimTable {
         for token in &lost {
             if held
                 .get(&token.root)
-                .is_some_and(|(epoch, _)| *epoch == token.epoch)
+                .is_some_and(|h| h.epoch == token.epoch)
             {
                 held.remove(&token.root);
             }
@@ -200,9 +205,9 @@ impl Drop for ClaimRelease {
         let wait = {
             let mut held = lock(&self.shared.held);
             match held.get_mut(&self.token.root) {
-                Some((epoch, claims)) if *epoch == self.token.epoch => {
-                    *claims -= 1;
-                    if *claims > 0 {
+                Some(h) if h.epoch == self.token.epoch => {
+                    h.claims -= 1;
+                    if h.claims > 0 {
                         return;
                     }
                 }

@@ -2,7 +2,9 @@
 //! session forks (ADR-0033): which source records a fork copies, and the
 //! projection it materializes from a prefix of the decoded log.
 
-use asterpath_protocol::{Item, LogEntry, Part, ProjectionError, SystemSection};
+use asterpath_protocol::{Item, Part, ProjectionError, SystemSection};
+
+use crate::scan::Decoded;
 
 /// What a fork materializes from its prefix.
 pub(crate) struct Snapshot {
@@ -17,8 +19,8 @@ pub(crate) struct Snapshot {
     pub(crate) items: Vec<Item>,
 }
 
-pub(crate) fn snapshot(prefix: &[LogEntry]) -> Result<Snapshot, ProjectionError> {
-    let history = asterpath_protocol::request_history(prefix)?;
+pub(crate) fn snapshot(prefix: Decoded<'_>) -> Result<Snapshot, ProjectionError> {
+    let history = asterpath_protocol::request_history_decoded(prefix)?;
     let mut items = history.items;
     items.retain(|item| {
         !matches!(

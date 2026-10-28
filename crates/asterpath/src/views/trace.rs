@@ -89,7 +89,7 @@ async fn fold_session(log: &CommitLog, session: SessionId) -> Result<Vec<Span>, 
     let parent_session = parent.as_ref().map(|parent| parent.session);
 
     let mut folder = Folder::new(session, &config, created_entry, parent_session);
-    for (entry, event) in &decoded {
+    for (entry, event) in decoded.iter() {
         // A step sees the config at its `StepStarted.seq`, as the agent does,
         // so a change recorded inside a step never redescribes its calls
         // (ADR-0030); a compaction sees the changes recorded before it.
@@ -726,7 +726,7 @@ impl Folder {
         let Ok(decoded) = log.read(parent).await else {
             return;
         };
-        for (entry, event) in &decoded {
+        for (entry, event) in decoded.iter() {
             let SessionEvent::ChildSessionSpawned { child, .. } = event else {
                 continue;
             };

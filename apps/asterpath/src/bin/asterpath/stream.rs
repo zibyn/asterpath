@@ -52,14 +52,18 @@ pub async fn run<R: AsyncBufRead + Unpin, W: Write>(
     };
     let mut ran = start;
     if start {
-        drive::drive(asterpath, handle, &mut app).await?;
+        drive::drive(asterpath, handle, &mut app)
+            .await
+            .map_err(aster_error)?;
     }
     // Between drives only input starts one; no approval is waiting.
     while let Some(command) = app.command().await {
         match command {
             Command::UserInput { parts } => {
                 submit(handle, parts).await.map_err(aster_error)?;
-                drive::drive(asterpath, handle, &mut app).await?;
+                drive::drive(asterpath, handle, &mut app)
+                    .await
+                    .map_err(aster_error)?;
                 ran = true;
             }
             Command::Approval { .. } => {}
