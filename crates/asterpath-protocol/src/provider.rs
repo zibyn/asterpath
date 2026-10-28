@@ -43,9 +43,9 @@ pub struct ModelRequest {
     pub output_format: Option<OutputFormat>,
     /// See [`RequestConfig::server_tools`].
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
-    /// The session the request is made for; `None` outside one. Adapters
-    /// ignore it; application wrappers pick credentials or endpoints by it
-    /// (ADR-0039).
+    /// The session the request is made for; `None` outside one. Application
+    /// wrappers pick credentials or endpoints by it (ADR-0039); adapters read
+    /// only [`SessionContext::cache_root`] for a default cache key.
     pub session: Option<SessionContext>,
 }
 
@@ -56,6 +56,10 @@ pub struct SessionContext {
     pub session: SessionId,
     /// The root of the session's tree; the session itself for a root.
     pub root: SessionId,
+    /// The session whose prompt cache this request shares: `root`, or for a
+    /// root forked from another session (ADR-0033), the source's
+    /// `cache_root`. Adapters derive their default cache key from it.
+    pub cache_root: SessionId,
     /// The root's session metadata (ADR-0032): children have their own, never
     /// inherited, so a tree's tenancy lives on its root.
     pub metadata: BTreeMap<String, String>,
