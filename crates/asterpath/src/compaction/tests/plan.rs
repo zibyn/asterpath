@@ -54,6 +54,7 @@ fn input(
     step_starts: Vec<i64>,
 ) -> CompactionInput {
     CompactionInput {
+        request: None,
         trigger,
         model: model(Some(100)),
         config: config(),

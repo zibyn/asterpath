@@ -477,6 +477,7 @@ pub struct CompactionInput {
     pub history: Vec<ProjectedEntry>,     // 模型可见投影，按序
     pub step_starts: Vec<LogId>,          // 可切割边界的 StepStarted LogId（已提交 step），升序
     pub last_usage: Option<UsageAnchor>,  // 最近一次 AssistantMessage
+    pub request: Option<ModelRequest>,    // 会话此刻的请求，由 history 渲染；None 时摘要走独立请求
 }
 
 pub struct UsageAnchor {
@@ -512,6 +513,7 @@ pub struct CompactionJob {
     pub usable_window: u32,               // 由会话模型算出，不是摘要模型
     pub retained_tokens: u64,             // first_kept 之后的估算
     pub session: Option<SessionContext>,  // plan 填 None，agent 在 compact 前填入；摘要请求原样带上（ADR-0039）
+    pub prefix: Option<ModelRequest>,     // request 截到被替换区间；模型与 model 相同时摘要请求沿用它（#176）
 }
 
 #[non_exhaustive]

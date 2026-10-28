@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compaction::DefaultCompactor;
+use asterpath_protocol::{CacheLifetime, ModelRequest, RequestConfig};
 use asterpath_protocol::{
     CompactSummary, CompactionConfig, CompactionJob, Compactor, InputTokens, Item, ModelId,
     ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderError, ProviderErrorKind,
@@ -85,6 +86,7 @@ fn job(usable: u32, retained: u64) -> CompactionJob {
         retained_tokens: retained,
         turn: turn(),
         session: None,
+        prefix: None,
     }
 }
 
@@ -205,4 +207,77 @@ fn compaction_config_defaults_match_the_spec() {
     assert_eq!(config.max_auto_compactions_per_turn, 1);
     assert_eq!(config.max_summary_tokens, 2048);
     assert!(config.summary_model.is_none());
+}
+
+fn session_request() -> ModelRequest {
+    let mut config = RequestConfig::default();
+    config.cache_ttl.messages = CacheLifetime::OneHour;
+    ModelRequest::new(
+        model(),
+        2,
+        vec![text("be helpful")],
+        vec![Item::Message {
+            role: Role::User,
+            parts: vec![text("hello")],
+            raw: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+        &config,
+    )
+}
+
+fn summarized(provider: &ScriptedProvider) -> ModelRequest {
+    provider.requests().pop().expect("one request")
+}
+
+#[tokio::test]
+async fn same_model_summary_forks_the_session_request() {
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![message("the summary")],
+        StopReason::EndTurn,
+        usage(1, 1),
+    ));
+    let mut job = job(1000, 0);
+    job.prefix = Some(session_request());
+    compactor(Arc::clone(&provider))
+        .compact(job)
+        .await
+        .expect("summary succeeds");
+
+    let session = session_request();
+    let request = summarized(&provider);
+    assert_eq!(request.system, session.system);
+    assert_eq!(request.prefix_epoch, 2);
+    assert_eq!(request.cache_ttl, session.cache_ttl);
+    assert_eq!(request.tool_choice, session.tool_choice);
+    assert_eq!(request.items[..1], session.items[..]);
+    assert_eq!(request.items.len(), 2);
+    assert!(matches!(
+        &request.items[1],
+        Item::Message { role: Role::User, parts, .. }
+            if matches!(&parts[0], Part::Text { text } if text.contains("Summarize"))
+    ));
+}
+
+#[tokio::test]
+async fn another_summary_model_falls_back_to_an_independent_request() {
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![message("the summary")],
+        StopReason::EndTurn,
+        usage(1, 1),
+    ));
+    let mut job = job(1000, 0);
+    job.model.model = ModelId::new("summarizer");
+    job.prefix = Some(session_request());
+    compactor(Arc::clone(&provider))
+        .compact(job)
+        .await
+        .expect("summary succeeds");
+
+    let request = summarized(&provider);
+    assert!(request.system.is_empty());
+    assert_eq!(request.cache_ttl, RequestConfig::default().cache_ttl);
+    assert_eq!(request.tool_choice, ToolChoice::None);
+    assert_eq!(request.items.len(), 3);
 }

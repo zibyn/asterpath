@@ -1377,6 +1377,8 @@ impl Agent {
             .filter(|(step, _)| committed.contains(step))
             .map(|(_, log_id)| log_id)
             .collect();
+        // Same log and watermark as `history`, so its items are `history`'s.
+        let (request, _) = self.build_request(session, &config, watermark).await?;
         Ok((
             CompactionInput {
                 trigger,
@@ -1386,6 +1388,7 @@ impl Agent {
                 history,
                 step_starts,
                 last_usage,
+                request: Some(request),
             },
             frontier,
         ))
