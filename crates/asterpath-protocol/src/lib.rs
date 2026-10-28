@@ -100,6 +100,6 @@ pub use tracing::{
     TraceError, TraceId, TurnAttrs, WaitAttrs, WaitKind,
 };
 pub use usage::{
-    InputTokens, OutputTokens, Usage, UsageBucket, UsageEntry, UsageError, UsageFilter,
-    UsageRecord, UsageReport, UsageScope, UsageTotals, usage_of,
+    ContextUsage, InputTokens, OutputTokens, Usage, UsageBucket, UsageEntry, UsageError,
+    UsageFilter, UsageRecord, UsageReport, UsageScope, UsageTotals, usage_of,
 };
