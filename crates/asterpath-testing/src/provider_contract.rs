@@ -31,6 +31,8 @@ pub async fn provider_contract(wire: &impl ProviderWire) {
     framing_variants_decode_identically(wire).await;
     multibyte_text_split_across_tcp_chunks_is_byte_exact(wire).await;
     stream_without_terminal_event_is_transport(wire).await;
+    unterminated_last_frame_without_terminal_event_is_transport(wire).await;
+    mid_stream_disconnect_keeps_request_id(wire).await;
     generic_status_classes(wire).await;
     retry_after_and_request_id_are_extracted(wire).await;
 }
@@ -148,6 +150,44 @@ async fn stream_without_terminal_event_is_transport(wire: &impl ProviderWire) {
             .any(|event| matches!(event, Ok(StreamEvent::ResponseEnded { .. }))),
         "{outcome:?}"
     );
+}
+
+/// The decoder still flushes the last frame at EOF, but that is no terminal event.
+async fn unterminated_last_frame_without_terminal_event_is_transport(wire: &impl ProviderWire) {
+    let mut events = wire.text_response("cut");
+    events.pop();
+    let body = render(&events, "\n", false);
+    let body = body
+        .strip_suffix('\n')
+        .expect("frame ends with a blank line");
+    let outcome = run(wire, Reply::sse(body)).await;
+    let error = outcome
+        .last()
+        .expect("at least one event")
+        .as_ref()
+        .expect_err("truncated stream fails");
+    assert_eq!(error.kind, ProviderErrorKind::Transport, "{outcome:?}");
+}
+
+/// The error keeps the request id the stream announced (header or event).
+async fn mid_stream_disconnect_keeps_request_id(wire: &impl ProviderWire) {
+    let body = render(&wire.text_response("Hello"), "\n", false);
+    let cut = body.find("Hello").expect("text in body");
+    let reply = Reply::truncated_sse(body, cut).header("request-id", "req_cut");
+    let outcome = run(wire, reply).await;
+    let error = outcome
+        .last()
+        .expect("at least one event")
+        .as_ref()
+        .expect_err("disconnected stream fails");
+    assert_eq!(error.kind, ProviderErrorKind::Transport, "{outcome:?}");
+    let started = outcome.iter().find_map(|event| match event {
+        Ok(StreamEvent::ResponseStarted { request_id, .. }) => Some(request_id.clone()),
+        _ => None,
+    });
+    let announced = started.flatten();
+    assert!(announced.is_some(), "{outcome:?}");
+    assert_eq!(error.request_id, announced, "{outcome:?}");
 }
 
 const ERROR_BODY: &str = r#"{"error":{"type":"contract_error","message":"boom"}}"#;

@@ -22,28 +22,23 @@ pub mod rules;
 use rules::{BASH, CommandRules, RuleKind};
 
 /// A session tree's approval mode (GLOSSARY「审批模式」): what a call
-/// outside the sandbox gets, and a cap on the sandbox.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// outside the sandbox gets, and a cap on the sandbox. `-a`,
+/// `[approval] default` and the desktop window all use these names; the
+/// old `untrusted` / `never` stay accepted (#213).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
-    /// Read-only: `bash` runs in a `ReadOnly` sandbox; calls outside the
-    /// sandbox are denied; MCP tools with `readOnlyHint` ask.
-    Deny,
-    /// Calls outside the sandbox and MCP tools ask (`config.toml`'s `untrusted`).
+    /// Bash runs in a read-only sandbox; calls outside it are denied
+    ReadOnly,
+    /// Calls outside the sandbox and MCP tools ask
     #[default]
+    #[serde(alias = "untrusted")]
+    #[value(alias = "untrusted")]
     Ask,
-    /// Nothing asks (`never`).
+    /// Nothing asks; the sandbox is the only guard
+    #[serde(alias = "never")]
+    #[value(alias = "never")]
     Allow,
-}
-
-impl From<config::ApprovalMode> for ApprovalMode {
-    fn from(mode: config::ApprovalMode) -> Self {
-        match mode {
-            config::ApprovalMode::Untrusted => Self::Ask,
-            config::ApprovalMode::Never => Self::Allow,
-            config::ApprovalMode::ReadOnly => Self::Deny,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -84,7 +79,7 @@ impl ApprovalModes {
 
     /// The mode, sandbox and command rules the application runs with.
     pub fn from_settings(settings: &config::Settings, workspace: &Workspace) -> Self {
-        Self::new(settings.approval.into())
+        Self::new(settings.approval)
             .with_sandbox(workspace)
             .with_rules(settings.rules.clone())
     }
@@ -158,12 +153,12 @@ impl ApprovalModes {
             .and_then(|tree| tree.mode)
             .unwrap_or(self.default);
         let recorded = tree.is_some_and(|tree| tree.capped.remove(&call));
-        recorded || mode == ApprovalMode::Deny
+        recorded || mode == ApprovalMode::ReadOnly
     }
 
     /// Whether `bash` runs in a restricted sandbox under `mode`.
     fn sandboxed(&self, mode: ApprovalMode) -> bool {
-        self.backend && (mode == ApprovalMode::Deny || !self.full_access)
+        self.backend && (mode == ApprovalMode::ReadOnly || !self.full_access)
     }
 }
 
@@ -178,7 +173,7 @@ impl ApprovalPolicy for ApprovalModes {
         let rule = rules.matches(request.tool.as_str(), request.args.as_str());
         let verdict = verdict(mode, self.sandboxed(mode), rule, request);
         if verdict == ApprovalVerdict::Allow
-            && mode == ApprovalMode::Deny
+            && mode == ApprovalMode::ReadOnly
             && self.backend
             && self.full_access
             && request.provenance == Provenance::InProcess
@@ -218,14 +213,14 @@ fn table(mode: ApprovalMode, sandboxed: bool, request: &ApprovalRequest) -> Appr
         reason: Some(reason.to_owned()),
     };
     let outside = match mode {
-        ApprovalMode::Deny => read_only("the session is read-only"),
+        ApprovalMode::ReadOnly => read_only("the session is read-only"),
         ApprovalMode::Ask => ApprovalVerdict::Ask,
         ApprovalMode::Allow => ApprovalVerdict::Allow,
     };
     match (request.provenance, request.side_effect) {
         (Provenance::InProcess, _) if request.tool.as_str() == BASH => match (sandboxed, mode) {
             (true, _) => ApprovalVerdict::Allow,
-            (false, ApprovalMode::Deny) => {
+            (false, ApprovalMode::ReadOnly) => {
                 read_only("the session is read-only and there is no sandbox to run commands in")
             }
             (false, _) => outside,
@@ -233,7 +228,7 @@ fn table(mode: ApprovalMode, sandboxed: bool, request: &ApprovalRequest) -> Appr
         (Provenance::InProcess, SideEffect::ReadOnly) => ApprovalVerdict::Allow,
         (Provenance::InProcess, SideEffect::Mutating) => outside,
         // MCP servers run under the configured sandbox; the mode cannot tighten them.
-        (Provenance::External { .. }, SideEffect::ReadOnly) if mode == ApprovalMode::Deny => {
+        (Provenance::External { .. }, SideEffect::ReadOnly) if mode == ApprovalMode::ReadOnly => {
             ApprovalVerdict::Ask
         }
         (Provenance::External { .. }, _) => outside,
