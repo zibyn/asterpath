@@ -35,6 +35,7 @@ fn usage() -> Usage {
             uncached: 5,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: 5,

@@ -19,6 +19,14 @@ pub struct InputTokens {
     pub uncached: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// Subset of `cache_write` written with a 1h TTL; never added on top.
+    /// Zero when the provider does not split writes by TTL.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
