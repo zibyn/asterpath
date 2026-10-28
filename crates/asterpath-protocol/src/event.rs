@@ -137,11 +137,12 @@ pub enum SessionEvent {
     ConfigChanged {
         patch: ConfigPatch,
     },
-    /// An external, keyed change to the session metadata (ADR-0044): a
-    /// value sets its key, `None` removes it. The catalog entry merges it in
-    /// the append's own transaction.
+    /// An external, keyed change to the session metadata (ADR-0044): `set`
+    /// sets its keys, then `remove` removes its keys. The catalog entry
+    /// merges it in the append's own transaction.
     MetadataChanged {
-        patch: BTreeMap<String, Option<String>>,
+        set: BTreeMap<String, String>,
+        remove: Vec<String>,
     },
 }
 

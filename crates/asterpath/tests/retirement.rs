@@ -258,6 +258,43 @@ async fn retire_interrupted_midway_leaves_the_root_whole_and_a_retry_finishes() 
 }
 
 #[tokio::test]
+async fn retire_reports_a_session_written_after_the_idle_check_as_frontier_moved() {
+    let store = Arc::new(Retirements::default());
+    store.allow(usize::MAX);
+    let asterpath = Asterpath::builder()
+        .providers(vec![Arc::new(ScriptedProvider::new("p"))])
+        .store(store.clone())
+        .build()
+        .await
+        .expect("facade builds");
+    let root = asterpath.create_session(spec("p")).await.expect("create");
+    let checked = asterpath
+        .store()
+        .frontier(root.id())
+        .await
+        .expect("frontier")
+        .expect("root exists");
+    let renamed = SessionEvent::MetadataChanged {
+        set: [("title".to_owned(), "late".to_owned())].into(),
+        remove: Vec::new(),
+    };
+    store.append_at_owner_check(encode_entry(root.id(), None, &renamed).expect("encode"));
+
+    let error = root
+        .claim()
+        .await
+        .expect("claim")
+        .retire()
+        .await
+        .expect_err("the root moved after the check");
+    assert!(
+        matches!(error, RetirementError::FrontierMoved { expected, .. } if expected == checked),
+        "{error:?}"
+    );
+    asterpath.open_session(root.id()).await.expect("untouched");
+}
+
+#[tokio::test]
 async fn open_session_reports_unknown_sessions_as_not_found() {
     let db = temp_db("unknown");
     let asterpath = Asterpath::builder()
@@ -281,12 +318,22 @@ async fn open_session_reports_unknown_sessions_as_not_found() {
 
 /// An in-memory store that retires only as often as allowed, then reports
 /// `Unsupported`: the default retirement, or a crash between retirements.
+/// An armed entry is appended at the next owner check, as another process
+/// writing between `retire`'s idle check and its retirements would.
 #[derive(Default)]
-struct Retirements(asterpath_testing::InMemoryEventLog, AtomicU64);
+struct Retirements(
+    asterpath_testing::InMemoryEventLog,
+    AtomicU64,
+    std::sync::Mutex<Option<asterpath::protocol::NewEntry>>,
+);
 
 impl Retirements {
     fn allow(&self, times: usize) {
         self.1.store(times as u64, Ordering::SeqCst);
+    }
+
+    fn append_at_owner_check(&self, entry: asterpath::protocol::NewEntry) {
+        *self.2.lock().expect("lock") = Some(entry);
     }
 }
 
@@ -353,7 +400,13 @@ impl SessionStore for Retirements {
         '_,
         Result<Option<asterpath::protocol::OwnerToken>, asterpath::protocol::StorageError>,
     > {
-        self.0.owner(root)
+        let armed = self.2.lock().expect("lock").take();
+        Box::pin(async move {
+            if let Some(entry) = armed {
+                self.0.append(entry).await?;
+            }
+            self.0.owner(root).await
+        })
     }
 
     fn renew(

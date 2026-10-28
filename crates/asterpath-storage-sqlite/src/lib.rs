@@ -472,7 +472,7 @@ fn append_in(
         }
     }
 
-    if let SessionEvent::MetadataChanged { patch } = &event {
+    if let SessionEvent::MetadataChanged { set, remove } = &event {
         let current: Option<String> = tx
             .query_row(
                 "SELECT metadata FROM sessions WHERE session_id = ?1",
@@ -490,7 +490,7 @@ fn append_in(
             session: Some(entry.session),
             detail: format!("catalog metadata: {error}"),
         })?;
-        let merged = asterpath_protocol::patched_metadata(current, patch)?;
+        let merged = asterpath_protocol::patched_metadata(current, set, remove)?;
         tx.execute(
             "UPDATE sessions SET metadata = ?2 WHERE session_id = ?1",
             params![

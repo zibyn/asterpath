@@ -44,8 +44,9 @@ pub use config::{
 };
 pub use contracts::{
     ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, Claim, DEFAULT_LEASE_TTL,
-    DedupKey, LogEntry, LogQuery, NewEntry, OwnerToken, ParentFilter, PendingApproval,
-    SessionQuery, SessionStore, check_metadata, patched_metadata, root_of, scan_all,
+    DedupKey, LogEntry, LogQuery, MetadataPatch, NewEntry, OwnerToken, ParentFilter,
+    PendingApproval, SessionQuery, SessionStore, check_metadata, patched_metadata, root_of,
+    scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;

@@ -50,10 +50,10 @@ use crate::watch::Watchers;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ConfigSnapshot, ContextUsage, ForkSource, ProjectedEntry, ProviderCatalog, RunRequest,
-    RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span, SpanFilter,
-    ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope,
-    UserInput, dedup,
+    ConfigSnapshot, ContextUsage, ForkSource, MetadataPatch, ProjectedEntry, ProviderCatalog,
+    RunRequest, RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span,
+    SpanFilter, ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport,
+    UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
     ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken, ParentFilter,
@@ -714,30 +714,35 @@ impl SessionHandle {
         Ok(())
     }
 
-    /// Set (`Some`) or remove (`None`) session metadata keys (ADR-0044): an
-    /// external write any process may make, root or child. Keys not named
-    /// keep their value; the same key written twice keeps the later write.
-    /// The catalog merges it in the append's own transaction; a merge over
-    /// the limits is a `Config` error and nothing is logged. The
+    /// Set (`patch.set`), then remove (`patch.remove`) session metadata keys
+    /// (ADR-0044): an external write any process may make, root or child.
+    /// Keys not named keep their value; the same key written twice keeps the
+    /// later write. The catalog merges it in the append's own transaction; a
+    /// merge over the limits is a `Config` error and nothing is logged; a
+    /// retired session is `NotFound`. The
     /// environment and `SessionContext` keep reading the metadata the
     /// session was created with.
-    pub async fn update_metadata(
-        &self,
-        patch: BTreeMap<String, Option<String>>,
-    ) -> Result<(), AsterError> {
+    pub async fn update_metadata(&self, patch: MetadataPatch) -> Result<(), AsterError> {
+        let MetadataPatch { set, remove } = patch;
         let entry = asterpath_protocol::encode_entry(
             self.session,
             None,
-            &SessionEvent::MetadataChanged { patch },
+            &SessionEvent::MetadataChanged { set, remove },
         )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
+        .map_err(corrupt(self.session))?;
+        let not_found = AsterError::Agent(AgentError::NotFound {
+            session: self.session,
+        });
         match self.store.append(entry).await {
             Ok(_) => Ok(()),
-            Err(asterpath_protocol::StorageError::InvalidEntry(message)) => {
-                Err(AsterError::Config { message })
+            Err(StorageError::Retired { .. }) => Err(not_found),
+            // A store that forgets retired sessions rejects them as entries.
+            Err(StorageError::InvalidEntry(_))
+                if self.store.frontier(self.session).await?.is_none() =>
+            {
+                Err(not_found)
             }
+            Err(StorageError::InvalidEntry(message)) => Err(AsterError::Config { message }),
             Err(error) => Err(error.into()),
         }
     }
@@ -804,23 +809,26 @@ impl SessionHandle {
     /// The effective config folded from the log at its frontier (ADR-0030):
     /// what the next step runs with, whichever process changed it.
     pub async fn config(&self) -> Result<ConfigSnapshot, AsterError> {
-        let records = scan::scan_decoded(&*self.store, self.session)
+        self.fold_log(|records| asterpath_protocol::effective_config(records, u64::MAX))
             .await
-            .map_err(AgentError::from)?;
-        asterpath_protocol::effective_config(&records, u64::MAX).ok_or(AsterError::Agent(
-            AgentError::NotFound {
-                session: self.session,
-            },
-        ))
     }
 
     /// The latest model request's input tokens against the effective
     /// context window, folded from the log.
     pub async fn context_usage(&self) -> Result<ContextUsage, AsterError> {
+        self.fold_log(ContextUsage::of).await
+    }
+
+    /// The decoded log folded by `fold`; `NotFound` when the fold finds no
+    /// `SessionCreated` (an unknown or retired session).
+    async fn fold_log<T>(
+        &self,
+        fold: impl FnOnce(&[(asterpath_protocol::LogEntry, SessionEvent)]) -> Option<T>,
+    ) -> Result<T, AsterError> {
         let records = scan::scan_decoded(&*self.store, self.session)
             .await
             .map_err(AgentError::from)?;
-        ContextUsage::of(&records).ok_or(AsterError::Agent(AgentError::NotFound {
+        fold(&records).ok_or(AsterError::Agent(AgentError::NotFound {
             session: self.session,
         }))
     }
@@ -1070,6 +1078,9 @@ impl OwnedSession {
             tree.extend(children.iter().map(|entry| entry.session));
             next += 1;
         }
+        // Each session's frontier as checked idle; retiring at it makes a
+        // write landing after the check `FrontierMoved`.
+        let mut frontiers = Vec::with_capacity(tree.len());
         for &session in &tree {
             let entries = scan_all(&*self.store, session).await?;
             let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
@@ -1079,13 +1090,14 @@ impl OwnedSession {
             if !facts.is_idle() {
                 return Err(RetirementError::NotIdle);
             }
+            frontiers.push((session, entries.last().map(|entry| entry.log_id)));
         }
-        for session in tree.into_iter().rev() {
+        for (session, frontier) in frontiers.into_iter().rev() {
             // The store does not check the claim; refuse once it is gone.
             if self.held.is_lost() || self.store.owner(owner.root).await? != Some(owner) {
                 return Err(StorageError::OwnedElsewhere { root: owner.root }.into());
             }
-            let Some(frontier) = self.store.frontier(session).await? else {
+            let Some(frontier) = frontier else {
                 continue;
             };
             self.store.retire(session, frontier).await?;
