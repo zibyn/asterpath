@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+const OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 
 /// The rendered top-level `tools`: the baseline when tool changes render
 /// inline, otherwise the effective set (ADR-0030). `tools_hash` covers these.
@@ -33,14 +34,45 @@ pub(crate) fn top_level_tools<'a>(
     }
 }
 
+/// Whether reasoning changes render in place (#180): an effort-only system
+/// message carries the new `output_config.effort` and the top level keeps
+/// `baseline_reasoning`. Only the effort can change in place; `thinking`
+/// (including `Off`, which disables it or omits effort), `budget_tokens`,
+/// `summary` (`thinking.display`) and every other request field live only
+/// at the top level, so any of those changing, or an effort the model does
+/// not accept, falls back to the effective reasoning at the top level. In
+/// place, a change after a tool result takes effect from the next user
+/// input, not the next step.
+pub(crate) fn inline_effort(rules: &AnthropicModelProfile, request: &ModelRequest) -> bool {
+    let baseline = request.baseline_reasoning.as_ref();
+    let in_place = |params: Option<&ReasoningParams>| {
+        params.is_some_and(|params| {
+            params.effort.is_some_and(|effort| {
+                effort != ReasoningEffort::Off && rules.efforts.contains(&effort)
+            }) && baseline.is_some_and(|baseline| {
+                params.budget_tokens == baseline.budget_tokens && params.summary == baseline.summary
+            })
+        })
+    };
+    rules.inline_effort
+        && in_place(baseline)
+        && request.items.iter().all(|item| match item {
+            Item::ReasoningChanged { reasoning } => in_place(reasoning.as_ref()),
+            _ => true,
+        })
+}
+
 /// The `anthropic-beta` header the rendered body needs.
-pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Option<&'static str> {
-    (rules.inline_changes
-        && request
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::ToolsChanged { .. })))
-    .then_some(INLINE_TOOLS_BETA)
+pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Option<String> {
+    let has = |predicate: fn(&Item) -> bool| request.items.iter().any(predicate);
+    let mut betas = Vec::new();
+    if rules.inline_changes && has(|item| matches!(item, Item::ToolsChanged { .. })) {
+        betas.push(INLINE_TOOLS_BETA);
+    }
+    if has(|item| matches!(item, Item::ReasoningChanged { .. })) && inline_effort(rules, request) {
+        betas.push(OUTPUT_CONFIG_BETA);
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 fn tool_definition(tool: &ToolDescriptor) -> Value {
@@ -217,7 +249,14 @@ pub(crate) fn render(
     let server_tools = server_tools_for(request)?;
     let top_tools = top_level_tools(rules, request);
     let tools_hash = asterpath_protocol::tools_hash(top_tools, &server_tools);
-    let messages = render_messages(provider, request, &tools_hash, rules, trace)?;
+    let messages = render_messages(
+        provider,
+        request,
+        &tools_hash,
+        rules,
+        inline_effort(rules, request),
+        trace,
+    )?;
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_changes {
         // Fallback: appended instructions join the top-level system.
@@ -280,8 +319,15 @@ pub(crate) fn render(
             fields.push(("top_k", Frag::Json(json!(top_k))));
         }
     }
-    if let Some(reasoning) = &request.reasoning {
-        // check() has rejected combinations the model does not accept.
+    let inline_effort = inline_effort(rules, request);
+    let reasoning = if inline_effort {
+        &request.baseline_reasoning
+    } else {
+        &request.reasoning
+    };
+    if let Some(reasoning) = reasoning {
+        // check() has rejected combinations the model does not accept;
+        // `inline_effort` has checked the baseline.
         if reasoning.effort == Some(ReasoningEffort::Off) {
             if rules.thinking_default_on {
                 fields.push(("thinking", Frag::Json(json!({"type": "disabled"}))));
@@ -329,15 +375,21 @@ fn render_reasoning(
         fields.push(("thinking", Frag::Json(thinking)));
     }
     if let Some(effort) = reasoning.effort {
-        let effort = match effort {
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            ReasoningEffort::XHigh => "xhigh",
-            ReasoningEffort::Max => "max",
-            _ => unreachable!("check rejects efforts missing from the model table"),
-        };
-        fields.push(("output_config", Frag::Json(json!({"effort": effort}))));
+        fields.push((
+            "output_config",
+            Frag::Json(json!({"effort": effort_name(effort)})),
+        ));
+    }
+}
+
+fn effort_name(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        _ => unreachable!("check rejects efforts missing from the model table"),
     }
 }
 
@@ -345,6 +397,8 @@ struct PendingMessage {
     role: &'static str,
     tool_results: Vec<Frag>,
     other: Vec<Frag>,
+    /// The message-level `output_config` of a system message.
+    output_config: Option<Value>,
 }
 
 /// Messages being rendered. Instruction blocks wait for the next assistant
@@ -354,6 +408,9 @@ struct PendingMessage {
 struct Messages {
     list: Vec<PendingMessage>,
     pending_system: Vec<Frag>,
+    /// An effort change rides on the pending system message, or alone with
+    /// empty content; the last of adjacent changes wins.
+    pending_effort: Option<&'static str>,
 }
 
 impl Messages {
@@ -365,9 +422,13 @@ impl Messages {
     }
 
     fn flush_system(&mut self) {
-        if !self.pending_system.is_empty() {
+        let effort = self.pending_effort.take();
+        if !self.pending_system.is_empty() || effort.is_some() {
             let system = std::mem::take(&mut self.pending_system);
             push_blocks(&mut self.list, "system", Vec::new(), system);
+            if let (Some(effort), Some(last)) = (effort, self.list.last_mut()) {
+                last.output_config = Some(json!({"effort": effort}));
+            }
         }
     }
 }
@@ -377,6 +438,7 @@ fn render_messages(
     request: &ModelRequest,
     tools_hash: &str,
     rules: &AnthropicModelProfile,
+    inline_effort: bool,
     trace: Option<&dyn TraceSink>,
 ) -> Result<String, ProviderError> {
     let inline_changes = rules.inline_changes;
@@ -527,11 +589,29 @@ fn render_messages(
             }
             // The top-level `tools` is already the effective set.
             Item::ToolsChanged { .. } => {}
+            Item::ReasoningChanged { reasoning } if inline_effort => {
+                messages.pending_effort = reasoning
+                    .as_ref()
+                    .and_then(|params| params.effort)
+                    .map(effort_name);
+            }
+            // The top level already carries the effective reasoning.
+            Item::ReasoningChanged { .. } => {}
         }
     }
     messages.flush_system();
 
-    let count = messages.list.len();
+    // The last two messages with blocks get breakpoints; the previous one is
+    // a fallback for steps that add more than the API's 20-block lookback.
+    // An effort-only system message has no block to carry one.
+    let carriers: Vec<usize> = messages
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| !message.tool_results.is_empty() || !message.other.is_empty())
+        .map(|(position, _)| position)
+        .collect();
+    let marked = &carriers[carriers.len().saturating_sub(2)..];
     let rendered = messages
         .list
         .into_iter()
@@ -539,9 +619,7 @@ fn render_messages(
         .map(|(position, message)| {
             let mut content = message.tool_results;
             content.extend(message.other);
-            // The previous message's breakpoint is a fallback for steps that add
-            // more than the API's 20-block lookback.
-            if position + 2 >= count {
+            if marked.contains(&position) {
                 // Breakpoint on the last carrier block; omitted if every block is raw.
                 let ttl = request.cache_ttl.messages;
                 let _ = content
@@ -549,10 +627,14 @@ fn render_messages(
                     .rev()
                     .any(|block| block.set_cache_control(ttl));
             }
-            Frag::Raw(object(vec![
+            let mut fields = vec![
                 ("role", Frag::Json(json!(message.role))),
                 ("content", Frag::Raw(array(content))),
-            ]))
+            ];
+            if let Some(config) = message.output_config {
+                fields.push(("output_config", Frag::Json(config)));
+            }
+            Frag::Raw(object(fields))
         })
         .collect();
     Ok(array(rendered))
@@ -580,6 +662,7 @@ fn push_blocks(
             role,
             tool_results,
             other,
+            output_config: None,
         }),
     }
 }

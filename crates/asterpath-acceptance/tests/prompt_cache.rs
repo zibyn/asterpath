@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use asterpath::anthropic::{AnthropicModelProfile, AnthropicProvider};
-use asterpath::openai::OpenAiProvider;
+use asterpath::openai::{OpenAiModelProfile, OpenAiProvider};
 use asterpath::{Asterpath, DefaultCompactor, OwnedSession};
 use asterpath_protocol::{
     CompactResult, CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Part, Provider,
@@ -28,6 +28,9 @@ use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
+/// `inline_changes` turns Anthropic's inline instructions, tool changes and
+/// effort changes on or off together; OpenAI always renders effort changes
+/// in place (`configuration_update`).
 #[derive(Clone, Copy, Debug)]
 enum Wire {
     Anthropic { inline_changes: bool },
@@ -84,11 +87,18 @@ impl Wire {
                     .with_base_url(server.base_url())
                     .with_model_profile(
                         self.model_id(),
-                        AnthropicModelProfile::latest().with_inline_changes(inline_changes),
+                        AnthropicModelProfile::latest()
+                            .with_inline_changes(inline_changes)
+                            .with_inline_effort(inline_changes),
                     ),
             ),
             Self::OpenAi => Arc::new(
-                OpenAiProvider::new("test-key").with_base_url(format!("{}/v1", server.base_url())),
+                OpenAiProvider::new("test-key")
+                    .with_base_url(format!("{}/v1", server.base_url()))
+                    .with_model_profile(
+                        self.model_id(),
+                        OpenAiModelProfile::latest().with_inline_effort(true),
+                    ),
             ),
         }
     }
@@ -198,6 +208,7 @@ struct Setup {
     patches: Vec<ConfigPatch>,
     compactor: bool,
     sections: Vec<SystemSection>,
+    request: RequestConfig,
 }
 
 impl Setup {
@@ -207,6 +218,7 @@ impl Setup {
             tools: ToolSelection::Names(tools.iter().map(|name| ToolName::new(*name)).collect()),
             patches: Vec::new(),
             compactor: false,
+            request: RequestConfig::default(),
             sections: Vec::new(),
         }
     }
@@ -251,7 +263,7 @@ async fn create(wire: Wire, asterpath: &Asterpath, setup: &Setup) -> OwnedSessio
             }],
             system_sections: setup.sections.clone(),
             tools: setup.tools.clone(),
-            request: RequestConfig::default(),
+            request: setup.request.clone(),
             turn: {
                 let mut config = TurnConfig::default();
                 config.initial_backoff = Duration::ZERO;
@@ -443,6 +455,41 @@ async fn tool_changes_extend_the_prefix_only_when_rendered_inline() {
     }
 }
 
+fn with_effort(effort: ReasoningEffort) -> RequestConfig {
+    let mut request = RequestConfig::default();
+    request.reasoning = Some({
+        let mut params = ReasoningParams::default();
+        params.effort = Some(effort);
+        params
+    });
+    request
+}
+
+#[tokio::test]
+async fn effort_changes_extend_the_prefix_only_when_rendered_in_place() {
+    for wire in WIRES {
+        let server = wire.serve(vec![calls(vec![call("call-1", "patch")]), ends("fini")]);
+        let mut setup = Setup::new(&["patch"]);
+        setup.request = with_effort(ReasoningEffort::High);
+        let mut patch = ConfigPatch::default();
+        patch.request = Some(with_effort(ReasoningEffort::Low));
+        setup.patches = vec![patch];
+        let bodies = session(wire, &server, &setup, &["go"]).await;
+        assert_eq!(bodies.len(), 2, "{wire:?}");
+        let broken = prefix_break(&bodies[0], &bodies[1]);
+        match wire {
+            // The effective effort replaces the top-level `output_config`.
+            Wire::Anthropic {
+                inline_changes: false,
+            } => assert_eq!(
+                broken.as_deref(),
+                Some(r#"{"output_config":{"effort":"low"}}"#)
+            ),
+            _ => assert_eq!(broken, None, "{wire:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn output_limits_keep_the_prefix_and_reasoning_params_break_it() {
     let mut limited = RequestConfig::default();
@@ -469,7 +516,7 @@ async fn output_limits_keep_the_prefix_and_reasoning_params_break_it() {
         let bodies = session(wire, &server, &setup, &["go"]).await;
         assert_eq!(bodies.len(), 3, "{wire:?}");
         assert_cache_prefix(&bodies[0], &bodies[1]);
-        // Top-level reasoning params (#180 renders them in place).
+        // Adding reasoning has no baseline effort to keep in place.
         let expected = match wire {
             Wire::Anthropic { .. } => r#"{"thinking":{"type":"adaptive"}}"#,
             Wire::OpenAi => r#"{"reasoning":{"effort":"high"}}"#,

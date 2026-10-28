@@ -1764,6 +1764,116 @@ async fn without_inline_changes_a_tool_change_rewrites_the_top_level_tools_and_d
     );
 }
 
+/// A second turn after the effort changed from `from` to `to`.
+fn effort_changed_request(
+    model_id: &str,
+    from: ReasoningEffort,
+    to: ReasoningEffort,
+) -> ModelRequest {
+    let mut request = request_for(model_id);
+    request.baseline_reasoning = effort(from);
+    request.reasoning = effort(to);
+    request.items = vec![
+        user_message(vec![text("hi")]),
+        assistant_message(vec![text("ok")]),
+        user_message(vec![text("more")]),
+        Item::ReasoningChanged {
+            reasoning: effort(to),
+        },
+    ];
+    request
+}
+
+const OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
+#[tokio::test]
+async fn an_effort_change_renders_as_an_effort_only_system_message_and_keeps_the_top_level_effort()
+{
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert!(
+        sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA),
+        "{}",
+        sent.head
+    );
+    let body = sent.json_body();
+    assert_eq!(body["output_config"]["effort"], "high", "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{body}");
+    assert_eq!(
+        messages[3],
+        serde_json::json!({"role": "system", "content": [], "output_config": {"effort": "low"}})
+    );
+    assert_eq!(
+        messages[2]["content"][0]["cache_control"]["type"], "ephemeral",
+        "the tail breakpoint skips the empty system message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_effort_change_joins_a_pending_system_message() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    request.items.insert(
+        3,
+        Item::Instruction {
+            key: None,
+            parts: vec![text("rule")],
+        },
+    );
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "system", "{body}");
+    assert_eq!(last["content"][0]["text"], "rule");
+    assert_eq!(last["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+#[tokio::test]
+async fn without_inline_effort_an_effort_change_rewrites_the_top_level_effort() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let provider = provider(&server).with_model_profile(
+        "claude-opus-5-5",
+        AnthropicModelProfile::latest().with_inline_effort(false),
+    );
+    let request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    drain(&provider, request).await;
+    let sent = &server.requests()[0];
+    assert!(!sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA));
+    let body = sent.json_body();
+    assert_eq!(body["output_config"]["effort"], "low");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn turning_reasoning_off_rewrites_the_top_level_even_with_inline_effort() {
+    // Off changes `thinking`, which only the top level carries.
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let request =
+        effort_changed_request("claude-opus-5", ReasoningEffort::High, ReasoningEffort::Off);
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert!(!sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA));
+    let body = sent.json_body();
+    assert_eq!(body["thinking"]["type"], "disabled", "{body}");
+    assert!(body.get("output_config").is_none(), "{body}");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{body}");
+}
+
 fn answer_format() -> Option<asterpath_protocol::OutputFormat> {
     Some(asterpath_protocol::OutputFormat::new(
         "answer",

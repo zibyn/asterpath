@@ -36,7 +36,7 @@ pub(crate) struct Decoder {
     prefix_epoch: u32,
     tools_hash: String,
     body: String,
-    beta: Option<&'static str>,
+    beta: Option<String>,
 
     phase: Option<Phase>,
     terminal: bool,
@@ -92,7 +92,7 @@ impl Decoder {
         prefix_epoch: u32,
         tools_hash: String,
         body: String,
-        beta: Option<&'static str>,
+        beta: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -172,8 +172,8 @@ impl Decoder {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        if let Some(beta) = self.beta {
-            request = request.header("anthropic-beta", beta);
+        if let Some(beta) = &self.beta {
+            request = request.header("anthropic-beta", beta.as_str());
         }
         let response = request.body(self.body.clone()).send().await;
         let response = match response {
