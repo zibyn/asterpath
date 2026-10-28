@@ -47,6 +47,36 @@ impl Usage {
     }
 }
 
+/// How full the model's context is: the input of the latest request against
+/// the effective window. A log fold; the framework never estimates tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ContextUsage {
+    /// `input_total()` of the latest `AssistantMessage`; `None` before the
+    /// first model request. A compaction does not refresh it.
+    pub used: Option<u64>,
+    /// The effective `ModelSpec.context_window`.
+    pub window: Option<u32>,
+}
+
+impl ContextUsage {
+    /// Fold `records`; `None` when they hold no `SessionCreated`.
+    pub fn of(records: &[(crate::LogEntry, SessionEvent)]) -> Option<Self> {
+        let window = crate::effective_config(records, u64::MAX)?
+            .model
+            .context_window;
+        let used = records
+            .iter()
+            .filter_map(|(entry, event)| match event {
+                SessionEvent::AssistantMessage { usage, .. } => Some((entry.seq, usage)),
+                _ => None,
+            })
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, usage)| usage.input_total());
+        Some(Self { used, window })
+    }
+}
+
 /// Where one usage sample came from. Only `ModelCall` and `Compaction` enter
 /// the total; `Partial` is a diagnostic lower bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

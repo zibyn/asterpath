@@ -50,9 +50,10 @@ use crate::watch::Watchers;
 use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, CancellationRegistry, CompactResult, ConfigPatch,
-    ForkSource, ProjectedEntry, ProviderCatalog, RunRequest, RunTrigger, SessionEvent,
-    SessionFacts, SessionSpec, SessionState, Span, SpanFilter, ToolSelection, TraceError,
-    UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
+    ConfigSnapshot, ContextUsage, ForkSource, ProjectedEntry, ProviderCatalog, RunRequest,
+    RunTrigger, SessionEvent, SessionFacts, SessionSpec, SessionState, Span, SpanFilter,
+    ToolSelection, TraceError, UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope,
+    UserInput, dedup,
 };
 use asterpath_protocol::{
     ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken, ParentFilter,
@@ -783,6 +784,30 @@ impl SessionHandle {
         Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
     }
 
+    /// The effective config folded from the log at its frontier (ADR-0030):
+    /// what the next step runs with, whichever process changed it.
+    pub async fn config(&self) -> Result<ConfigSnapshot, AsterError> {
+        let records = scan::scan_decoded(&*self.store, self.session)
+            .await
+            .map_err(AgentError::from)?;
+        asterpath_protocol::effective_config(&records, u64::MAX).ok_or(AsterError::Agent(
+            AgentError::NotFound {
+                session: self.session,
+            },
+        ))
+    }
+
+    /// The latest model request's input tokens against the effective
+    /// context window, folded from the log.
+    pub async fn context_usage(&self) -> Result<ContextUsage, AsterError> {
+        let records = scan::scan_decoded(&*self.store, self.session)
+            .await
+            .map_err(AgentError::from)?;
+        ContextUsage::of(&records).ok_or(AsterError::Agent(AgentError::NotFound {
+            session: self.session,
+        }))
+    }
+
     /// Observe the session without driving it (ADR-0038): every committed
     /// record after `after` (the whole log for `None`), then
     /// [`WatchEvent::Synced`], then each new commit as it lands. A drive in
@@ -840,14 +865,7 @@ impl OwnedSession {
         if self.env.is_none() {
             return Ok(());
         }
-        let records = scan::scan_decoded(&*self.store, self.session)
-            .await
-            .map_err(AgentError::from)?;
-        let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
-            AsterError::Agent(AgentError::NotFound {
-                session: self.session,
-            }),
-        )?;
+        let effective = self.config().await?;
         let mut patch = ConfigPatch::default();
         for recorded in &effective.tools {
             match self.tool(&recorded.name) {
