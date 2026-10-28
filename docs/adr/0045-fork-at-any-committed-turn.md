@@ -1,6 +1,6 @@
 # 会话分叉可指定任一已提交回合为水位
 
-**Status**: proposed (2026-10-25)
+**Status**: accepted (2026-10-28)
 **部分取代**: [ADR-0033](0033-session-fork-reuses-context-fork-snapshot.md) 的「水位是源会话最后一个已提交回合的末尾」
 **来源**: [#167](https://github.com/zibyn/asterpath/issues/167)（拆自 [#157](https://github.com/zibyn/asterpath/issues/157)）
 

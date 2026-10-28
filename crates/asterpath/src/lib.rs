@@ -287,6 +287,28 @@ impl Asterpath {
         source: SessionId,
         metadata: BTreeMap<String, String>,
     ) -> Result<SessionHandle, AsterError> {
+        self.fork(source, metadata, None).await
+    }
+
+    /// [`Self::fork_session`] at the end of `source`'s committed turn `at`
+    /// rather than its last one (ADR-0045): history and config are the
+    /// source's there, even if it compacted or changed config since. An `at`
+    /// that is unknown, uncommitted or another session's = `InvalidForkPoint`.
+    pub async fn fork_session_at(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+        at: TurnId,
+    ) -> Result<SessionHandle, AsterError> {
+        self.fork(source, metadata, Some(at)).await
+    }
+
+    async fn fork(
+        &self,
+        source: SessionId,
+        metadata: BTreeMap<String, String>,
+        at: Option<TurnId>,
+    ) -> Result<SessionHandle, AsterError> {
         check_metadata(&metadata)?;
         let env = self.resolve(&metadata).await?;
         let records = scan::scan_decoded(&*self.store, source)
@@ -299,7 +321,16 @@ impl Asterpath {
                 detail,
             })
         };
-        let (waterline, prefix) = fork::session_prefix(&records).ok_or_else(not_found)?;
+        if records.is_empty() {
+            return Err(not_found());
+        }
+        let (waterline, prefix) = fork::session_prefix(&records, at).ok_or_else(|| match at {
+            Some(turn) => AsterError::InvalidForkPoint {
+                session: source,
+                turn,
+            },
+            None => not_found(),
+        })?;
         let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
         let mut config =
             asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;

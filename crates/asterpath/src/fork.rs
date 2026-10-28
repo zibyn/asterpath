@@ -3,7 +3,7 @@
 //! projection it materializes.
 
 use asterpath_protocol::{
-    Item, LogEntry, LogId, Part, ProjectionError, SessionEvent, SystemSection,
+    Item, LogEntry, LogId, Part, ProjectionError, SessionEvent, SystemSection, TurnId,
 };
 
 /// What a fork materializes from its prefix.
@@ -54,21 +54,28 @@ pub(crate) fn spawn_prefix(
     )
 }
 
-/// A session fork's waterline and prefix (ADR-0033). The waterline is the
-/// last `TurnCommitted`, or `SessionCreated` when none has committed; nothing
-/// after it is copied, compactions included, so a turn in progress never
+/// A session fork's waterline and prefix (ADR-0033, ADR-0045). The waterline
+/// is `at`'s `TurnCommitted`, or without `at` the last one, or
+/// `SessionCreated` when none has committed; nothing after it is copied,
+/// compactions included, so a turn in progress or a later compaction never
 /// leaks. Inputs recorded after the waterline turn's last `StepStarted`
-/// belong to the next turn. `None` for an empty log.
+/// belong to the next turn. `None` for an empty log or an `at` that is not a
+/// committed turn of this log.
 pub(crate) fn session_prefix(
     entries: &[(LogEntry, SessionEvent)],
+    at: Option<TurnId>,
 ) -> Option<(LogEntry, Vec<LogEntry>)> {
-    let waterline = entries
-        .iter()
-        .rev()
-        .find(|(_, event)| matches!(event, SessionEvent::TurnCommitted { .. }))
-        .or_else(|| entries.first())?
-        .0
-        .clone();
+    let committed = |event: &SessionEvent| match event {
+        SessionEvent::TurnCommitted { turn_id, .. } => at.is_none_or(|at| *turn_id == at),
+        _ => false,
+    };
+    let found = entries.iter().rev().find(|(_, event)| committed(event));
+    let waterline = match at {
+        Some(_) => found?,
+        None => found.or_else(|| entries.first())?,
+    }
+    .0
+    .clone();
     let last_step = entries
         .iter()
         .filter(|(entry, event)| {
