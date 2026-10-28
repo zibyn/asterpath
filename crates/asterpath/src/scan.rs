@@ -224,7 +224,7 @@ mod tests {
         SessionQuery, SessionStore, StepId, StorageError, TurnEndReason, TurnId, Usage,
         decode_entry,
     };
-    use asterpath_testing::InMemoryEventLog;
+    use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
     use futures_core::future::BoxFuture;
     use futures_core::stream::BoxStream;
     use futures_util::StreamExt;
@@ -234,6 +234,17 @@ mod tests {
     const SESSION: SessionId = SessionId::from_bytes([5; 16]);
     const TURN: TurnId = TurnId::from_bytes([6; 16]);
     const STEP: StepId = StepId::from_bytes([7; 16]);
+
+    /// The facade's commit log over `store`.
+    fn commit_log(store: Arc<dyn SessionStore>) -> Arc<CommitLog> {
+        crate::Asterpath::from_config(crate::AsterpathConfig {
+            store: Some(store),
+            providers: vec![Arc::new(ScriptedProvider::new("p"))],
+            ..crate::AsterpathConfig::default()
+        })
+        .expect("assemble")
+        .store
+    }
 
     fn kinds(prefix: &[LogEntry]) -> Vec<&'static str> {
         prefix
@@ -294,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_step_prefix_carries_compactions_recorded_after_the_step() {
-        let log = CommitLog::for_tests(Arc::new(InMemoryEventLog::new()));
+        let log = commit_log(Arc::new(InMemoryEventLog::new()));
         let step = seeded(&log).await;
 
         let decoded = log.read(SESSION).await.expect("read");
@@ -308,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_fork_prefix_leaves_out_compactions_after_the_waterline() {
-        let log = CommitLog::for_tests(Arc::new(InMemoryEventLog::new()));
+        let log = commit_log(Arc::new(InMemoryEventLog::new()));
         seeded(&log).await;
 
         let decoded = log.read(SESSION).await.expect("read");
@@ -332,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_undecodable_record_reads_as_corrupt() {
-        let log = CommitLog::for_tests(Arc::new(Undecodable(InMemoryEventLog::new())));
+        let log = commit_log(Arc::new(Undecodable(InMemoryEventLog::new())));
 
         let error = AgentError::from(log.read(SESSION).await.unwrap_err());
 
