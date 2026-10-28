@@ -3,6 +3,7 @@
 //! This crate is for test targets only. The in-memory backend is **not**
 //! durable: it does not satisfy G1 (committed-prefix persistence).
 
+pub mod cache_prefix;
 pub mod clock;
 pub mod contract;
 pub mod failpoint;
