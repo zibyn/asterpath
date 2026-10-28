@@ -6,6 +6,7 @@ members = [
     "crates/asterpath-sandbox-linux",
     "crates/asterpath-provider-openai",
     "crates/asterpath-storage-sqlite",
+    "crates/asterpath-storage-postgres",
     "crates/asterpath-provider-anthropic",
     "crates/asterpath-mcp",
     "crates/asterpath-skills",

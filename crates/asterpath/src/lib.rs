@@ -69,6 +69,11 @@ pub use error::AsterError;
 #[cfg(feature = "openai")]
 pub use asterpath_provider_openai as openai;
 
+/// Re-export of the Postgres store when the `postgres` feature is enabled;
+/// the application builds the pool and injects the store as `store`.
+#[cfg(feature = "postgres")]
+pub use asterpath_storage_postgres as postgres;
+
 /// The assembled framework.
 pub struct Asterpath {
     /// The single append entry: the backend wrapped in `CommitLog`, so every

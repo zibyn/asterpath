@@ -403,6 +403,7 @@ mod tests {
             ("asterpath-http", Role::Adapter),
             ("asterpath-sandbox-linux", Role::Adapter),
             ("asterpath-storage-sqlite", Role::Adapter),
+            ("asterpath-storage-postgres", Role::Adapter),
             ("asterpath-provider-anthropic", Role::Adapter),
             ("asterpath-provider-openai", Role::Adapter),
             ("asterpath-mcp", Role::Adapter),

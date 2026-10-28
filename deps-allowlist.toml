@@ -35,6 +35,12 @@ name = "asterpath-storage-sqlite"
 role = "adapter"
 allow = ["asterpath-protocol"]
 
+# Postgres store for several nodes sharing one database (#162).
+[[package]]
+name = "asterpath-storage-postgres"
+role = "adapter"
+allow = ["asterpath-protocol"]
+
 [[package]]
 name = "asterpath-provider-anthropic"
 role = "adapter"
@@ -76,6 +82,7 @@ allow = [
     "asterpath-provider-anthropic",
     "asterpath-provider-openai",
     "asterpath-storage-sqlite",
+    "asterpath-storage-postgres",
 ]
 
 # Local application (ADR-0049): the CLI binary and, behind the `tauri`

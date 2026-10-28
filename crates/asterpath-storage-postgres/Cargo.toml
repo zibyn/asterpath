@@ -1,0 +1,18 @@
+[package]
+name = "asterpath-storage-postgres"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterpath-protocol = { path = "../asterpath-protocol" }
+deadpool-postgres = "0.14"
+futures-core = "0.3"
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+asterpath-testing = { path = "../asterpath-testing" }
+futures-executor = "0.3"

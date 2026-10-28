@@ -6,7 +6,7 @@
 
 ## 1. 决策摘要
 
-- 引擎是一个 crate（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，[#79](https://github.com/zibyn/asterpath/issues/79)）：agent、scheduler、durable waits、工具表、trace / usage 视图与默认压缩是 `asterpath` 的内部模块；`asterpath-core` 并入 `asterpath-protocol`。workspace = 13 个库/应用成员 + `xtask`（§2；#80 以 `asterpath-mcp` 取代 `asterpath-plugin-host` 与 `asterpath-sandbox`）。独立 crate 只为真实适配器或可选重依赖。
+- 引擎是一个 crate（[ADR-0026](../adr/0026-engine-is-one-crate-only-adapter-traits-public.md)，[#79](https://github.com/zibyn/asterpath/issues/79)）：agent、scheduler、durable waits、工具表、trace / usage 视图与默认压缩是 `asterpath` 的内部模块；`asterpath-core` 并入 `asterpath-protocol`。workspace = 15 个库/应用成员 + `xtask`（§2；#80 以 `asterpath-mcp` 取代 `asterpath-plugin-host` 与 `asterpath-sandbox`）。独立 crate 只为真实适配器或可选重依赖。
 - 依赖规则按角色（`protocol` / `adapter` / `engine` / `app` / `tool`，ADR-0048 去掉了 `host`），由 `cargo xtask check-deps` 对照根目录 `deps-allowlist.toml` 检查（§2）。
 - 全部成员 lockstep `0.1.0`；**稳定面只有 facade（`asterpath`）、`asterpath-protocol` 与日志 schema**，适配器 crate 是 0.x 实验面。
 - v1 **不发布 crates.io**；嵌入者用 git/path 依赖。
@@ -21,11 +21,12 @@
 | crate | 角色 | 职责 | 允许的 workspace 依赖 |
 | --- | --- | --- | --- |
 | `asterpath-protocol` | protocol | ID、日志信封与存储契约（`SessionStore`、`scan_all`）、`Clock`、错误；规范化模型、适配器 trait（`Provider` / `Tool` / `Compactor` / `ApprovalPolicy` / `SandboxProvider` 及沙箱类型，ADR-0027）、`Hooks`、会话事件、`ConfigSnapshot`、`AgentEvent` | 无 |
-| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite` |
+| `asterpath` | engine | facade / 组装根，暴露稳定 API；内部模块 `agent`、`scheduler`、`waits`、`tools`、`views::{trace, usage}`、`compaction`、`commit`（§2.2） | `protocol` 及其再导出 / feature 提供的适配器：`provider-anthropic`、`provider-openai`、`storage-sqlite`、`storage-postgres` |
 | `asterpath-http` | adapter | 适配器共用 HTTP 工具：`SseDecoder`（字节进、事件出；LF / CRLF；非法 UTF-8 报错）、`classify_status`、`retry_after`、`request_id`（#67）；`provider_options` 深合并与同 provider raw 字段提取（#101、#103）；不属于稳定面（ADR-0026 修订） | `protocol` |
 | `asterpath-provider-anthropic` | adapter | Anthropic Messages adapter | `protocol`, `http` |
 | `asterpath-provider-openai` | adapter | OpenAI Responses adapter | `protocol`, `http` |
 | `asterpath-storage-sqlite` | adapter | `SessionStore`（含退役）的 SQLite 实现 | `protocol` |
+| `asterpath-storage-postgres` | adapter | `SessionStore`（含退役）的 Postgres 实现，接收应用建好的连接池（[storage-postgres.md](storage-postgres.md)） | `protocol` |
 | `asterpath-mcp` | adapter | MCP 工具来源：`McpServerConfig`、`McpServers::load` / `tools()` / `statuses()` / `shutdown()`，stdio 与 HTTP adapter 为 crate 私有（[plugins.md](plugins.md)、[mcp.md](mcp.md)，ADR-0027） | `protocol`, `http` |
 | `asterpath-sandbox-linux` | adapter | Linux bwrap 参考后端（实现 protocol 的 `SandboxProvider`） | `protocol` |
 | `asterpath-skills` | adapter | 技能包解析、索引渲染与 `load_skill` 工具（[skills.md](skills.md)） | `protocol` |
@@ -328,12 +329,13 @@ pub enum AsterError {
 
 | crate | features | 默认 |
 | --- | --- | --- |
-| `asterpath` | `anthropic`, `openai`, `sqlite` | `anthropic`, `openai`, `sqlite` |
+| `asterpath` | `anthropic`, `openai`, `sqlite`, `postgres` | `anthropic`, `openai`, `sqlite` |
 | `asterpath-app` | facade 的三个，加 `tauri`（桌面窗口） | `anthropic`, `openai`, `sqlite` |
 | 适配器 crate | 无 | — |
 | `protocol` | 无 | — |
 
 - `sqlite` 关闭时必须经 `AsterpathConfig.store` 注入实现。
+- `postgres` 只再导出 `asterpath-storage-postgres`（`asterpath::postgres`）；应用用 `from_pool` 建好存储后经 `AsterpathConfig.store` 注入。关闭时依赖树里没有 `tokio-postgres`。
 - facade 没有 MCP feature；`asterpath-mcp` 是独立的适配器 crate（[plugins.md](plugins.md)）。
 - feature 不得改变公共契约类型（ADR-0026）。
 
