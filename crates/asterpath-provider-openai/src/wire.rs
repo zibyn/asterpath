@@ -106,15 +106,21 @@ pub(crate) fn stream(
                         Ok(frames) => state.process(frames),
                         Err(error) => return Some((vec![Err(error)], None)),
                     };
-                    if events.is_empty() && !state.normalizer.finished() {
-                        events.push(Err(transport(
+                    if !state.normalizer.finished() {
+                        events.push(Err(state.normalizer.with_request_id(transport(
                             "openai stream ended without a terminal event",
-                        )));
+                        ))));
                     }
                     return (!events.is_empty()).then_some((events, None));
                 }
                 Err(error) => {
-                    return Some((vec![Err(transport(error.to_string()))], None));
+                    let kind = if error.is_timeout() {
+                        ProviderErrorKind::Timeout
+                    } else {
+                        ProviderErrorKind::Transport
+                    };
+                    let error = ProviderError::new(kind, error.to_string());
+                    return Some((vec![Err(state.normalizer.with_request_id(error))], None));
                 }
             }
         }
@@ -167,6 +173,15 @@ impl Normalizer {
 
     fn finished(&self) -> bool {
         self.terminal || self.poisoned
+    }
+
+    /// Attach the best known request id; OpenAI reports usage only on the terminal event.
+    fn with_request_id(&self, mut error: ProviderError) -> ProviderError {
+        error.request_id = self
+            .request_id
+            .clone()
+            .or_else(|| self.header_request_id.clone());
+        error
     }
 
     fn next_sequence(&mut self) -> u64 {
