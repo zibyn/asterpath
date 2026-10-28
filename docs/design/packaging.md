@@ -51,6 +51,7 @@
 pub struct ConfigSnapshot {
     pub model: ModelSpec,
     pub system: Vec<Part>,          // 只允许 Text
+    pub system_sections: Vec<SystemSection>, // 带键的指令节，渲染在 system 之后；折叠后每键为最新值（ADR-0057）；serde default
     pub tools: Vec<ToolDescriptor>, // 创建时解析后的固定集合（name / description / schema / 执行声明）
     pub request: RequestConfig,     // 回合内模型调用的请求参数（#26）
     pub turn: TurnConfig,
@@ -186,6 +187,7 @@ impl Asterpath {
 pub struct SessionSpec {
     pub model: ModelSpec,
     pub system: Vec<Part>,
+    pub system_sections: Vec<SystemSection>,  // 创建时的指令节；键非空且不重复，只含 Text（ADR-0057）
     pub tools: ToolSelection,
     pub request: RequestConfig,
     pub turn: TurnConfig,
