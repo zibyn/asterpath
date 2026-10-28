@@ -1730,6 +1730,47 @@ fn with_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> Mode
     request
 }
 
+fn effort_change(effort: asterpath_protocol::ReasoningEffort) -> Item {
+    let mut reasoning = asterpath_protocol::ReasoningParams::default();
+    reasoning.effort = Some(effort);
+    Item::ReasoningChanged {
+        reasoning: Some(reasoning),
+    }
+}
+
+/// `High` at the baseline, then two adjacent changes ending at `Low`.
+fn effort_changed_request(model: &str) -> ModelRequest {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Medium};
+    let mut request = with_effort(model, Low);
+    request.baseline_reasoning = with_effort(model, High).reasoning;
+    request.items.push(effort_change(Medium));
+    request.items.push(effort_change(Low));
+    request
+}
+
+#[tokio::test]
+async fn an_effort_change_renders_as_one_configuration_update_on_gpt_6() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    collect(&provider(&server), effort_changed_request("gpt-6-astra")).await;
+    let body: Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+    assert_eq!(body["reasoning"], json!({"effort": "high"}), "{body}");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2, "adjacent updates collapse: {body}");
+    assert_eq!(
+        input[1],
+        json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
+    );
+}
+
+#[tokio::test]
+async fn without_inline_effort_an_effort_change_rewrites_the_top_level_reasoning() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    collect(&provider(&server), effort_changed_request("gpt-5.5")).await;
+    let body: Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+    assert_eq!(body["reasoning"], json!({"effort": "low"}), "{body}");
+    assert_eq!(body["input"].as_array().unwrap().len(), 1, "{body}");
+}
+
 #[tokio::test]
 async fn every_effort_renders_its_wire_value_on_a_model_that_accepts_it() {
     use asterpath_protocol::ReasoningEffort::{High, Low, Max, Medium, Minimal, Off, XHigh};

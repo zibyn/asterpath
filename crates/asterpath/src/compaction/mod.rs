@@ -335,7 +335,8 @@ fn text_view(items: &[Item]) -> Vec<Item> {
             | Item::ProviderOpaque { .. }
             | Item::ServerToolCall { .. }
             | Item::Instruction { .. }
-            | Item::ToolsChanged { .. } => {}
+            | Item::ToolsChanged { .. }
+            | Item::ReasoningChanged { .. } => {}
             Item::ToolCall { name, raw_args, .. } => view.push(text_item(format!(
                 "tool call {name}({})",
                 raw_args.as_str()

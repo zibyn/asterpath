@@ -794,3 +794,90 @@ fn a_patch_recorded_before_tool_changes_still_decodes() {
     let patch: ConfigPatch = serde_json::from_value(json!({"model": null})).expect("decode");
     assert!(!patch.changes_tools());
 }
+
+fn effort(effort: ReasoningEffort) -> Option<ReasoningParams> {
+    let mut params = ReasoningParams::default();
+    params.effort = Some(effort);
+    Some(params)
+}
+
+fn created_with_effort(level: ReasoningEffort) -> SessionEvent {
+    let mut config = config();
+    config.request.reasoning = effort(level);
+    SessionEvent::SessionCreated {
+        config,
+        parent: None,
+        metadata: Default::default(),
+    }
+}
+
+fn effort_changed(level: ReasoningEffort) -> SessionEvent {
+    let mut request = RequestConfig::default();
+    request.reasoning = effort(level);
+    let mut patch = ConfigPatch::default();
+    patch.request = Some(request);
+    SessionEvent::ConfigChanged { patch }
+}
+
+#[test]
+fn a_reasoning_change_lands_at_the_next_step_and_keeps_the_baseline_reasoning() {
+    let entries = log(&[
+        created_with_effort(ReasoningEffort::High),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        step_started(1),
+        assistant("ok"),
+        effort_changed(ReasoningEffort::Low),
+        // The same reasoning again changes nothing.
+        effort_changed(ReasoningEffort::Low),
+        SessionEvent::InputRecorded {
+            input: vec![text("more")],
+        },
+        step_started(2),
+    ]);
+    let projected = request_history(&entries).expect("project");
+    assert_eq!(projected.reasoning, effort(ReasoningEffort::High));
+    assert_eq!(projected.items.len(), 4, "{:?}", projected.items);
+    assert_eq!(
+        projected.items[3],
+        Item::ReasoningChanged {
+            reasoning: effort(ReasoningEffort::Low)
+        }
+    );
+}
+
+#[test]
+fn compaction_moves_replaced_reasoning_changes_into_the_baseline() {
+    let entries = log(&[
+        created_with_effort(ReasoningEffort::High),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        effort_changed(ReasoningEffort::Low),
+        step_started(1),
+        assistant("ok"),
+        SessionEvent::CompactionApplied {
+            first_kept: LogId::from_i64(7),
+            summary: vec![text("summary")],
+            replaces: LogIdRange {
+                first: LogId::from_i64(2),
+                last: LogId::from_i64(5),
+            },
+            model: model(),
+            usage: Usage::default(),
+            raw: None,
+        },
+        step_started(2),
+    ]);
+    let projected = request_history(&entries).expect("project");
+    assert_eq!(projected.reasoning, effort(ReasoningEffort::Low));
+    assert!(
+        !projected
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::ReasoningChanged { .. })),
+        "{:?}",
+        projected.items
+    );
+}

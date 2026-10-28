@@ -4,17 +4,17 @@
 //! (including any previous summary) and inserts the new summary immediately
 //! before `first_kept`. The raw log is never modified.
 //!
-//! An instruction or tool change recorded by `ConfigChanged` takes its place
+//! An instruction, tool change or reasoning change recorded by `ConfigChanged` takes its place
 //! at the next `StepStarted` (or the end of the scanned entries), so it always
 //! follows the tool results of the step it was recorded in. A compaction that
-//! replaces it moves it into the baseline system or tools instead of the
+//! replaces it moves it into the baseline system, tools or reasoning instead of the
 //! summary (ADR-0030).
 
 use std::collections::HashMap;
 
 use crate::{LogEntry, LogId, LogIdRange, ToolCallId};
 
-use crate::config::{ToolDescriptor, change_tools};
+use crate::config::{ReasoningParams, ToolDescriptor, change_tools};
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::event::{SessionEvent, StopReason, ToolResultStatus};
 use crate::item::{Item, Part};
@@ -49,6 +49,9 @@ pub struct RequestHistory {
     /// The baseline tools: `SessionCreated.config.tools` with every tool
     /// change a compaction has replaced applied, in log order.
     pub tools: Vec<ToolDescriptor>,
+    /// The baseline reasoning: `SessionCreated.config.request.reasoning`, or
+    /// the last reasoning change a compaction has replaced.
+    pub reasoning: Option<ReasoningParams>,
     pub items: Vec<Item>,
 }
 
@@ -56,6 +59,7 @@ pub struct RequestHistory {
 struct Baseline {
     system: Vec<Part>,
     tools: Vec<ToolDescriptor>,
+    reasoning: Option<ReasoningParams>,
 }
 
 impl Baseline {
@@ -66,6 +70,7 @@ impl Baseline {
                 Item::ToolsChanged { added, removed } => {
                     change_tools(&mut self.tools, added, removed);
                 }
+                Item::ReasoningChanged { reasoning } => self.reasoning.clone_from(reasoning),
                 _ => {}
             }
         }
@@ -86,6 +91,7 @@ pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, Projectio
     Ok(RequestHistory {
         system: baseline.system,
         tools: baseline.tools,
+        reasoning: baseline.reasoning,
         items: history
             .into_iter()
             .flat_map(|projected| projected.items)
@@ -102,13 +108,17 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
     let mut pending_results: Vec<(u64, ProjectedEntry)> = Vec::new();
     let mut pending_changes: Vec<ProjectedEntry> = Vec::new();
     let mut baseline: Option<Baseline> = None;
+    // The effective reasoning, to tell which request patches change it.
+    let mut reasoning: Option<ReasoningParams> = None;
 
     for entry in ordered {
         match decode_entry(entry)? {
             SessionEvent::SessionCreated { config, .. } if baseline.is_none() => {
+                reasoning.clone_from(&config.request.reasoning);
                 baseline = Some(Baseline {
                     system: config.system,
                     tools: config.tools,
+                    reasoning: config.request.reasoning,
                 });
             }
             SessionEvent::ConfigChanged { patch } => {
@@ -123,6 +133,14 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
                     items.push(Item::ToolsChanged {
                         added: patch.add_tools,
                         removed: patch.remove_tools,
+                    });
+                }
+                if let Some(request) = patch.request
+                    && request.reasoning != reasoning
+                {
+                    reasoning.clone_from(&request.reasoning);
+                    items.push(Item::ReasoningChanged {
+                        reasoning: request.reasoning,
                     });
                 }
                 if !items.is_empty() {

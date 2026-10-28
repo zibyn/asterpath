@@ -36,6 +36,10 @@ pub struct ModelRequest {
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,
     pub reasoning: Option<ReasoningParams>,
+    /// The reasoning at creation or the latest compaction; the
+    /// `Item::ReasoningChanged` entries in `items` lead from it to
+    /// `reasoning`. `new` sets it to `reasoning`.
+    pub baseline_reasoning: Option<ReasoningParams>,
     pub stop_sequences: Vec<String>,
     /// See [`RequestConfig::provider_options`].
     pub provider_options: BTreeMap<ProviderId, JsonString>,
@@ -85,6 +89,7 @@ impl ModelRequest {
             sampling: request.sampling.clone(),
             max_output_tokens: request.max_output_tokens.get(),
             reasoning: request.reasoning.clone(),
+            baseline_reasoning: request.reasoning.clone(),
             stop_sequences: request.stop_sequences.clone(),
             provider_options: request.provider_options.clone(),
             output_format: request.output_format.clone(),

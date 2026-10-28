@@ -15,6 +15,13 @@
 //! lists it except gpt-5.4-pro, gpt-5.2-pro and o1-mini. Unrecognized ids
 //! are not assumed to have it, nor file input (protocol.md §5).
 //!
+//! `inline_effort`: "Change reasoning mid-conversation" in the reasoning guide
+//! (api/docs/guides/reasoning, checked 2026-10-28): a `configuration_update`
+//! input item changes only reasoning effort, on the GPT-6 family in
+//! standard single-agent mode (pro and tournament models reject it). The
+//! guide names `gpt-6-astra` and `gpt-6.1-sol`; `gpt-6-sol` and `gpt-6-luna`
+//! are the other GPT-6 rows here.
+//!
 //! To update: add a row for each new model id. Rows match by prefix, first match
 //! wins, so list a specific id (`gpt-5.5-pro`) before its prefix (`gpt-5.5`),
 //! and `gpt-5` last of the GPT-5 family. Ids no row matches get [`LATEST`], so
@@ -39,6 +46,10 @@ pub struct OpenAiModelProfile {
     pub forced_tool_choice: bool,
     /// Accepts `temperature` / `top_p`.
     pub sampling: bool,
+    /// Accepts `configuration_update` input items. With it a change of
+    /// reasoning effort renders in place and the top-level `reasoning` keeps
+    /// the baseline; see `render::inline_effort`.
+    pub inline_effort: bool,
     /// Accepts server-executed tools in `tools`.
     pub server_tools: bool,
     /// Accepts `text.format` `json_schema` (structured outputs).
@@ -75,6 +86,12 @@ impl OpenAiModelProfile {
     }
 
     #[must_use]
+    pub fn with_inline_effort(mut self, inline: bool) -> Self {
+        self.inline_effort = inline;
+        self
+    }
+
+    #[must_use]
     pub fn with_server_tools(mut self, server_tools: bool) -> Self {
         self.server_tools = server_tools;
         self
@@ -98,10 +115,16 @@ const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
         efforts: Cow::Borrowed(efforts),
         forced_tool_choice: true,
         sampling: true,
+        inline_effort: false,
         server_tools: true,
         structured_output: true,
         file_media_types: Cow::Borrowed(PDF),
     }
+}
+
+const fn inline_effort(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
+    profile.inline_effort = true;
+    profile
 }
 
 const fn without_server_tools(mut profile: OpenAiModelProfile) -> OpenAiModelProfile {
@@ -127,10 +150,10 @@ const PRO: &[ReasoningEffort] = &[Medium, High, XHigh];
 const LOW_TO_HIGH: &[ReasoningEffort] = &[Low, Medium, High];
 
 static TABLE: &[(&str, OpenAiModelProfile)] = &[
-    ("gpt-6.1-sol", profile(LATEST)),
-    ("gpt-6-astra", profile(LATEST)),
-    ("gpt-6-luna", profile(NONE_TO_MAX)),
-    ("gpt-6-sol", profile(NONE_TO_MAX)),
+    ("gpt-6.1-sol", inline_effort(profile(LATEST))),
+    ("gpt-6-astra", inline_effort(profile(LATEST))),
+    ("gpt-6-luna", inline_effort(profile(NONE_TO_MAX))),
+    ("gpt-6-sol", inline_effort(profile(NONE_TO_MAX))),
     ("gpt-5.6", profile(NONE_TO_MAX)),
     ("gpt-5.5-pro", profile(PRO)),
     ("gpt-5.5", profile(NONE_TO_XHIGH)),
@@ -156,6 +179,7 @@ static LATEST_PROFILE: OpenAiModelProfile = OpenAiModelProfile {
     efforts: Cow::Borrowed(LATEST),
     forced_tool_choice: true,
     sampling: true,
+    inline_effort: false,
     server_tools: false,
     structured_output: false,
     file_media_types: Cow::Borrowed(&[]),
