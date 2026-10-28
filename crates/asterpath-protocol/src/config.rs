@@ -42,7 +42,8 @@ pub struct RequestConfig {
     #[serde(default)]
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
     /// Prompt cache lifetimes; adapters without TTL control ignore them.
-    /// Which sessions get which is application policy (ADR-0048).
+    /// Which sessions get which is application policy (ADR-0048); children
+    /// take [`SubagentConfig::cache_ttl`], summaries [`CompactionConfig::cache_ttl`].
     #[serde(default, skip_serializing_if = "CacheTtl::is_default")]
     pub cache_ttl: CacheTtl,
 }
@@ -209,6 +210,10 @@ pub struct CompactionConfig {
     pub max_summary_tokens: u32,
     /// `None`: the session model.
     pub summary_model: Option<ModelSpec>,
+    /// The summary request's prompt cache lifetimes, in place of the
+    /// session's `request.cache_ttl`.
+    #[serde(default)]
+    pub cache_ttl: CacheTtl,
 }
 
 impl Default for CompactionConfig {
@@ -219,6 +224,7 @@ impl Default for CompactionConfig {
             max_auto_compactions_per_turn: 1,
             max_summary_tokens: 2048,
             summary_model: None,
+            cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -231,6 +237,10 @@ pub struct SubagentConfig {
     pub max_concurrent_children: NonZeroUsize,
     pub spawn_timeout: Option<Duration>,
     pub cancel_grace: Duration,
+    /// Replaces the parent's `request.cache_ttl` in a spawned child's
+    /// config, so children do not inherit a main session's 1h TTL.
+    #[serde(default)]
+    pub cache_ttl: CacheTtl,
 }
 
 impl Default for SubagentConfig {
@@ -241,6 +251,7 @@ impl Default for SubagentConfig {
             max_concurrent_children: NonZeroUsize::new(8).expect("non-zero"),
             spawn_timeout: None,
             cancel_grace: Duration::from_secs(10),
+            cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -291,8 +302,9 @@ impl ConfigPatch {
         !self.add_tools.is_empty() || !self.remove_tools.is_empty()
     }
 
-    /// Whether the patch has a place in history (appended instructions or a
-    /// tool change); applying such a patch twice is not idempotent.
+    /// Whether the patch has a place in history (appended instructions,
+    /// system sections or a tool change); applying such a patch twice is not
+    /// idempotent.
     pub fn is_positional(&self) -> bool {
         !self.append_system.is_empty() || !self.system_sections.is_empty() || self.changes_tools()
     }

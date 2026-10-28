@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compaction::DefaultCompactor;
-use asterpath_protocol::{CacheLifetime, ModelRequest, RequestConfig};
+use asterpath_protocol::{CacheLifetime, CacheTtl, ModelRequest, RequestConfig};
 use asterpath_protocol::{
     CompactSummary, CompactionConfig, CompactionJob, Compactor, InputTokens, Item, ModelId,
     ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderError, ProviderErrorKind,
@@ -87,6 +87,7 @@ fn job(usable: u32, retained: u64) -> CompactionJob {
         turn: turn(),
         session: None,
         prefix: None,
+        cache_ttl: CacheTtl::default(),
     }
 }
 
@@ -185,6 +186,35 @@ async fn rejected_failure_is_not_retried() {
 }
 
 #[tokio::test]
+async fn reply_without_text_is_a_summary_failure() {
+    // `tool_choice` stays `Auto` on a forked request, so the model may answer
+    // with tool calls only.
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![Item::ToolCall {
+            call_id: "c9".to_owned(),
+            provider_item_id: None,
+            name: asterpath_protocol::ToolName::new("shell"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            raw: None,
+        }],
+        StopReason::ToolUse,
+        usage(1, 1),
+    ));
+    let mut job = job(1000, 0);
+    job.prefix = Some(session_request());
+    let error = compactor(Arc::clone(&provider))
+        .compact(job)
+        .await
+        .expect_err("an empty summary is never applied");
+    assert!(matches!(
+        error,
+        asterpath_protocol::CompactionError::Provider(error)
+            if error.kind == ProviderErrorKind::StreamProtocol
+    ));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn missing_summary_provider_is_an_error_without_fallback() {
     let compactor = DefaultCompactor::new(Arc::new(ProviderCatalog::default()));
     let mut job = job(1000, 0);
@@ -249,7 +279,9 @@ async fn same_model_summary_forks_the_session_request() {
     let request = summarized(&provider);
     assert_eq!(request.system, session.system);
     assert_eq!(request.prefix_epoch, 2);
-    assert_eq!(request.cache_ttl, session.cache_ttl);
+    // Compaction has its own TTL bucket; the session's 1h does not carry over.
+    assert_ne!(session.cache_ttl, CacheTtl::default());
+    assert_eq!(request.cache_ttl, CacheTtl::default());
     assert_eq!(request.tool_choice, session.tool_choice);
     assert_eq!(request.items[..1], session.items[..]);
     assert_eq!(request.items.len(), 2);
@@ -270,6 +302,7 @@ async fn another_summary_model_falls_back_to_an_independent_request() {
     let mut job = job(1000, 0);
     job.model.model = ModelId::new("summarizer");
     job.prefix = Some(session_request());
+    job.cache_ttl.messages = CacheLifetime::OneHour;
     compactor(Arc::clone(&provider))
         .compact(job)
         .await
@@ -277,7 +310,7 @@ async fn another_summary_model_falls_back_to_an_independent_request() {
 
     let request = summarized(&provider);
     assert!(request.system.is_empty());
-    assert_eq!(request.cache_ttl, RequestConfig::default().cache_ttl);
+    assert_eq!(request.cache_ttl.messages, CacheLifetime::OneHour);
     assert_eq!(request.tool_choice, ToolChoice::None);
     assert_eq!(request.items.len(), 3);
 }

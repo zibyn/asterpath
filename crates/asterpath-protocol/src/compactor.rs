@@ -9,7 +9,7 @@ use crate::{LogId, LogIdRange, SessionContext};
 use futures_core::future::BoxFuture;
 
 use crate::agent::{CompactionError, CompactionOutcome};
-use crate::config::{CompactionConfig, ModelSpec, TurnConfig};
+use crate::config::{CacheTtl, CompactionConfig, ModelSpec, TurnConfig};
 use crate::event::CompactionTrigger;
 use crate::item::Item;
 use crate::projection::ProjectedEntry;
@@ -81,6 +81,9 @@ pub struct CompactionJob {
     /// call shares the session's cached prefix (#176). Used only when its
     /// model is `model`; otherwise the summary call is independent.
     pub prefix: Option<ModelRequest>,
+    /// [`CompactionConfig::cache_ttl`]: the summary request's TTL whether or
+    /// not it reuses `prefix`.
+    pub cache_ttl: CacheTtl,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -50,6 +50,10 @@ use futures_core::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt, stream};
 use pipeline::{SpawnFn, ToolOutcome, ToolPipeline, ToolStep};
 
+/// Bounds a fork chain in `session_context`. Real chains are as long as the
+/// forks the application made; the bound only stops a corrupt cycle.
+const MAX_FORK_CHAIN: usize = 64;
+
 /// The turn driver.
 pub(crate) struct Agent {
     log: Arc<dyn SessionStore>,
@@ -1126,15 +1130,13 @@ impl Agent {
         Ok((request, format.map(|format| ToolName::new(&format.name))))
     }
 
-    /// Who a model request of `session` is for (ADR-0039): its tree's root
-    /// and the root's metadata.
+    /// Who a model request of `session` is for (ADR-0039): its tree's root,
+    /// the root's metadata and the cache root its fork chain started from.
     async fn session_context(&self, session: SessionId) -> Result<SessionContext, AgentError> {
         let root = root_of(&*self.log, session).await?;
         let (metadata, mut source) = self.root_head(root).await?;
         let mut cache_root = root;
-        // A fork chain is bounded by the forks the application made; the bound
-        // only stops a corrupt cycle.
-        for _ in 0..64 {
+        for _ in 0..MAX_FORK_CHAIN {
             let Some(from) = source else { break };
             cache_root = root_of(&*self.log, from).await?;
             source = self.root_head(cache_root).await?.1;

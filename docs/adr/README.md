@@ -66,5 +66,6 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0055](0055-sandbox-is-the-boundary-for-spawned-commands.md) | 起进程的工具以沙箱为边界，审批只问能否越出沙箱；审批模式只收紧沙箱，命令规则只改审批结论（模式切换部分由 0056 修正） |
 | [0056](0056-read-only-cap-sticks-to-the-calls-it-allowed.md) | 因只读上限而放行的 `bash` 调用启动时保留 `ReadOnly`，记录只在内存中 |
 | [0057](0057-instruction-sections-are-replaced-by-key.md) | 指令节按键刷新：带键条目留在历史原位，压缩时每个键只保留最新值 |
+| [0058](0058-reasoning-changes-take-a-place-in-history.md) | reasoning 变更是历史中的一个位置，模型支持时原位渲染，顶层保持基线 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。

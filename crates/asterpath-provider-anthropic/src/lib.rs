@@ -135,7 +135,7 @@ impl Provider for AnthropicProvider {
             return stream::once(async move { Err(error) }).boxed();
         }
         let provider = self.id();
-        let (body, tools_hash) =
+        let (body, tools_hash, beta) =
             match request::render(&provider, profile, &request, self.trace.as_deref()) {
                 Ok(rendered) => rendered,
                 Err(error) => return stream::once(async move { Err(error) }).boxed(),
@@ -149,7 +149,7 @@ impl Provider for AnthropicProvider {
             request.prefix_epoch,
             tools_hash,
             body,
-            request::beta(profile, &request),
+            beta,
         );
         stream::unfold(Some(decoder), |state| async move {
             let mut decoder = state?;

@@ -2248,3 +2248,16 @@ async fn a_profile_can_turn_the_prompt_cache_key_off() {
     let body = sent_body(&provider, &server, request).await;
     assert!(body.get("prompt_cache_key").is_none(), "{body}");
 }
+
+#[tokio::test]
+async fn a_null_option_omits_the_prompt_cache_key_for_one_request() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server);
+    let mut request = in_session(1, 9);
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":null}"#),
+    );
+    let body = sent_body(&provider, &server, request).await;
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+}

@@ -6,7 +6,7 @@
 
 use asterpath_http::{
     TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
-    same_provider_raw_field, server_tools_for, unrenderable_part,
+    reasoning_in_place, same_provider_raw_field, server_tools_for, unrenderable_part,
 };
 use asterpath_protocol::{
     CacheLifetime, FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities,
@@ -43,33 +43,28 @@ pub(crate) fn top_level_tools<'a>(
 /// not accept, falls back to the effective reasoning at the top level. In
 /// place, a change after a tool result takes effect from the next user
 /// input, not the next step.
-pub(crate) fn inline_effort(rules: &AnthropicModelProfile, request: &ModelRequest) -> bool {
-    let baseline = request.baseline_reasoning.as_ref();
-    let in_place = |params: Option<&ReasoningParams>| {
-        params.is_some_and(|params| {
+fn inline_effort(rules: &AnthropicModelProfile, request: &ModelRequest) -> bool {
+    rules.inline_effort
+        && reasoning_in_place(request, |params, baseline| {
             params.effort.is_some_and(|effort| {
                 effort != ReasoningEffort::Off && rules.efforts.contains(&effort)
-            }) && baseline.is_some_and(|baseline| {
-                params.budget_tokens == baseline.budget_tokens && params.summary == baseline.summary
-            })
-        })
-    };
-    rules.inline_effort
-        && in_place(baseline)
-        && request.items.iter().all(|item| match item {
-            Item::ReasoningChanged { reasoning } => in_place(reasoning.as_ref()),
-            _ => true,
+            }) && params.budget_tokens == baseline.budget_tokens
+                && params.summary == baseline.summary
         })
 }
 
 /// The `anthropic-beta` header the rendered body needs.
-pub(crate) fn beta(rules: &AnthropicModelProfile, request: &ModelRequest) -> Option<String> {
+fn beta(
+    rules: &AnthropicModelProfile,
+    request: &ModelRequest,
+    inline_effort: bool,
+) -> Option<String> {
     let has = |predicate: fn(&Item) -> bool| request.items.iter().any(predicate);
     let mut betas = Vec::new();
     if rules.inline_changes && has(|item| matches!(item, Item::ToolsChanged { .. })) {
         betas.push(INLINE_TOOLS_BETA);
     }
-    if has(|item| matches!(item, Item::ReasoningChanged { .. })) && inline_effort(rules, request) {
+    if inline_effort && has(|item| matches!(item, Item::ReasoningChanged { .. })) {
         betas.push(OUTPUT_CONFIG_BETA);
     }
     (!betas.is_empty()).then(|| betas.join(","))
@@ -236,27 +231,21 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
-/// Render the full Messages request body and the `tools_hash` of its
-/// top-level tools. Capability checks are the caller's responsibility so they
+/// Render the full Messages request body, the `tools_hash` of its top-level
+/// tools and the `anthropic-beta` header it needs. Capability checks are the caller's responsibility so they
 /// can run before anything is serialized.
 pub(crate) fn render(
     provider: &ProviderId,
     rules: &AnthropicModelProfile,
     request: &ModelRequest,
     trace: Option<&dyn TraceSink>,
-) -> Result<(String, String), ProviderError> {
+) -> Result<(String, String, Option<String>), ProviderError> {
     let options = provider_options_for(request, &[])?;
+    let inline_effort = inline_effort(rules, request);
     let server_tools = server_tools_for(request)?;
     let top_tools = top_level_tools(rules, request);
     let tools_hash = asterpath_protocol::tools_hash(top_tools, &server_tools);
-    let messages = render_messages(
-        provider,
-        request,
-        &tools_hash,
-        rules,
-        inline_effort(rules, request),
-        trace,
-    )?;
+    let messages = render_messages(provider, request, &tools_hash, rules, inline_effort, trace)?;
     let mut system: Vec<&Part> = request.system.iter().collect();
     if !rules.inline_changes {
         // Fallback: appended instructions join the top-level system.
@@ -319,7 +308,6 @@ pub(crate) fn render(
             fields.push(("top_k", Frag::Json(json!(top_k))));
         }
     }
-    let inline_effort = inline_effort(rules, request);
     let reasoning = if inline_effort {
         &request.baseline_reasoning
     } else {
@@ -355,7 +343,11 @@ pub(crate) fn render(
             None => fields.push((key.as_str(), Frag::Json(value.clone()))),
         }
     }
-    Ok((object(fields), tools_hash))
+    Ok((
+        object(fields),
+        tools_hash,
+        beta(rules, request, inline_effort),
+    ))
 }
 
 fn render_reasoning(
