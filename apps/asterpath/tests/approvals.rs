@@ -270,12 +270,12 @@ async fn deny_mode_denies_writes_and_allow_mode_runs_them_without_asking() {
 
     fixture
         .desktop
-        .set_approval_mode(id, ApprovalMode::Deny)
+        .set_approval_mode(id, ApprovalMode::ReadOnly)
         .await
         .unwrap();
     assert_eq!(
         fixture.desktop.approval_mode(id).await.unwrap(),
-        ApprovalMode::Deny
+        ApprovalMode::ReadOnly
     );
     fixture
         .desktop
@@ -409,7 +409,7 @@ async fn read_only_mode_runs_bash_in_a_read_only_sandbox() {
     // Switched after the session's environment was resolved: takes effect at once.
     fixture
         .desktop
-        .set_approval_mode(id, ApprovalMode::Deny)
+        .set_approval_mode(id, ApprovalMode::ReadOnly)
         .await
         .unwrap();
 
@@ -479,11 +479,11 @@ fn workspace(sandbox: SandboxMode, backend: bool) -> Workspace {
 /// runs outside it, and read-only mode tightens even `full-access`.
 #[test]
 fn the_mode_decides_only_calls_outside_the_sandbox() {
-    use ApprovalMode::{Allow, Ask, Deny};
+    use ApprovalMode::{Allow, Ask, ReadOnly};
     let sandboxed =
         ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::WorkspaceWrite, true));
     assert_eq!(
-        row(&sandboxed, Deny),
+        row(&sandboxed, ReadOnly),
         ["allow", "deny", "allow", "ask", "deny"]
     );
     assert_eq!(
@@ -493,12 +493,15 @@ fn the_mode_decides_only_calls_outside_the_sandbox() {
     assert_eq!(row(&sandboxed, Allow), ["allow"; 5]);
 
     let full = ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::FullAccess, true));
-    assert_eq!(row(&full, Deny)[0], "allow", "tightened to ReadOnly");
+    assert_eq!(row(&full, ReadOnly)[0], "allow", "tightened to ReadOnly");
     assert_eq!(row(&full, Ask)[0], "ask");
     assert_eq!(row(&full, Allow)[0], "allow");
 
     let none = ApprovalModes::new(Ask).with_sandbox(&workspace(SandboxMode::WorkspaceWrite, false));
-    assert_eq!(row(&none, Deny), ["deny", "deny", "allow", "ask", "deny"]);
+    assert_eq!(
+        row(&none, ReadOnly),
+        ["deny", "deny", "allow", "ask", "deny"]
+    );
     assert_eq!(row(&none, Ask), ["ask", "ask", "allow", "ask", "ask"]);
     assert_eq!(row(&none, Allow), ["allow"; 5]);
 }
@@ -521,7 +524,7 @@ fn a_subagent_follows_its_tree_s_mode_and_allowances() {
         ApprovalVerdict::Ask
     );
 
-    modes.set_mode(root, ApprovalMode::Deny);
+    modes.set_mode(root, ApprovalMode::ReadOnly);
     assert!(matches!(
         modes.classify(&request(child, root, "write_file")),
         ApprovalVerdict::Deny { .. }
@@ -542,9 +545,16 @@ fn a_subagent_follows_its_tree_s_mode_and_allowances() {
 /// The JSON `src/lib/commands.ts` sends and reads.
 #[test]
 fn modes_and_answers_have_the_frontend_s_json() {
+    let modes = [
+        ApprovalMode::ReadOnly,
+        ApprovalMode::Ask,
+        ApprovalMode::Allow,
+    ];
+    let json = serde_json::json!(["read-only", "ask", "allow"]);
+    assert_eq!(serde_json::to_value(modes).unwrap(), json);
     assert_eq!(
-        serde_json::to_value([ApprovalMode::Deny, ApprovalMode::Ask, ApprovalMode::Allow]).unwrap(),
-        serde_json::json!(["deny", "ask", "allow"])
+        serde_json::from_value::<[ApprovalMode; 3]>(json).unwrap(),
+        modes
     );
     let answers: Vec<Answer> = serde_json::from_value(serde_json::json!([
         {"kind": "allow_once"},
@@ -610,7 +620,7 @@ fn deny_and_ask_rules_hold_inside_the_sandbox() {
 /// fall back to the mode.
 #[test]
 fn allow_rules_turn_ask_into_allow_outside_the_sandbox() {
-    use ApprovalMode::{Ask, Deny};
+    use ApprovalMode::{Ask, ReadOnly};
     let none = with_rules(false, &["bash(cargo test)"], &[], &[]);
     assert_eq!(command(&none, Ask, "ls -la"), "allow");
     assert_eq!(command(&none, Ask, "find . -delete"), "ask");
@@ -619,8 +629,8 @@ fn allow_rules_turn_ask_into_allow_outside_the_sandbox() {
     assert_eq!(command(&none, Ask, "git status"), "ask");
     assert_eq!(command(&none, Ask, "cargo test -p foo"), "allow");
     // Allow rules never loosen read-only mode.
-    assert_eq!(command(&none, Deny, "cargo test -p foo"), "deny");
-    assert_eq!(command(&none, Deny, "ls"), "deny");
+    assert_eq!(command(&none, ReadOnly, "cargo test -p foo"), "deny");
+    assert_eq!(command(&none, ReadOnly, "ls"), "deny");
 }
 
 /// An ask rule beats a tool allowed for the session, and never loosens a deny.
@@ -633,7 +643,7 @@ fn an_ask_rule_beats_a_session_allowance() {
 
     let none = with_rules(false, &[], &["bash(git push)"], &[]);
     assert!(none.allow_for_session(&bash_request(root, "git push")));
-    assert_eq!(command(&none, ApprovalMode::Deny, "git push"), "deny");
+    assert_eq!(command(&none, ApprovalMode::ReadOnly, "git push"), "deny");
 }
 
 fn bash_request(root: SessionId, command: &str) -> ApprovalRequest {
@@ -758,7 +768,7 @@ async fn a_call_allowed_for_the_read_only_cap_stays_confined_after_a_switch() {
         ApprovalModes::new(ApprovalMode::Ask)
             .with_sandbox(&workspace(SandboxMode::FullAccess, true)),
     );
-    modes.set_mode(root, ApprovalMode::Deny);
+    modes.set_mode(root, ApprovalMode::ReadOnly);
     let approved = request(root, root, "bash");
     assert_eq!(modes.classify(&approved), ApprovalVerdict::Allow);
 

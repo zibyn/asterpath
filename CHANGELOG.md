@@ -18,6 +18,7 @@
 - **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
 - **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
+- **审批模式统一用 `read-only` / `ask` / `allow`**（#213）：CLI 的 `-a`、`config.toml` 的 `[approval] default` 与桌面端共用一个 `approval::ApprovalMode`（变体 `ReadOnly` / `Ask` / `Allow`，`Deny` 改名为 `ReadOnly`）。旧名 `untrusted` / `never` 作为 `ask` / `allow` 的别名继续可用；桌面端命令的 JSON 取值由 `deny` 改为 `read-only`。`config::ApprovalMode` 删除。
 
 ### 新增
 
