@@ -18,6 +18,7 @@ use futures_util::lock::Mutex as AsyncMutex;
 
 use crate::error::AsterError;
 use crate::owner::Ownership;
+use crate::scan::{DecodedLog, ScanError, scan_decoded};
 use crate::watch::Watchers;
 
 /// Why a typed append did not commit. An event that does not encode is an
@@ -116,6 +117,11 @@ impl CommitLog {
             detail: error.to_string(),
         })?;
         Ok(self.append(entry).await?)
+    }
+
+    /// The whole log of `session`, decoded once.
+    pub(crate) async fn read(&self, session: SessionId) -> Result<DecodedLog, ScanError> {
+        scan_decoded(self, session).await
     }
 
     fn cursor(&self, session: SessionId) -> Arc<AsyncMutex<Cursor>> {

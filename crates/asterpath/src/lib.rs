@@ -325,7 +325,7 @@ impl Asterpath {
         if records.is_empty() {
             return Err(not_found());
         }
-        let (waterline, prefix) = fork::session_prefix(&records, at).ok_or_else(|| match at {
+        let (waterline, prefix) = records.fork_prefix(at).ok_or_else(|| match at {
             Some(turn) => AsterError::InvalidForkPoint {
                 session: source,
                 turn,
@@ -333,8 +333,7 @@ impl Asterpath {
             None => not_found(),
         })?;
         let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
-        let mut config =
-            asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
+        let mut config = records.config_at(waterline.log_id).ok_or_else(not_found)?;
         config.system = snapshot.system;
         config.system_sections = snapshot.system_sections;
         let items = snapshot.items;

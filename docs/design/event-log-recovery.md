@@ -262,6 +262,13 @@ recover(session):
 - 恢复次数上限不在内核：应用 supervisor 用 `StreamResumed` 记录计数并决定停车；压缩失败有终态，不会因同一意图自循环。
 - 恢复期间的补记（`StreamResumed`、`ModelCallAborted{Crash}`、`ToolResult::Interrupted`、`ChildSessionCompleted`）都受 §4 的幂等键保护。
 
+### 已解码日志与两种前缀
+
+引擎经提交日志整条读取一个会话，得到**已解码日志**（GLOSSARY）：每条记录只解码一次，任一记录解码失败即整次读取失败，agent 侧报 `AgentError::Corrupt`。一个步骤读一次并沿调用链传递；之后有追加、且下游要看到它时才重读。两种前缀都以 log id 为锚，定义只在已解码日志上写一处：
+
+- **步骤前缀**（锚 = 某步骤的 `StepStarted`）：`seq` 小于锚的全部记录，加上全部 `CompactionApplied`（无论落在锚前还是锚后，压缩是改写算子）。agent 的模型请求、压缩输入与 spawn 分叉（[subagents.md](subagents.md) §4.2）都投影它；锚本身是 `StepStarted`，不投影，所以含不含锚结果相同。生效配置同样取锚之前的 `ConfigChanged`。没有打开的步骤时（阈值压缩、手动压缩）取整条日志。
+- **分叉前缀**（锚 = 水位 `TurnCommitted`，未指定回合时取最后一个，没有则取 `SessionCreated`）：`seq` 不超过水位的记录，其后的记录（压缩也一样）不带入；水位回合最后一个 `StepStarted` 之后记下的输入属于下一回合，也不带入（[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)，[ADR-0045](../adr/0045-fork-at-any-committed-turn.md)）。分叉会话的生效配置取水位之前的变更。
+
 ## 7. 验收场景
 
 | # | 场景 | 断言 |
