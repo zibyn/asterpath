@@ -43,3 +43,7 @@
 - `ModelRequest.session: Option<SessionContext>` 带上会话、根会话与根会话的会话元数据，应用包装 provider 可按用户选凭据；压缩摘要调用经 `CompactionJob.session` 同样带上。
 - `ApprovalGate::pending_in(root)` 列出一棵会话树（含子会话）的待审批请求。
 - `ApprovalRequest.root`：请求所在会话树的根会话，审批策略可按会话树记状态（子代理沿用父会话树的设置）。
+
+### 修复
+
+- OpenAI 适配器（#208）：流结束时只要没收到终止事件就报 `Transport`，最后一帧缺结尾空行时也不再静默结束；流中途读失败按超时分出 `Timeout`，错误带上已知的 request id。provider 契约套件新增这两个场景。
