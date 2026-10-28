@@ -69,6 +69,8 @@ impl Provider for PerUserKeys {
 
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let context = request.session.clone().expect("a session's request");
+        // No forks here: a root and its children share the root's prompt cache.
+        assert_eq!(context.cache_root, context.root);
         let key = format!("key-of-{}", context.metadata["user"]);
         self.used
             .lock()

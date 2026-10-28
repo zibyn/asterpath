@@ -178,7 +178,7 @@ impl Asterpath {
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、会话元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
 - `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
 - `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带会话元数据。按元数据排序、前缀或范围匹配由应用在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
-- 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
+- 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, cache_root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
 ### 3.3 Session 驱动
 
