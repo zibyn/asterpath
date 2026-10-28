@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::{LogEntry, LogId, LogIdRange, ToolCallId};
 
-use crate::config::{ReasoningParams, ToolDescriptor, change_tools};
+use crate::config::{ReasoningParams, SystemSection, ToolDescriptor, change_tools, set_section};
 use crate::decode::{LogDecodeError, decode_entry};
 use crate::event::{SessionEvent, StopReason, ToolResultStatus};
 use crate::item::{Item, Part};
@@ -46,6 +46,9 @@ pub struct RequestHistory {
     /// The baseline system: `SessionCreated.config.system` plus every
     /// instruction a compaction has replaced, in log order.
     pub system: Vec<Part>,
+    /// The baseline keyed sections, rendered after `system`: the created
+    /// sections with each replaced section change applied, by key.
+    pub system_sections: Vec<SystemSection>,
     /// The baseline tools: `SessionCreated.config.tools` with every tool
     /// change a compaction has replaced applied, in log order.
     pub tools: Vec<ToolDescriptor>,
@@ -58,6 +61,7 @@ pub struct RequestHistory {
 #[derive(Default)]
 struct Baseline {
     system: Vec<Part>,
+    sections: Vec<SystemSection>,
     tools: Vec<ToolDescriptor>,
     reasoning: Option<ReasoningParams>,
 }
@@ -66,7 +70,15 @@ impl Baseline {
     fn absorb(&mut self, items: &[Item]) {
         for item in items {
             match item {
-                Item::Instruction { parts } => self.system.extend(parts.iter().cloned()),
+                Item::Instruction { key: None, parts } => self.system.extend(parts.iter().cloned()),
+                // The first part is the notice; the rest is the new value.
+                Item::Instruction {
+                    key: Some(key),
+                    parts,
+                } => set_section(
+                    &mut self.sections,
+                    &SystemSection::new(key.clone(), parts[1..].to_vec()),
+                ),
                 Item::ToolsChanged { added, removed } => {
                     change_tools(&mut self.tools, added, removed);
                 }
@@ -90,6 +102,7 @@ pub fn request_history(entries: &[LogEntry]) -> Result<RequestHistory, Projectio
     let (history, baseline) = fold(entries)?;
     Ok(RequestHistory {
         system: baseline.system,
+        system_sections: baseline.sections,
         tools: baseline.tools,
         reasoning: baseline.reasoning,
         items: history
@@ -117,6 +130,7 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
                 reasoning.clone_from(&config.request.reasoning);
                 baseline = Some(Baseline {
                     system: config.system,
+                    sections: config.system_sections,
                     tools: config.tools,
                     reasoning: config.request.reasoning,
                 });
@@ -126,9 +140,11 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
                 let mut items = Vec::new();
                 if !patch.append_system.is_empty() {
                     items.push(Item::Instruction {
+                        key: None,
                         parts: patch.append_system,
                     });
                 }
+                items.extend(patch.system_sections.into_iter().map(section_item));
                 if changes_tools {
                     items.push(Item::ToolsChanged {
                         added: patch.add_tools,
@@ -264,6 +280,27 @@ fn fold(entries: &[LogEntry]) -> Result<(Vec<ProjectedEntry>, Baseline), Project
     history.append(&mut pending_changes);
 
     Ok((history, baseline.unwrap_or_default()))
+}
+
+/// A keyed section change as history renders it: a notice, then the new value.
+fn section_item(section: SystemSection) -> Item {
+    let notice = if section.parts.is_empty() {
+        format!(
+            "Instruction section `{}` removed; disregard its earlier text.",
+            section.key
+        )
+    } else {
+        format!(
+            "Instruction section `{}` (supersedes any earlier text of this section):",
+            section.key
+        )
+    };
+    let mut parts = vec![Part::Text { text: notice }];
+    parts.extend(section.parts);
+    Item::Instruction {
+        key: Some(section.key),
+        parts,
+    }
 }
 
 fn flush_results(pending: &mut Vec<(u64, ProjectedEntry)>, history: &mut Vec<ProjectedEntry>) {

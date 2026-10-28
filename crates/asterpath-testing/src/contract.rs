@@ -86,6 +86,7 @@ fn model() -> ModelSpec {
 
 fn config() -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: model(),
         system: vec![],
         tools: vec![],

@@ -37,6 +37,7 @@ pub(super) fn model() -> ModelSpec {
 
 pub(super) fn config(tools: Vec<ToolDescriptor>) -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: model(),
         system: vec![text("be helpful")],
         tools,

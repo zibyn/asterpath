@@ -42,7 +42,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0026](0026-engine-is-one-crate-only-adapter-traits-public.md) | 引擎是一个 crate，只有适配器 trait 与钩子公开，宿主显式驱动 |
 | [0027](0027-mcp-is-a-tool-source-not-a-plugin-host.md) | MCP 是工具来源；ACP 不属于工具层 |
 | [0029](0029-provider-instance-is-a-vendor-endpoint.md) | provider 实例 = 供应商端点，模型规则可由宿主注入 |
-| [0030](0030-session-config-is-a-fold-of-log-records.md) | 会话配置是日志记录的折叠，变更是历史中的一个位置 |
+| [0030](0030-session-config-is-a-fold-of-log-records.md) | 会话配置是日志记录的折叠，变更是历史中的一个位置（「system 只能追加」由 0057 修订） |
 | [0031](0031-server-tools-structured-output-and-file-input.md) | 服务端工具按 provider 声明，文件引用绑定 provider，结构化输出是请求约束 |
 | [0032](0032-sessions-carry-opaque-host-metadata.md) | 会话携带创建时写入、不可变、框架不解释的宿主元数据 |
 | [0033](0033-session-fork-reuses-context-fork-snapshot.md) | 会话分叉是宿主创建的独立会话，复用上下文分叉的快照 |
@@ -65,5 +65,6 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0054](0054-output-styles-do-not-reach-subagents.md) | 输出风格不进入子会话：应用在会话环境里提供不带风格的基础 system，fork 子会话例外 |
 | [0055](0055-sandbox-is-the-boundary-for-spawned-commands.md) | 起进程的工具以沙箱为边界，审批只问能否越出沙箱；审批模式只收紧沙箱，命令规则只改审批结论（模式切换部分由 0056 修正） |
 | [0056](0056-read-only-cap-sticks-to-the-calls-it-allowed.md) | 因只读上限而放行的 `bash` 调用启动时保留 `ReadOnly`，记录只在内存中 |
+| [0057](0057-instruction-sections-are-replaced-by-key.md) | 指令节按键刷新：带键条目留在历史原位，压缩时每个键只保留最新值 |
 
 其余编号（0001、0003–0005、0009、0012–0018、0020、0022、0024、0028）是 superseded / merged / retired 的短桩；0040 已被 0048 取代；0041–0043 已否决（见 0047）。

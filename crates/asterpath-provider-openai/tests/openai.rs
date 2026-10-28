@@ -1309,6 +1309,7 @@ async fn an_instruction_renders_as_a_developer_message_in_place() {
     let mut request = request(vec![
         user_text("hi"),
         Item::Instruction {
+            key: None,
             parts: texts("answer in French"),
         },
     ]);
