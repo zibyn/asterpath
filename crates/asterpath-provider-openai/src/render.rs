@@ -111,7 +111,7 @@ pub(crate) fn render(
         .map(reasoning),
         text,
         // Keyed by the cache root so children, forks and summaries share a cache
-        // node; an explicit provider option wins.
+        // node; an explicit provider option wins, `null` omits it.
         prompt_cache_key: request
             .session
             .as_ref()
@@ -131,6 +131,10 @@ pub(crate) fn render(
     let mut fields: BTreeMap<String, Box<RawValue>> =
         serde_json::from_slice(&bytes).map_err(not_serializable)?;
     for (key, value) in options {
+        // `"prompt_cache_key": null` opts this request out of the derived key.
+        if key == "prompt_cache_key" && value.is_null() {
+            continue;
+        }
         let value = match fields.get(&key) {
             Some(existing) => {
                 let mut target: Value =
