@@ -59,11 +59,8 @@ pub async fn interactive(
             transcript(&mut io::stdout(), &entries);
             return opened.shutdown().await;
         };
-        // The TTY prompt is this mode's approval channel (§4.4).
-        let endpoint = opened
-            .asterpath
-            .approval_gate()
-            .register(owned.owner().root);
+        // The TTY prompt is this mode's approval channel (§4.4); the session
+        // driver opens the endpoint while it drives.
         let next = repl(
             &opened.asterpath,
             owned,
@@ -73,7 +70,6 @@ pub async fn interactive(
             io::stdout(),
         )
         .await;
-        drop(endpoint);
         // `/new` keeps the model in use, including one chosen with `/model`.
         // shortcut: carries the model id only, so a resumed session on another provider than the config's hands over a foreign id; carry the provider when `-m` can name one
         let model = match &next {
@@ -208,7 +204,8 @@ async fn turn<W: Write>(
             out: &mut *out,
         },
     )
-    .await?;
+    .await
+    .map_err(aster_error)?;
     let _ = writeln!(out);
     let entries = scan(asterpath.store(), handle.id())
         .await
@@ -372,10 +369,11 @@ impl<W: Write> drive::Operator for Terminal<'_, W> {
         }
     }
 
-    async fn interrupted(&mut self) {
+    async fn interrupted(&mut self) -> drive::Interrupt {
         if self.interrupts.recv().await.is_none() {
             std::future::pending::<()>().await;
         }
+        drive::Interrupt::Cancel
     }
 }
 

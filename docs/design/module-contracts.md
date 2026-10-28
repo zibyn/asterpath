@@ -6,7 +6,7 @@
 
 ## 1. 决策摘要
 
-- 公开 trait 只有适配器与钩子（ADR-0026）：`Provider`、`Tool`、存储后端（`SessionStore`：日志 + 会话目录，可选退役）、`Compactor`、`ApprovalPolicy`、`SandboxProvider`、`Clock`、`Hooks`。它们与值类型、日志信封一起在 `asterpath-protocol`。
+- 公开 trait 只有适配器与钩子（ADR-0026）：`Provider`、`Tool`、存储后端（`SessionStore`：日志 + 会话目录，可选退役；`ClaimRows`：后端交给共用认领表 `ClaimTable` 的认领 / 释放 / 续约行操作）、`Compactor`、`ApprovalPolicy`、`SandboxProvider`、`Clock`、`Hooks`。它们与值类型、日志信封一起在 `asterpath-protocol`。
 - 引擎（agent 循环、scheduler、持久等待、工具表、trace / usage 视图、默认压缩）是 `asterpath` 的内部模块，不可替换；替换能力只经适配器，观察 / 拦截只经 `Hooks`。
 - 消息只出现在跨进程与跨恢复边界；进程内是直接调用。
 - 插件是外部传输，不是特权层。外部能力带 `Provenance::External`，经进程内 adapter 以 `Tool` 暴露。
@@ -76,7 +76,15 @@ pub trait Hooks: Send + Sync {
 
 ### 3.2 单一 append 入口
 
-agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由应用在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
+agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`，即提交日志）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由应用在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
+
+提交日志的 interface（#202）：
+
+- **追加**：`append_event(session, event: SessionEvent, key: Option<DedupKey>) -> Result<LogId, AppendError>`。编码只在这里发生（引擎内非测试代码不再调用 `encode_entry`）。dedup key 由调用方显式给；重放已提交的 key 返回原记录的 log id，不再 `on_record`。
+- **属主**：在 drive / 压缩被 poll 期间的写入盖上该认领的 owner（ADR-0036）；已失去的认领在本地即拒绝为 `OwnedElsewhere`，存储报 `OwnedElsewhere` 时标记该认领失去。
+- **hook 与通知**：同一会话的追加在会话游标锁下串行，记录按日志顺序各 `on_record` 一次；观察失败只记日志，不把已成功的追加变成错误。成功后通知本进程 watcher。
+- **错误形状**：`AppendError { Encode, Storage(StorageError) }`。编码失败是引擎内部错误：映射到 `ExecutionError::Backend`（`AgentError::Execution`、facade 的 `AsterError::Execution`），不再报成 `Config` 或 corrupt；存储失败原样为 `Storage`。各调用方只经 `From` 映射一次。
+- **持有方**：agent、tool pipeline、scheduler、waits、trace 视图持 `Arc<CommitLog>`；usage 视图与 `Asterpath::store()` 把它作为 `dyn SessionStore` 使用（usage 的分页扫描经提交日志的原始 scan），应用的 append 同样经过上述语义。
 
 ### 3.3 （已删除）事件总线
 
@@ -226,7 +234,7 @@ pub trait ApprovalPolicy: Send + Sync { /* classify，见 tools.md §4 */ }
 ## 5. 生命周期规则
 
 1. facade（组装根）显式构造引擎；只有它知道具体类型。替换能力只经适配器字段（provider、tools、compactor、存储后端、审批策略、clock）与 `Hooks`。
-2. 构造顺序固定：存储 → trace / usage 视图（读后端）→ append 入口（含钩子）→ waits → scheduler → 工具表（`AsterpathConfig.spawn_tool` 开启时先注册 `spawn_agent` 描述符，默认开启）→ agent（持有 scheduler）。agent 执行 `spawn_agent` 时把自己传给 `Scheduler::run_spawn_tool` 作为子会话驱动者，scheduler 不持有 agent，没有循环引用。
+2. 构造顺序固定：存储 → append 入口（提交日志，含钩子）→ trace / usage 视图（经提交日志读）→ waits → scheduler → 工具表（`AsterpathConfig.spawn_tool` 开启时先注册 `spawn_agent` 描述符，默认开启）→ agent（持有 scheduler）。agent 执行 `spawn_agent` 时把自己传给 `Scheduler::run_spawn_tool` 作为子会话驱动者，scheduler 不持有 agent，没有循环引用。
 3. 引擎没有后台任务；`shutdown()` 只释放引擎。
 4. 工具表可在运行期增加工具（只在组装时用）；session 的模型可见工具集在创建时快照。
 5. v1 不做动态发现、热替换、运行期卸载；换组件 = 重启进程。

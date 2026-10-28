@@ -14,15 +14,15 @@
 //! through one queue, in order; appends, retirements and reads run
 //! concurrently.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
-    OwnerToken, ParentFilter, RetirementError, SessionEvent, SessionFacts, SessionId, SessionQuery,
-    SessionStore, StorageError, SystemClock, Timestamp, decode_payload,
+    CatalogEntry, Claim, ClaimRows, ClaimTable, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry,
+    LogId, LogQuery, NewEntry, OwnerToken, ParentFilter, ReleaseWait, RetirementError,
+    SessionEvent, SessionFacts, SessionId, SessionQuery, SessionStore, StorageError, SystemClock,
+    Timestamp, decode_payload,
 };
 use deadpool_postgres::Pool;
 use futures_core::future::BoxFuture;
@@ -153,10 +153,9 @@ pub async fn from_pool_with_clock(
         commands: Some(commands),
         exit: Mutex::new(exit),
         pool,
-        me: me.clone(),
         lease,
         clock,
-        held: Mutex::default(),
+        claims: ClaimTable::new(Rows(me.clone())),
     }))
 }
 
@@ -166,12 +165,9 @@ pub struct PostgresStorage {
     /// Disconnects once the control task has freed this process's trees.
     exit: Mutex<mpsc::Receiver<()>>,
     pool: Pool,
-    /// For claims, which release through the store if it is still open.
-    me: Weak<PostgresStorage>,
     lease: Lease,
     clock: Arc<dyn Clock>,
-    /// Root -> (epoch, live claims) of the trees held through this handle.
-    held: Mutex<HashMap<SessionId, (u64, usize)>>,
+    claims: ClaimTable,
 }
 
 impl Drop for PostgresStorage {
@@ -1042,18 +1038,6 @@ impl PostgresStorage {
             .send(command)
             .map_err(|_| stopped())
     }
-
-    fn held(&self) -> MutexGuard<'_, HashMap<SessionId, (u64, usize)>> {
-        lock(&self.held)
-    }
-
-    fn claim_of(&self, token: OwnerToken) -> Claim {
-        let release = Release {
-            store: self.me.clone(),
-            token,
-        };
-        Claim::new(token, release)
-    }
 }
 
 impl SessionStore for PostgresStorage {
@@ -1092,30 +1076,7 @@ impl SessionStore for PostgresStorage {
     }
 
     fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
-        Box::pin(async move {
-            let response = {
-                let mut held = self.held();
-                if let Some((epoch, claims)) = held.get_mut(&root) {
-                    *claims += 1;
-                    let epoch = *epoch;
-                    return Ok(self.claim_of(OwnerToken { root, epoch }));
-                }
-                let (reply, response) = oneshot::channel();
-                // Sent under the lock, so a release of this root queued
-                // before it commits first.
-                self.send(Control::Claim { root, reply })?;
-                response
-            };
-            let (epoch, _) = response.await.unwrap_or_else(|_| Err(stopped()))?;
-            let mut held = self.held();
-            let entry = held.entry(root).or_insert((epoch, 0));
-            if entry.0 != epoch {
-                *entry = (epoch, 0);
-            }
-            entry.1 += 1;
-            drop(held);
-            Ok(self.claim_of(OwnerToken { root, epoch }))
-        })
+        Box::pin(self.claims.claim(root))
     }
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
@@ -1137,29 +1098,7 @@ impl SessionStore for PostgresStorage {
     }
 
     fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
-        Box::pin(async move {
-            let held = self
-                .held()
-                .iter()
-                .map(|(root, (epoch, _))| OwnerToken {
-                    root: *root,
-                    epoch: *epoch,
-                })
-                .collect();
-            let (reply, response) = oneshot::channel();
-            self.send(Control::Renew { held, reply })?;
-            let lost = response.await.unwrap_or_else(|_| Err(stopped()))?;
-            let mut held = self.held();
-            for token in &lost {
-                if held
-                    .get(&token.root)
-                    .is_some_and(|(epoch, _)| *epoch == token.epoch)
-                {
-                    held.remove(&token.root);
-                }
-            }
-            Ok(lost)
-        })
+        Box::pin(self.claims.renew())
     }
 
     fn retire(
@@ -1175,41 +1114,44 @@ impl SessionStore for PostgresStorage {
     }
 }
 
-/// Drops one claim; the last one of its epoch releases the tree, committed
-/// before `drop` returns so another process may claim it at once. A store
-/// already closed has freed the tree on exit.
-struct Release {
-    store: Weak<PostgresStorage>,
-    token: OwnerToken,
+/// The claim table's row operations, run by the control task. A store
+/// already closed has freed its trees on exit.
+struct Rows(Weak<PostgresStorage>);
+
+impl Rows {
+    fn send(&self, control: Control) -> Result<(), StorageError> {
+        self.0.upgrade().ok_or_else(stopped)?.send(control)
+    }
 }
 
-impl Drop for Release {
-    fn drop(&mut self) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        let committed = {
-            let mut held = store.held();
-            match held.get_mut(&self.token.root) {
-                Some((epoch, claims)) if *epoch == self.token.epoch => {
-                    *claims -= 1;
-                    if *claims > 0 {
-                        return;
-                    }
-                }
-                _ => return,
-            }
-            held.remove(&self.token.root);
-            let (done, committed) = mpsc::channel();
-            let release = Control::Release {
-                token: self.token,
-                done,
-            };
-            if store.send(release).is_err() {
-                return;
-            }
-            committed
-        };
-        let _ = committed.recv();
+impl ClaimRows for Rows {
+    fn claim(&self, root: SessionId) -> BoxFuture<'static, Result<u64, StorageError>> {
+        let (reply, response) = oneshot::channel();
+        let sent = self.send(Control::Claim { root, reply });
+        Box::pin(async move {
+            sent?;
+            let (epoch, _) = response.await.unwrap_or_else(|_| Err(stopped()))?;
+            Ok(epoch)
+        })
+    }
+
+    fn release(&self, token: OwnerToken) -> ReleaseWait {
+        let (done, committed) = mpsc::channel();
+        let _ = self.send(Control::Release { token, done });
+        Box::new(move || {
+            let _ = committed.recv();
+        })
+    }
+
+    fn renew(
+        &self,
+        held: Vec<OwnerToken>,
+    ) -> BoxFuture<'static, Result<Vec<OwnerToken>, StorageError>> {
+        let (reply, response) = oneshot::channel();
+        let sent = self.send(Control::Renew { held, reply });
+        Box::pin(async move {
+            sent?;
+            response.await.unwrap_or_else(|_| Err(stopped()))
+        })
     }
 }

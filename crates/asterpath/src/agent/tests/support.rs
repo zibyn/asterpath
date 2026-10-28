@@ -5,17 +5,14 @@ use std::time::Duration;
 
 use crate::agent::Agent;
 use crate::tools::ToolTable;
-use crate::waits::Waits;
+use crate::{Asterpath, AsterpathConfig};
 use asterpath_protocol::{
-    AgentEvent, ApprovalPolicy, CompactionConfig, ConfigSnapshot, DefaultApprovalPolicy, Hooks,
-    Item, JsonString, ModelId, ModelSpec, Parallelism, Part, Provider, ProviderCatalog, ProviderId,
-    ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger, SessionEvent, SideEffect,
-    SubagentConfig, Tool, ToolConfig, ToolDescriptor, ToolName, TurnConfig, decode_entry,
-    encode_entry,
+    AgentEvent, CompactionConfig, ConfigSnapshot, Hooks, Item, JsonString, ModelId, ModelSpec,
+    Parallelism, Part, ProviderId, ReplaySafety, RequestConfig, Role, RunRequest, RunTrigger,
+    SessionEvent, SideEffect, SubagentConfig, Tool, ToolConfig, ToolDescriptor, ToolName,
+    TurnConfig, decode_entry, encode_entry,
 };
-use asterpath_protocol::{
-    ApprovalGate, DedupKey, LogEntry, LogId, SessionId, SessionStore, scan_all,
-};
+use asterpath_protocol::{DedupKey, LogEntry, LogId, SessionId, SessionStore, scan_all};
 use asterpath_testing::{InMemoryEventLog, ManualClock, ScriptedProvider};
 use futures_util::StreamExt;
 
@@ -112,6 +109,26 @@ pub(super) async fn decoded(log: &InMemoryEventLog) -> Vec<SessionEvent> {
         .collect()
 }
 
+/// The engine over `log`, assembled by the facade's composition root with
+/// `provider`, `tools`, a manual clock and no spawn tool; the rest of
+/// `config` is the caller's.
+pub(super) fn engine(
+    log: Arc<dyn SessionStore>,
+    provider: Arc<ScriptedProvider>,
+    tools: Arc<ToolTable>,
+    config: AsterpathConfig,
+) -> Asterpath {
+    Asterpath::from_config(AsterpathConfig {
+        store: Some(log),
+        providers: vec![provider],
+        tools: tools.list(),
+        clock: Arc::new(ManualClock::new()),
+        spawn_tool: false,
+        ..config
+    })
+    .expect("assemble")
+}
+
 /// An agent with the default approval policy over a closed gate.
 pub(super) fn agent(
     log: Arc<dyn SessionStore>,
@@ -119,33 +136,13 @@ pub(super) fn agent(
     tools: Arc<ToolTable>,
     tool_config: ToolConfig,
     hooks: Vec<Arc<dyn Hooks>>,
-) -> Agent {
-    let gate = Arc::new(ApprovalGate::new());
-    let policy = Arc::new(DefaultApprovalPolicy);
-    agent_with(log, provider, tools, tool_config, policy, gate, None).with_hooks(hooks, None)
-}
-
-pub(super) fn agent_with(
-    log: Arc<dyn SessionStore>,
-    provider: Arc<ScriptedProvider>,
-    tools: Arc<ToolTable>,
-    tool_config: ToolConfig,
-    approval: Arc<dyn ApprovalPolicy>,
-    gate: Arc<ApprovalGate>,
-    waits: Option<Arc<Waits>>,
-) -> Agent {
-    let waits = waits.unwrap_or_else(|| Arc::new(Waits::new(Arc::clone(&log))));
-    let provider: Arc<dyn Provider> = provider;
-    Agent::new(
-        log,
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        tools,
-        tool_config,
-        approval,
-        gate,
-        waits,
-        Arc::new(ManualClock::new()),
-    )
+) -> Arc<Agent> {
+    let config = AsterpathConfig {
+        tool: tool_config,
+        hooks,
+        ..AsterpathConfig::default()
+    };
+    Arc::clone(engine(log, provider, tools, config).agent())
 }
 
 pub(super) async fn drive(agent: &Agent) -> Vec<AgentEvent> {

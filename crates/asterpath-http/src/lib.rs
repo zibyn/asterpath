@@ -3,14 +3,18 @@
 //! Not part of the stable surface (ADR-0026, re-audit candidate 5 revision).
 #![allow(clippy::result_large_err)]
 
+mod streamed_call;
+
 use std::time::Duration;
 
 use asterpath_protocol::{
-    FileSource, Item, ModelRequest, Part, ProviderError, ProviderErrorKind, ProviderId,
-    RawProviderData, ReasoningParams,
+    FileSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError, ProviderErrorKind,
+    ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort, ReasoningParams,
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
+
+pub use streamed_call::{ErrorEnvelope, SseNormalizer, streamed_call};
 
 /// One dispatched server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +235,87 @@ pub fn unrenderable_part(request: &ModelRequest, accepted: &[&str]) -> Option<St
         Part::File { .. } => Some("this file source".to_owned()),
         _ => None,
     })
+}
+
+/// The checks every adapter runs before rendering: no feature `capabilities`
+/// lacks, no part it cannot render ([`unrenderable_part`] with `file_media_types`),
+/// `spec.provider` is `adapter`, the system and every instruction are text only,
+/// and any reasoning effort is in `efforts`. Unsupported errors name `adapter_name`.
+/// Adapter-specific checks stay in the adapter.
+pub fn check_request(
+    request: &ModelRequest,
+    adapter: &ProviderId,
+    adapter_name: &str,
+    capabilities: ProviderCapabilities,
+    file_media_types: &[&str],
+    efforts: &[ReasoningEffort],
+) -> Result<(), ProviderError> {
+    let unsupported = |detail: &str| {
+        ProviderError::new(
+            ProviderErrorKind::Unsupported,
+            format!("{detail} is not supported by the {adapter_name} adapter"),
+        )
+    };
+    let invalid = |message: String| ProviderError::new(ProviderErrorKind::InvalidRequest, message);
+    if let Some(feature) = capabilities.unsupported_feature(request) {
+        return Err(unsupported(feature));
+    }
+    if let Some(detail) = unrenderable_part(request, file_media_types) {
+        return Err(unsupported(&detail));
+    }
+    if request.spec.provider != *adapter {
+        return Err(invalid(format!(
+            "request provider {} does not match adapter {adapter}",
+            request.spec.provider
+        )));
+    }
+    let instructions = request.items.iter().flat_map(|item| match item {
+        Item::Instruction { parts, .. } => parts.as_slice(),
+        _ => &[],
+    });
+    if !request
+        .system
+        .iter()
+        .chain(instructions)
+        .all(|part| matches!(part, Part::Text { .. }))
+    {
+        return Err(invalid(
+            "system and instructions may only contain text parts".to_owned(),
+        ));
+    }
+    if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
+        && !efforts.contains(&effort)
+    {
+        return Err(unsupported(&format!(
+            "reasoning.effort {effort:?} on {}",
+            request.spec.model
+        )));
+    }
+    Ok(())
+}
+
+/// Why a reasoning item may not be replayed into `request`, if it may not:
+/// `cross_provider` when the binding or the raw came from another provider,
+/// then `model_mismatch`, `prefix_epoch_mismatch`, and `tools_hash_mismatch`
+/// when the adapter checks the tool set (`tools_hash` is `Some`).
+pub fn reasoning_drop_reason(
+    binding: &ReasoningBinding,
+    raw: &RawProviderData,
+    request: &ModelRequest,
+    tools_hash: Option<&str>,
+) -> Option<&'static str> {
+    let provider = &request.spec.provider;
+    if binding.provider != *provider || raw.provider != *provider {
+        Some("cross_provider")
+    } else if binding.model != request.spec.model {
+        Some("model_mismatch")
+    } else if binding.prefix_epoch != request.prefix_epoch {
+        Some("prefix_epoch_mismatch")
+    } else if tools_hash.is_some_and(|hash| binding.tools_hash != hash) {
+        Some("tools_hash_mismatch")
+    } else {
+        None
+    }
 }
 
 /// Every part of the request: the system, then each item's parts.

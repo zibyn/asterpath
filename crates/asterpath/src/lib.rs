@@ -40,7 +40,9 @@ pub use asterpath_provider_anthropic as anthropic;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentParts};
+use crate::commit::{AppendError, CommitLog};
+use crate::scan::DecodedLog;
 use crate::scheduler::{Scheduler, SpawnTool};
 use crate::tools::ToolTable;
 use crate::views::trace::TracingQuery;
@@ -78,7 +80,7 @@ pub use asterpath_storage_postgres as postgres;
 pub struct Asterpath {
     /// The single append entry: the backend wrapped in `CommitLog`, so every
     /// append reaches the hooks.
-    store: Arc<dyn SessionStore>,
+    store: Arc<CommitLog>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
@@ -105,10 +107,12 @@ impl Asterpath {
     }
 
     pub async fn build(config: AsterpathConfig) -> Result<Self, AsterError> {
-        Self::from_config(config).await
+        Self::from_config(config)
     }
 
-    pub(crate) async fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
+    /// The composition root: the only place engine parts are constructed.
+    /// Synchronous so crate tests assemble through it too.
+    pub(crate) fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
         check_tool_names(&config.tools)?;
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {
@@ -143,22 +147,22 @@ impl Asterpath {
             }
         };
 
-        // Projections read the backend; every write goes through the one
-        // append entry so hooks see it.
-        let trace = TracingQuery::new(Arc::clone(&backend));
-        let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
         let watchers = Arc::new(Watchers::default());
         let ownership = Arc::new(owner::Ownership::new(
             Arc::clone(&backend),
             config.hooks.clone(),
         ));
         owner::Ownership::keep_renewed(&ownership, config.lease_renew_interval);
-        let store: Arc<dyn SessionStore> = Arc::new(commit::CommitLog::new(
+        let store = Arc::new(CommitLog::new(
             backend,
             config.hooks.clone(),
             Arc::clone(&watchers),
             Arc::clone(&ownership),
         ));
+        // Every read and write goes through the one append entry, so hooks
+        // see every write.
+        let trace = TracingQuery::new(Arc::clone(&store));
+        let usage = Arc::new(UsageService::new(store.clone()));
 
         let waits = Arc::new(Waits::new(Arc::clone(&store)));
         let cancellations = Arc::new(CancellationRegistry::new());
@@ -194,23 +198,22 @@ impl Asterpath {
                     .await
             })
         });
-        let agent = Arc::new(
-            Agent::new(
-                Arc::clone(&store),
-                Arc::clone(&providers),
-                Arc::clone(&tools),
-                config.tool.clone(),
-                approval,
-                Arc::clone(&gate),
-                Arc::clone(&waits),
-                Arc::clone(&config.clock),
-            )
-            .with_hooks(config.hooks, Some(usage_lookup))
-            .with_compactor(config.compactor.clone())
-            .with_cancellations(Arc::clone(&cancellations))
-            .with_scheduler(scheduler)
-            .with_watchers(Arc::clone(&watchers)),
-        );
+        let agent = Arc::new(Agent::new(AgentParts {
+            log: Arc::clone(&store),
+            providers: Arc::clone(&providers),
+            tools: Arc::clone(&tools),
+            tool_config: config.tool.clone(),
+            approval,
+            gate: Arc::clone(&gate),
+            waits: Arc::clone(&waits),
+            clock: Arc::clone(&config.clock),
+            hooks: config.hooks,
+            usage: usage_lookup,
+            compactor: config.compactor.clone(),
+            cancellations: Arc::clone(&cancellations),
+            scheduler,
+            watchers: Arc::clone(&watchers),
+        }));
 
         Ok(Self {
             store,
@@ -227,6 +230,21 @@ impl Asterpath {
             watchers,
             ownership,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent(&self) -> &Arc<Agent> {
+        &self.agent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler(&self) -> &Arc<Scheduler> {
+        self.agent.scheduler()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waits(&self) -> &Arc<Waits> {
+        &self.waits
     }
 
     pub async fn create_session(&self, spec: SessionSpec) -> Result<SessionHandle, AsterError> {
@@ -269,15 +287,9 @@ impl Asterpath {
             parent: None,
             metadata: spec.metadata,
         };
-        let entry = asterpath_protocol::encode_entry(
-            session,
-            Some(dedup::session_created(session)),
-            &event,
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(session, event, Some(dedup::session_created(session)))
+            .await?;
         Ok(self.handle(session, env))
     }
 
@@ -317,9 +329,7 @@ impl Asterpath {
     ) -> Result<SessionHandle, AsterError> {
         check_metadata(&metadata)?;
         let env = self.resolve(&metadata).await?;
-        let records = scan::scan_decoded(&*self.store, source)
-            .await
-            .map_err(AgentError::from)?;
+        let records = self.store.read(source).await.map_err(AgentError::from)?;
         let not_found = || AsterError::Agent(AgentError::NotFound { session: source });
         let corrupt = |detail: String| {
             AsterError::Agent(AgentError::Corrupt {
@@ -330,16 +340,15 @@ impl Asterpath {
         if records.is_empty() {
             return Err(not_found());
         }
-        let (waterline, prefix) = fork::session_prefix(&records, at).ok_or_else(|| match at {
+        let (waterline, prefix) = records.fork_prefix(at).ok_or_else(|| match at {
             Some(turn) => AsterError::InvalidForkPoint {
                 session: source,
                 turn,
             },
             None => not_found(),
         })?;
-        let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
-        let mut config =
-            asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
+        let snapshot = fork::snapshot(prefix).map_err(|e| corrupt(e.to_string()))?;
+        let mut config = records.config_at(waterline.log_id).ok_or_else(not_found)?;
         config.system = snapshot.system;
         config.system_sections = snapshot.system_sections;
         let items = snapshot.items;
@@ -364,9 +373,7 @@ impl Asterpath {
                 },
             ),
         ] {
-            let entry = asterpath_protocol::encode_entry(session, Some(key), &event)
-                .map_err(|error| corrupt(error.to_string()))?;
-            self.store.append(entry).await?;
+            self.store.append_event(session, event, Some(key)).await?;
         }
         Ok(self.handle(session, env))
     }
@@ -437,7 +444,7 @@ impl Asterpath {
     /// the claimed tree in order (`Unsupported` when the injected store has
     /// no retirement).
     pub fn store(&self) -> Arc<dyn SessionStore> {
-        Arc::clone(&self.store)
+        self.store.clone()
     }
 
     /// One page of the session catalog, session metadata included (ADR-0032):
@@ -592,7 +599,7 @@ pub struct SessionHandle {
     session: SessionId,
     /// Resolved when the handle was made; `None` without an adapter.
     env: Option<Arc<SessionEnvironment>>,
-    store: Arc<dyn SessionStore>,
+    store: Arc<CommitLog>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
@@ -641,15 +648,9 @@ impl SessionHandle {
     /// Append `InputRecorded` only. Never starts a turn.
     pub async fn submit_input(&self, input: UserInput) -> Result<InputId, AsterError> {
         let event = SessionEvent::InputRecorded { input: input.parts };
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            Some(dedup::input_recorded(input.id)),
-            &event,
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, event, Some(dedup::input_recorded(input.id)))
+            .await?;
         Ok(input.id)
     }
 
@@ -687,7 +688,9 @@ impl SessionHandle {
         }
         let key = patch.id.map(dedup::config_changed);
         if patch.changes_tools() {
-            let records = scan::scan_decoded(&*self.store, self.session)
+            let records = self
+                .store
+                .read(self.session)
                 .await
                 .map_err(AgentError::from)?;
             // A retry of a recorded change is a no-op, not a conflict with itself.
@@ -699,23 +702,17 @@ impl SessionHandle {
             {
                 return Ok(());
             }
-            let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
-                AsterError::Agent(AgentError::NotFound {
+            let effective = records
+                .config()
+                .ok_or(AsterError::Agent(AgentError::NotFound {
                     session: self.session,
-                }),
-            )?;
+                }))?;
             self.check_tool_change(&patch, &effective.tools)?;
         }
         // Without an id a retry may land twice; whole-field overrides fold the same.
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            key,
-            &SessionEvent::ConfigChanged { patch },
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, SessionEvent::ConfigChanged { patch }, key)
+            .await?;
         Ok(())
     }
 
@@ -729,25 +726,22 @@ impl SessionHandle {
     /// session was created with.
     pub async fn update_metadata(&self, patch: MetadataPatch) -> Result<(), AsterError> {
         let MetadataPatch { set, remove } = patch;
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            None,
-            &SessionEvent::MetadataChanged { set, remove },
-        )
-        .map_err(corrupt(self.session))?;
+        let event = SessionEvent::MetadataChanged { set, remove };
         let not_found = AsterError::Agent(AgentError::NotFound {
             session: self.session,
         });
-        match self.store.append(entry).await {
+        match self.store.append_event(self.session, event, None).await {
             Ok(_) => Ok(()),
-            Err(StorageError::Retired { .. }) => Err(not_found),
+            Err(AppendError::Storage(StorageError::Retired { .. })) => Err(not_found),
             // A store that forgets retired sessions rejects them as entries.
-            Err(StorageError::InvalidEntry(_))
+            Err(AppendError::Storage(StorageError::InvalidEntry(_)))
                 if self.store.frontier(self.session).await?.is_none() =>
             {
                 Err(not_found)
             }
-            Err(StorageError::InvalidEntry(message)) => Err(AsterError::Config { message }),
+            Err(AppendError::Storage(StorageError::InvalidEntry(message))) => {
+                Err(AsterError::Config { message })
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -800,37 +794,37 @@ impl SessionHandle {
 
     /// The session facts folded from the log, not driver memory.
     pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
-        Ok(SessionFacts::fold(&entries).map_err(corrupt(self.session))?)
+        Ok(self.store.read(self.session).await?.facts())
     }
 
     /// The model-visible projection folded from the log, not driver memory.
     /// Each entry keeps its origin so applications can map items back to log ids.
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
-        Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
+        let log = self.store.read(self.session).await?;
+        Ok(asterpath_protocol::project_decoded(log.decoded()).map_err(corrupt(self.session))?)
     }
 
     /// The effective config folded from the log at its frontier (ADR-0030):
     /// what the next step runs with, whichever process changed it.
     pub async fn config(&self) -> Result<ConfigSnapshot, AsterError> {
-        self.fold_log(|records| asterpath_protocol::effective_config(records, u64::MAX))
-            .await
+        self.fold_log(DecodedLog::config).await
     }
 
     /// The latest model request's input tokens against the effective
     /// context window, folded from the log.
     pub async fn context_usage(&self) -> Result<ContextUsage, AsterError> {
-        self.fold_log(ContextUsage::of).await
+        self.fold_log(|log| ContextUsage::of(log)).await
     }
 
     /// The decoded log folded by `fold`; `NotFound` when the fold finds no
     /// `SessionCreated` (an unknown or retired session).
     async fn fold_log<T>(
         &self,
-        fold: impl FnOnce(&[(asterpath_protocol::LogEntry, SessionEvent)]) -> Option<T>,
+        fold: impl FnOnce(&DecodedLog) -> Option<T>,
     ) -> Result<T, AsterError> {
-        let records = scan::scan_decoded(&*self.store, self.session)
+        let records = self
+            .store
+            .read(self.session)
             .await
             .map_err(AgentError::from)?;
         fold(&records).ok_or(AsterError::Agent(AgentError::NotFound {
@@ -851,7 +845,7 @@ impl SessionHandle {
         &self,
         after: Option<LogId>,
     ) -> BoxStream<'static, Result<WatchEvent, AsterError>> {
-        watch::watch(Arc::clone(&self.store), &self.watchers, self.session, after)
+        watch::watch(self.store.clone(), &self.watchers, self.session, after)
     }
 
     /// State is the log-derived classification, not driver memory.
@@ -910,15 +904,9 @@ impl OwnedSession {
             return Ok(());
         }
         // Folds the same if a concurrent claim in this process appends it too.
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            None,
-            &SessionEvent::ConfigChanged { patch },
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, SessionEvent::ConfigChanged { patch }, None)
+            .await?;
         Ok(())
     }
 

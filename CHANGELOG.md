@@ -17,7 +17,12 @@
 - **多个进程可以共用一个数据库，驱动前要认领会话树**（ADR-0036）：`open_session` 等返回只读句柄，`claim()` 得到能 `drive` 的 `OwnedSession`，别的进程持有时得到 `OwnedElsewhere`。存活靠进程租约，`Asterpath` 在 tokio runtime 上定期续约（`lease_renew_interval`，默认 10 s；SQLite 的 TTL 是 `OpenOptions::lease_ttl`，默认 30 s）。正常退出立即释放；被 kill 的进程的会话树要等一个 TTL 才能在别处续跑。失去属主时驱动停止并调用新的 `Hooks::on_ownership_lost`。`SessionStore` 实现要加 `claim` / `owner` / `renew`；`StorageError::Conflict` 是可重试的冲突。
 - **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
 - **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。
+- OpenAI 适配器遇到含非文本条目的指令（`Item::Instruction`）时返回 `InvalidRequest`，不再把非文本条目渲染成占位文本（#210）。
+- Anthropic 适配器开始检查 `spec.provider`：与适配器的 id 不一致时返回 `InvalidRequest`，不发 HTTP（#210）。OpenAI 适配器回放推理时也检查 raw 的 provider，不一致按 `cross_provider` 丢弃。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
+- `exec --input-format stream-json` 也会把子会话的审批请求作为 `approval_requested` 一行发到 stdout，`approval` 命令的决定写到请求所在的会话；以前子会话的 `Ask` 不出现在 stdout，回合一直挂起（#212）。审批请求一次发出一个，应用回答后才发下一个。
+- CLI 交互、`exec` 与桌面端共用一个会话驱动（GLOSSARY「会话驱动」，#212）：一次驱动正常结束后**只在有待处理输入时**再驱动，出错后不再驱动。stream-json 不再按 `is_wakeable` 再驱动；CLI 交互与 headless `exec` 现在也会接着处理驱动期间到达的输入。
+- **审批模式统一用 `read-only` / `ask` / `allow`**（#213）：CLI 的 `-a`、`config.toml` 的 `[approval] default` 与桌面端共用一个 `approval::ApprovalMode`（变体 `ReadOnly` / `Ask` / `Allow`，`Deny` 改名为 `ReadOnly`）。旧名 `untrusted` / `never` 作为 `ask` / `allow` 的别名继续可用；桌面端命令的 JSON 取值由 `deny` 改为 `read-only`。`config::ApprovalMode` 删除。
 
 ### 新增
 
@@ -42,3 +47,8 @@
 - `ModelRequest.session: Option<SessionContext>` 带上会话、根会话与根会话的会话元数据，应用包装 provider 可按用户选凭据；压缩摘要调用经 `CompactionJob.session` 同样带上。
 - `ApprovalGate::pending_in(root)` 列出一棵会话树（含子会话）的待审批请求。
 - `ApprovalRequest.root`：请求所在会话树的根会话，审批策略可按会话树记状态（子代理沿用父会话树的设置）。
+
+### 修复
+
+- OpenAI 适配器（#208）：流结束时只要没收到终止事件就报 `Transport`，最后一帧缺结尾空行时也不再静默结束；流中途读失败按超时分出 `Timeout`，错误带上已知的 request id。provider 契约套件新增这两个场景。
+- 两个协议适配器改用 `asterpath-http` 的流式调用（#209），HTTP 错误信封统一：OpenAI 非 2xx 错误的 `message` 取 `error.message`（以前是整个响应体），`raw` 带上模型；两边空响应体的消息都是 `<provider> returned HTTP <status>`；Anthropic 在 `message_start` 之前读失败或截断时，错误也带上响应头的 request id。

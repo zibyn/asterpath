@@ -21,6 +21,8 @@ use asterpath_protocol::{
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+use asterpath_http::{ErrorEnvelope, streamed_call};
+
 pub use asterpath_http::{TraceMark, TraceSink};
 pub use models::{AnthropicModelProfile, Thinking};
 
@@ -131,31 +133,37 @@ impl Provider for AnthropicProvider {
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let capabilities = self.capabilities(&request.spec);
         let profile = self.profile(&request.spec);
-        if let Err(error) = request::check(capabilities, profile, &request) {
+        let provider = self.id();
+        if let Err(error) = request::check(&provider, capabilities, profile, &request) {
             return stream::once(async move { Err(error) }).boxed();
         }
-        let provider = self.id();
         let (body, tools_hash, beta) =
             match request::render(&provider, profile, &request, self.trace.as_deref()) {
                 Ok(rendered) => rendered,
                 Err(error) => return stream::once(async move { Err(error) }).boxed(),
             };
+        let mut http = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", request::ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        if let Some(beta) = beta {
+            http = http.header("anthropic-beta", beta);
+        }
+        let errors = ErrorEnvelope {
+            provider: provider.clone(),
+            model: request.spec.model.clone(),
+            raw_kind: "anthropic.error",
+            classify: error::classify,
+        };
         let decoder = sse::Decoder::new(
-            self.client.clone(),
-            self.messages_url(),
-            self.api_key.clone(),
             provider,
-            request.spec.model.clone(),
+            request.spec.model,
             request.prefix_epoch,
             tools_hash,
-            body,
-            beta,
         );
-        stream::unfold(Some(decoder), |state| async move {
-            let mut decoder = state?;
-            let event = decoder.next_event().await;
-            event.map(|event| (event, Some(decoder)))
-        })
-        .boxed()
+        streamed_call(http.body(body), decoder, errors)
     }
 }

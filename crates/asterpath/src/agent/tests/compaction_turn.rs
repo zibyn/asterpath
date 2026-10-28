@@ -5,10 +5,11 @@
 use std::sync::Arc;
 
 use super::support::{self, SESSION, append, drive, model, text, tool_table};
+use crate::AsterpathConfig;
 use crate::agent::Agent;
 use asterpath_protocol::{
     CompactPlan, CompactSummary, CompactionError, CompactionJob, CompactionOutcome, ConfigSnapshot,
-    InputTokens, Item, ModelSpec, OutputTokens, Role, SessionEvent, StopReason, Tool, ToolConfig,
+    InputTokens, Item, ModelSpec, OutputTokens, Role, SessionEvent, StopReason, Tool,
     ToolDescriptor, Usage, decode_entry, dedup,
 };
 use asterpath_protocol::{LogId, SessionStore, StepId, TurnId};
@@ -50,15 +51,12 @@ fn agent(
     provider: Arc<ScriptedProvider>,
     tools: Vec<Arc<dyn Tool>>,
     compactor: Option<Arc<dyn asterpath_protocol::Compactor>>,
-) -> Agent {
-    support::agent(
-        log,
-        provider,
-        tool_table(tools),
-        ToolConfig::default(),
-        Vec::new(),
-    )
-    .with_compactor(compactor)
+) -> Arc<Agent> {
+    let config = AsterpathConfig {
+        compactor,
+        ..AsterpathConfig::default()
+    };
+    Arc::clone(support::engine(log, provider, tool_table(tools), config).agent())
 }
 
 async fn seed(log: &Arc<InMemoryEventLog>, config: ConfigSnapshot) {

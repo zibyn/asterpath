@@ -193,7 +193,7 @@ pub struct RawProviderData {
 `ConfigChanged.patch.append_system` 非空时，投影生成一条 `Item::Instruction`；`add_tools` 或 `remove_tools` 非空时生成一条 `Item::ToolsChanged { added, removed }`（同一补丁两者都有时，指令在前）：
 
 - **位置**：记录之后的第一个 `StepStarted` 处（先输出此前缓冲的工具结果）；扫描在水位处结束时放在末尾。所以它总在所在 step 的 `tool_result` 之后，不会落在 `tool_use` 与 `tool_result` 之间；之后的请求里位置不变。
-- **基线**：`request_history(entries)` 同时返回基线 system、基线工具集与 items。基线 system 是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）；基线工具集是 `SessionCreated.config.tools`，依次应用被替换区间内的工具变更（先删后加，同名替换）。压缩不把它们交给摘要，而是并入基线（[compaction.md](compaction.md) §5），所以压缩后基线工具集等于压缩时的生效工具集。
+- **基线**：`request_history(entries)` 同时返回基线 system、基线工具集与 items。基线 system 是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）；基线工具集是 `SessionCreated.config.tools`，依次应用被替换区间内的工具变更（先删后加，同名替换）。压缩不把它们交给摘要，而是并入基线（[compaction.md](compaction.md) §5），所以压缩后基线工具集等于压缩时的生效工具集。`project` / `request_history` 各有 `_decoded` 变体，接收已解码的记录，引擎用它们投影已解码日志而不再解码一遍。
 - `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。它的 `tools` 是生效工具集，即 `ModelRequest.tools`。
 - 被移除工具在历史中的 `ToolCall` / `ToolResult` 原样保留。
 - **指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：`patch.system_sections` 的每一节生成一条带 `key` 的 `Instruction`（排在无键指令之后、`ToolsChanged` 之前），落位规则同上。`parts` 为首个文本片段 ``Instruction section `<key>` (supersedes any earlier text of this section):`` 加新值；新值为空表示删除，只有 ``Instruction section `<key>` removed; disregard its earlier text.``。基线另有 `system_sections`（`SessionCreated.config.system_sections` 起始）：被替换区间内的带键条目按键并入（原位替换、新键追加在后、删除即移除），所以同一节刷新多次后压缩，基线里只有最新值。`ModelRequest.system` 是基线 system 后接各节的 parts。

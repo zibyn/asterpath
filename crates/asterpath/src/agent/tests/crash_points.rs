@@ -17,12 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::support::{self, SESSION, append, decoded, drive, model, text, tool_table};
+use crate::AsterpathConfig;
 use crate::agent::Agent;
 use asterpath_protocol::{
     AbortKind, CompactPlan, CompactSummary, CompactionError, CompactionInput, CompactionJob,
     CompactionOutcome, CompactionTrigger, Compactor, ConfigSnapshot, Item, ProjectedOrigin,
-    ProviderError, ProviderErrorKind, Role, SessionEvent, StopReason, ToolConfig, TurnConfig,
-    TurnEndReason, Usage, dedup,
+    ProviderError, ProviderErrorKind, Role, SessionEvent, StopReason, TurnConfig, TurnEndReason,
+    Usage, dedup,
 };
 use asterpath_protocol::{InputId, LogId, LogIdRange, SessionStore, StepId, TurnId};
 use asterpath_testing::{Failpoint, FailpointEventLog, InMemoryEventLog, Point, ScriptedProvider};
@@ -185,15 +186,12 @@ fn agent(
     log: Arc<dyn SessionStore>,
     provider: Arc<ScriptedProvider>,
     compactor: Arc<ForcedCompactor>,
-) -> Agent {
-    support::agent(
-        log,
-        provider,
-        tool_table(Vec::new()),
-        ToolConfig::default(),
-        Vec::new(),
-    )
-    .with_compactor(Some(compactor))
+) -> Arc<Agent> {
+    let config = AsterpathConfig {
+        compactor: Some(compactor),
+        ..AsterpathConfig::default()
+    };
+    Arc::clone(support::engine(log, provider, tool_table(Vec::new()), config).agent())
 }
 
 async fn input(log: &InMemoryEventLog, id: u8) -> LogId {

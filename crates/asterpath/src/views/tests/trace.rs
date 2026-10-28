@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::AsterpathConfig;
 use crate::views::trace::TracingQuery;
 use asterpath_protocol::{
     AbortKind, ApprovalDecision, ChildOutcome, CompactionTrigger, ConfigSnapshot, ContextPolicy,
@@ -18,7 +19,7 @@ use asterpath_protocol::{
 use asterpath_protocol::{
     DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StepId, ToolCallId, TurnId,
 };
-use asterpath_testing::InMemoryEventLog;
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 
@@ -199,8 +200,19 @@ async fn entries(log: &dyn SessionStore, session: SessionId) -> Vec<LogEntry> {
     .expect("scan")
 }
 
+/// The facade's trace query over `log`.
+fn tracing(log: &Arc<dyn SessionStore>) -> TracingQuery {
+    crate::Asterpath::from_config(AsterpathConfig {
+        store: Some(Arc::clone(log)),
+        providers: vec![Arc::new(ScriptedProvider::new("p"))],
+        ..AsterpathConfig::default()
+    })
+    .expect("assemble")
+    .trace
+}
+
 async fn fold(log: &Arc<dyn SessionStore>, session: SessionId) -> Vec<Span> {
-    let query = TracingQuery::new(Arc::clone(log));
+    let query = tracing(log);
     let mut stream = query.spans(SpanFilter {
         session: Some(session),
         ..SpanFilter::default()
@@ -1746,7 +1758,7 @@ async fn t13_spans_never_carry_content() {
 #[tokio::test]
 async fn retired_or_unknown_session_is_not_found() {
     let log: Arc<dyn SessionStore> = Arc::new(InMemoryEventLog::new());
-    let query = TracingQuery::new(Arc::clone(&log));
+    let query = tracing(&log);
     let mut stream = query.spans(SpanFilter {
         session: Some(sid(99)),
         ..SpanFilter::default()
@@ -1773,7 +1785,7 @@ async fn a_log_without_session_created_is_corrupt() {
     )
     .await;
 
-    let query = TracingQuery::new(Arc::clone(&log));
+    let query = tracing(&log);
     let mut stream = query.spans(SpanFilter {
         session: Some(session),
         ..SpanFilter::default()

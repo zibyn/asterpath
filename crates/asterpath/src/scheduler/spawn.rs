@@ -9,7 +9,7 @@ use asterpath_protocol::{
     AgentError, AgentProfile, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
     ConfigSnapshot, ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role,
     RunRequest, RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason,
-    dedup, effective_config, encode_entry,
+    dedup,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -22,18 +22,16 @@ use futures_util::StreamExt;
 use super::tool::SPAWN_TOOL_NAME;
 use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
 use crate::agent::Agent;
+use crate::commit::CommitLog;
 use crate::fork;
-use crate::scan::{backend, scan_decoded};
+use crate::scan::{DecodedLog, backend};
 use crate::waits::Waits;
-
-#[cfg(test)]
-const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
 
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
 
 pub(crate) struct Scheduler {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
     waits: Arc<Waits>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
@@ -63,26 +61,10 @@ struct ParentAdmission {
 }
 
 impl Scheduler {
-    #[cfg(test)]
-    pub(crate) fn with_defaults(
-        log: Arc<dyn SessionStore>,
-        waits: Arc<Waits>,
-        aliases: BTreeMap<ModelAlias, ModelSpec>,
-    ) -> Self {
-        Self::new(
-            log,
-            waits,
-            aliases,
-            Arc::new(asterpath_protocol::SystemClock),
-            DEFAULT_MAX_LIVE_CHILDREN,
-            Arc::new(CancellationRegistry::new()),
-        )
-    }
-
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
     pub(crate) fn new(
-        log: Arc<dyn SessionStore>,
+        log: Arc<CommitLog>,
         waits: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
@@ -101,29 +83,13 @@ impl Scheduler {
         }
     }
 
-    /// The registry child drives must share to see cancellation.
-    #[cfg(test)]
-    pub(crate) fn cancellations(&self) -> Arc<CancellationRegistry> {
-        Arc::clone(&self.cancellations)
-    }
-
-    async fn append(
-        &self,
-        session: SessionId,
-        event: SessionEvent,
-        key: Option<asterpath_protocol::DedupKey>,
-    ) -> Result<LogId, ExecutionError> {
-        let entry = encode_entry(session, key, &event).map_err(backend)?;
-        self.log.append(entry).await.map_err(backend)
-    }
-
     /// The parent `ToolCallRequested` log id for a spawn tool call.
     pub(crate) async fn caused_by(
         &self,
         session: SessionId,
         tool_call: ToolCallId,
     ) -> Result<Option<LogId>, ExecutionError> {
-        let events = scan_decoded(&*self.log, session).await?;
+        let events = self.log.read(session).await?;
         Ok(events.iter().find_map(|(entry, event)| match event {
             SessionEvent::ToolCallRequested { tool_call_id, .. } if *tool_call_id == tool_call => {
                 Some(entry.log_id)
@@ -153,18 +119,20 @@ impl Scheduler {
 impl Scheduler {
     pub(crate) fn spawn(&self, req: SpawnRequest) -> BoxFuture<'_, Result<ChildRef, SpawnError>> {
         Box::pin(async move {
-            let parent_events = scan_decoded(&*self.log, req.parent.session)
+            let parent_events = self
+                .log
+                .read(req.parent.session)
                 .await
                 .map_err(|error| SpawnError::Execution(error.into()))?;
             // The parent's effective config at the spawn step's `StepStarted`;
             // later parent changes never reach the child (ADR-0030).
-            let watermark =
-                spawn_step_start(&parent_events, req.caused_by).map_or(u64::MAX, |entry| entry.seq);
-            let parent_config = effective_config(&parent_events, watermark).ok_or(
-                SpawnError::Execution(ExecutionError::NotFound {
-                    session: req.parent.session,
-                }),
-            )?;
+            let parent_config = match spawn_step_start(&parent_events, req.caused_by) {
+                Some(start) => parent_events.config_at(start.log_id),
+                None => parent_events.config(),
+            }
+            .ok_or(SpawnError::Execution(ExecutionError::NotFound {
+                session: req.parent.session,
+            }))?;
             let subagents = parent_config.subagents.clone();
             // Per-call wins; otherwise the inherited default (None by default).
             let timeout = req.timeout.or(subagents.spawn_timeout);
@@ -184,9 +152,7 @@ impl Scheduler {
 
             // Rebuild this parent's queue and Running count from the log first;
             // a result that landed since then also closes its queue entry.
-            let parent_facts = SessionFacts::fold_decoded(
-                parent_events.iter().map(|(entry, event)| (entry, event)),
-            );
+            let parent_facts = parent_events.facts();
             self.recover_parent(req.parent.session, &parent_facts)
                 .await
                 .map_err(SpawnError::Execution)?;
@@ -336,21 +302,22 @@ impl Scheduler {
             let deadline = timeout.map(|timeout| {
                 now.saturating_add(i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX))
             });
-            self.append(
-                req.parent.session,
-                SessionEvent::ChildSessionSpawned {
-                    child,
-                    task: req.task.clone(),
-                    config: config.clone(),
-                    context: context.clone(),
-                    parent_tool_call_id: req.parent.tool_call,
-                    caused_by: req.caused_by,
-                    deadline,
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await
-            .map_err(SpawnError::Execution)?;
+            self.log
+                .append_event(
+                    req.parent.session,
+                    SessionEvent::ChildSessionSpawned {
+                        child,
+                        task: req.task.clone(),
+                        config: config.clone(),
+                        context: context.clone(),
+                        parent_tool_call_id: req.parent.tool_call,
+                        caused_by: req.caused_by,
+                        deadline,
+                    },
+                    Some(dedup::child_session(child)),
+                )
+                .await
+                .map_err(|error| SpawnError::Execution(error.into()))?;
 
             self.materialize(req.parent.clone(), child, &req.task, &config, &context)
                 .await
@@ -371,7 +338,9 @@ impl Scheduler {
     ) -> BoxFuture<'a, Result<ChildOutcome, WaitError>> {
         let child = child.clone();
         Box::pin(async move {
-            let mut parent_events = scan_decoded(&*self.log, child.parent.session)
+            let mut parent_events = self
+                .log
+                .read(child.parent.session)
                 .await
                 .map_err(WaitError::from)?;
 
@@ -392,7 +361,7 @@ impl Scheduler {
             }
 
             // An unreadable child becomes a recorded `Lost`, never a hang.
-            if let Err(error) = scan_decoded(&*self.log, child.child).await {
+            if let Err(error) = self.log.read(child.child).await {
                 return self.lost(&child, error.to_string()).await;
             }
 
@@ -406,9 +375,7 @@ impl Scheduler {
             )
             .await
             .map_err(WaitError::Execution)?;
-            let mut child_events = scan_decoded(&*self.log, child.child)
-                .await
-                .map_err(WaitError::from)?;
+            let mut child_events = self.log.read(child.child).await.map_err(WaitError::from)?;
 
             if let Some(outcome) = child_outcome(&child_events) {
                 self.record_completion(&child, outcome.clone()).await?;
@@ -416,14 +383,16 @@ impl Scheduler {
             }
 
             loop {
-                parent_events = scan_decoded(&*self.log, child.parent.session)
+                parent_events = self
+                    .log
+                    .read(child.parent.session)
                     .await
                     .map_err(WaitError::from)?;
                 if let Some(outcome) = find_completion(&parent_events, child.child) {
                     return wait_outcome(&outcome);
                 }
 
-                child_events = match scan_decoded(&*self.log, child.child).await {
+                child_events = match self.log.read(child.child).await {
                     Ok(events) => events,
                     Err(error) => return self.lost(&child, error.to_string()).await,
                 };
@@ -465,9 +434,7 @@ impl Scheduler {
                     None => {}
                     Some(Ok(())) => {
                         if child_outcome(
-                            &scan_decoded(&*self.log, child.child)
-                                .await
-                                .map_err(WaitError::from)?,
+                            &self.log.read(child.child).await.map_err(WaitError::from)?,
                         )
                         .is_none()
                         {
@@ -660,9 +627,7 @@ impl Scheduler {
         agent: &Agent,
     ) -> Result<Option<ChildOutcome>, WaitError> {
         self.drain_child(agent, child.child, grace).await;
-        let child_events = scan_decoded(&*self.log, child.child)
-            .await
-            .map_err(WaitError::from)?;
+        let child_events = self.log.read(child.child).await.map_err(WaitError::from)?;
         if let Some(outcome) = child_outcome(&child_events)
             // A `Cancelled{Application}` is the child reacting to our own drain, not a
             // terminal that beat the timeout.
@@ -689,7 +654,9 @@ impl Scheduler {
         child: ChildRef,
         agent: &Agent,
     ) -> Result<(), WaitError> {
-        let parent_events = scan_decoded(&*self.log, child.parent.session)
+        let parent_events = self
+            .log
+            .read(child.parent.session)
             .await
             .map_err(WaitError::from)?;
         if find_completion(&parent_events, child.child).is_some() {
@@ -702,7 +669,9 @@ impl Scheduler {
 
         self.drain_child(agent, child.child, grace).await;
 
-        let parent_events = scan_decoded(&*self.log, child.parent.session)
+        let parent_events = self
+            .log
+            .read(child.parent.session)
             .await
             .map_err(WaitError::from)?;
         // A committed outcome (possibly Completed) is authoritative.
@@ -724,7 +693,7 @@ impl Scheduler {
         &self,
         parent: ParentRef,
     ) -> Result<Option<ChildRef>, ExecutionError> {
-        let events = scan_decoded(&*self.log, parent.session).await?;
+        let events = self.log.read(parent.session).await?;
         Ok(
             find_spawn(&events, parent.tool_call).map(|record| ChildRef {
                 parent,
@@ -761,7 +730,7 @@ impl Scheduler {
         parent: ParentRef,
         at: LogId,
     ) -> Result<Vec<Item>, ExecutionError> {
-        let entries = scan_decoded(&*self.log, parent.session).await?;
+        let entries = self.log.read(parent.session).await?;
         let items = fork_snapshot_at(&entries, at)?.items;
         Ok(items)
     }
@@ -776,7 +745,7 @@ impl Scheduler {
         config: &ConfigSnapshot,
         context: &ContextPolicy,
     ) -> Result<(), ExecutionError> {
-        let events = scan_decoded(&*self.log, child).await?;
+        let events = self.log.read(child).await?;
 
         match session_config(&events) {
             Some(existing) if existing != config => {
@@ -786,17 +755,18 @@ impl Scheduler {
             }
             Some(_) => {}
             None => {
-                self.append(
-                    child,
-                    SessionEvent::SessionCreated {
-                        config: config.clone(),
-                        parent: Some(parent.clone()),
-                        // Children never inherit session metadata (ADR-0032).
-                        metadata: Default::default(),
-                    },
-                    Some(dedup::session_created(child)),
-                )
-                .await?;
+                self.log
+                    .append_event(
+                        child,
+                        SessionEvent::SessionCreated {
+                            config: config.clone(),
+                            parent: Some(parent.clone()),
+                            // Children never inherit session metadata (ADR-0032).
+                            metadata: Default::default(),
+                        },
+                        Some(dedup::session_created(child)),
+                    )
+                    .await?;
             }
         }
 
@@ -808,30 +778,32 @@ impl Scheduler {
                 .any(|(_, event)| matches!(event, SessionEvent::ContextForked { .. }))
         {
             let items = self.fork_snapshot(parent.clone(), *at).await?;
-            self.append(
-                child,
-                SessionEvent::ContextForked {
-                    source: ForkSource::Spawn(parent),
-                    source_log: *at,
-                    items,
-                },
-                Some(dedup::context_forked(child)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    child,
+                    SessionEvent::ContextForked {
+                        source: ForkSource::Spawn(parent),
+                        source_log: *at,
+                        items,
+                    },
+                    Some(dedup::context_forked(child)),
+                )
+                .await?;
         }
 
         if !events
             .iter()
             .any(|(_, event)| matches!(event, SessionEvent::InputRecorded { .. }))
         {
-            self.append(
-                child,
-                SessionEvent::InputRecorded {
-                    input: task.to_vec(),
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    child,
+                    SessionEvent::InputRecorded {
+                        input: task.to_vec(),
+                    },
+                    Some(dedup::child_session(child)),
+                )
+                .await?;
         }
 
         // TurnStarted is deliberately not written here: the agent loop opens the
@@ -845,18 +817,18 @@ impl Scheduler {
         child: &ChildRef,
         outcome: ChildOutcome,
     ) -> Result<(), WaitError> {
-        self.append(
-            child.parent.session,
-            SessionEvent::ChildSessionCompleted {
-                child: child.child,
-                outcome,
-            },
-            Some(dedup::child_session(child.child)),
-        )
-        .await
-        .map_err(WaitError::Execution)?;
+        self.log
+            .append_event(
+                child.parent.session,
+                SessionEvent::ChildSessionCompleted {
+                    child: child.child,
+                    outcome,
+                },
+                Some(dedup::child_session(child.child)),
+            )
+            .await
+            .map_err(|error| WaitError::Execution(error.into()))?;
         self.release_slot(child.parent.session, child.parent.tool_call);
-        self.waits.wake_child(child.child);
         Ok(())
     }
 
@@ -931,17 +903,14 @@ fn resolve_context(
 }
 
 /// The parent's fork snapshot at `at`, the spawn step's `StepStarted`.
-fn fork_snapshot_at(
-    entries: &[(LogEntry, SessionEvent)],
-    at: LogId,
-) -> Result<fork::Snapshot, ExecutionError> {
-    let prefix = fork::spawn_prefix(entries, at).ok_or_else(|| {
+fn fork_snapshot_at(entries: &DecodedLog, at: LogId) -> Result<fork::Snapshot, ExecutionError> {
+    let prefix = entries.step_prefix(at).ok_or_else(|| {
         backend(format!(
             "fork point LogId({}) is not in the parent log",
             at.as_i64()
         ))
     })?;
-    fork::snapshot(&prefix).map_err(backend)
+    fork::snapshot(prefix).map_err(backend)
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.

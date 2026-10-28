@@ -16,7 +16,6 @@
 //! its process and epoch. Claims, releases and the epoch check of an owner
 //! write are ordinary statements in write transactions; no file lock.
 
-use std::collections::HashMap;
 use std::fs::OpenOptions as FsOpenOptions;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
@@ -24,9 +23,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry, LogId, LogQuery, NewEntry,
-    OwnerToken, ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
-    SystemClock, Timestamp,
+    CatalogEntry, Claim, ClaimRows, ClaimTable, Clock, DEFAULT_LEASE_TTL, DedupKey, LogEntry,
+    LogId, LogQuery, NewEntry, OwnerToken, ParentFilter, ReleaseWait, RetirementError, SessionId,
+    SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_channel::oneshot;
@@ -158,10 +157,9 @@ pub fn open_with_clock(
             thread: Some(thread),
         },
         reader: Mutex::new(reader),
-        me: me.clone(),
         lease,
         clock,
-        held: Mutex::default(),
+        claims: ClaimTable::new(Rows(me.clone())),
     }))
 }
 
@@ -170,12 +168,9 @@ pub fn open_with_clock(
 pub struct SqliteStorage {
     writer: Writer,
     reader: Mutex<Connection>,
-    /// For claims, which release through the store if it is still open.
-    me: Weak<SqliteStorage>,
     lease: Lease,
     clock: Arc<dyn Clock>,
-    /// Root -> (epoch, live claims) of the trees held through this handle.
-    held: Mutex<HashMap<SessionId, (u64, usize)>>,
+    claims: ClaimTable,
 }
 
 /// This handle's process: its id in `process_leases` and how long, in
@@ -805,18 +800,6 @@ impl SqliteStorage {
         })
     }
 
-    fn held(&self) -> MutexGuard<'_, HashMap<SessionId, (u64, usize)>> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn claim_of(&self, token: OwnerToken) -> Claim {
-        let release = Release {
-            store: self.me.clone(),
-            token,
-        };
-        Claim::new(token, release)
-    }
-
     fn parent_sync(&self, session: SessionId) -> Result<Option<SessionId>, StorageError> {
         let conn = self.reader();
         let parent: Option<Option<Vec<u8>>> = conn
@@ -869,30 +852,7 @@ impl SessionStore for SqliteStorage {
     }
 
     fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
-        Box::pin(async move {
-            let response = {
-                let mut held = self.held();
-                if let Some((epoch, claims)) = held.get_mut(&root) {
-                    *claims += 1;
-                    let epoch = *epoch;
-                    return Ok(self.claim_of(OwnerToken { root, epoch }));
-                }
-                let (reply, response) = oneshot::channel();
-                // Sent under the lock, so a release of this root queued
-                // before it commits first.
-                self.send(Command::Alone(Alone::Claim { root, reply }))?;
-                response
-            };
-            let (epoch, _) = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
-            let mut held = self.held();
-            let entry = held.entry(root).or_insert((epoch, 0));
-            if entry.0 != epoch {
-                *entry = (epoch, 0);
-            }
-            entry.1 += 1;
-            drop(held);
-            Ok(self.claim_of(OwnerToken { root, epoch }))
-        })
+        Box::pin(self.claims.claim(root))
     }
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
@@ -900,29 +860,7 @@ impl SessionStore for SqliteStorage {
     }
 
     fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
-        Box::pin(async move {
-            let held = self
-                .held()
-                .iter()
-                .map(|(root, (epoch, _))| OwnerToken {
-                    root: *root,
-                    epoch: *epoch,
-                })
-                .collect();
-            let (reply, response) = oneshot::channel();
-            self.send(Command::Alone(Alone::Renew { held, reply }))?;
-            let lost = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
-            let mut held = self.held();
-            for token in &lost {
-                if held
-                    .get(&token.root)
-                    .is_some_and(|(epoch, _)| *epoch == token.epoch)
-                {
-                    held.remove(&token.root);
-                }
-            }
-            Ok(lost)
-        })
+        Box::pin(self.claims.renew())
     }
 
     fn retire(
@@ -956,42 +894,48 @@ fn create_private_file(path: &Path) -> Result<(), StorageError> {
         .map_err(backend)
 }
 
-/// Drops one claim; the last one of its epoch releases the tree, committed
-/// before `drop` returns so another process may claim it at once. A store
-/// already closed has freed the tree on exit.
-struct Release {
-    store: Weak<SqliteStorage>,
-    token: OwnerToken,
+/// The claim table's row operations, run on the writer thread. A store
+/// already closed has freed its trees on exit.
+struct Rows(Weak<SqliteStorage>);
+
+impl Rows {
+    fn send(&self, alone: Alone) -> Result<(), StorageError> {
+        self.0
+            .upgrade()
+            .ok_or_else(writer_stopped)?
+            .send(Command::Alone(alone))
+    }
 }
 
-impl Drop for Release {
-    fn drop(&mut self) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        let committed = {
-            let mut held = store.held();
-            match held.get_mut(&self.token.root) {
-                Some((epoch, claims)) if *epoch == self.token.epoch => {
-                    *claims -= 1;
-                    if *claims > 0 {
-                        return;
-                    }
-                }
-                _ => return,
-            }
-            held.remove(&self.token.root);
-            let (done, committed) = mpsc::channel();
-            let release = Alone::Release {
-                token: self.token,
-                done,
-            };
-            if store.send(Command::Alone(release)).is_err() {
-                return;
-            }
-            committed
-        };
-        let _ = committed.recv();
+impl ClaimRows for Rows {
+    fn claim(&self, root: SessionId) -> BoxFuture<'static, Result<u64, StorageError>> {
+        let (reply, response) = oneshot::channel();
+        let sent = self.send(Alone::Claim { root, reply });
+        Box::pin(async move {
+            sent?;
+            let (epoch, _) = response.await.unwrap_or_else(|_| Err(writer_stopped()))?;
+            Ok(epoch)
+        })
+    }
+
+    fn release(&self, token: OwnerToken) -> ReleaseWait {
+        let (done, committed) = mpsc::channel();
+        let _ = self.send(Alone::Release { token, done });
+        Box::new(move || {
+            let _ = committed.recv();
+        })
+    }
+
+    fn renew(
+        &self,
+        held: Vec<OwnerToken>,
+    ) -> BoxFuture<'static, Result<Vec<OwnerToken>, StorageError>> {
+        let (reply, response) = oneshot::channel();
+        let sent = self.send(Alone::Renew { held, reply });
+        Box::pin(async move {
+            sent?;
+            response.await.unwrap_or_else(|_| Err(writer_stopped()))
+        })
     }
 }
 

@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use crate::agent::Agent;
 use crate::scheduler::{ChildRef, Scheduler, SpawnError, SpawnRequest, WaitError};
-use crate::tools::ToolTable;
-use crate::waits::Waits;
 use asterpath_protocol::{
     CancelReason, ChildFailure, ChildOutcome, CompactionConfig, ConfigSnapshot, ContextPolicy,
     Item, ModelAlias, ModelId, ModelSpec, Parallelism, Part, Provenance, ProviderId, ReplaySafety,
@@ -17,10 +15,7 @@ use asterpath_protocol::{
     ToolDescriptor, ToolName, ToolResultStatus, TurnConfig, TurnEndReason, Usage, dedup,
     encode_entry,
 };
-use asterpath_protocol::{
-    CancelToken, DefaultApprovalPolicy, Provider, ProviderCatalog, ToolArgs, ToolConfig,
-    ToolContext, ToolError,
-};
+use asterpath_protocol::{CancelToken, ToolArgs, ToolContext, ToolError};
 use asterpath_protocol::{
     Clock, DedupKey, LogEntry, LogId, LogQuery, SessionId, SessionStore, StorageError, SystemClock,
     Timestamp, ToolCallId, TurnId,
@@ -111,60 +106,51 @@ async fn events(log: &dyn SessionStore, session: SessionId) -> Vec<SessionEvent>
     events
 }
 
-/// The scheduler and a real agent over the store `log`. The agent's provider has no script; tests that drive a child
-/// build their own with [`agent_for`].
+/// The scheduler and the real agent that drives its children, assembled by
+/// the facade's composition root over the store `log` (no spawn tool).
+/// `provider` serves as `p`; a script-less `q` backs aliases to it.
+fn engine<L: SessionStore + 'static>(
+    log: Arc<L>,
+    aliases: BTreeMap<ModelAlias, ModelSpec>,
+    clock: Arc<dyn Clock>,
+    provider: Arc<ScriptedProvider>,
+) -> (Arc<Scheduler>, Arc<Agent>) {
+    let engine = crate::Asterpath::from_config(crate::AsterpathConfig {
+        store: Some(log),
+        providers: vec![provider, Arc::new(ScriptedProvider::new("q"))],
+        model_aliases: aliases,
+        clock,
+        spawn_tool: false,
+        ..Default::default()
+    })
+    .expect("assemble");
+    (Arc::clone(engine.scheduler()), Arc::clone(engine.agent()))
+}
+
+/// [`engine`] whose agent's provider has no script; tests that drive a
+/// child build their own with [`engine`].
 fn new_scheduler<L: SessionStore + 'static>(
     log: Arc<L>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
-) -> (Arc<Scheduler>, Agent) {
-    let log: Arc<dyn SessionStore> = log;
-    let scheduler = Arc::new(Scheduler::with_defaults(
-        Arc::clone(&log),
-        Arc::new(Waits::new(Arc::clone(&log))),
+) -> (Arc<Scheduler>, Arc<Agent>) {
+    engine(
+        log,
         aliases,
-    ));
-    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
-    (scheduler, agent)
+        Arc::new(SystemClock),
+        Arc::new(ScriptedProvider::new("p")),
+    )
 }
 
 fn new_scheduler_with<L: SessionStore + 'static>(
     log: Arc<L>,
     clock: Arc<dyn Clock>,
-) -> (Arc<Scheduler>, Agent) {
-    let log: Arc<dyn SessionStore> = log;
-    let scheduler = Arc::new(Scheduler::new(
-        Arc::clone(&log),
-        Arc::new(Waits::new(Arc::clone(&log))),
+) -> (Arc<Scheduler>, Arc<Agent>) {
+    engine(
+        log,
         BTreeMap::new(),
         clock,
-        NonZeroUsize::new(32).expect("non-zero"),
-        Default::default(),
-    ));
-    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
-    (scheduler, agent)
-}
-
-/// The real agent that drives children of `scheduler`, sharing its
-/// cancellation registry.
-fn agent_for(
-    log: Arc<dyn SessionStore>,
-    scheduler: &Arc<Scheduler>,
-    provider: Arc<ScriptedProvider>,
-) -> Agent {
-    let provider: Arc<dyn Provider> = provider;
-    let gate = Arc::new(asterpath_protocol::ApprovalGate::new());
-    Agent::new(
-        Arc::clone(&log),
-        Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
-        Arc::new(ToolTable::new()),
-        ToolConfig::default(),
-        Arc::new(DefaultApprovalPolicy),
-        gate,
-        Arc::new(Waits::new(log)),
-        Arc::new(SystemClock),
+        Arc::new(ScriptedProvider::new("p")),
     )
-    .with_cancellations(scheduler.cancellations())
-    .with_scheduler(Arc::clone(scheduler))
 }
 
 /// Seeds a root parent with its `SessionCreated` and the spawn
@@ -912,7 +898,6 @@ async fn cancel_writes_parent_only_once_and_never_overwrites_an_outcome() {
 async fn driving_a_fresh_child_opens_exactly_one_turn() {
     let log = Arc::new(InMemoryEventLog::new());
     let (parent, reference, caused_by) = seed_parent(&log, 3).await;
-    let (scheduler, _) = new_scheduler(log.clone(), BTreeMap::new());
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         vec![Item::Message {
             role: Role::Assistant,
@@ -922,7 +907,12 @@ async fn driving_a_fresh_child_opens_exactly_one_turn() {
         StopReason::EndTurn,
         Usage::default(),
     ));
-    let agent = agent_for(log.clone(), &scheduler, Arc::clone(&provider));
+    let (scheduler, agent) = engine(
+        log.clone(),
+        BTreeMap::new(),
+        Arc::new(SystemClock),
+        Arc::clone(&provider),
+    );
 
     let child = scheduler
         .spawn(SpawnRequest::new(
@@ -2035,17 +2025,12 @@ async fn a_tree_that_changed_owner_rebuilds_admission_from_the_log() {
     let subagents = limit(1);
     let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
     let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
-    let as_owner = |epoch, future| crate::owner::Owned {
-        owner: asterpath_protocol::OwnerToken {
-            root: reference.session,
-            epoch,
-        },
-        future,
-    };
+    let as_owner = |owner, future| crate::owner::Owned { owner, future };
 
     // Epoch 1: call A takes the only slot.
+    let first = log.claim(reference.session).await.expect("claim");
     let a = as_owner(
-        1,
+        first.token(),
         scheduler.spawn(request_for(&reference, calls[0], caused_by[0])),
     )
     .await
@@ -2062,12 +2047,14 @@ async fn a_tree_that_changed_owner_rebuilds_admission_from_the_log() {
         },
     )
     .await;
+    drop(first);
 
     // Epoch 2: the slot A held here is not counted from stale memory.
+    let second = log.claim(reference.session).await.expect("reclaim");
     let b = tokio::time::timeout(
         Duration::from_secs(1),
         as_owner(
-            2,
+            second.token(),
             scheduler.spawn(request_for(&reference, calls[1], caused_by[1])),
         ),
     )
@@ -2376,12 +2363,16 @@ async fn completions(log: &dyn SessionStore, parent: SessionId) -> Vec<ChildOutc
         .collect()
 }
 
-/// An agent whose child never reaches a terminal, however long it is driven:
-/// the model stream opens and never ends.
-fn hanging_agent(log: Arc<dyn SessionStore>, scheduler: &Arc<Scheduler>) -> Agent {
-    agent_for(
+/// A scheduler whose agent's child never reaches a terminal, however long it
+/// is driven: the model stream opens and never ends.
+fn hanging_engine(
+    log: Arc<InMemoryEventLog>,
+    clock: Arc<dyn Clock>,
+) -> (Arc<Scheduler>, Arc<Agent>) {
+    engine(
         log,
-        scheduler,
+        BTreeMap::new(),
+        clock,
         Arc::new(
             ScriptedProvider::new("p")
                 .respond(Vec::new(), StopReason::EndTurn, Usage::default())
@@ -2459,8 +2450,7 @@ async fn a_spawn_deadline_that_expired_while_stopped_times_out_exactly_once_afte
     };
 
     for _restart in 0..2 {
-        let (scheduler, _) = new_scheduler_with(log.clone(), clock.clone());
-        let agent = hanging_agent(log.clone(), &scheduler);
+        let (scheduler, agent) = hanging_engine(log.clone(), clock.clone());
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             scheduler.await_completion(&child_ref, &agent),
@@ -2490,8 +2480,7 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
         spawn_with_deadline(child, reference.tool_call, caused_by, clock.now() + 50),
     )
     .await;
-    let (scheduler, _) = new_scheduler_with(log.clone(), clock);
-    let agent = hanging_agent(log.clone(), &scheduler);
+    let (scheduler, agent) = hanging_engine(log.clone(), clock);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         scheduler.await_completion(

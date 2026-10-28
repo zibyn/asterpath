@@ -183,7 +183,7 @@ impl AsterpathBuilder {
     }
 
     pub async fn build(self) -> Result<crate::Asterpath, AsterError> {
-        crate::Asterpath::from_config(self.config).await
+        crate::Asterpath::from_config(self.config)
     }
 }
 

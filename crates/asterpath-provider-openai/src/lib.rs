@@ -6,8 +6,9 @@
 //! full history with `store: false`, and replayable reasoning is sent as raw
 //! JSON with `include: ["reasoning.encrypted_content"]`.
 //!
-//! The adapter owns transport, wire mapping, usage normalization and error
-//! classification. It never retries, executes tools or writes logs.
+//! The adapter owns wire mapping, usage normalization and error
+//! classification; the streamed call in `asterpath-http` owns transport. It
+//! never retries, executes tools or writes logs.
 
 // `ProviderError` is the fixed protocol shape; boxing it would change the contract.
 #![allow(clippy::result_large_err)]
@@ -18,9 +19,9 @@ mod wire;
 
 use std::sync::Arc;
 
+use asterpath_http::{ErrorEnvelope, streamed_call};
 use asterpath_protocol::{
-    ModelRequest, ModelSpec, Provider, ProviderCapabilities, ProviderError, ProviderErrorKind,
-    ProviderId, StreamEvent,
+    ModelRequest, ModelSpec, Provider, ProviderCapabilities, ProviderError, ProviderId, StreamEvent,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -148,14 +149,13 @@ impl Provider for OpenAiProvider {
             Err(error) => return stream::once(async move { Err(error) }).boxed(),
         };
 
-        let send = self
+        let http = self
             .client
             .post(self.endpoint())
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .body(body)
-            .send();
+            .body(body);
 
         let context = WireContext {
             provider: self.id.clone(),
@@ -164,68 +164,12 @@ impl Provider for OpenAiProvider {
             tools_hash,
         };
 
-        let provider = self.id.clone();
-        stream::once(async move { connect(send, provider).await })
-            .flat_map(move |result| match result {
-                Ok(response) => wire::stream(response, context.clone()),
-                Err(error) => stream::once(async move { Err(error) }).boxed(),
-            })
-            .boxed()
+        let errors = ErrorEnvelope {
+            provider: self.id.clone(),
+            model: context.spec.model.clone(),
+            raw_kind: "openai.error",
+            classify: wire::classify,
+        };
+        streamed_call(http, wire::Normalizer::new(context), errors)
     }
-}
-
-async fn connect(
-    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
-    provider: ProviderId,
-) -> Result<reqwest::Response, ProviderError> {
-    let response = send.await.map_err(transport_error)?;
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    Err(http_error(response, provider).await)
-}
-
-fn transport_error(error: reqwest::Error) -> ProviderError {
-    let kind = if error.is_timeout() {
-        ProviderErrorKind::Timeout
-    } else {
-        ProviderErrorKind::Transport
-    };
-    ProviderError::new(kind, error.to_string())
-}
-
-async fn http_error(response: reqwest::Response, provider: ProviderId) -> ProviderError {
-    let status = response.status();
-    let request_id = asterpath_http::request_id(response.headers());
-    let retry_after = asterpath_http::retry_after(response.headers());
-    let body = response.text().await.unwrap_or_default();
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let field = |name: &str| parsed.pointer(name).and_then(serde_json::Value::as_str);
-    let (kind, retryable) = wire::classify_code(field("/error/code"), field("/error/type"))
-        .unwrap_or_else(|| {
-            let kind = if wire::context_exceeded_message(&body) {
-                ProviderErrorKind::ContextExceeded
-            } else {
-                asterpath_http::classify_status(status.as_u16())
-            };
-            (kind, kind.retryable_by_default())
-        });
-    let message = if body.is_empty() {
-        format!("openai returned HTTP {status}")
-    } else {
-        body.clone()
-    };
-    let mut error = ProviderError::new(kind, message);
-    error.retryable = retryable;
-    error.retry_after = retry_after;
-    error.request_id = request_id;
-    if !body.is_empty() {
-        error.raw = Some(asterpath_protocol::RawProviderData {
-            provider,
-            model: None,
-            kind: "openai.error".to_owned(),
-            json: asterpath_protocol::JsonString::new(body),
-        });
-    }
-    error
 }
