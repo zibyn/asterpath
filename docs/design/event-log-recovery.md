@@ -83,6 +83,7 @@ pub enum SessionEvent {
     ChildSessionCompleted { child: SessionId, outcome: ChildOutcome },
     ApprovalDecided { tool_call_id: ToolCallId, decision: ApprovalDecision },
     ConfigChanged { patch: ConfigPatch },                         // 下一个 StepStarted 生效；append_system / 工具增删投影为 Instruction / ToolsChanged 条目
+    MetadataChanged { patch: BTreeMap<String, Option<String>> },  // 外部写入：按键设置（Some）或删除（None）会话元数据，目录行同事务合并；非模型可见（ADR-0044）
 }
 
 pub enum AbortKind { Transport, Rejected, Cancelled, Crash }

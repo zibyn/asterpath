@@ -213,6 +213,9 @@ impl SessionHandle {
     pub async fn config(&self) -> Result<ConfigSnapshot, AsterError>;        // 生效配置（ADR-0030）
     pub async fn context_usage(&self) -> Result<ContextUsage, AsterError>;
     pub async fn update_config(&self, patch: ConfigPatch) -> Result<(), AsterError>;
+    pub async fn update_metadata(
+        &self, patch: BTreeMap<String, Option<String>>,
+    ) -> Result<(), AsterError>;                                     // ADR-0044
     pub async fn approve(
         &self, call: ToolCallId, decision: ApprovalDecision,
     ) -> Result<(), AsterError>;
@@ -254,6 +257,7 @@ impl OwnedSession {
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒本进程内该调用的等待；属主在另一个进程时，它的等待至多 500 ms 后从日志读到决定。
 - `update_config()` 先校验（`model.provider` 已在 `ProviderCatalog` 注册；`append_system` / `add_tools` / `remove_tools` 非空时必须带 `id`；`append_system` 只含 `Part::Text`；`add_tools` 的每个描述符必须与本 `Asterpath` 工具注册表中同名工具的描述符完全相同（与 `ToolSelection::Names` 同一来源），名字不在生效集合中、补丁内不重复；`remove_tools` 的名字必须在生效集合中；否则 `AsterError::Config`，不落日志），再把它原样记成一条 `ConfigChanged { patch }`。应用直接构造 §2.1 的 `ConfigPatch`（`#[non_exhaustive]`，用 `ConfigPatch::default()` 再赋字段），不另设请求类型；新增工具时传入自己注册的工具的 `descriptor().clone()`。`id: Option<UpdateId>` 是应用选的 dedup key，随补丁落日志：追加与增删工具不幂等，应用重试同一次更新时用同一个 `id`，只记一条（日志里已有同 `id` 的工具变更时直接返回 `Ok`，不再按生效集合判冲突）；只覆盖字段的更新可以不带 `id`。生效集合按整条日志折叠（`u64::MAX` 水位）；运行期向注册表添加新工具不在范围内。回合进行中也可调用：记录立即追加，下一个 `StepStarted` 生效，进行中的 step（含其重试与强制压缩）不受影响（[agent-loop.md](agent-loop.md) §3）。
+- `update_metadata(patch)` 是外部写入，不需要认领，根会话与子会话都可以：把 patch 原样记成一条 `MetadataChanged { patch }`（`Some` 设置该键，`None` 删除该键，未提到的键不变）；存储在同一事务里合并进目录行，合并结果超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`，不落日志（ADR-0044）。改名、自动标题、归档标记都是应用约定的键。会话环境解析与 `SessionContext.metadata` 仍读创建时的元数据。
 - `compact_now()` 仅 Idle 且无活跃驱动者时可用，委托 agent 的 `compact_now`；否则返回 `AgentError::Busy`；`NotConfigured` / `NothingToDo` / `Insufficient` 是 `Ok` 状态（[compaction.md](compaction.md) §5）。
 - `watch(after)` 先订阅本进程的实时事件，再从游标（不含；`None` 为整条日志）重放已提交记录，追平处发一次 `Synced`，之后推送新提交。本进程的提交即时唤醒订阅者；另一进程的提交靠轮询存储，至多 500 ms 后到达。`Live` 是本进程内任何 `drive`（含父会话驱动的子会话）产生的 `AgentEvent`，扇出给该会话的所有订阅者，不只给驱动者；跨进程订阅者只看到记录。订阅者落后超过缓冲（1024 条）时跳过部分 `Live`，记录不丢。同一次唤醒中先给 `Live` 再给记录。续订时传最后一条 `Record` 的 `log_id`，不丢不重。
 - 没有后台 driver；框架不 spawn。驱动者的生命周期由应用负责，应用退出等价于崩溃，恢复走日志。

@@ -52,7 +52,7 @@ ADR 记录**难以逆转、跨模块、有真实权衡**的决定及其理由。
 | [0037](0037-session-environment.md) | 会话环境由宿主适配器按会话解析，子进程默认不继承进程环境 |
 | [0038](0038-watch-separates-observing-from-driving.md) | 观察与驱动分离：已提交日志可订阅，流式增量在属主进程内扇出 |
 | [0039](0039-multi-user-embedding-mechanisms.md) | 多用户内嵌：用户是宿主元数据，内核只补按会话的机制（前提由 0047 修正） |
-| [0044](0044-host-metadata-is-patchable.md) | 宿主元数据可按键修改：外部写入的 patch，目录行同事务合并（proposed） |
+| [0044](0044-host-metadata-is-patchable.md) | 宿主元数据可按键修改：外部写入的 patch，目录行同事务合并 |
 | [0045](0045-fork-at-any-committed-turn.md) | 会话分叉可指定任一已提交回合为水位 |
 | [0046](0046-local-hosts-and-web-sdk-do-not-share.md) | 本地应用与 web 集成分开，互不共享数据（`asterpath-host` 部分由 0048 取代） |
 | [0047](0047-multi-user-and-multi-node-belong-to-the-platform.md) | 多用户与多机部署归集成平台；内核只保证会话树单写者与 SQLite、Postgres 两种后端 |

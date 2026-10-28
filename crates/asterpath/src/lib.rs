@@ -564,18 +564,7 @@ fn check_tool_names(tools: &[Arc<dyn Tool>]) -> Result<(), AsterError> {
 
 /// Session metadata limits (storage.md §5).
 fn check_metadata(metadata: &BTreeMap<String, String>) -> Result<(), AsterError> {
-    if metadata.len() > 64
-        || metadata
-            .iter()
-            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
-    {
-        return Err(AsterError::Config {
-            message: "metadata allows at most 64 entries, keys up to 128 bytes and values \
-                      up to 4096 bytes"
-                .to_owned(),
-        });
-    }
-    Ok(())
+    asterpath_protocol::check_metadata(metadata).map_err(|message| AsterError::Config { message })
 }
 
 /// Totals over `scope` with no further narrowing.
@@ -723,6 +712,34 @@ impl SessionHandle {
         })?;
         self.store.append(entry).await?;
         Ok(())
+    }
+
+    /// Set (`Some`) or remove (`None`) session metadata keys (ADR-0044): an
+    /// external write any process may make, root or child. Keys not named
+    /// keep their value; the same key written twice keeps the later write.
+    /// The catalog merges it in the append's own transaction; a merge over
+    /// the limits is a `Config` error and nothing is logged. The
+    /// environment and `SessionContext` keep reading the metadata the
+    /// session was created with.
+    pub async fn update_metadata(
+        &self,
+        patch: BTreeMap<String, Option<String>>,
+    ) -> Result<(), AsterError> {
+        let entry = asterpath_protocol::encode_entry(
+            self.session,
+            None,
+            &SessionEvent::MetadataChanged { patch },
+        )
+        .map_err(|error| AsterError::Config {
+            message: error.to_string(),
+        })?;
+        match self.store.append(entry).await {
+            Ok(_) => Ok(()),
+            Err(asterpath_protocol::StorageError::InvalidEntry(message)) => {
+                Err(AsterError::Config { message })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Added tools must be registered with this exact descriptor and not yet
