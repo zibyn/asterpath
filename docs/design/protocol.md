@@ -247,12 +247,13 @@ pub struct ModelRequest {
     pub provider_options: BTreeMap<ProviderId, JsonString>,
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
     pub output_format: Option<OutputFormat>,
-    pub session: Option<SessionContext>, // 请求为谁而发（ADR-0039）；会话外构造为 None，适配器不读
+    pub session: Option<SessionContext>, // 请求为谁而发（ADR-0039）；会话外构造为 None；适配器只读 cache_root 作默认缓存键
 }
 
 pub struct SessionContext {
     pub session: SessionId,
     pub root: SessionId,                    // 会话树的根；根会话即自身
+    pub cache_root: SessionId,              // 共享 prompt cache 的会话：root；fork 出的根取源会话的 cache_root（ADR-0033）
     pub metadata: BTreeMap<String, String>, // 根会话的会话元数据：子会话不继承，租户键在根上
 }
 
@@ -303,7 +304,7 @@ pub enum ReasoningEffort {
 | R6 | `sampling` 非空时需要 `sampling` 能力；不支持返回 `Unsupported`，不静默丢弃字段。 |
 | R7 | `disable_parallel_tool_use = true` 需要 `parallel_tool_calls` 能力；否则 `Unsupported`。 |
 | R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
-| R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
+| R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。请求带 `session` 时默认发 `prompt_cache_key` = `cache_root` 的十六进制，子会话、fork 与摘要请求共享；`provider_options` 给出的 `prompt_cache_key` 优先，`OpenAiModelProfile::with_prompt_cache_key(false)` 不发（不认识该字段的兼容端点）。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。adapter 尚不认识的 `Part` 变体（system 与所有 item 中）在发 HTTP 前经 `asterpath_http::unrenderable_part` 返回 `Unsupported`。 |
 | R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于应用策略。 |
 | R12 | `server_tools` 只取 `spec.provider` 对应的条目，每个值必须是 JSON 对象（否则 `InvalidRequest`），按序原样追加在函数工具之后；adapter 不校验内容。非空而模型 `server_tools` 能力为 false → `Unsupported`。只支持服务端执行的工具；客户端执行的供应商工具（OpenAI `shell` / `apply_patch` / `computer`，Anthropic `text_editor` / `computer` / `memory` 等）不在此机制内，误放时由供应商报错。`tool_choice` 不指向服务端工具。 |

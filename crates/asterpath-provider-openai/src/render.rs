@@ -83,6 +83,8 @@ pub(crate) fn render(
         reasoning: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_key: Option<String>,
         store: bool,
         stream: bool,
         include: &'static [&'static str],
@@ -101,6 +103,13 @@ pub(crate) fn render(
         top_p: sampling.and_then(|params| params.top_p),
         reasoning: request.reasoning.as_ref().map(reasoning),
         text,
+        // Keyed by the cache root so children, forks and summaries share a cache
+        // node; an explicit provider option wins.
+        prompt_cache_key: request
+            .session
+            .as_ref()
+            .filter(|_| profile.prompt_cache_key && !options.contains_key("prompt_cache_key"))
+            .map(|context| context.cache_root.to_hex()),
         store: false,
         stream: true,
         include: &["reasoning.encrypted_content"],
