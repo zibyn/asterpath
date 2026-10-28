@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compaction::DefaultCompactor;
-use asterpath_protocol::{CacheLifetime, ModelRequest, RequestConfig};
+use asterpath_protocol::{CacheLifetime, CacheTtl, ModelRequest, RequestConfig};
 use asterpath_protocol::{
     CompactSummary, CompactionConfig, CompactionJob, Compactor, InputTokens, Item, ModelId,
     ModelSpec, OutputTokens, Part, Provider, ProviderCatalog, ProviderError, ProviderErrorKind,
@@ -87,6 +87,7 @@ fn job(usable: u32, retained: u64) -> CompactionJob {
         turn: turn(),
         session: None,
         prefix: None,
+        cache_ttl: CacheTtl::default(),
     }
 }
 
@@ -278,7 +279,9 @@ async fn same_model_summary_forks_the_session_request() {
     let request = summarized(&provider);
     assert_eq!(request.system, session.system);
     assert_eq!(request.prefix_epoch, 2);
-    assert_eq!(request.cache_ttl, session.cache_ttl);
+    // Compaction has its own TTL bucket; the session's 1h does not carry over.
+    assert_ne!(session.cache_ttl, CacheTtl::default());
+    assert_eq!(request.cache_ttl, CacheTtl::default());
     assert_eq!(request.tool_choice, session.tool_choice);
     assert_eq!(request.items[..1], session.items[..]);
     assert_eq!(request.items.len(), 2);
@@ -299,6 +302,7 @@ async fn another_summary_model_falls_back_to_an_independent_request() {
     let mut job = job(1000, 0);
     job.model.model = ModelId::new("summarizer");
     job.prefix = Some(session_request());
+    job.cache_ttl.messages = CacheLifetime::OneHour;
     compactor(Arc::clone(&provider))
         .compact(job)
         .await
@@ -306,7 +310,7 @@ async fn another_summary_model_falls_back_to_an_independent_request() {
 
     let request = summarized(&provider);
     assert!(request.system.is_empty());
-    assert_eq!(request.cache_ttl, RequestConfig::default().cache_ttl);
+    assert_eq!(request.cache_ttl.messages, CacheLifetime::OneHour);
     assert_eq!(request.tool_choice, ToolChoice::None);
     assert_eq!(request.items.len(), 3);
 }

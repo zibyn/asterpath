@@ -308,13 +308,14 @@ impl Scheduler {
                     ),
             };
 
-            let config = ConfigSnapshot {
+            let mut config = ConfigSnapshot {
                 model,
                 system,
                 system_sections,
                 tools,
                 ..parent_config
             };
+            config.request.cache_ttl = config.subagents.cache_ttl;
 
             self.admit(
                 &mut queue_guard,

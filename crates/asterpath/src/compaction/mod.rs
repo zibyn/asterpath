@@ -147,6 +147,7 @@ impl Compactor for DefaultCompactor {
             turn: input.turn.clone(),
             session: None,
             prefix,
+            cache_ttl: input.config.cache_ttl,
         })
     }
 
@@ -208,6 +209,7 @@ impl DefaultCompactor {
             }
         };
         request.session.clone_from(&job.session);
+        request.cache_ttl = job.cache_ttl;
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {
             Ok(result) => result,

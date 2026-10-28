@@ -151,6 +151,7 @@ impl Compactor for ForcedCompactor {
             turn: input.turn.clone(),
             session: None,
             prefix: None,
+            cache_ttl: Default::default(),
         })
     }
 

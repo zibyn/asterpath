@@ -90,10 +90,11 @@ pub enum CompactResult {
 
 ### 摘要
 
-- **同模型：沿用会话请求**（cache-safe fork，#176）。agent 在 `CompactionInput.request` 里带上会话此刻的请求（与 `history` 同一日志、同一水位，由 `build_request` 渲染，含基线 system、指令节、工具、`cache_ttl`、`prefix_epoch`）；`plan` 把它的 `items` 截到被替换区间（`history` 中被替换条目的 item 数之和），放进 `CompactionJob.prefix`。`compact` 在 `prefix.spec == job.model` 时用它：末尾追加摘要指令作为最后一条 user 消息，其余字段原样保留，因此去掉最后一条 user 消息后，摘要请求是会话最后一次请求的前缀。例外只有会改变回复形态的字段：
+- **同模型：沿用会话请求**（cache-safe fork，#176）。agent 在 `CompactionInput.request` 里带上会话此刻的请求（与 `history` 同一日志、同一水位，由 `build_request` 渲染，含基线 system、指令节、工具、`prefix_epoch`）；`plan` 把它的 `items` 截到被替换区间（`history` 中被替换条目的 item 数之和），放进 `CompactionJob.prefix`。`compact` 在 `prefix.spec == job.model` 时用它：末尾追加摘要指令作为最后一条 user 消息，其余字段原样保留，因此去掉最后一条 user 消息后，摘要请求是会话最后一次请求的前缀。例外只有会改变回复形态的字段：
   - `tool_choice` 为 `Required` / `Tool` 时改成 `None`；`Auto` / `None` 保持不变——`tool_choice` 属于 Anthropic 消息缓存的前缀，改成 `None` 会让被摘要区间按全价重读。指令里要求只回复文本，模型若仍调用工具，只取文本部分；回复里没有非空文本（例如只有工具调用）按摘要调用失败处理（`StreamProtocol`，不重试，→ `CompactionAborted{SummaryFailed}`），不会以空摘要替换历史；
   - `output_format = None`：结构化输出会把摘要约束成应用的 schema，而摘要必须是自由文本。与 `tool_choice` 不同，这里没有保持不变的选项；供应商若把输出格式计入缓存（Anthropic 改 `output_config.format` 会使缓存失效），设了结构化输出的会话压缩时付一次全价读；
   - `max_output_tokens = max_summary_tokens + reasoning.budget_tokens`（thinking 预算计入输出上限）。
+  - `cache_ttl` 取 `compaction.cache_ttl`（默认 5m），不沿用会话的：压缩与子会话是主会话之外的 TTL 分桶（#178），会话用 1h 时摘要请求不跟着写 1h 缓存。TTL 只在断点上，不改前缀内容；
   - reasoning 照常回放：system、工具、`prefix_epoch` 都与会话请求一致，adapter 的 reasoning 回放门控（provider / 模型 / `prefix_epoch` / 工具指纹）按普通会话请求判断。
 - **不同模型：独立请求**。不同模型不共享缓存，摘要请求不带 system 与工具。**输入只含文本**（避免把 reasoning / raw / 图片交给摘要模型，触发 400 或无界图片）：
   - 整条丢弃 `Reasoning` item 及其 binding，丢弃 provider raw 与 `ProviderOpaque`；
@@ -102,7 +103,7 @@ pub enum CompactResult {
   - 摘要请求不挂工具，不启用 reasoning / thinking。
 - 摘要模型：默认 = 当前会话的 provider + 模型；可配 `compaction.summary_model` 单独指定；**不做跨 provider 自动回退**。
 - 摘要调用的 attempt / 退避 / `request_timeout` 取 `CompactionInput.turn`（`TurnConfig`），与模型调用一致。
-- 独立请求**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（应用包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
+- 独立请求**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`cache_ttl = compaction.cache_ttl`、`session = job.session`（应用包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
 - 提示词是 compactor 内的固定模板，v1 不开放给应用；沿用会话请求时放在最后，独立请求时放在最前；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
 - 产出是单条 `Item::Compaction { parts: Vec<Part> }`（类型归 #11）；v1 两边都渲染为文本——Anthropic 为用户文本块，OpenAI 为普通 input 文本消息；原生 compaction item 出界。
 
@@ -206,6 +207,7 @@ pub struct CompactionConfig {
     pub max_auto_compactions_per_turn: u32,   // 1
     pub max_summary_tokens: u32,              // 2048
     pub summary_model: Option<ModelSpec>,     // None：当前模型
+    pub cache_ttl: CacheTtl,                  // 5m；摘要请求的缓存 TTL，serde default
 }
 ```
 
@@ -219,6 +221,7 @@ pub struct CompactionConfig {
 | `max_auto_compactions_per_turn` | `1` | 不含手动与每 step 一次的强制压缩 |
 | `max_summary_tokens` | `2048` | 摘要输出上限 |
 | `summary_model` | 当前模型 | 不做跨 provider 回退 |
+| `cache_ttl` | 5m / 5m | 摘要请求的断点 TTL，不随会话的 `request.cache_ttl` |
 | 估算 | `bytes/3` | 刻意高估；不引入 tokenizer |
 
 ## 9. 验收场景
