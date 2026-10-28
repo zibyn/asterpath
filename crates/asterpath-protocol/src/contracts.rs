@@ -87,6 +87,134 @@ impl fmt::Debug for Claim {
     }
 }
 
+/// Waits until a queued release has committed.
+pub type ReleaseWait = Box<dyn FnOnce() + Send>;
+
+/// The row operations a store adapter brings to its [`ClaimTable`].
+pub trait ClaimRows: Send + Sync + 'static {
+    /// Queue a claim of `root` before returning: queue order is commit
+    /// order. The future yields the granted epoch.
+    fn claim(&self, root: SessionId) -> BoxFuture<'static, Result<u64, StorageError>>;
+    /// Queue the release of `token` before returning; the returned wait
+    /// blocks until it has committed. A store already closed has nothing to
+    /// wait for.
+    fn release(&self, token: OwnerToken) -> ReleaseWait;
+    /// Renew the lease; the claims in `held` this process no longer holds.
+    fn renew(
+        &self,
+        held: Vec<OwnerToken>,
+    ) -> BoxFuture<'static, Result<Vec<OwnerToken>, StorageError>>;
+}
+
+/// The claim table (GLOSSARY): one store handle's in-process count of its
+/// claims per root and their release order, for store adapters. Claims of a
+/// root share one epoch; the last one to drop queues the release and waits
+/// for its commit. Looking a root up and queueing its claim happen under one
+/// lock, so a release already queued commits before a later claim.
+pub struct ClaimTable {
+    shared: Arc<ClaimShared>,
+}
+
+struct ClaimShared {
+    /// Root -> (epoch, live claims).
+    held: Mutex<BTreeMap<SessionId, (u64, usize)>>,
+    rows: Box<dyn ClaimRows>,
+}
+
+impl ClaimTable {
+    pub fn new(rows: impl ClaimRows) -> Self {
+        Self {
+            shared: Arc::new(ClaimShared {
+                held: Mutex::default(),
+                rows: Box::new(rows),
+            }),
+        }
+    }
+
+    /// See [`SessionStore::claim`].
+    pub async fn claim(&self, root: SessionId) -> Result<Claim, StorageError> {
+        let response = {
+            let mut held = lock(&self.shared.held);
+            if let Some((epoch, claims)) = held.get_mut(&root) {
+                *claims += 1;
+                let epoch = *epoch;
+                return Ok(self.claim_of(OwnerToken { root, epoch }));
+            }
+            self.shared.rows.claim(root)
+        };
+        let epoch = response.await?;
+        {
+            let mut held = lock(&self.shared.held);
+            let entry = held.entry(root).or_insert((epoch, 0));
+            if entry.0 != epoch {
+                *entry = (epoch, 0);
+            }
+            entry.1 += 1;
+        }
+        Ok(self.claim_of(OwnerToken { root, epoch }))
+    }
+
+    /// See [`SessionStore::renew`]: lost claims leave the table, unless the
+    /// root has been claimed again at another epoch since.
+    pub async fn renew(&self) -> Result<Vec<OwnerToken>, StorageError> {
+        let held = lock(&self.shared.held)
+            .iter()
+            .map(|(root, (epoch, _))| OwnerToken {
+                root: *root,
+                epoch: *epoch,
+            })
+            .collect();
+        let lost = self.shared.rows.renew(held).await?;
+        let mut held = lock(&self.shared.held);
+        for token in &lost {
+            if held
+                .get(&token.root)
+                .is_some_and(|(epoch, _)| *epoch == token.epoch)
+            {
+                held.remove(&token.root);
+            }
+        }
+        Ok(lost)
+    }
+
+    fn claim_of(&self, token: OwnerToken) -> Claim {
+        Claim::new(
+            token,
+            ClaimRelease {
+                shared: Arc::clone(&self.shared),
+                token,
+            },
+        )
+    }
+}
+
+/// Drops one claim; the last one of its epoch releases the tree, committed
+/// before `drop` returns so another process may claim it at once.
+struct ClaimRelease {
+    shared: Arc<ClaimShared>,
+    token: OwnerToken,
+}
+
+impl Drop for ClaimRelease {
+    fn drop(&mut self) {
+        let wait = {
+            let mut held = lock(&self.shared.held);
+            match held.get_mut(&self.token.root) {
+                Some((epoch, claims)) if *epoch == self.token.epoch => {
+                    *claims -= 1;
+                    if *claims > 0 {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            held.remove(&self.token.root);
+            self.shared.rows.release(self.token)
+        };
+        wait();
+    }
+}
+
 /// A committed log record as returned by the storage layer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogEntry {

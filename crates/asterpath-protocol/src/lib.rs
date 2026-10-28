@@ -43,10 +43,10 @@ pub use config::{
     ToolChoice, ToolConfig, ToolDescriptor, TransportKind, TurnConfig, effective_config,
 };
 pub use contracts::{
-    ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, Claim, DEFAULT_LEASE_TTL,
-    DedupKey, LogEntry, LogQuery, MetadataPatch, NewEntry, OwnerToken, ParentFilter,
-    PendingApproval, SessionQuery, SessionStore, check_metadata, patched_metadata, root_of,
-    scan_all,
+    ApprovalEndpoint, ApprovalGate, CatalogCursor, CatalogEntry, Claim, ClaimRows, ClaimTable,
+    DEFAULT_LEASE_TTL, DedupKey, LogEntry, LogQuery, MetadataPatch, NewEntry, OwnerToken,
+    ParentFilter, PendingApproval, ReleaseWait, SessionQuery, SessionStore, check_metadata,
+    patched_metadata, root_of, scan_all,
 };
 pub use decode::{LOG_SCHEMA_VERSION, LogDecodeError, decode_entry, decode_payload};
 pub use encode::encode_entry;
