@@ -131,10 +131,10 @@ impl Provider for AnthropicProvider {
     fn stream(&self, request: ModelRequest) -> BoxStream<'_, Result<StreamEvent, ProviderError>> {
         let capabilities = self.capabilities(&request.spec);
         let profile = self.profile(&request.spec);
-        if let Err(error) = request::check(capabilities, profile, &request) {
+        let provider = self.id();
+        if let Err(error) = request::check(&provider, capabilities, profile, &request) {
             return stream::once(async move { Err(error) }).boxed();
         }
-        let provider = self.id();
         let (body, tools_hash, beta) =
             match request::render(&provider, profile, &request, self.trace.as_deref()) {
                 Ok(rendered) => rendered,
