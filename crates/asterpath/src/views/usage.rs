@@ -362,6 +362,7 @@ fn add_usage(target: &mut Usage, usage: Usage) {
     target.input.uncached += usage.input.uncached;
     target.input.cache_read += usage.input.cache_read;
     target.input.cache_write += usage.input.cache_write;
+    target.input.cache_write_1h += usage.input.cache_write_1h;
     target.output.total += usage.output.total;
     target.output.reasoning += usage.output.reasoning;
 }

@@ -545,6 +545,7 @@ async fn the_status_bar_shows_the_model_and_tokens_and_switches_the_model() {
             uncached: 10,
             cache_read: 2,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: 5,
