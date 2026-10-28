@@ -131,7 +131,7 @@ pub async fn root_of(log: &dyn SessionStore, session: SessionId) -> Result<Sessi
 - 子会话的请求登记在根会话的树下；`pending_in(root)` 列出整棵树的待审批项，按会话路由到具体 UI 是应用的事。
 - `Clock` 是时间来源接缝：引擎（agent / scheduler）注入 `Arc<dyn Clock>` 取 `now`；存储不读时间（`recorded_at` 只供诊断）。生产用 `SystemClock`，测试用 `asterpath-testing` 的 `ManualClock`（#19，[testing.md](testing.md)）。
 - 唤醒发现不在存储：facade 的 `Asterpath::wakeable()` 对 `sessions()` 逐个折叠会话事实（[storage.md](storage.md) §7）。
-- 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），应用经 `store().retire(..)` 调用；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
+- 退役是 `SessionStore` 的**可选**方法（整会话退役，默认 `Unsupported`），应用经门面 `OwnedSession::retire()` 认领后自底向上退役整棵会话树（`store().retire(..)` 仍公开、不查认领）；签名与语义见 [retention.md](retention.md)。导出用现有 `frontier` + `scan`，导入不在 v1。
 - 事件枚举与恢复算法由 #3 定，schema 版本由 #4 定。
 - `SessionStore::frontier` 返回最后一条已提交记录的 `LogId`（前缘）；恢复点是它之后的下一个位置，见 [GLOSSARY](../../GLOSSARY.md) 与 [event-log-recovery.md](event-log-recovery.md) §6。
 - 持久等待是引擎内部的 `waits::Waits`，不是 trait，在 protocol 里没有值类型：持久等待只有审批与子会话完成。审批是 `await_approval` / `record_approval`，子会话是 `await_child` / `wake_child`。

@@ -1,6 +1,6 @@
 # 会话分叉复用上下文分叉的快照
 
-**Status**: accepted (2026-10-24)；水位固定为最后已提交回合部分取代 by [ADR-0045](0045-fork-at-any-committed-turn.md)（proposed）
+**Status**: accepted (2026-10-24)；水位固定为最后已提交回合部分取代 by [ADR-0045](0045-fork-at-any-committed-turn.md)
 **来源**: CLI 重设计（[packaging.md](../design/packaging.md) §4，[对比研究](../research/cli-codex-vs-claude-code.md)）
 **扩展**: [ADR-0008](0008-subagent-model.md) 的 fork 快照（来源不再只是 spawn 调用）
 

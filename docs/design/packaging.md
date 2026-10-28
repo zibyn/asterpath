@@ -87,7 +87,7 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  可变的是 `model`、`request`、追加 system 指令、指令节与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
+  可变的是 `model`、`request`、追加 system 指令、指令节与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与门面 `SessionHandle::config()` 都经它取值，CLI 与桌面端经 `config()` 读取。
 
 - **易变内容放进指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：日期、cwd、git 状态这类会变的内容不要写进无键的 `SessionSpec.system`，否则要么过时，要么只能新开会话。把它们放进 `SessionSpec.system_sections`（如键 `date`、`env`），变化时用 `update_config` 按同一个键写一节（带 `id`）。刷新落在历史原位，不改前缀缓存；压缩后基线里每个键只有最新值。AGENTS.md、技能索引这类会被刷新的指令同理。键非空、同一补丁内不重复，节只含 `Part::Text`。
 
@@ -147,6 +147,8 @@ impl Asterpath {
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError>;
     pub async fn fork_session(&self, source: SessionId, metadata: BTreeMap<String, String>)
         -> Result<SessionHandle, AsterError>;           // 会话分叉（ADR-0033）
+    pub async fn fork_session_at(&self, source: SessionId, metadata: BTreeMap<String, String>, at: TurnId)
+        -> Result<SessionHandle, AsterError>;           // 在指定已提交回合分叉（ADR-0045）
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
@@ -177,7 +179,7 @@ impl Asterpath {
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、会话元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
-- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
+- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。`fork_session_at(source, metadata, at)` 把水位换成源会话回合 `at` 的 `TurnCommitted`（[ADR-0045](../adr/0045-fork-at-any-committed-turn.md)）：投影与生效配置都在该处折叠，之后的压缩与配置变更不影响；`at` 不存在、未提交或属于别的会话 = `AsterError::InvalidForkPoint`，不创建会话。分叉不写源会话。
 - `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带会话元数据。按元数据排序、前缀或范围匹配由应用在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
 - 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, cache_root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
@@ -208,6 +210,8 @@ impl SessionHandle {
     pub async fn state(&self) -> Result<SessionState, AsterError>;
     pub async fn facts(&self) -> Result<SessionFacts, AsterError>;
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError>;
+    pub async fn config(&self) -> Result<ConfigSnapshot, AsterError>;        // 生效配置（ADR-0030）
+    pub async fn context_usage(&self) -> Result<ContextUsage, AsterError>;
     pub async fn update_config(&self, patch: ConfigPatch) -> Result<(), AsterError>;
     pub async fn update_metadata(
         &self, patch: BTreeMap<String, Option<String>>,
@@ -247,6 +251,8 @@ impl OwnedSession {
 - `submit_input` 只 append `InputRecorded`（dedup key = `input.id`）并通知在途回合；session 空闲时**不**自动开回合，调用方随后 `drive()`。
 - `state()` 返回恢复分类器的 `SessionState`（[event-log-recovery.md](event-log-recovery.md) §6）：`Idle` 或 `TurnOpen { turn, step }`，委托 `facts()`（会话事实 `SessionFacts`，对日志折叠一次）推导，不依赖驱动者。
 - `projection()` 返回对日志折叠出的模型可见投影（每项带来源 log id），不读驱动者内存。
+- `config()` 返回日志末尾（`u64::MAX` 水位）折叠出的生效配置，即下一个 step 使用的配置；别的进程写入的 `ConfigChanged` 也读得到。
+- `context_usage()` 返回 `ContextUsage { used, window }`（protocol，`#[non_exhaustive]`）：`used` 是最近一条 `AssistantMessage` 的 `usage.input_total()`，还没有模型请求时为 `None`；`window` 是生效配置的 `ModelSpec.context_window`。压缩不刷新 `used`，框架不估算 token；累计用量仍走 `Asterpath::usage`。
 - `drive()` 单飞：同一 session 同时只能有一个驱动者，第二个返回 `AsterError::Agent(AgentError::Busy)`。
 - 持久等待（审批 / 子会话）在 `drive()` 内原地 await；流在 `TurnCommitted` 或 `Idle` 后结束。
 - `approve()` 写 `ApprovalDecided { tool_call_id, decision }`（dedup key = `tool_call_id`）并唤醒本进程内该调用的等待；属主在另一个进程时，它的等待至多 500 ms 后从日志读到决定。

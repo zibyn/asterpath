@@ -550,6 +550,10 @@ _Avoid_: 失败消耗、估算用量
 自身用量是单个会话日志内的用量；子树用量是自身加全部后代会话的用量，两者分开返回。
 _Avoid_: 父总量、累计用量
 
+**上下文占用（Context Usage）**：
+最近一条 `AssistantMessage` 的输入 token（`uncached + cache_read + cache_write`）对生效配置 `ModelSpec.context_window` 的比较（`ContextUsage { used, window }`，`SessionHandle::context_usage`）。对日志折叠，框架不估算；压缩后到下一次请求前仍是上一次请求的值。
+_Avoid_: 上下文估算、剩余 token
+
 ## 打包与交付
 
 **门面（Facade）**：
@@ -569,7 +573,7 @@ _Avoid_: session 配置、运行时配置
 _Avoid_: 配置覆盖、热更新
 
 **生效配置（Effective Config）**：
-配置快照依次应用水位之前全部配置变更的折叠结果（`effective_config`）。模型调用按 step 的 `StepStarted.seq` 取值，恢复、调度、trace 用同一个折叠。代码里它与配置快照同为 `ConfigSnapshot` 类型：类型名指形状，「配置快照」一词只指 `SessionCreated` 里的初始值。
+配置快照依次应用水位之前全部配置变更的折叠结果（`effective_config`）。模型调用按 step 的 `StepStarted.seq` 取值，恢复、调度、trace 与门面 `SessionHandle::config`（日志末尾水位）用同一个折叠。代码里它与配置快照同为 `ConfigSnapshot` 类型：类型名指形状，「配置快照」一词只指 `SessionCreated` 里的初始值。
 _Avoid_: 当前配置、运行时配置
 
 **验收场景（Acceptance Scenario）**：

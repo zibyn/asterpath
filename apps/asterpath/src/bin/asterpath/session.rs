@@ -16,13 +16,11 @@ use asterpath_app::workspace::{
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
     CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, SessionId, StorageError,
-    decode_entry,
 };
 use asterpath_skills::SkillDiagnosticKind;
 use clap::{Args, ValueEnum};
 
-use crate::drive::scan;
-use crate::{CliError, CliResult, GlobalArgs, aster_error, not_found};
+use crate::{CliError, CliResult, GlobalArgs, aster_error};
 
 /// How many sessions the `-r` picker lists.
 const PICKER_SIZE: usize = 20;
@@ -448,17 +446,8 @@ fn pick<R: BufRead, W: Write>(
 
 /// The effective config at the end of the log: what the next step runs with.
 pub async fn snapshot(asterpath: &Asterpath, session: SessionId) -> CliResult<ConfigSnapshot> {
-    let entries = scan(asterpath.store(), session)
-        .await
-        .map_err(CliError::run)?;
-    let decoded: Vec<_> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            let event = decode_entry(&entry).ok()?;
-            Some((entry, event))
-        })
-        .collect();
-    asterpath_protocol::effective_config(&decoded, u64::MAX).ok_or_else(|| not_found(session))
+    let handle = asterpath.open_session(session).await.map_err(aster_error)?;
+    handle.config().await.map_err(aster_error)
 }
 
 /// One `mcp: <id> ...` line per configured server, in config order.

@@ -1,5 +1,6 @@
-//! Application session fork (ADR-0033): a new, parentless session whose initial
-//! history is the source's projection at its last committed turn.
+//! Application session fork (ADR-0033, ADR-0045): a new, parentless session
+//! whose initial history is the source's projection at a committed turn, the
+//! last one by default.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -401,4 +402,182 @@ async fn a_compaction_inside_the_turn_in_progress_is_not_copied() {
         .unwrap();
 
     assert_eq!(history(&fork).await, [user("one"), assistant("a")]);
+}
+
+/// The source's committed turns, oldest first.
+async fn committed(asterpath: &Asterpath, handle: &OwnedSession) -> Vec<TurnId> {
+    events(asterpath, handle)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::TurnCommitted { turn_id, .. } => Some(turn_id),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn fork_at(asterpath: &Asterpath, source: &OwnedSession, at: TurnId) -> OwnedSession {
+    asterpath
+        .fork_session_at(source.id(), BTreeMap::new(), at)
+        .await
+        .expect("fork")
+        .claim()
+        .await
+        .unwrap()
+}
+
+fn created_model(events: &[SessionEvent]) -> ModelId {
+    let SessionEvent::SessionCreated { config, .. } = &events[0] else {
+        panic!("first record is SessionCreated: {events:?}");
+    };
+    config.model.model.clone()
+}
+
+#[tokio::test]
+async fn a_fork_at_an_earlier_turn_copies_and_configures_only_up_to_it() {
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(vec![assistant("a")], StopReason::EndTurn, Usage::default())
+            .respond(vec![assistant("b")], StopReason::EndTurn, Usage::default())
+            .respond(vec![assistant("c")], StopReason::EndTurn, Usage::default()),
+    );
+    let asterpath = build(&provider).await;
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    turn(&source, 1, "one").await;
+    turn(&source, 2, "two").await;
+    let mut patch = asterpath::protocol::ConfigPatch::default();
+    patch.model = Some(ModelSpec {
+        model: ModelId::new("model-2"),
+        ..spec().model
+    });
+    source.update_config(patch).await.expect("update");
+    turn(&source, 3, "three").await;
+    let turns = committed(&asterpath, &source).await;
+    assert_eq!(turns.len(), 3);
+    let frontier = asterpath
+        .store()
+        .frontier(source.id())
+        .await
+        .expect("frontier");
+
+    let first = fork_at(&asterpath, &source, turns[0]).await;
+    assert_eq!(history(&first).await, [user("one"), assistant("a")]);
+    assert_eq!(
+        created_model(&events(&asterpath, &first).await),
+        ModelId::new("model-1"),
+        "the config before the later update"
+    );
+    let third = fork_at(&asterpath, &source, turns[2]).await;
+    assert_eq!(history(&third).await.len(), 6);
+    assert_eq!(
+        created_model(&events(&asterpath, &third).await),
+        ModelId::new("model-2")
+    );
+    assert_eq!(
+        asterpath
+            .store()
+            .frontier(source.id())
+            .await
+            .expect("frontier"),
+        frontier,
+        "forking never writes the source"
+    );
+}
+
+#[tokio::test]
+async fn a_fork_before_a_later_compaction_sees_the_uncompacted_history() {
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(vec![assistant("a")], StopReason::EndTurn, Usage::default())
+            .respond(vec![assistant("b")], StopReason::EndTurn, Usage::default())
+            .respond(
+                vec![assistant("the summary")],
+                StopReason::EndTurn,
+                Usage::default(),
+            ),
+    );
+    let asterpath = build(&provider).await;
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    turn(&source, 1, "one").await;
+    turn(&source, 2, "two").await;
+    let result = source.compact_now().await.expect("compact");
+    assert!(matches!(result, CompactResult::Applied(_)), "{result:?}");
+    let turns = committed(&asterpath, &source).await;
+
+    let fork = fork_at(&asterpath, &source, turns[0]).await;
+    assert_eq!(history(&fork).await, [user("one"), assistant("a")]);
+}
+
+#[tokio::test]
+async fn a_fork_at_an_uncommitted_or_foreign_turn_is_refused() {
+    let provider = Arc::new(
+        ScriptedProvider::new("p")
+            .respond(vec![assistant("a")], StopReason::EndTurn, Usage::default())
+            .respond(vec![assistant("b")], StopReason::EndTurn, Usage::default()),
+    );
+    let asterpath = build(&provider).await;
+    let source = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    let other = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    turn(&source, 1, "one").await;
+    turn(&other, 2, "two").await;
+    let foreign = committed(&asterpath, &other).await[0];
+    // A turn that started but has not committed.
+    let open = TurnId::from_bytes([9; 16]);
+    let entry = encode_entry(
+        source.id(),
+        None,
+        &SessionEvent::TurnStarted { turn_id: open },
+    )
+    .expect("encode");
+    asterpath.store().append(entry).await.expect("append");
+    let before = asterpath
+        .sessions(Default::default())
+        .await
+        .expect("catalog")
+        .len();
+
+    for at in [open, foreign] {
+        let error = asterpath
+            .fork_session_at(source.id(), BTreeMap::new(), at)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(error, asterpath::AsterError::InvalidForkPoint { session, turn }
+                if session == source.id() && turn == at),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        asterpath
+            .sessions(Default::default())
+            .await
+            .expect("catalog")
+            .len(),
+        before,
+        "no session was created"
+    );
 }

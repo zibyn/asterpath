@@ -536,6 +536,38 @@ async fn an_owner_whose_tree_was_taken_over_stops_and_tells_the_application() {
     );
 }
 
+#[tokio::test]
+async fn an_owner_whose_tree_was_taken_over_cannot_retire_it() {
+    let db = TempDb::new("retire-taken");
+    let clock = Arc::new(ManualClock::new());
+    let desktop = clocked_process(&db.path(), answer(), clock.clone(), Arc::default()).await;
+    let session = desktop.create_session(spec()).await.unwrap();
+    let owned = session.claim().await.unwrap();
+
+    clock.advance(LEASE_EXPIRY);
+    let cli = clocked_process(&db.path(), answer(), clock.clone(), Arc::default()).await;
+    let _taken = cli
+        .open_session(session.id())
+        .await
+        .unwrap()
+        .claim()
+        .await
+        .unwrap();
+
+    let error = owned.retire().await.expect_err("the tree is the CLI's now");
+    assert!(
+        matches!(
+            error,
+            asterpath::protocol::RetirementError::Storage(StorageError::OwnedElsewhere { root })
+                if root == session.id()
+        ),
+        "{error:?}"
+    );
+    cli.open_session(session.id())
+        .await
+        .expect("nothing retired");
+}
+
 /// A store whose lease renewal fails once `failing` is set.
 struct Unrenewable {
     inner: Arc<dyn SessionStore>,
