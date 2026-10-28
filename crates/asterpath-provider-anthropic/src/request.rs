@@ -5,13 +5,14 @@
 //! verbatim and is never parsed or re-serialized.
 
 use asterpath_http::{
-    TraceMark, TraceSink, merge_provider_option, provider_option_conflict, provider_options_for,
-    reasoning_in_place, same_provider_raw_field, server_tools_for, unrenderable_part,
+    TraceMark, TraceSink, check_request, merge_provider_option, provider_option_conflict,
+    provider_options_for, reasoning_drop_reason, reasoning_in_place, same_provider_raw_field,
+    server_tools_for,
 };
 use asterpath_protocol::{
     CacheLifetime, FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities,
-    ProviderError, ProviderErrorKind, ProviderId, RawProviderData, ReasoningBinding,
-    ReasoningEffort, ReasoningParams, Role, ToolChoice, ToolDescriptor,
+    ProviderError, ProviderErrorKind, ProviderId, ReasoningEffort, ReasoningParams, Role,
+    ToolChoice, ToolDescriptor,
 };
 
 use crate::models::{AnthropicModelProfile, Thinking};
@@ -161,24 +162,19 @@ fn array(items: Vec<Frag>) -> String {
 
 /// Capability and structural checks that must run before any HTTP request.
 pub(crate) fn check(
+    provider: &ProviderId,
     capabilities: ProviderCapabilities,
     rules: &AnthropicModelProfile,
     request: &ModelRequest,
 ) -> Result<(), ProviderError> {
-    if let Some(feature) = capabilities.unsupported_feature(request) {
-        return Err(unsupported(feature));
-    }
-    if let Some(detail) = unrenderable_part(request, &rules.file_media_types) {
-        return Err(unsupported(&detail));
-    }
-    if !request
-        .system
-        .iter()
-        .chain(instruction_parts(request))
-        .all(|part| matches!(part, Part::Text { .. }))
-    {
-        return Err(invalid_request("system may only contain text parts"));
-    }
+    check_request(
+        request,
+        provider,
+        ADAPTER_NAME,
+        capabilities,
+        &rules.file_media_types,
+        &rules.efforts,
+    )?;
     if request
         .sampling
         .as_ref()
@@ -187,14 +183,6 @@ pub(crate) fn check(
         return Err(unsupported("sampling.seed"));
     }
     if let Some(reasoning) = &request.reasoning {
-        if let Some(effort) = reasoning.effort
-            && !rules.efforts.contains(&effort)
-        {
-            return Err(unsupported(&format!(
-                "reasoning.effort {effort:?} on {}",
-                request.spec.model
-            )));
-        }
         if reasoning.effort == Some(ReasoningEffort::Off) && reasoning.budget_tokens.is_some() {
             return Err(invalid_request(
                 "reasoning.effort Off contradicts reasoning.budget_tokens",
@@ -220,10 +208,12 @@ fn instruction_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
     })
 }
 
+const ADAPTER_NAME: &str = "Anthropic Messages";
+
 fn unsupported(detail: &str) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Unsupported,
-        format!("{detail} is not supported by the Anthropic Messages adapter"),
+        format!("{detail} is not supported by the {ADAPTER_NAME} adapter"),
     )
 }
 
@@ -469,7 +459,7 @@ fn render_messages(
                 }
             }
             Item::Reasoning { binding, raw, .. } => {
-                let reason = drop_reason(binding, raw, request, tools_hash)
+                let reason = reasoning_drop_reason(binding, raw, request, Some(tools_hash))
                     .or((index < replay_from).then_some("system_changed"));
                 match (reason, trace) {
                     (None, _) => messages.push(
@@ -703,25 +693,5 @@ fn render_part(provider: &ProviderId, part: &Part) -> Option<Frag> {
             ..
         } => (item_provider == provider).then(|| Frag::Raw(raw.json.as_str().to_owned())),
         _ => unreachable!("check rejects unknown parts"),
-    }
-}
-
-/// Why a reasoning item may not be replayed into this request, if it may not.
-fn drop_reason(
-    binding: &ReasoningBinding,
-    raw: &RawProviderData,
-    request: &ModelRequest,
-    tools_hash: &str,
-) -> Option<&'static str> {
-    if binding.provider != request.spec.provider || raw.provider != request.spec.provider {
-        Some("cross_provider")
-    } else if binding.model != request.spec.model {
-        Some("model_mismatch")
-    } else if binding.prefix_epoch != request.prefix_epoch {
-        Some("prefix_epoch_mismatch")
-    } else if binding.tools_hash != tools_hash {
-        Some("tools_hash_mismatch")
-    } else {
-        None
     }
 }
