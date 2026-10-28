@@ -61,6 +61,7 @@ fn usage(input: u64, output: u64) -> Usage {
             uncached: input,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: output,

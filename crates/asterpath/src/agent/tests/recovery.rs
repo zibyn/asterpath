@@ -322,6 +322,7 @@ async fn usage_survives_the_recovered_step() {
             uncached: 11,
             cache_read: 2,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: asterpath_protocol::OutputTokens {
             total: 7,

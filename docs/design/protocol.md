@@ -564,6 +564,8 @@ pub struct InputTokens {
     pub uncached: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// cache_write 中 1h TTL 的部分，是子集、不叠加
+    pub cache_write_1h: u64,
 }
 
 pub struct OutputTokens {
@@ -587,6 +589,7 @@ impl Usage {
 | `input.uncached` | `input_tokens` | `input_tokens - cached_tokens - cache_write_tokens`（饱和减到 0） |
 | `input.cache_read` | `cache_read_input_tokens` | `input_tokens_details.cached_tokens` |
 | `input.cache_write` | `cache_creation_input_tokens` | `input_tokens_details.cache_write_tokens` |
+| `input.cache_write_1h` | `cache_creation.ephemeral_1h_input_tokens` | 0 |
 | `output.total` | `output_tokens` | `output_tokens` |
 | `output.reasoning` | `output_tokens_details.thinking_tokens` | `output_tokens_details.reasoning_tokens` |
 | 总 token | 派生 | 派生；忽略供应商的 `total_tokens` |

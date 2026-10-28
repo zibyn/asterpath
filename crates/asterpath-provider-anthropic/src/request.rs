@@ -9,9 +9,9 @@ use asterpath_http::{
     same_provider_raw_field, server_tools_for, unrenderable_part,
 };
 use asterpath_protocol::{
-    FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
-    ProviderErrorKind, ProviderId, RawProviderData, ReasoningBinding, ReasoningEffort,
-    ReasoningParams, Role, ToolChoice, ToolDescriptor,
+    CacheLifetime, FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities,
+    ProviderError, ProviderErrorKind, ProviderId, RawProviderData, ReasoningBinding,
+    ReasoningEffort, ReasoningParams, Role, ToolChoice, ToolDescriptor,
 };
 
 use crate::models::{AnthropicModelProfile, Thinking};
@@ -78,15 +78,15 @@ impl Frag {
     /// Add an ephemeral cache breakpoint. Replayed raw blocks are never
     /// modified (ADR 0010), so they cannot carry one, and the API rejects one
     /// on an empty text block; returns whether it was set.
-    fn set_cache_control(&mut self) -> bool {
+    fn set_cache_control(&mut self, ttl: CacheLifetime) -> bool {
         match self {
             Self::Json(value) if is_empty_text(value) => false,
             Self::Json(Value::Object(map)) => {
-                map.insert("cache_control".to_owned(), ephemeral());
+                map.insert("cache_control".to_owned(), ephemeral(ttl));
                 true
             }
             Self::Object(fields) => {
-                fields.push(("cache_control", Frag::Json(ephemeral())));
+                fields.push(("cache_control", Frag::Json(ephemeral(ttl))));
                 true
             }
             Self::Json(_) | Self::Raw(_) => false,
@@ -98,8 +98,12 @@ fn is_empty_text(block: &Value) -> bool {
     block["type"] == "text" && block["text"] == ""
 }
 
-fn ephemeral() -> Value {
-    json!({"type": "ephemeral"})
+fn ephemeral(ttl: CacheLifetime) -> Value {
+    match ttl {
+        // No `ttl` field: the API default, and the bytes sessions already cached.
+        CacheLifetime::FiveMinutes => json!({"type": "ephemeral"}),
+        CacheLifetime::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+    }
 }
 
 fn object(fields: Vec<(&str, Frag)>) -> String {
@@ -220,6 +224,8 @@ pub(crate) fn render(
         system.extend(instruction_parts(request));
     }
 
+    // Cache order is tools, system, messages, and the API needs longer TTLs first.
+    let prefix_ttl = request.cache_ttl.prefix.max(request.cache_ttl.messages);
     let mut fields: Vec<(&str, Frag)> = vec![
         ("model", Frag::Json(json!(request.spec.model.as_str()))),
         ("max_tokens", Frag::Json(json!(request.max_output_tokens))),
@@ -233,7 +239,7 @@ pub(crate) fn render(
             })
             .collect();
         if let Some(last) = blocks.iter_mut().rev().find(|block| !is_empty_text(block)) {
-            last["cache_control"] = ephemeral();
+            last["cache_control"] = ephemeral(prefix_ttl);
         }
         fields.push(("system", Frag::Json(Value::Array(blocks))));
     }
@@ -241,7 +247,7 @@ pub(crate) fn render(
     if !top_tools.is_empty() || !server_tools.is_empty() {
         let mut tools: Vec<Value> = top_tools.iter().map(tool_definition).collect();
         if let Some(last) = tools.last_mut() {
-            last["cache_control"] = ephemeral();
+            last["cache_control"] = ephemeral(prefix_ttl);
         }
         // Server tools go last, verbatim; the breakpoint stays on the function tools.
         tools.extend(server_tools);
@@ -533,9 +539,15 @@ fn render_messages(
         .map(|(position, message)| {
             let mut content = message.tool_results;
             content.extend(message.other);
-            if position + 1 == count {
+            // The previous message's breakpoint is a fallback for steps that add
+            // more than the API's 20-block lookback.
+            if position + 2 >= count {
                 // Breakpoint on the last carrier block; omitted if every block is raw.
-                let _ = content.iter_mut().rev().any(Frag::set_cache_control);
+                let ttl = request.cache_ttl.messages;
+                let _ = content
+                    .iter_mut()
+                    .rev()
+                    .any(|block| block.set_cache_control(ttl));
             }
             Frag::Raw(object(vec![
                 ("role", Frag::Json(json!(message.role))),

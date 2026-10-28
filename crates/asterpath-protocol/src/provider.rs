@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures_core::stream::BoxStream;
 
 use crate::config::{
-    ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
+    CacheTtl, ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
     ToolDescriptor,
 };
 use crate::ids::{JsonString, ProviderId, SessionId};
@@ -43,6 +43,8 @@ pub struct ModelRequest {
     pub output_format: Option<OutputFormat>,
     /// See [`RequestConfig::server_tools`].
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
+    /// See [`RequestConfig::cache_ttl`].
+    pub cache_ttl: CacheTtl,
     /// The session the request is made for; `None` outside one. Adapters
     /// ignore it; application wrappers pick credentials or endpoints by it
     /// (ADR-0039).
@@ -89,6 +91,7 @@ impl ModelRequest {
             provider_options: request.provider_options.clone(),
             output_format: request.output_format.clone(),
             server_tools: request.server_tools.clone(),
+            cache_ttl: request.cache_ttl,
             session: None,
         }
     }
