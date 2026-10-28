@@ -256,7 +256,6 @@ pub fn output_result(entries: &[LogEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
     use asterpath::{Asterpath, AsterpathBuilder, AsterpathConfig};
     use asterpath_app::approval::ApprovalModes;
     use asterpath_protocol::{InputId, SandboxPolicy, UserInput};
@@ -662,7 +661,7 @@ mod tests {
         cleanup(&db);
     }
 
-    /// The CLI `untrusted` policy over a real `bash` tool that would create `ran`.
+    /// The CLI `ask` policy over a real `bash` tool that would create `ran`.
     async fn ask_bash(db: &Path, root: &Path) -> Asterpath {
         let provider = Arc::new(ScriptedProvider::new("p").respond(
             vec![Item::ToolCall {
@@ -683,7 +682,9 @@ mod tests {
         )
         .expect("absolute root");
         let config = AsterpathConfig::default();
-        let policy = Arc::new(ApprovalModes::new(config::ApprovalMode::Untrusted.into()));
+        let policy = Arc::new(ApprovalModes::new(
+            asterpath_app::approval::ApprovalMode::Ask,
+        ));
         AsterpathBuilder::from_config(config)
             .database(db)
             .providers(vec![provider as Arc<dyn Provider>])
