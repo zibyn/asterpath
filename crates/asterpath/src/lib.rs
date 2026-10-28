@@ -55,8 +55,9 @@ use asterpath_protocol::{
     UsageError, UsageFilter, UsageLookup, UsageReport, UsageScope, UserInput, dedup,
 };
 use asterpath_protocol::{
-    ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken,
-    SessionEnvironment, SessionQuery, SessionStore, Tool, root_of, unique_bytes,
+    ApprovalGate, CatalogEntry, Clock, EnvironmentAdapter, LogQuery, OwnerToken, ParentFilter,
+    RetirementError, SessionEnvironment, SessionQuery, SessionStore, StorageError, Tool, root_of,
+    unique_bytes,
 };
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
@@ -393,9 +394,11 @@ impl Asterpath {
         Ok(())
     }
 
-    /// The session store. Appends made here reach the `on_record` hooks;
-    /// retirement is `store().retire(...)` (`Unsupported` when the injected
-    /// store has none).
+    /// The session store. Appends made here reach the `on_record` hooks.
+    /// `store().retire(...)` retires one session without checking the
+    /// claim; applications should use [`OwnedSession::retire`], which retires
+    /// the claimed tree in order (`Unsupported` when the injected store has
+    /// no retirement).
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
     }
@@ -974,6 +977,54 @@ impl OwnedSession {
             future: self.agent.compact_now(self.session),
         };
         Ok(compaction.await?)
+    }
+
+    /// Retire this session's whole tree, from any session of it (retention.md
+    /// §3). Every session must be idle first, or nothing is retired and the
+    /// result is `NotIdle`; nothing is cancelled for the application. Then
+    /// each session is one store retirement, deepest first and the root last,
+    /// so a crash midway leaves the rest of the tree whole and a second call
+    /// finishes it. A frontier that moved meanwhile is `FrontierMoved`; a
+    /// store without retirement is `Unsupported`; a claim lost to another
+    /// process is `Storage(OwnedElsewhere)`. Afterwards the tree's reads
+    /// report `NotFound`.
+    pub async fn retire(self) -> Result<(), RetirementError> {
+        let owner = self.owner();
+        // Breadth-first: every session comes after its parent.
+        let mut tree = vec![owner.root];
+        let mut next = 0;
+        while let Some(&session) = tree.get(next) {
+            let children = self
+                .store
+                .sessions(SessionQuery {
+                    parent: ParentFilter::ChildrenOf(session),
+                    ..SessionQuery::default()
+                })
+                .await?;
+            tree.extend(children.iter().map(|entry| entry.session));
+            next += 1;
+        }
+        for &session in &tree {
+            let entries = scan_all(&*self.store, session).await?;
+            let facts = SessionFacts::fold(&entries).map_err(|error| StorageError::Corrupt {
+                session: Some(session),
+                detail: error.to_string(),
+            })?;
+            if !facts.is_idle() {
+                return Err(RetirementError::NotIdle);
+            }
+        }
+        for session in tree.into_iter().rev() {
+            // The store does not check the claim; refuse once it is gone.
+            if self.held.is_lost() || self.store.owner(owner.root).await? != Some(owner) {
+                return Err(StorageError::OwnedElsewhere { root: owner.root }.into());
+            }
+            let Some(frontier) = self.store.frontier(session).await? else {
+                continue;
+            };
+            self.store.retire(session, frontier).await?;
+        }
+        Ok(())
     }
 }
 
