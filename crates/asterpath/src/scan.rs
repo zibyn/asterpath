@@ -208,6 +208,15 @@ impl From<ScanError> for TraceError {
     }
 }
 
+impl From<ScanError> for crate::error::AsterError {
+    fn from(error: ScanError) -> Self {
+        match error {
+            ScanError::Storage { source, .. } => Self::Storage(source),
+            decode @ ScanError::Decode { .. } => Self::Agent(decode.into()),
+        }
+    }
+}
+
 impl From<ScanError> for crate::scheduler::WaitError {
     fn from(error: ScanError) -> Self {
         Self::Execution(error.into())

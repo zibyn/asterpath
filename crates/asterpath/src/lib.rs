@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::commit::{AppendError, CommitLog};
+use crate::scan::DecodedLog;
 use crate::scheduler::{Scheduler, SpawnTool};
 use crate::tools::ToolTable;
 use crate::views::trace::TracingQuery;
@@ -312,9 +313,7 @@ impl Asterpath {
     ) -> Result<SessionHandle, AsterError> {
         check_metadata(&metadata)?;
         let env = self.resolve(&metadata).await?;
-        let records = scan::scan_decoded(&*self.store, source)
-            .await
-            .map_err(AgentError::from)?;
+        let records = self.store.read(source).await.map_err(AgentError::from)?;
         let not_found = || AsterError::Agent(AgentError::NotFound { session: source });
         let corrupt = |detail: String| {
             AsterError::Agent(AgentError::Corrupt {
@@ -673,7 +672,9 @@ impl SessionHandle {
         }
         let key = patch.id.map(dedup::config_changed);
         if patch.changes_tools() {
-            let records = scan::scan_decoded(&*self.store, self.session)
+            let records = self
+                .store
+                .read(self.session)
                 .await
                 .map_err(AgentError::from)?;
             // A retry of a recorded change is a no-op, not a conflict with itself.
@@ -685,11 +686,11 @@ impl SessionHandle {
             {
                 return Ok(());
             }
-            let effective = asterpath_protocol::effective_config(&records, u64::MAX).ok_or(
-                AsterError::Agent(AgentError::NotFound {
+            let effective = records
+                .config()
+                .ok_or(AsterError::Agent(AgentError::NotFound {
                     session: self.session,
-                }),
-            )?;
+                }))?;
             self.check_tool_change(&patch, &effective.tools)?;
         }
         // Without an id a retry may land twice; whole-field overrides fold the same.
@@ -777,37 +778,37 @@ impl SessionHandle {
 
     /// The session facts folded from the log, not driver memory.
     pub async fn facts(&self) -> Result<SessionFacts, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
-        Ok(SessionFacts::fold(&entries).map_err(corrupt(self.session))?)
+        Ok(self.store.read(self.session).await?.facts())
     }
 
     /// The model-visible projection folded from the log, not driver memory.
     /// Each entry keeps its origin so applications can map items back to log ids.
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
-        let entries = scan_all(&*self.store, self.session).await?;
+        let entries = self.store.read(self.session).await?.entries();
         Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
     }
 
     /// The effective config folded from the log at its frontier (ADR-0030):
     /// what the next step runs with, whichever process changed it.
     pub async fn config(&self) -> Result<ConfigSnapshot, AsterError> {
-        self.fold_log(|records| asterpath_protocol::effective_config(records, u64::MAX))
-            .await
+        self.fold_log(DecodedLog::config).await
     }
 
     /// The latest model request's input tokens against the effective
     /// context window, folded from the log.
     pub async fn context_usage(&self) -> Result<ContextUsage, AsterError> {
-        self.fold_log(ContextUsage::of).await
+        self.fold_log(|log| ContextUsage::of(log)).await
     }
 
     /// The decoded log folded by `fold`; `NotFound` when the fold finds no
     /// `SessionCreated` (an unknown or retired session).
     async fn fold_log<T>(
         &self,
-        fold: impl FnOnce(&[(asterpath_protocol::LogEntry, SessionEvent)]) -> Option<T>,
+        fold: impl FnOnce(&DecodedLog) -> Option<T>,
     ) -> Result<T, AsterError> {
-        let records = scan::scan_decoded(&*self.store, self.session)
+        let records = self
+            .store
+            .read(self.session)
             .await
             .map_err(AgentError::from)?;
         fold(&records).ok_or(AsterError::Agent(AgentError::NotFound {

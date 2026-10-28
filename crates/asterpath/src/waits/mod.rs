@@ -13,7 +13,6 @@ use asterpath_protocol::{SessionEvent, dedup};
 use futures_core::future::BoxFuture;
 
 use crate::commit::CommitLog;
-use crate::scan::scan_decoded;
 use crate::watch::POLL_INTERVAL;
 
 /// Approval and child-completion waits backed by the event log.
@@ -31,7 +30,9 @@ impl Waits {
         session: SessionId,
         call: ToolCallId,
     ) -> Result<Option<ApprovalDecision>, ExecutionError> {
-        Ok(scan_decoded(&*self.log, session)
+        Ok(self
+            .log
+            .read(session)
             .await?
             .into_iter()
             .find_map(|(_, event)| match event {
@@ -49,15 +50,12 @@ impl Waits {
         session: SessionId,
         child: SessionId,
     ) -> Result<Option<()>, ExecutionError> {
-        let completed = scan_decoded(&*self.log, session)
-            .await?
-            .iter()
-            .any(|(_, event)| {
-                matches!(
-                    event,
-                    SessionEvent::ChildSessionCompleted { child: done, .. } if *done == child
-                )
-            });
+        let completed = self.log.read(session).await?.iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::ChildSessionCompleted { child: done, .. } if *done == child
+            )
+        });
         Ok(completed.then_some(()))
     }
 

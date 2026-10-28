@@ -15,11 +15,10 @@ use std::time::Duration;
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest,
     ApprovalVerdict, CancelReason, CancelToken, ChildOutcome, Clock, HookError, Hooks, Item,
-    LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance, ReplaySafety, SessionEvent,
-    SessionFacts, SessionId, StepId, Tool, ToolArgs, ToolCallCtx, ToolCallId, ToolConfig,
-    ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName,
-    ToolOutput, ToolResultStatus, ToolResultView, TurnId, UsageLookup, dedup, root_of,
-    unique_bytes,
+    NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance, ReplaySafety, SessionEvent, SessionId,
+    StepId, Tool, ToolArgs, ToolCallCtx, ToolCallId, ToolConfig, ToolContext, ToolDescriptor,
+    ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName, ToolOutput, ToolResultStatus,
+    ToolResultView, TurnId, UsageLookup, dedup, root_of, unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -27,7 +26,7 @@ use futures_util::{FutureExt, StreamExt};
 
 use super::{EventSink, caught};
 use crate::commit::CommitLog;
-use crate::scan::scan_decoded;
+use crate::scan::DecodedLog;
 use crate::scheduler::SPAWN_TOOL_NAME;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
@@ -350,7 +349,7 @@ impl ToolPipeline {
     /// One read of the log per step: this step's recorded intents and which
     /// of them are closed.
     async fn recorded(&self, step: &ToolStep<'_>) -> Result<Recorded, AgentError> {
-        let decoded = scan_decoded(&*self.log, step.session).await?;
+        let decoded = self.log.read(step.session).await?;
         Ok(Recorded::of(&decoded, step.turn, step.step))
     }
 
@@ -474,8 +473,8 @@ impl ToolPipeline {
         pending: &[CallInfo],
         started: &Mutex<HashSet<ToolCallId>>,
     ) -> Result<(), AgentError> {
-        let decoded = scan_decoded(&*self.log, step.session).await?;
-        let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
+        let decoded = self.log.read(step.session).await?;
+        let facts = decoded.facts();
         let step_calls: HashSet<ToolCallId> = decoded
             .iter()
             .filter_map(|(_, event)| match event {
@@ -937,7 +936,7 @@ struct Recorded {
 }
 
 impl Recorded {
-    fn of(decoded: &[(LogEntry, SessionEvent)], turn: TurnId, step: StepId) -> Self {
+    fn of(decoded: &DecodedLog, turn: TurnId, step: StepId) -> Self {
         let mut recorded = Self::default();
         for (_, event) in decoded {
             match event {
@@ -965,7 +964,7 @@ impl Recorded {
                 _ => {}
             }
         }
-        let facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
+        let facts = decoded.facts();
         recorded.closed = recorded
             .intents
             .values()
