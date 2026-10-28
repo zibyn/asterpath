@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, Clock, DEFAULT_LEASE_TTL, LogEntry, LogId, LogQuery, NewEntry, OwnerToken,
-    ParentFilter, RetirementError, SessionId, SessionQuery, SessionStore, StorageError,
-    SystemClock, Timestamp,
+    CatalogEntry, Claim, ClaimRows, ClaimTable, Clock, DEFAULT_LEASE_TTL, LogEntry, LogId,
+    LogQuery, NewEntry, OwnerToken, ParentFilter, ReleaseWait, RetirementError, SessionId,
+    SessionQuery, SessionStore, StorageError, SystemClock, Timestamp,
 };
 use asterpath_protocol::{SessionEvent, SessionFacts, decode_payload};
 use futures_core::future::BoxFuture;
@@ -40,8 +40,6 @@ struct State {
     owners: HashMap<SessionId, (u64, Option<u64>)>,
     /// Per handle: when its process lease expires.
     leases: HashMap<u64, Timestamp>,
-    /// Per handle and root: the epoch it holds and its number of live claims.
-    held: HashMap<(u64, SessionId), (u64, usize)>,
     /// Handles opened on this state, each standing for one process.
     handles: u64,
 }
@@ -164,6 +162,7 @@ pub struct InMemoryEventLog {
     clock: Arc<dyn Clock>,
     /// Which handle this is; claims conflict across handles.
     handle: u64,
+    claims: ClaimTable,
 }
 
 /// A normal exit: the lease goes and every tree this handle holds is freed.
@@ -172,7 +171,6 @@ impl Drop for InMemoryEventLog {
         let handle = self.handle;
         let mut state = self.state();
         state.leases.remove(&handle);
-        state.held.retain(|(holder, _), _| *holder != handle);
         for (_, process) in state.owners.values_mut() {
             if *process == Some(handle) {
                 *process = None;
@@ -194,10 +192,20 @@ impl InMemoryEventLog {
 
     /// A log that stamps `recorded_at` from `clock`.
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self::handle(Arc::default(), clock, 0)
+    }
+
+    fn handle(state: Arc<Mutex<State>>, clock: Arc<dyn Clock>, handle: u64) -> Self {
+        let rows = Rows {
+            state: Arc::clone(&state),
+            clock: Arc::clone(&clock),
+            handle,
+        };
         Self {
-            state: Arc::default(),
+            state,
             clock,
-            handle: 0,
+            handle,
+            claims: ClaimTable::new(rows),
         }
     }
 
@@ -209,49 +217,11 @@ impl InMemoryEventLog {
             state.handles += 1;
             state.handles
         };
-        Self {
-            state: Arc::clone(&self.state),
-            clock: Arc::clone(&self.clock),
-            handle,
-        }
+        Self::handle(Arc::clone(&self.state), Arc::clone(&self.clock), handle)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         lock(&self.state)
-    }
-
-    fn lease_until(&self) -> Timestamp {
-        self.clock.now() + DEFAULT_LEASE_TTL.as_millis() as Timestamp
-    }
-
-    fn claim_sync(&self, root: SessionId) -> Result<Claim, StorageError> {
-        let now = self.clock.now();
-        let mut state = self.state();
-        state.leases.insert(self.handle, self.lease_until());
-        let epoch = match state.held.get_mut(&(self.handle, root)) {
-            Some((epoch, claims)) => {
-                *claims += 1;
-                *epoch
-            }
-            None => {
-                if state.holder(root, self.handle, now).is_some() {
-                    return Err(StorageError::OwnedElsewhere { root });
-                }
-                let row = state.owners.entry(root).or_default();
-                row.0 += 1;
-                row.1 = Some(self.handle);
-                let epoch = row.0;
-                state.held.insert((self.handle, root), (epoch, 1));
-                epoch
-            }
-        };
-        let token = OwnerToken { root, epoch };
-        let release = Release {
-            state: Arc::clone(&self.state),
-            handle: self.handle,
-            token,
-        };
-        Ok(Claim::new(token, release))
     }
 
     fn append_sync(&self, entry: NewEntry) -> Result<LogId, StorageError> {
@@ -374,8 +344,10 @@ impl SessionStore for InMemoryEventLog {
     }
 
     fn claim(&self, root: SessionId) -> BoxFuture<'_, Result<Claim, StorageError>> {
-        let result = self.claim_sync(root);
-        Box::pin(async move { result })
+        self.state()
+            .leases
+            .insert(self.handle, lease_until(self.clock.as_ref()));
+        Box::pin(self.claims.claim(root))
     }
 
     fn owner(&self, root: SessionId) -> BoxFuture<'_, Result<Option<OwnerToken>, StorageError>> {
@@ -384,23 +356,7 @@ impl SessionStore for InMemoryEventLog {
     }
 
     fn renew(&self) -> BoxFuture<'_, Result<Vec<OwnerToken>, StorageError>> {
-        let mut state = self.state();
-        state.leases.insert(self.handle, self.lease_until());
-        let lost: Vec<OwnerToken> = state
-            .held
-            .iter()
-            .filter(|((handle, _), _)| *handle == self.handle)
-            .map(|((_, root), (epoch, _))| OwnerToken {
-                root: *root,
-                epoch: *epoch,
-            })
-            .filter(|token| !state.holds(self.handle, *token))
-            .collect();
-        for token in &lost {
-            state.held.remove(&(self.handle, token.root));
-        }
-        drop(state);
-        Box::pin(async move { Ok(lost) })
+        Box::pin(self.claims.renew())
     }
 
     /// Idle check, frontier CAS, delete and tombstone under one lock.
@@ -418,34 +374,55 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Drops one claim; the last one of its epoch releases the root, unless
-/// another process has taken it over since.
-struct Release {
-    state: Arc<Mutex<State>>,
-    handle: u64,
-    token: OwnerToken,
+fn lease_until(clock: &dyn Clock) -> Timestamp {
+    clock.now() + DEFAULT_LEASE_TTL.as_millis() as Timestamp
 }
 
-impl Drop for Release {
-    fn drop(&mut self) {
+/// One handle's owner-row operations for its claim table.
+struct Rows {
+    state: Arc<Mutex<State>>,
+    clock: Arc<dyn Clock>,
+    handle: u64,
+}
+
+impl ClaimRows for Rows {
+    fn claim(&self, root: SessionId) -> BoxFuture<'static, Result<u64, StorageError>> {
         let mut state = lock(&self.state);
-        let key = (self.handle, self.token.root);
-        let Some((epoch, claims)) = state.held.get_mut(&key) else {
-            return;
+        let result = if state.holder(root, self.handle, self.clock.now()).is_some() {
+            Err(StorageError::OwnedElsewhere { root })
+        } else {
+            let row = state.owners.entry(root).or_default();
+            row.0 += 1;
+            row.1 = Some(self.handle);
+            Ok(row.0)
         };
-        if *epoch != self.token.epoch {
-            return;
-        }
-        *claims -= 1;
-        if *claims > 0 {
-            return;
-        }
-        state.held.remove(&key);
-        if state.holds(self.handle, self.token)
-            && let Some((_, process)) = state.owners.get_mut(&self.token.root)
+        Box::pin(async move { result })
+    }
+
+    /// Unless another process has taken the root over since.
+    fn release(&self, token: OwnerToken) -> ReleaseWait {
+        let mut state = lock(&self.state);
+        if state.holds(self.handle, token)
+            && let Some((_, process)) = state.owners.get_mut(&token.root)
         {
             *process = None;
         }
+        Box::new(|| {})
+    }
+
+    fn renew(
+        &self,
+        held: Vec<OwnerToken>,
+    ) -> BoxFuture<'static, Result<Vec<OwnerToken>, StorageError>> {
+        let mut state = lock(&self.state);
+        state
+            .leases
+            .insert(self.handle, lease_until(self.clock.as_ref()));
+        let lost = held
+            .into_iter()
+            .filter(|token| !state.holds(self.handle, *token))
+            .collect();
+        Box::pin(async move { Ok(lost) })
     }
 }
 

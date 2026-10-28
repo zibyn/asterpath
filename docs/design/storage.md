@@ -234,7 +234,7 @@ COMMIT                                           -- FULL 下返回时已 fsync
 - **FULL 的承诺**：append 返回后，条目能扛进程崩溃**与掉电**。**NORMAL 的承诺**：能扛进程崩溃，掉电可能丢最近提交（Pi Durable 的取舍），只用于测试/开发。
 - **进程租约与属主行**（ADR-0036），不用文件锁：
   - 每个存储句柄打开时取一个随机进程 id。认领、续约、释放与退出清理都在 writer 线程上单独执行（不进批），各自一个 `BEGIN IMMEDIATE` 事务。
-  - 认领：续约本进程租约；读属主行与其进程的租约；属主是本进程 → 共享纪元；是别的进程且 `now < expires_at` → `OwnedElsewhere`；否则 `epoch + 1`、`process = 本进程`。同一句柄对同一根的多次认领在进程内引用计数，最后一个 `Claim` drop 时执行 `UPDATE ... SET process = NULL WHERE root=? AND epoch=? AND process=本进程`，提交后 drop 才返回，别的进程可以立即认领。调用方放弃等待时 writer 撤销它刚拿到的树。
+  - 认领：续约本进程租约；读属主行与其进程的租约；属主是本进程 → 共享纪元；是别的进程且 `now < expires_at` → `OwnedElsewhere`；否则 `epoch + 1`、`process = 本进程`。同一句柄对同一根的多次认领在进程内引用计数（计数与释放顺序由 protocol 的认领表 `ClaimTable` 持有，三个后端共用；后端只提供认领、释放、续约三个行操作），最后一个 `Claim` drop 时执行 `UPDATE ... SET process = NULL WHERE root=? AND epoch=? AND process=本进程`，提交后 drop 才返回，别的进程可以立即认领。调用方放弃等待时 writer 撤销它刚拿到的树。
   - 续约（`renew`）：`expires_at = now + lease_ttl`，顺带删除已过期的租约行（被 kill 的进程留下的），并逐个检查本句柄持有的认领：属主行不再是「本纪元 + 本进程」的报告为已失去。
   - 句柄 drop（正常退出）：writer 排空队列后删除本进程租约、把本进程名下的属主行置为已释放。
   - 到期用读者的墙钟判断（存储的 `Clock`）；部署要求时钟同步，偏差只让接管提前或推迟，正确性只靠纪元。
