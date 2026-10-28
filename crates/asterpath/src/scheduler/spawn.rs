@@ -24,7 +24,7 @@ use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
 use crate::agent::Agent;
 use crate::commit::CommitLog;
 use crate::fork;
-use crate::scan::{backend, scan_decoded};
+use crate::scan::{DecodedLog, backend, scan_decoded};
 use crate::waits::Waits;
 
 /// Consecutive child spawns; used for the depth check.
@@ -901,11 +901,8 @@ fn resolve_context(
 }
 
 /// The parent's fork snapshot at `at`, the spawn step's `StepStarted`.
-fn fork_snapshot_at(
-    entries: &[(LogEntry, SessionEvent)],
-    at: LogId,
-) -> Result<fork::Snapshot, ExecutionError> {
-    let prefix = fork::spawn_prefix(entries, at).ok_or_else(|| {
+fn fork_snapshot_at(entries: &DecodedLog, at: LogId) -> Result<fork::Snapshot, ExecutionError> {
+    let prefix = entries.step_prefix(at).ok_or_else(|| {
         backend(format!(
             "fork point LogId({}) is not in the parent log",
             at.as_i64()

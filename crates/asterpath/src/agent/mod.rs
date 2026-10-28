@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use asterpath_protocol::scan_all;
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalPolicy, CancelReason, CancelRegistration,
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
@@ -31,7 +30,7 @@ use asterpath_protocol::{
     ProviderErrorInfo, ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts,
     SessionState, StepCtx, StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName,
     ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup,
-    decode_entry, dedup, effective_config,
+    decode_entry, dedup,
 };
 use asterpath_protocol::{
     ApprovalGate, Clock, DedupKey, LogEntry, LogId, LogQuery, OwnerToken, SessionContext,
@@ -40,7 +39,7 @@ use asterpath_protocol::{
 use futures_core::Stream;
 
 use crate::commit::CommitLog;
-use crate::scan::scan_decoded;
+use crate::scan::DecodedLog;
 use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
 use crate::views::usage;
@@ -170,34 +169,37 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        let mut decoded = scan_decoded(&*self.log, session).await?;
+        let mut log = self.log.read(session).await?;
         // Only the immutable turn/compaction/subagent fields are read from
         // this; each step folds its own model and request (ADR-0030).
-        let config = config_at(session, &decoded, u64::MAX)?;
+        let config = config_at(&log, None)?;
 
-        let mut facts =
-            SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
+        let mut facts = log.facts();
 
         // R4: a child whose parent already stopped waiting is an orphan; close
         // its open intents as cancelled and never open another turn.
         if self.parent_recorded_completion(session, &facts).await? {
-            return self.close_orphan(session, &decoded, &facts, events).await;
+            return self.close_orphan(session, &log, &facts, events).await;
         }
 
         // A dangling compaction intent is redone only when a compactor is
         // assembled; otherwise it stays open and never blocks Idle.
-        if self.compactor.is_some()
-            && let Some(reason) = self.resolve_open_compaction(session, &facts).await?
-        {
-            decoded = scan_decoded(&*self.log, session).await?;
-            facts = SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)));
-            if let SessionState::TurnOpen { turn, step } = facts.state() {
-                if step.is_some()
-                    && let Some(open) = open_step(&facts, turn)
-                {
-                    self.commit_step(session, turn, open.step).await?;
+        if self.compactor.is_some() && facts.open_compactions().next().is_some() {
+            let reason = self.resolve_open_compaction(&log, &facts).await?;
+            // The redo appended its terminal: the step's attempt history
+            // read below must see it. `facts` keeps the pre-recovery
+            // frontier for `StreamResumed.from`.
+            log = self.log.read(session).await?;
+            if let Some(reason) = reason {
+                facts = log.facts();
+                if let SessionState::TurnOpen { turn, step } = facts.state() {
+                    if step.is_some()
+                        && let Some(open) = open_step(&facts, turn)
+                    {
+                        self.commit_step(session, turn, open.step).await?;
+                    }
+                    return self.commit_turn(session, turn, reason, events).await;
                 }
-                return self.commit_turn(session, turn, reason, events).await;
             }
         }
 
@@ -212,27 +214,29 @@ impl Agent {
                     .append_event(session, SessionEvent::TurnStarted { turn_id: turn }, None)
                     .await?;
                 events.push(Ok(AgentEvent::TurnStarted { turn }));
-                self.run_steps(session, &config, turn, None, cancel, events)
+                self.run_steps(session, &config, turn, 0, None, cancel, events)
                     .await
             }
             SessionState::TurnOpen { turn, .. } => {
-                self.recover(session, &facts, &config, turn, cancel, events)
+                self.recover(&log, &facts, &config, turn, cancel, events)
                     .await
             }
         }
     }
 
-    /// Resume from the committed prefix. Only open intents are handled; a
-    /// completed turn is never replayed from the session head.
+    /// Resume from the committed prefix `log`. Only open intents are handled;
+    /// a completed turn is never replayed from the session head.
     async fn recover(
         &self,
-        session: SessionId,
+        log: &DecodedLog,
         facts: &SessionFacts,
         config: &ConfigSnapshot,
         turn: TurnId,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
+        let session = log.session();
+        // `StreamResumed` changes nothing recovery reads, so `log` stays current.
         self.log
             .append_event(
                 session,
@@ -244,31 +248,24 @@ impl Agent {
             )
             .await?;
 
-        let current = scan_decoded(&*self.log, session).await?;
         let max_attempts = config.turn.max_attempts.get();
-        let Some(OpenStep {
-            step,
-            seq: watermark,
-            ..
-        }) = open_step(
-            &SessionFacts::fold_decoded(current.iter().map(|(entry, event)| (entry, event))),
-            turn,
-        )
-        else {
+        let prior_steps = steps_in_turn(log, turn);
+        let Some(OpenStep { step, .. }) = open_step(facts, turn) else {
             // Between steps: the last committed step decides whether the turn
             // goes on, exactly as it did live.
-            if let Some(reason) = committed_step_end(&current, turn, max_attempts, facts) {
+            if let Some(reason) = committed_step_end(log, turn, max_attempts, facts) {
                 return self.commit_turn(session, turn, reason, events).await;
             }
             return self
-                .run_steps(session, config, turn, None, cancel, events)
+                .run_steps(session, config, turn, prior_steps, None, cancel, events)
                 .await;
         };
+        let watermark = step_start(log, step)?;
 
-        if assistant_message(&current, turn, step).is_some() {
+        if assistant_message(log, turn, step).is_some() {
             // The model call is committed: never call it again.
             match self
-                .resume_step(session, watermark, turn, step, cancel, events)
+                .resume_step(log, watermark, turn, step, cancel, events)
                 .await?
             {
                 StepOutcome::Continue => {}
@@ -277,46 +274,46 @@ impl Agent {
                 }
             }
             return self
-                .run_steps(session, config, turn, None, cancel, events)
+                .run_steps(session, config, turn, prior_steps, None, cancel, events)
                 .await;
         }
 
         // The attempt policy replays the step's history. D3: a recorded
         // backoff is not waited out; D4: an attempt in flight after a
         // recorded abort is redone under the same number.
-        let (history, next) =
-            match attempt::replay(max_attempts, step_records(&current, turn, step)) {
-                Some(decided) => decided,
-                None => {
-                    // No attempt was ever decided: record the crash first.
-                    self.log
-                        .append_event(
-                            session,
-                            SessionEvent::ModelCallAborted {
-                                turn_id: turn,
-                                step_id: step,
-                                attempt: 1,
-                                kind: AbortKind::Crash,
-                                partial: None,
-                                model: config_at(session, &current, watermark)?.model,
-                                backoff_ms: 0,
-                                usage: None,
-                                error: None,
-                            },
-                            None,
-                        )
-                        .await?;
-                    let history = Attempts::FIRST;
-                    (
-                        history,
-                        attempt::after_failure(max_attempts, history, Failure::Crash),
+        let (history, next) = match attempt::replay(max_attempts, step_records(log, turn, step)) {
+            Some(decided) => decided,
+            None => {
+                // No attempt was ever decided: record the crash first.
+                self.log
+                    .append_event(
+                        session,
+                        SessionEvent::ModelCallAborted {
+                            turn_id: turn,
+                            step_id: step,
+                            attempt: 1,
+                            kind: AbortKind::Crash,
+                            partial: None,
+                            model: config_at(log, Some(watermark))?.model,
+                            backoff_ms: 0,
+                            usage: None,
+                            error: None,
+                        },
+                        None,
                     )
-                }
-            };
+                    .await?;
+                let history = Attempts::FIRST;
+                (
+                    history,
+                    attempt::after_failure(max_attempts, history, Failure::Crash),
+                )
+            }
+        };
         self.run_steps(
             session,
             config,
             turn,
+            prior_steps,
             Some(OpenAttempt {
                 step,
                 watermark,
@@ -340,8 +337,8 @@ impl Agent {
         let Some(parent) = facts.parent().map(|parent| parent.session) else {
             return Ok(false);
         };
-        let parent_decoded = scan_decoded(&*self.log, parent).await?;
-        Ok(parent_decoded.iter().any(|(_, event)| {
+        let parent_log = self.log.read(parent).await?;
+        Ok(parent_log.iter().any(|(_, event)| {
             matches!(
                 event,
                 SessionEvent::ChildSessionCompleted { child, .. } if *child == session
@@ -435,18 +432,13 @@ impl Agent {
         session: SessionId,
         config: &ConfigSnapshot,
         turn: TurnId,
+        prior_steps: u32,
         open: Option<OpenAttempt>,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let mut pending = open;
         let mut steps_started = 0u32;
-        // Steps of this turn already in the log; only read when hooks need it.
-        let prior_steps = if self.hooks.is_empty() {
-            0
-        } else {
-            self.steps_in_turn(session, turn).await?
-        };
         let mut auto_compactions = 0u32;
 
         loop {
@@ -463,8 +455,9 @@ impl Agent {
                     if self.compactor.is_some()
                         && auto_compactions < config.compaction.max_auto_compactions_per_turn
                     {
+                        let log = self.log.read(session).await?;
                         let (input, frontier) = self
-                            .compaction_input(session, CompactionTrigger::Threshold, u64::MAX)
+                            .compaction_input(&log, CompactionTrigger::Threshold, None)
                             .await?;
                         match self
                             .perform_compaction(session, input, frontier, Some(turn), None)
@@ -530,7 +523,7 @@ impl Agent {
                             .await;
                     }
                     let step = StepId::from_bytes(self.fresh_id());
-                    let log_id = self
+                    let watermark = self
                         .log
                         .append_event(
                             session,
@@ -541,11 +534,10 @@ impl Agent {
                             None,
                         )
                         .await?;
-                    let seq = self.seq_of(session, log_id).await?;
                     steps_started += 1;
                     OpenAttempt {
                         step,
-                        watermark: seq,
+                        watermark,
                         history: Attempts::FIRST,
                         next: Next::Retry {
                             attempt: 1,
@@ -562,21 +554,6 @@ impl Agent {
                 }
             }
         }
-    }
-
-    /// Steps of `turn` already recorded.
-    async fn steps_in_turn(&self, session: SessionId, turn: TurnId) -> Result<u32, AgentError> {
-        let mut count = 0;
-        for entry in scan_all(&*self.log, session).await? {
-            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            })?;
-            if matches!(event, SessionEvent::StepStarted { turn_id, .. } if turn_id == turn) {
-                count += 1;
-            }
-        }
-        Ok(count)
     }
 
     /// Application `before_step` hooks in order; the first `EndTurn` wins and an
@@ -616,14 +593,11 @@ impl Agent {
         } = open;
         // The step's effective config: changes recorded after its
         // `StepStarted` wait for the next step (ADR-0030).
-        let config = &config_at(
-            session,
-            &scan_decoded(&*self.log, session).await?,
-            watermark,
-        )?;
+        let log = self.log.read(session).await?;
+        let config = &config_at(&log, Some(watermark))?;
         // The projection is computed once per step; retries reuse it (L12).
         // A forced compaction re-projects the same step.
-        let (mut request, mut output) = self.build_request(session, config, watermark).await?;
+        let (mut request, mut output) = self.build_request(&log, config, Some(watermark)).await?;
         let max_attempts = config.turn.max_attempts.get();
 
         loop {
@@ -636,7 +610,9 @@ impl Agent {
                     history.compacted = true;
                     let forced = self.force_compact(session, turn, watermark).await?;
                     if forced == Forced::Applied {
-                        (request, output) = self.build_request(session, config, watermark).await?;
+                        let log = self.log.read(session).await?;
+                        (request, output) =
+                            self.build_request(&log, config, Some(watermark)).await?;
                     }
                     next = attempt::after_compaction(history, forced);
                     continue;
@@ -839,10 +815,11 @@ impl Agent {
         &self,
         session: SessionId,
         turn: TurnId,
-        watermark: u64,
+        watermark: LogId,
     ) -> Result<Forced, AgentError> {
+        let log = self.log.read(session).await?;
         let (input, frontier) = self
-            .compaction_input(session, CompactionTrigger::ProviderError, watermark)
+            .compaction_input(&log, CompactionTrigger::ProviderError, Some(watermark))
             .await?;
         Ok(
             match self
@@ -892,30 +869,17 @@ impl Agent {
     /// The calls run under the config at the step's `watermark`, as they did live.
     async fn resume_step(
         &self,
-        session: SessionId,
-        watermark: u64,
+        log: &DecodedLog,
+        watermark: LogId,
         turn: TurnId,
         step: StepId,
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<StepOutcome, AgentError> {
-        let decoded = scan_decoded(&*self.log, session).await?;
-        let config = &config_at(session, &decoded, watermark)?;
-        let (items, stop_reason) = decoded
-            .iter()
-            .find_map(|(_, event)| match event {
-                SessionEvent::AssistantMessage {
-                    turn_id,
-                    step_id,
-                    items,
-                    stop_reason,
-                    ..
-                } if *turn_id == turn && *step_id == step => {
-                    Some((items.clone(), stop_reason.clone()))
-                }
-                _ => None,
-            })
-            .ok_or_else(|| AgentError::Corrupt {
+        let session = log.session();
+        let config = &config_at(log, Some(watermark))?;
+        let (items, stop_reason) =
+            assistant_message(log, turn, step).ok_or_else(|| AgentError::Corrupt {
                 session,
                 detail: "open step has no AssistantMessage".to_owned(),
             })?;
@@ -925,6 +889,7 @@ impl Agent {
         // Upgrade by recording output_index on AssistantMessage items if applications
         // need to correlate resumed ToolStarted with pre-crash deltas.
         let indexed: Vec<(u32, Item)> = (0..).zip(items.iter().cloned()).collect();
+        let stop_reason = stop_reason.clone();
         // Recorded output intents are known by provenance; this only names
         // the output tool for calls whose intent is not recorded.
         let output = self
@@ -1042,11 +1007,7 @@ impl Agent {
     }
 
     async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
-        let decoded = scan_decoded(&*self.log, session).await?;
-        Ok(
-            SessionFacts::fold_decoded(decoded.iter().map(|(entry, event)| (entry, event)))
-                .has_pending_input(),
-        )
+        Ok(self.log.read(session).await?.facts().has_pending_input())
     }
 
     /// The format `config` delivers through the output tool for this model,
@@ -1056,32 +1017,21 @@ impl Agent {
         output::tool(&config.request, &provider.capabilities(&config.model))
     }
 
-    /// Project the log at the `StepStarted.seq` waterline. `CompactionApplied`
-    /// is a rewrite operator and is folded regardless of the waterline. Also
-    /// returns the output tool the request carries.
+    /// Project the step prefix at `watermark`, the step's `StepStarted`
+    /// (`None`: the whole log). Also returns the output tool the request
+    /// carries.
     async fn build_request(
         &self,
-        session: SessionId,
+        log: &DecodedLog,
         config: &ConfigSnapshot,
-        watermark: u64,
+        watermark: Option<LogId>,
     ) -> Result<(ModelRequest, Option<ToolName>), AgentError> {
-        let entries = scan_all(&*self.log, session).await?;
-        let mut visible = Vec::new();
-        let mut prefix_epoch = 0u32;
-        for entry in entries {
-            let event = decode_entry(&entry).map_err(|error| AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            })?;
-            match event {
-                SessionEvent::CompactionApplied { .. } => {
-                    prefix_epoch += 1;
-                    visible.push(entry);
-                }
-                _ if entry.seq < watermark => visible.push(entry),
-                _ => {}
-            }
-        }
+        let session = log.session();
+        let visible = visible(log, watermark)?;
+        let prefix_epoch = log
+            .iter()
+            .filter(|(_, event)| matches!(event, SessionEvent::CompactionApplied { .. }))
+            .count() as u32;
         // The baseline system, not `config.system`: appended instructions sit
         // in `items` at their place until a compaction rebases them (ADR-0030).
         let history =
@@ -1188,30 +1138,22 @@ impl Agent {
 
     /// Model calls plus compactions of one turn, folded from its own records.
     async fn turn_usage(&self, session: SessionId, turn: TurnId) -> Result<Usage, AgentError> {
-        let entries = scan_all(&*self.log, session).await?;
-        let start = entries
+        let log = self.log.read(session).await?;
+        let start = log
             .iter()
-            .rposition(|entry| {
-                matches!(decode_entry(entry), Ok(SessionEvent::TurnStarted { turn_id }) if turn_id == turn)
-            })
+            .rposition(
+                |(_, event)| matches!(event, SessionEvent::TurnStarted { turn_id } if *turn_id == turn),
+            )
             .unwrap_or(0);
-        usage::turn_usage(session, turn, &entries[start..]).map_err(|error| match error {
+        let entries: Vec<LogEntry> = log[start..]
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        usage::turn_usage(session, turn, &entries).map_err(|error| match error {
             UsageError::NotFound { session } => AgentError::NotFound { session },
             UsageError::Corrupt { session, detail } => AgentError::Corrupt { session, detail },
             other => AgentError::Storage(StorageError::Backend(other.to_string())),
         })
-    }
-
-    async fn seq_of(&self, session: SessionId, log_id: LogId) -> Result<u64, AgentError> {
-        scan_all(&*self.log, session)
-            .await?
-            .into_iter()
-            .find(|entry| entry.log_id == log_id)
-            .map(|entry| entry.seq)
-            .ok_or_else(|| AgentError::Corrupt {
-                session,
-                detail: "appended record is missing from the log".to_owned(),
-            })
     }
 }
 
@@ -1263,12 +1205,6 @@ impl Agent {
         session: SessionId,
     ) -> BoxFuture<'_, Result<CompactResult, AgentError>> {
         Box::pin(async move {
-            let entries = scan_decoded(&*self.log, session).await?;
-            if !SessionFacts::fold_decoded(entries.iter().map(|(entry, event)| (entry, event)))
-                .is_idle()
-            {
-                return Err(AgentError::Busy { session });
-            }
             // Share the drive single-flight; compact_now is turn-free.
             if !self.acquire(session) {
                 return Err(AgentError::Busy { session });
@@ -1277,8 +1213,12 @@ impl Agent {
                 busy: Arc::clone(&self.busy),
                 session,
             };
+            let log = self.log.read(session).await?;
+            if !log.facts().is_idle() {
+                return Err(AgentError::Busy { session });
+            }
             let (input, frontier) = self
-                .compaction_input(session, CompactionTrigger::Manual, u64::MAX)
+                .compaction_input(&log, CompactionTrigger::Manual, None)
                 .await?;
             match self
                 .perform_compaction(session, input, frontier, None, None)
@@ -1293,31 +1233,25 @@ impl Agent {
 
 /// Compaction machinery shared by all three triggers.
 impl Agent {
-    /// Build the compactor's planning input from the projection at `watermark`.
-    /// `CompactionApplied` is folded regardless of the watermark.
+    /// Build the compactor's planning input from the step prefix at
+    /// `watermark` (`None`: the whole log).
     async fn compaction_input(
         &self,
-        session: SessionId,
+        log: &DecodedLog,
         trigger: CompactionTrigger,
-        watermark: u64,
+        watermark: Option<LogId>,
     ) -> Result<(CompactionInput, LogId), AgentError> {
-        let decoded = scan_decoded(&*self.log, session).await?;
+        let session = log.session();
         // The effective model when the compaction runs, at the same watermark.
-        let config = config_at(session, &decoded, watermark)?;
-        let entries: Vec<LogEntry> = decoded.into_iter().map(|(entry, _)| entry).collect();
-        let frontier = entries
+        let config = config_at(log, watermark)?;
+        let frontier = log
             .last()
-            .map(|entry| entry.log_id)
+            .map(|(entry, _)| entry.log_id)
             .unwrap_or_else(|| LogId::from_i64(0));
-        let mut visible = Vec::new();
         let mut started: Vec<(StepId, LogId)> = Vec::new();
         let mut committed: HashSet<StepId> = HashSet::new();
-        for entry in &entries {
-            let event = decode_entry(entry).map_err(|error| AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            })?;
-            match &event {
+        for (entry, event) in log.iter() {
+            match event {
                 SessionEvent::StepStarted { step_id, .. } => {
                     started.push((*step_id, entry.log_id));
                 }
@@ -1326,15 +1260,13 @@ impl Agent {
                 }
                 _ => {}
             }
-            if matches!(event, SessionEvent::CompactionApplied { .. }) || entry.seq < watermark {
-                visible.push(entry.clone());
-            }
         }
-        let history =
-            asterpath_protocol::project(&visible).map_err(|error| AgentError::Corrupt {
+        let history = asterpath_protocol::project(&visible(log, watermark)?).map_err(|error| {
+            AgentError::Corrupt {
                 session,
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         let live: HashSet<LogId> = history
             .iter()
             .filter_map(|entry| match entry.origin {
@@ -1342,15 +1274,15 @@ impl Agent {
                 ProjectedOrigin::Summary(_) => None,
             })
             .collect();
-        let last_usage = entries
+        // Only records of the prefix are live, so this is the last model
+        // call the step sees.
+        let last_usage = log
             .iter()
-            .filter_map(|entry| match decode_entry(entry).ok()? {
-                SessionEvent::AssistantMessage { usage, .. }
-                    if entry.seq < watermark && live.contains(&entry.log_id) =>
-                {
+            .filter_map(|(entry, event)| match event {
+                SessionEvent::AssistantMessage { usage, .. } if live.contains(&entry.log_id) => {
                     Some(UsageAnchor {
                         origin: entry.log_id,
-                        usage,
+                        usage: *usage,
                     })
                 }
                 _ => None,
@@ -1362,7 +1294,7 @@ impl Agent {
             .map(|(_, log_id)| log_id)
             .collect();
         // Same log and watermark as `history`, so its items are `history`'s.
-        let (request, _) = self.build_request(session, &config, watermark).await?;
+        let (request, _) = self.build_request(log, &config, watermark).await?;
         Ok((
             CompactionInput {
                 trigger,
@@ -1486,9 +1418,10 @@ impl Agent {
     /// redo produced a terminal that must close the current turn.
     async fn resolve_open_compaction(
         &self,
-        session: SessionId,
+        log: &DecodedLog,
         facts: &SessionFacts,
     ) -> Result<Option<TurnEndReason>, AgentError> {
+        let session = log.session();
         let Some(open) = facts.open_compactions().max_by_key(|open| open.seq) else {
             return Ok(None);
         };
@@ -1496,10 +1429,10 @@ impl Agent {
         // D5: a forced (C5) compaction is redone at the open step's watermark,
         // as live; threshold and manual compactions see the whole log.
         let watermark = match (trigger, facts.open_step()) {
-            (CompactionTrigger::ProviderError, Some(step)) => step.seq,
-            _ => u64::MAX,
+            (CompactionTrigger::ProviderError, Some(step)) => Some(step_start(log, step.step)?),
+            _ => None,
         };
-        let (input, frontier) = self.compaction_input(session, trigger, watermark).await?;
+        let (input, frontier) = self.compaction_input(log, trigger, watermark).await?;
         match self
             .perform_compaction(session, input, frontier, None, Some(key))
             .await?
@@ -1650,19 +1583,50 @@ async fn caught<'a, T>(
     }
 }
 
-/// The effective config at `watermark`, via `effective_config`.
-fn config_at(
-    session: SessionId,
-    decoded: &[(LogEntry, SessionEvent)],
-    watermark: u64,
-) -> Result<ConfigSnapshot, AgentError> {
-    effective_config(decoded, watermark).ok_or_else(|| AgentError::Corrupt {
-        session,
+/// The effective config at `watermark`, a step's `StepStarted`; `None`
+/// applies every recorded change.
+fn config_at(log: &DecodedLog, watermark: Option<LogId>) -> Result<ConfigSnapshot, AgentError> {
+    match watermark {
+        Some(at) => log.config_at(at),
+        None => log.config(),
+    }
+    .ok_or_else(|| AgentError::Corrupt {
+        session: log.session(),
         detail: "session log has no SessionCreated".to_owned(),
     })
 }
 
-/// The open step of `turn`, with its `StepStarted.seq` waterline.
+/// The records a step at `watermark` sees: its step prefix, or with `None`
+/// the whole log.
+fn visible(log: &DecodedLog, watermark: Option<LogId>) -> Result<Vec<LogEntry>, AgentError> {
+    match watermark {
+        Some(at) => log.step_prefix(at).ok_or_else(|| missing_step(log)),
+        None => Ok(log.entries()),
+    }
+}
+
+/// The `StepStarted` of `step`, the step's watermark.
+fn step_start(log: &DecodedLog, step: StepId) -> Result<LogId, AgentError> {
+    log.step_started(step)
+        .map(|entry| entry.log_id)
+        .ok_or_else(|| missing_step(log))
+}
+
+fn missing_step(log: &DecodedLog) -> AgentError {
+    AgentError::Corrupt {
+        session: log.session(),
+        detail: "a step's StepStarted is missing from the log".to_owned(),
+    }
+}
+
+/// Steps of `turn` already recorded.
+fn steps_in_turn(log: &DecodedLog, turn: TurnId) -> u32 {
+    log.iter()
+        .filter(|(_, event)| matches!(event, SessionEvent::StepStarted { turn_id, .. } if *turn_id == turn))
+        .count() as u32
+}
+
+/// The open step of `turn`.
 fn open_step(facts: &SessionFacts, turn: TurnId) -> Option<OpenStep> {
     facts.open_step().filter(|open| open.turn == turn)
 }
@@ -1687,7 +1651,8 @@ struct StepCalls<'a> {
 /// the next action.
 struct OpenAttempt {
     step: StepId,
-    watermark: u64,
+    /// The step's `StepStarted`.
+    watermark: LogId,
     history: Attempts,
     next: Next,
 }
