@@ -7,62 +7,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use asterpath::{AsterError, Asterpath, OwnedSession, SessionHandle};
-use asterpath_app::approval::ApprovalModes;
+use asterpath_app::approval::{ApprovalMode, ApprovalModes};
 use asterpath_app::config;
 use asterpath_app::workspace::{
-    self, AGENT, NAME, STYLE, WorkRoot, Workspace, by_id_or_name, continued_root, in_root,
-    load_mcp, metadata, new_session_spec, work_root, workspace_tools,
+    self, AGENT, NAME, STYLE, SandboxMode, WorkRoot, Workspace, by_id_or_name, continued_root,
+    in_root, load_mcp, metadata, new_session_spec, work_root, workspace_tools,
 };
 use asterpath_mcp::{McpServers, ServerStatus};
 use asterpath_protocol::{
     CatalogEntry, ConfigPatch, ConfigSnapshot, ModelId, OutputFormat, SessionId, StorageError,
 };
 use asterpath_skills::SkillDiagnosticKind;
-use clap::{Args, ValueEnum};
+use clap::Args;
 
 use crate::{CliError, CliResult, GlobalArgs, aster_error};
 
 /// How many sessions the `-r` picker lists.
 const PICKER_SIZE: usize = 20;
-
-/// `-a`: the library's `config::ApprovalMode`, kept free of clap.
-#[derive(Clone, Copy, ValueEnum)]
-pub enum ApprovalMode {
-    /// Calls outside the sandbox and MCP tools ask
-    Untrusted,
-    /// Nothing asks; the sandbox is the only guard
-    Never,
-    /// Bash runs in a read-only sandbox; calls outside it are denied
-    ReadOnly,
-}
-
-impl From<ApprovalMode> for config::ApprovalMode {
-    fn from(mode: ApprovalMode) -> Self {
-        match mode {
-            ApprovalMode::Untrusted => Self::Untrusted,
-            ApprovalMode::Never => Self::Never,
-            ApprovalMode::ReadOnly => Self::ReadOnly,
-        }
-    }
-}
-
-/// `-s`: the library's `SandboxMode`.
-#[derive(Clone, Copy, ValueEnum)]
-pub enum SandboxMode {
-    ReadOnly,
-    WorkspaceWrite,
-    FullAccess,
-}
-
-impl From<SandboxMode> for asterpath_app::workspace::SandboxMode {
-    fn from(mode: SandboxMode) -> Self {
-        match mode {
-            SandboxMode::ReadOnly => Self::ReadOnly,
-            SandboxMode::WorkspaceWrite => Self::WorkspaceWrite,
-            SandboxMode::FullAccess => Self::FullAccess,
-        }
-    }
-}
 
 /// Options of the session-running commands (interactive and `exec`).
 #[derive(Args)]
@@ -174,10 +135,10 @@ pub async fn open(
     args.check()?;
     let mut settings = global.settings()?;
     if let Some(mode) = args.approval {
-        settings.approval = mode.into();
+        settings.approval = mode;
     }
     if let Some(mode) = args.sandbox {
-        settings.set_sandbox(mode.into());
+        settings.set_sandbox(mode);
     }
     let explicit_root = args
         .cd

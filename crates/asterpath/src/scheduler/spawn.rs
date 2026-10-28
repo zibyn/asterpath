@@ -9,7 +9,7 @@ use asterpath_protocol::{
     AgentError, AgentProfile, CancelReason, CancellationRegistry, ChildFailure, ChildOutcome,
     ConfigSnapshot, ContextPolicy, ForkSource, Item, ModelAlias, ModelSpec, ParentRef, Part, Role,
     RunRequest, RunTrigger, SessionEvent, SessionFacts, SubagentConfig, Summary, TurnEndReason,
-    dedup, effective_config, encode_entry,
+    dedup, effective_config,
 };
 use asterpath_protocol::{
     Clock, ExecutionError, LogEntry, LogId, SessionId, SessionStore, Timestamp, ToolCallId,
@@ -22,6 +22,7 @@ use futures_util::StreamExt;
 use super::tool::SPAWN_TOOL_NAME;
 use super::{ChildRef, SpawnError, SpawnRequest, WaitError};
 use crate::agent::Agent;
+use crate::commit::CommitLog;
 use crate::fork;
 use crate::scan::{backend, scan_decoded};
 use crate::waits::Waits;
@@ -33,7 +34,7 @@ const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("no
 const MAX_PARENT_CHAIN: u8 = 64;
 
 pub(crate) struct Scheduler {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
     waits: Arc<Waits>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
     clock: Arc<dyn Clock>,
@@ -65,7 +66,7 @@ struct ParentAdmission {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn with_defaults(
-        log: Arc<dyn SessionStore>,
+        log: Arc<CommitLog>,
         waits: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
     ) -> Self {
@@ -82,7 +83,7 @@ impl Scheduler {
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
     pub(crate) fn new(
-        log: Arc<dyn SessionStore>,
+        log: Arc<CommitLog>,
         waits: Arc<Waits>,
         aliases: BTreeMap<ModelAlias, ModelSpec>,
         clock: Arc<dyn Clock>,
@@ -107,14 +108,10 @@ impl Scheduler {
         Arc::clone(&self.cancellations)
     }
 
-    async fn append(
-        &self,
-        session: SessionId,
-        event: SessionEvent,
-        key: Option<asterpath_protocol::DedupKey>,
-    ) -> Result<LogId, ExecutionError> {
-        let entry = encode_entry(session, key, &event).map_err(backend)?;
-        self.log.append(entry).await.map_err(backend)
+    /// The log and waits child drives must share with this scheduler.
+    #[cfg(test)]
+    pub(crate) fn wiring(&self) -> (Arc<CommitLog>, Arc<Waits>) {
+        (Arc::clone(&self.log), Arc::clone(&self.waits))
     }
 
     /// The parent `ToolCallRequested` log id for a spawn tool call.
@@ -336,21 +333,22 @@ impl Scheduler {
             let deadline = timeout.map(|timeout| {
                 now.saturating_add(i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX))
             });
-            self.append(
-                req.parent.session,
-                SessionEvent::ChildSessionSpawned {
-                    child,
-                    task: req.task.clone(),
-                    config: config.clone(),
-                    context: context.clone(),
-                    parent_tool_call_id: req.parent.tool_call,
-                    caused_by: req.caused_by,
-                    deadline,
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await
-            .map_err(SpawnError::Execution)?;
+            self.log
+                .append_event(
+                    req.parent.session,
+                    SessionEvent::ChildSessionSpawned {
+                        child,
+                        task: req.task.clone(),
+                        config: config.clone(),
+                        context: context.clone(),
+                        parent_tool_call_id: req.parent.tool_call,
+                        caused_by: req.caused_by,
+                        deadline,
+                    },
+                    Some(dedup::child_session(child)),
+                )
+                .await
+                .map_err(|error| SpawnError::Execution(error.into()))?;
 
             self.materialize(req.parent.clone(), child, &req.task, &config, &context)
                 .await
@@ -786,17 +784,18 @@ impl Scheduler {
             }
             Some(_) => {}
             None => {
-                self.append(
-                    child,
-                    SessionEvent::SessionCreated {
-                        config: config.clone(),
-                        parent: Some(parent.clone()),
-                        // Children never inherit session metadata (ADR-0032).
-                        metadata: Default::default(),
-                    },
-                    Some(dedup::session_created(child)),
-                )
-                .await?;
+                self.log
+                    .append_event(
+                        child,
+                        SessionEvent::SessionCreated {
+                            config: config.clone(),
+                            parent: Some(parent.clone()),
+                            // Children never inherit session metadata (ADR-0032).
+                            metadata: Default::default(),
+                        },
+                        Some(dedup::session_created(child)),
+                    )
+                    .await?;
             }
         }
 
@@ -808,30 +807,32 @@ impl Scheduler {
                 .any(|(_, event)| matches!(event, SessionEvent::ContextForked { .. }))
         {
             let items = self.fork_snapshot(parent.clone(), *at).await?;
-            self.append(
-                child,
-                SessionEvent::ContextForked {
-                    source: ForkSource::Spawn(parent),
-                    source_log: *at,
-                    items,
-                },
-                Some(dedup::context_forked(child)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    child,
+                    SessionEvent::ContextForked {
+                        source: ForkSource::Spawn(parent),
+                        source_log: *at,
+                        items,
+                    },
+                    Some(dedup::context_forked(child)),
+                )
+                .await?;
         }
 
         if !events
             .iter()
             .any(|(_, event)| matches!(event, SessionEvent::InputRecorded { .. }))
         {
-            self.append(
-                child,
-                SessionEvent::InputRecorded {
-                    input: task.to_vec(),
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    child,
+                    SessionEvent::InputRecorded {
+                        input: task.to_vec(),
+                    },
+                    Some(dedup::child_session(child)),
+                )
+                .await?;
         }
 
         // TurnStarted is deliberately not written here: the agent loop opens the
@@ -845,16 +846,17 @@ impl Scheduler {
         child: &ChildRef,
         outcome: ChildOutcome,
     ) -> Result<(), WaitError> {
-        self.append(
-            child.parent.session,
-            SessionEvent::ChildSessionCompleted {
-                child: child.child,
-                outcome,
-            },
-            Some(dedup::child_session(child.child)),
-        )
-        .await
-        .map_err(WaitError::Execution)?;
+        self.log
+            .append_event(
+                child.parent.session,
+                SessionEvent::ChildSessionCompleted {
+                    child: child.child,
+                    outcome,
+                },
+                Some(dedup::child_session(child.child)),
+            )
+            .await
+            .map_err(|error| WaitError::Execution(error.into()))?;
         self.release_slot(child.parent.session, child.parent.tool_call);
         self.waits.wake_child(child.child);
         Ok(())

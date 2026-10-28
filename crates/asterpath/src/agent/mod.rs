@@ -39,6 +39,7 @@ use asterpath_protocol::{
 };
 use futures_core::Stream;
 
+use crate::commit::CommitLog;
 use crate::scan::scan_decoded;
 use crate::scheduler::Scheduler;
 use crate::tools::ToolTable;
@@ -56,7 +57,7 @@ const MAX_FORK_CHAIN: usize = 64;
 
 /// The turn driver.
 pub(crate) struct Agent {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
     providers: Arc<ProviderCatalog>,
     pipeline: ToolPipeline,
     clock: Arc<dyn Clock>,
@@ -80,7 +81,7 @@ impl Agent {
     /// module never constructs them, so approval waits are real.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        log: Arc<dyn SessionStore>,
+        log: Arc<CommitLog>,
         providers: Arc<ProviderCatalog>,
         tools: Arc<ToolTable>,
         tool_config: ToolConfig,
@@ -169,21 +170,6 @@ impl Agent {
             .insert(session)
     }
 
-    async fn append(
-        &self,
-        session: SessionId,
-        event: SessionEvent,
-        key: Option<DedupKey>,
-    ) -> Result<LogId, AgentError> {
-        let entry = asterpath_protocol::encode_entry(session, key, &event).map_err(|error| {
-            AgentError::Corrupt {
-                session,
-                detail: error.to_string(),
-            }
-        })?;
-        Ok(self.log.append(entry).await?)
-    }
-
     async fn execute(&self, session: SessionId, cancel: &CancelToken, events: &EventSink) {
         if let Err(error) = self.execute_inner(session, cancel, events).await {
             events.push(Err(error));
@@ -234,7 +220,8 @@ impl Agent {
                     return Ok(());
                 }
                 let turn = TurnId::from_bytes(self.fresh_id());
-                self.append(session, SessionEvent::TurnStarted { turn_id: turn }, None)
+                self.log
+                    .append_event(session, SessionEvent::TurnStarted { turn_id: turn }, None)
                     .await?;
                 events.push(Ok(AgentEvent::TurnStarted { turn }));
                 self.run_steps(session, &config, turn, None, cancel, events)
@@ -258,15 +245,16 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::StreamResumed {
-                from: last_log_id(facts),
-                reason: ResumeReason::Crash,
-            },
-            None,
-        )
-        .await?;
+        self.log
+            .append_event(
+                session,
+                SessionEvent::StreamResumed {
+                    from: last_log_id(facts),
+                    reason: ResumeReason::Crash,
+                },
+                None,
+            )
+            .await?;
 
         let current = scan_decoded(&*self.log, session).await?;
         let max_attempts = config.turn.max_attempts.get();
@@ -313,22 +301,23 @@ impl Agent {
                 Some(decided) => decided,
                 None => {
                     // No attempt was ever decided: record the crash first.
-                    self.append(
-                        session,
-                        SessionEvent::ModelCallAborted {
-                            turn_id: turn,
-                            step_id: step,
-                            attempt: 1,
-                            kind: AbortKind::Crash,
-                            partial: None,
-                            model: config_at(session, &current, watermark)?.model,
-                            backoff_ms: 0,
-                            usage: None,
-                            error: None,
-                        },
-                        None,
-                    )
-                    .await?;
+                    self.log
+                        .append_event(
+                            session,
+                            SessionEvent::ModelCallAborted {
+                                turn_id: turn,
+                                step_id: step,
+                                attempt: 1,
+                                kind: AbortKind::Crash,
+                                partial: None,
+                                model: config_at(session, &current, watermark)?.model,
+                                backoff_ms: 0,
+                                usage: None,
+                                error: None,
+                            },
+                            None,
+                        )
+                        .await?;
                     let history = Attempts::FIRST;
                     (
                         history,
@@ -386,15 +375,16 @@ impl Agent {
             events.push(Ok(AgentEvent::Idle { session }));
             return Ok(());
         };
-        self.append(
-            session,
-            SessionEvent::StreamResumed {
-                from: last_log_id(facts),
-                reason: ResumeReason::Crash,
-            },
-            None,
-        )
-        .await?;
+        self.log
+            .append_event(
+                session,
+                SessionEvent::StreamResumed {
+                    from: last_log_id(facts),
+                    reason: ResumeReason::Crash,
+                },
+                None,
+            )
+            .await?;
 
         for (tool_call_id, tool) in facts.open_tools() {
             // Never run in this process: announced, then closed, like any
@@ -408,18 +398,19 @@ impl Agent {
                 tool: tool.name.clone(),
                 args,
             }));
-            self.append(
-                session,
-                SessionEvent::ToolResult {
-                    tool_call_id,
-                    status: ToolResultStatus::Interrupted,
-                    output: None,
-                    error: None,
-                    truncated: false,
-                },
-                Some(dedup::tool_result(tool_call_id)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    session,
+                    SessionEvent::ToolResult {
+                        tool_call_id,
+                        status: ToolResultStatus::Interrupted,
+                        output: None,
+                        error: None,
+                        truncated: false,
+                    },
+                    Some(dedup::tool_result(tool_call_id)),
+                )
+                .await?;
             events.push(Ok(AgentEvent::ToolFinished {
                 turn: tool.turn,
                 step: tool.step,
@@ -430,17 +421,18 @@ impl Agent {
             }));
         }
         for (child, _) in facts.open_children() {
-            self.append(
-                session,
-                SessionEvent::ChildSessionCompleted {
-                    child,
-                    outcome: ChildOutcome::Cancelled {
-                        reason: CancelReason::Parent,
+            self.log
+                .append_event(
+                    session,
+                    SessionEvent::ChildSessionCompleted {
+                        child,
+                        outcome: ChildOutcome::Cancelled {
+                            reason: CancelReason::Parent,
+                        },
                     },
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await?;
+                    Some(dedup::child_session(child)),
+                )
+                .await?;
         }
         if let Some(open) = open_step(facts, turn) {
             self.commit_step(session, turn, open.step).await?;
@@ -551,7 +543,8 @@ impl Agent {
                     }
                     let step = StepId::from_bytes(self.fresh_id());
                     let log_id = self
-                        .append(
+                        .log
+                        .append_event(
                             session,
                             SessionEvent::StepStarted {
                                 turn_id: turn,
@@ -743,20 +736,21 @@ impl Agent {
             if let Some((stop_reason, usage)) = terminal {
                 let indexed: Vec<(u32, Item)> = completed.into_iter().collect();
                 let items: Vec<Item> = indexed.iter().map(|(_, item)| item.clone()).collect();
-                self.append(
-                    session,
-                    SessionEvent::AssistantMessage {
-                        turn_id: turn,
-                        step_id: step,
-                        items: items.clone(),
-                        raw: None,
-                        model: config.model.clone(),
-                        usage,
-                        stop_reason: stop_reason.clone(),
-                    },
-                    Some(dedup::assistant_message(turn, step)),
-                )
-                .await?;
+                self.log
+                    .append_event(
+                        session,
+                        SessionEvent::AssistantMessage {
+                            turn_id: turn,
+                            step_id: step,
+                            items: items.clone(),
+                            raw: None,
+                            model: config.model.clone(),
+                            usage,
+                            stop_reason: stop_reason.clone(),
+                        },
+                        Some(dedup::assistant_message(turn, step)),
+                    )
+                    .await?;
 
                 let calls = StepCalls {
                     recovering: false,
@@ -804,26 +798,27 @@ impl Agent {
                 Some(completed.into_values().collect())
             };
 
-            self.append(
-                session,
-                SessionEvent::ModelCallAborted {
-                    turn_id: turn,
-                    step_id: step,
-                    attempt,
-                    kind: if error.retryable {
-                        AbortKind::Transport
-                    } else {
-                        AbortKind::Rejected
+            self.log
+                .append_event(
+                    session,
+                    SessionEvent::ModelCallAborted {
+                        turn_id: turn,
+                        step_id: step,
+                        attempt,
+                        kind: if error.retryable {
+                            AbortKind::Transport
+                        } else {
+                            AbortKind::Rejected
+                        },
+                        partial,
+                        model: config.model.clone(),
+                        backoff_ms: backoff.as_millis() as u64,
+                        usage: error.partial_usage,
+                        error: Some(ProviderErrorInfo::from(&error)),
                     },
-                    partial,
-                    model: config.model.clone(),
-                    backoff_ms: backoff.as_millis() as u64,
-                    usage: error.partial_usage,
-                    error: Some(ProviderErrorInfo::from(&error)),
-                },
-                None,
-            )
-            .await?;
+                    None,
+                )
+                .await?;
 
             match &next {
                 Next::End(_) if cancel.is_cancelled() => {
@@ -884,23 +879,24 @@ impl Agent {
         attempt: u32,
         partial: Option<Vec<Item>>,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::ModelCallAborted {
-                turn_id: turn,
-                step_id: step,
-                attempt,
-                kind: AbortKind::Cancelled,
-                partial,
-                model: config.model.clone(),
-                backoff_ms: 0,
-                usage: None,
-                error: None,
-            },
-            None,
-        )
-        .await
-        .map(|_| ())
+        self.log
+            .append_event(
+                session,
+                SessionEvent::ModelCallAborted {
+                    turn_id: turn,
+                    step_id: step,
+                    attempt,
+                    kind: AbortKind::Cancelled,
+                    partial,
+                    model: config.model.clone(),
+                    backoff_ms: 0,
+                    usage: None,
+                    error: None,
+                },
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Finish an open step whose `AssistantMessage` is already committed: run
@@ -1049,16 +1045,17 @@ impl Agent {
         turn: TurnId,
         step: StepId,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::StepCommitted {
-                turn_id: turn,
-                step_id: step,
-            },
-            Some(dedup::step_committed(step)),
-        )
-        .await
-        .map(|_| ())
+        self.log
+            .append_event(
+                session,
+                SessionEvent::StepCommitted {
+                    turn_id: turn,
+                    step_id: step,
+                },
+                Some(dedup::step_committed(step)),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn pending_input(&self, session: SessionId) -> Result<bool, AgentError> {
@@ -1187,15 +1184,16 @@ impl Agent {
         reason: TurnEndReason,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::TurnCommitted {
-                turn_id: turn,
-                reason: reason.clone(),
-            },
-            Some(dedup::turn_committed(turn)),
-        )
-        .await?;
+        self.log
+            .append_event(
+                session,
+                SessionEvent::TurnCommitted {
+                    turn_id: turn,
+                    reason: reason.clone(),
+                },
+                Some(dedup::turn_committed(turn)),
+            )
+            .await?;
         let usage = self.turn_usage(session, turn).await?;
         events.push(Ok(AgentEvent::TurnCommitted {
             turn,
@@ -1424,17 +1422,18 @@ impl Agent {
         let recording_intent = existing_key.is_none();
         let key = existing_key.unwrap_or_else(|| dedup::compaction(frontier));
         if recording_intent {
-            self.append(
-                session,
-                SessionEvent::CompactionStarted {
-                    trigger: input.trigger,
-                    replaces_from: job.replaces.first,
-                    caused_by: frontier,
-                    turn,
-                },
-                Some(key.clone()),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    session,
+                    SessionEvent::CompactionStarted {
+                        trigger: input.trigger,
+                        replaces_from: job.replaces.first,
+                        caused_by: frontier,
+                        turn,
+                    },
+                    Some(key.clone()),
+                )
+                .await?;
         }
         job.session = Some(self.session_context(session).await?);
         match compactor.compact(job).await {
@@ -1467,20 +1466,21 @@ impl Agent {
         outcome: &CompactionOutcome,
         key: DedupKey,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::CompactionApplied {
-                first_kept: outcome.first_kept,
-                summary: outcome.summary.clone(),
-                replaces: outcome.replaces,
-                model: outcome.model.clone(),
-                usage: outcome.usage,
-                raw: outcome.raw.clone(),
-            },
-            Some(key),
-        )
-        .await
-        .map(|_| ())
+        self.log
+            .append_event(
+                session,
+                SessionEvent::CompactionApplied {
+                    first_kept: outcome.first_kept,
+                    summary: outcome.summary.clone(),
+                    replaces: outcome.replaces,
+                    model: outcome.model.clone(),
+                    usage: outcome.usage,
+                    raw: outcome.raw.clone(),
+                },
+                Some(key),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn append_aborted(
@@ -1489,13 +1489,14 @@ impl Agent {
         reason: CompactionAbortReason,
         key: DedupKey,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::CompactionAborted { reason },
-            Some(key),
-        )
-        .await
-        .map(|_| ())
+        self.log
+            .append_event(
+                session,
+                SessionEvent::CompactionAborted { reason },
+                Some(key),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Redo an open `CompactionStarted`. Returns the turn end reason when the

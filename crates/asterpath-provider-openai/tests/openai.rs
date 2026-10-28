@@ -830,26 +830,40 @@ async fn reasoning_is_dropped_and_traced_when_binding_does_not_match() {
     let raw_item = r#"{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA"}"#;
     let cases = [
         (
-            ReasoningBinding {
-                provider: ProviderId::new("other"),
-                model: ModelId::new("gpt-5"),
-                prefix_epoch: 0,
-                tools_hash: "x".to_owned(),
+            reasoning_item(
+                ReasoningBinding {
+                    provider: ProviderId::new("other"),
+                    model: ModelId::new("gpt-5"),
+                    prefix_epoch: 0,
+                    tools_hash: "x".to_owned(),
+                },
+                raw_item,
+            ),
+            "cross_provider",
+        ),
+        // The raw's own provider is checked too, not only the binding's.
+        (
+            Item::Reasoning {
+                summary: Vec::new(),
+                binding: binding("gpt-5", 0, "x"),
+                raw: raw_data("other", "openai.reasoning", raw_item),
             },
             "cross_provider",
         ),
-        (binding("gpt-4", 0, "x"), "model_mismatch"),
-        (binding("gpt-5", 1, "x"), "prefix_epoch_mismatch"),
+        (
+            reasoning_item(binding("gpt-4", 0, "x"), raw_item),
+            "model_mismatch",
+        ),
+        (
+            reasoning_item(binding("gpt-5", 1, "x"), raw_item),
+            "prefix_epoch_mismatch",
+        ),
     ];
-    for (binding, reason) in cases {
+    for (item, reason) in cases {
         let server = MockServer::start(vec![MockResponse::sse(completed_text_body("ok"))]);
         let sink = std::sync::Arc::new(RecordingSink::default());
         let provider = provider(&server).with_trace_sink(sink.clone());
-        let events = collect(
-            &provider,
-            request(vec![user_text("go"), reasoning_item(binding, raw_item)]),
-        )
-        .await;
+        let events = collect(&provider, request(vec![user_text("go"), item])).await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         assert!(
             !server.requests()[0].body.contains(raw_item),
@@ -1440,6 +1454,41 @@ async fn unsupported_requests_fail_before_http_without_dropping_fields() {
     assert!(
         server.requests().is_empty(),
         "capability failures must not reach HTTP"
+    );
+}
+
+#[tokio::test]
+async fn invalid_requests_fail_before_http() {
+    let server = MockServer::start(Vec::new());
+    let provider = provider(&server);
+
+    let mut other_provider = request(vec![user_text("go")]);
+    other_provider.spec.provider = ProviderId::new("other");
+    let non_text_instruction = request(vec![
+        user_text("go"),
+        Item::Instruction {
+            key: None,
+            parts: vec![Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::Base64 {
+                    data: "AAAA".to_owned(),
+                },
+            }],
+        },
+    ]);
+
+    for request in [other_provider, non_text_instruction] {
+        let events = collect(&provider, request).await;
+        let errors: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect();
+        assert_eq!(errors.len(), 1, "{events:?}");
+        assert_eq!(errors[0].kind, ProviderErrorKind::InvalidRequest);
+    }
+    assert!(
+        server.requests().is_empty(),
+        "invalid requests must not reach HTTP"
     );
 }
 

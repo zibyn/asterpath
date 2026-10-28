@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::commit::CommitLog;
 use crate::waits::Waits;
 use asterpath_protocol::{
     ApprovalDecision, CancelReason, ChildOutcome, LogQuery, SessionId, SessionStore, ToolCallId,
@@ -20,7 +21,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let log = Arc::new(InMemoryEventLog::new());
-    let waits = Arc::new(Waits::new(log.clone()));
+    let waits = Arc::new(Waits::new(CommitLog::for_tests(log.clone())));
     Fixture { log, waits }
 }
 

@@ -23,15 +23,16 @@ use asterpath_protocol::{
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 
+use crate::commit::CommitLog;
 use crate::scan::scan_decoded;
 
 /// Pull seam: folds one session's log per request.
 pub(crate) struct TracingQuery {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
 }
 
 impl TracingQuery {
-    pub(crate) fn new(log: Arc<dyn SessionStore>) -> Self {
+    pub(crate) fn new(log: Arc<CommitLog>) -> Self {
         Self { log }
     }
 }

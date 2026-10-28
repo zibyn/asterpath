@@ -8,6 +8,7 @@ use std::time::Duration;
 use super::support::{SESSION, append, decoded, descriptor, text, tool_call, tool_table};
 use crate::agent::EventSink;
 use crate::agent::pipeline::{ToolOutcome, ToolPipeline, ToolStep};
+use crate::commit::CommitLog;
 use crate::waits::Waits;
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CancelReason,
@@ -16,9 +17,7 @@ use asterpath_protocol::{
     ToolCallCtx, ToolConfig, ToolDescriptor, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName,
     ToolOutput, ToolResultStatus, ToolResultView, dedup,
 };
-use asterpath_protocol::{
-    ApprovalGate, LogId, SessionId, SessionStore, StepId, ToolCallId, TurnId,
-};
+use asterpath_protocol::{ApprovalGate, LogId, SessionId, StepId, ToolCallId, TurnId};
 use asterpath_testing::{InMemoryEventLog, ManualClock, TestTool};
 use futures_core::future::BoxFuture;
 
@@ -28,6 +27,8 @@ const RECORDED: ToolCallId = ToolCallId::from_bytes([3; 16]);
 
 struct Harness {
     log: Arc<InMemoryEventLog>,
+    /// The engine's append entry over `log`, shared by the pipeline and `waits`.
+    commit: Arc<CommitLog>,
     gate: Arc<ApprovalGate>,
     waits: Arc<Waits>,
     tools: Vec<Arc<dyn Tool>>,
@@ -51,9 +52,11 @@ impl Harness {
             None,
         )
         .await;
-        let waits = Arc::new(Waits::new(log.clone()));
+        let commit = CommitLog::for_tests(log.clone());
+        let waits = Arc::new(Waits::new(Arc::clone(&commit)));
         Self {
             log,
+            commit,
             gate: Arc::new(ApprovalGate::new()),
             waits,
             tools,
@@ -116,13 +119,12 @@ impl Harness {
     }
 
     fn pipeline(&self) -> ToolPipeline {
-        let log: Arc<dyn SessionStore> = self.log.clone();
         let policy = self
             .policy
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultApprovalPolicy));
         ToolPipeline::new(
-            log,
+            Arc::clone(&self.commit),
             tool_table(self.tools.clone()),
             self.config.clone(),
             policy,

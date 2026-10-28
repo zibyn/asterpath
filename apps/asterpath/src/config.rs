@@ -25,23 +25,9 @@ use asterpath_protocol::{
 use asterpath_skills::{SkillRoot, SkillRootLabel};
 use serde::Deserialize;
 
-use crate::approval::ApprovalModes;
 use crate::approval::rules::CommandRules;
+use crate::approval::{ApprovalMode, ApprovalModes};
 use crate::workspace::{SandboxBackend, SandboxMode, WorkRoot, Workspace, WorkspaceError};
-
-/// `-a` and `[approval] default`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalMode {
-    /// Calls outside the sandbox and external tools ask (ADR-0055).
-    #[default]
-    Untrusted,
-    /// Never ask; the sandbox, if any, is the only guard.
-    Never,
-    /// `bash` runs in a read-only sandbox; calls outside it are denied.
-    #[serde(rename = "read-only")]
-    ReadOnly,
-}
 
 /// The file with `-c` overrides merged in, then the dedicated flags.
 #[derive(Clone)]
@@ -153,10 +139,10 @@ pub const TEMPLATE: &str = r#"# asterpath configuration. Uncomment and edit; `as
 # mode = "workspace-write"        # read-only | workspace-write | full-access
 
 # [approval]
-# untrusted: calls outside the sandbox and MCP tools ask
-# never:     nothing asks; the sandbox is the only guard
 # read-only: bash runs in a read-only sandbox; calls outside it are denied
-# default = "untrusted"           # untrusted | never | read-only
+# ask:       calls outside the sandbox and MCP tools ask
+# allow:     nothing asks; the sandbox is the only guard
+# default = "ask"                 # read-only | ask | allow
 # Command rules: `tool` or `bash(command prefix)`; deny > ask > allow.
 # Deny and ask hold inside the sandbox too; allow only skips a question.
 # deny = ["bash(git push --force)"]
