@@ -127,6 +127,10 @@ _Avoid_: 事件
 实现 `Provider` 契约、在规范模型与某个协议（Anthropic Messages、OpenAI Responses）的传输格式之间双向映射的适配器 crate；每个供应商端点是它的一个 provider 实例（ADR-0029）。
 _Avoid_: provider 客户端、SDK 包装
 
+**流式调用（Streamed Call）**：
+一次模型请求的 HTTP 往返：发送、按状态分类错误、解码 SSE、检测截断与读失败、到终止事件即停止。由 asterpath-http 提供；协议适配器只自备请求构造、逐事件归一化与错误体分类。
+_Avoid_: HTTP 客户端、SSE 包装、流驱动
+
 **provider 实例（Provider Instance）**：
 协议适配器的一个实例，对应一个供应商端点：协议 + 端点 + key + 模型规则，以自己的 `ProviderId` 注册；同 provider 回放按实例 id 门控（ADR-0029）。
 _Avoid_: 把 provider id 当作协议名
