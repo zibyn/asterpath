@@ -76,7 +76,15 @@ pub trait Hooks: Send + Sync {
 
 ### 3.2 单一 append 入口
 
-agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由应用在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
+agent、waits、scheduler 与 facade 都经引擎内同一个 append 入口（`commit::CommitLog`，即提交日志）写日志：append 成功 → 依次 `on_record`。没有注册钩子时不做任何观察工作。没有 trace 推送：实时导出由应用在 `on_record` 上自行增量折叠（ADR-0026 重审候选 4）。
+
+提交日志的 interface（#202）：
+
+- **追加**：`append_event(session, event: SessionEvent, key: Option<DedupKey>) -> Result<LogId, AppendError>`。编码只在这里发生（引擎内非测试代码不再调用 `encode_entry`）。dedup key 由调用方显式给；重放已提交的 key 返回原记录的 log id，不再 `on_record`。
+- **属主**：在 drive / 压缩被 poll 期间的写入盖上该认领的 owner（ADR-0036）；已失去的认领在本地即拒绝为 `OwnedElsewhere`，存储报 `OwnedElsewhere` 时标记该认领失去。
+- **hook 与通知**：同一会话的追加在会话游标锁下串行，记录按日志顺序各 `on_record` 一次；观察失败只记日志，不把已成功的追加变成错误。成功后通知本进程 watcher。
+- **错误形状**：`AppendError { Encode, Storage(StorageError) }`。编码失败是引擎内部错误：映射到 `ExecutionError::Backend`（`AgentError::Execution`、facade 的 `AsterError::Execution`），不再报成 `Config` 或 corrupt；存储失败原样为 `Storage`。各调用方只经 `From` 映射一次。
+- **持有方**：agent、tool pipeline、scheduler、waits、trace 视图持 `Arc<CommitLog>`；`Asterpath::store()` 把它作为 `dyn SessionStore` 交给应用，应用的 append 同样经过上述语义。usage 视图仍读后端。
 
 ### 3.3 （已删除）事件总线
 

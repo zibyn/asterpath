@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::Agent;
+use crate::commit::CommitLog;
 use crate::tools::ToolTable;
 use crate::waits::Waits;
 use asterpath_protocol::{
@@ -134,6 +135,7 @@ pub(super) fn agent_with(
     gate: Arc<ApprovalGate>,
     waits: Option<Arc<Waits>>,
 ) -> Agent {
+    let log = CommitLog::for_tests(log);
     let waits = waits.unwrap_or_else(|| Arc::new(Waits::new(Arc::clone(&log))));
     let provider: Arc<dyn Provider> = provider;
     Agent::new(
