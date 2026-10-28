@@ -16,14 +16,24 @@ const SESSION: SessionId = SessionId::from_bytes([7; 16]);
 
 struct Fixture {
     log: Arc<InMemoryEventLog>,
+    commits: Arc<CommitLog>,
     waits: Arc<Waits>,
 }
 
 fn fixture() -> Fixture {
     let log = Arc::new(InMemoryEventLog::new());
-    let waits = Arc::new(Waits::new(CommitLog::for_tests(log.clone())));
-    Fixture { log, waits }
+    let commits = CommitLog::for_tests(log.clone());
+    let waits = Arc::new(Waits::new(Arc::clone(&commits)));
+    Fixture {
+        log,
+        commits,
+        waits,
+    }
 }
+
+/// Below the cross-process poll interval: only the commit signal can wake
+/// a wait this soon.
+const PROMPTLY: Duration = Duration::from_millis(100);
 
 async fn events(log: &InMemoryEventLog) -> Vec<SessionEvent> {
     let mut stream = log.scan(LogQuery {
@@ -122,13 +132,12 @@ async fn a_child_wait_resolves_once_the_completion_is_recorded() {
         },
     };
     fixture
-        .log
+        .commits
         .append(
             encode_entry(SESSION, Some(dedup::child_session(child)), &completed).expect("encode"),
         )
         .await
         .expect("append");
-    fixture.waits.wake_child(child);
 
     handle.await.expect("join").expect("child wait");
     // An already recorded completion satisfies a later wait immediately.
@@ -137,4 +146,65 @@ async fn a_child_wait_resolves_once_the_completion_is_recorded() {
         .await_child(SESSION, child)
         .await
         .expect("later wait");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_appended_through_the_store_wakes_the_wait_before_the_poll() {
+    let fixture = fixture();
+    let call = ToolCallId::from_bytes([4; 16]);
+    let waiting = Arc::clone(&fixture.waits);
+    let handle = tokio::spawn(async move { waiting.await_approval(SESSION, call).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let started = tokio::time::Instant::now();
+
+    let decided = SessionEvent::ApprovalDecided {
+        tool_call_id: call,
+        decision: ApprovalDecision::Allow,
+    };
+    fixture
+        .commits
+        .append(
+            encode_entry(SESSION, Some(dedup::approval_decided(call)), &decided).expect("encode"),
+        )
+        .await
+        .expect("append");
+
+    let decision = handle.await.expect("join").expect("decision");
+    assert_eq!(decision, ApprovalDecision::Allow);
+    assert!(
+        started.elapsed() < PROMPTLY,
+        "woke after {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_child_completion_appended_through_the_store_wakes_the_wait_before_the_poll() {
+    let fixture = fixture();
+    let child = SessionId::from_bytes([6; 16]);
+    let waiting = Arc::clone(&fixture.waits);
+    let handle = tokio::spawn(async move { waiting.await_child(SESSION, child).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let started = tokio::time::Instant::now();
+
+    let completed = SessionEvent::ChildSessionCompleted {
+        child,
+        outcome: ChildOutcome::Cancelled {
+            reason: CancelReason::Application,
+        },
+    };
+    fixture
+        .commits
+        .append(
+            encode_entry(SESSION, Some(dedup::child_session(child)), &completed).expect("encode"),
+        )
+        .await
+        .expect("append");
+
+    handle.await.expect("join").expect("child wait");
+    assert!(
+        started.elapsed() < PROMPTLY,
+        "woke after {:?}",
+        started.elapsed()
+    );
 }

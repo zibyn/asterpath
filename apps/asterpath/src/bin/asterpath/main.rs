@@ -7,7 +7,7 @@
 //! Layout: `config` (from the `asterpath_app` library) resolves the file and
 //! `-c`; `session` resolves the flags and opens a new, continued or forked
 //! session with the library's work-root assembly (ADR-0049); `drive`
-//! runs it to the end of a turn; `exec`, `doctor`, `agents`, `styles` and `debug` are the
+//! runs it with the library's session driver (`driver`); `exec`, `doctor`, `agents`, `styles` and `debug` are the
 //! commands; `interactive` is the bare command (`command: None`) and reuses
 //! `session::open` and `drive`.
 
