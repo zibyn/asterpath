@@ -20,6 +20,8 @@
 - OpenAI 适配器遇到含非文本条目的指令（`Item::Instruction`）时返回 `InvalidRequest`，不再把非文本条目渲染成占位文本（#210）。
 - Anthropic 适配器开始检查 `spec.provider`：与适配器的 id 不一致时返回 `InvalidRequest`，不发 HTTP（#210）。OpenAI 适配器回放推理时也检查 raw 的 provider，不一致按 `cross_provider` 丢弃。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
+- `exec --input-format stream-json` 也会把子会话的审批请求作为 `approval_requested` 一行发到 stdout，`approval` 命令的决定写到请求所在的会话；以前子会话的 `Ask` 不出现在 stdout，回合一直挂起（#212）。审批请求一次发出一个，应用回答后才发下一个。
+- CLI 交互、`exec` 与桌面端共用一个会话驱动（GLOSSARY「会话驱动」，#212）：一次驱动正常结束后**只在有待处理输入时**再驱动，出错后不再驱动。stream-json 不再按 `is_wakeable` 再驱动；CLI 交互与 headless `exec` 现在也会接着处理驱动期间到达的输入。
 - **审批模式统一用 `read-only` / `ask` / `allow`**（#213）：CLI 的 `-a`、`config.toml` 的 `[approval] default` 与桌面端共用一个 `approval::ApprovalMode`（变体 `ReadOnly` / `Ask` / `Allow`，`Deny` 改名为 `ReadOnly`）。旧名 `untrusted` / `never` 作为 `ask` / `allow` 的别名继续可用；桌面端命令的 JSON 取值由 `deny` 改为 `read-only`。`config::ApprovalMode` 删除。
 
 ### 新增
