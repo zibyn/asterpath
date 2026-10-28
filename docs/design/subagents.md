@@ -196,7 +196,7 @@ pub enum ForkSource {
 }
 ```
 
-- **会话分叉**复用同一记录（[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）：应用调用 `Asterpath::fork_session(source, metadata)`，新会话 `SessionCreated { parent: None, metadata }` 之后写 `ContextForked { source: Session { session }, source_log, items }`。`source_log` 是源会话最后一条 `TurnCommitted`（没有已提交回合时是 `SessionCreated`）；该回合最后一个 `StepStarted` 之后记录的输入属于下一回合，不复制。配置取源会话在水位处的生效配置，不收窄；`system` 取快照的基线 system（复制的历史已带着更早的 `Instruction`）；复制的历史去掉 `ToolsChanged`。新会话不进源会话的会话树，不等待、不返回任务总结、不参与取消传播。
+- **会话分叉**复用同一记录（[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）：应用调用 `Asterpath::fork_session(source, metadata)`，新会话 `SessionCreated { parent: None, metadata }` 之后写 `ContextForked { source: Session { session }, source_log, items }`。`source_log` 是源会话最后一条 `TurnCommitted`（没有已提交回合时是 `SessionCreated`），`fork_session_at` 时是指定回合的 `TurnCommitted`（[ADR-0045](../adr/0045-fork-at-any-committed-turn.md)），水位之后的压缩不进快照；该回合最后一个 `StepStarted` 之后记录的输入属于下一回合，不复制。配置取源会话在水位处的生效配置，不收窄；`system` 取快照的基线 system（复制的历史已带着更早的 `Instruction`）；复制的历史去掉 `ToolsChanged`。新会话不进源会话的会话树，不等待、不返回任务总结、不参与取消传播。
 
 - `items` 是**投影后的快照**，尊重 `CompactionApplied`；不是原始事件的复制。
 - 水位是 spawn 所在 step 的 `StepStarted.seq`：子看不到"自己这次 spawn"的 `AssistantMessage`，也看不到同 step 的兄弟工具结果。

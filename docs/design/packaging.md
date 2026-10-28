@@ -147,6 +147,8 @@ impl Asterpath {
     pub async fn open_session(&self, id: SessionId) -> Result<SessionHandle, AsterError>;
     pub async fn fork_session(&self, source: SessionId, metadata: BTreeMap<String, String>)
         -> Result<SessionHandle, AsterError>;           // 会话分叉（ADR-0033）
+    pub async fn fork_session_at(&self, source: SessionId, metadata: BTreeMap<String, String>, at: TurnId)
+        -> Result<SessionHandle, AsterError>;           // 在指定已提交回合分叉（ADR-0045）
     pub async fn shutdown(self) -> Result<(), AsterError>;
 
     pub fn store(&self) -> Arc<dyn SessionStore>;       // append 经唯一入口送达 on_record；退役 = store().retire(..)
@@ -177,7 +179,7 @@ impl Asterpath {
 - `build()` 用 `ProviderCatalog::new` 建 provider 索引；`Provider::id()` 重复是 `AsterError::Config`。
 - 内置组件不是可替换模块；替换只经上述适配器字段，观察与拦截只经 `hooks`。`shutdown()` 只释放引擎：没有后台任务，无需收尾顺序。
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、会话元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
-- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
+- `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。`fork_session_at(source, metadata, at)` 把水位换成源会话回合 `at` 的 `TurnCommitted`（[ADR-0045](../adr/0045-fork-at-any-committed-turn.md)）：投影与生效配置都在该处折叠，之后的压缩与配置变更不影响；`at` 不存在、未提交或属于别的会话 = `AsterError::InvalidForkPoint`，不创建会话。分叉不写源会话。
 - `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带会话元数据。按元数据排序、前缀或范围匹配由应用在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
 - 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, cache_root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
