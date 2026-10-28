@@ -13,16 +13,21 @@ pub(crate) struct Snapshot {
     pub(crate) system: Vec<Part>,
     /// The baseline keyed sections, so the fork can still refresh them by key.
     pub(crate) system_sections: Vec<SystemSection>,
-    /// The projected history without `ToolsChanged`: the fork's created
-    /// tools are already the effective set, so copied changes would re-add
-    /// removed tools (ADR-0030).
+    /// The projected history without `ToolsChanged` or `ReasoningChanged`:
+    /// the fork's created tools and request are already the effective ones,
+    /// so copied changes would re-add removed tools (ADR-0030).
     pub(crate) items: Vec<Item>,
 }
 
 pub(crate) fn snapshot(prefix: &[LogEntry]) -> Result<Snapshot, ProjectionError> {
     let history = asterpath_protocol::request_history(prefix)?;
     let mut items = history.items;
-    items.retain(|item| !matches!(item, Item::ToolsChanged { .. }));
+    items.retain(|item| {
+        !matches!(
+            item,
+            Item::ToolsChanged { .. } | Item::ReasoningChanged { .. }
+        )
+    });
     Ok(Snapshot {
         system: history.system,
         system_sections: history.system_sections,

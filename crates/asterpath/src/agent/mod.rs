@@ -1117,6 +1117,7 @@ impl Agent {
             history.tools,
             &config.request,
         );
+        request.baseline_reasoning = history.reasoning;
         request.session = Some(self.session_context(session).await?);
         let format = self.output_tool(config);
         if let Some(format) = format {

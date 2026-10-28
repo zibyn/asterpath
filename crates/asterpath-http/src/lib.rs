@@ -227,6 +227,7 @@ fn all_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
         Item::ToolCall { .. }
         | Item::ServerToolCall { .. }
         | Item::ToolsChanged { .. }
+        | Item::ReasoningChanged { .. }
         | Item::ProviderOpaque { .. } => &[],
     });
     request.system.iter().chain(item_parts)

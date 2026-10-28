@@ -70,6 +70,11 @@ pub enum Item {
         added: Vec<crate::ToolDescriptor>,
         removed: Vec<ToolName>,
     },
+    /// A mid-session change of `RequestConfig::reasoning` (#180), placed like
+    /// `Instruction`. The request's `baseline_reasoning` is the value before it.
+    ReasoningChanged {
+        reasoning: Option<crate::ReasoningParams>,
+    },
     ProviderOpaque {
         provider: ProviderId,
         kind: String,
