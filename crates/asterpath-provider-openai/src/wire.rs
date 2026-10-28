@@ -2,13 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use asterpath_http::{SseDecoder, SseEvent};
+use asterpath_http::{SseEvent, SseNormalizer};
 use asterpath_protocol::{
     Item, JsonString, ModelSpec, Part, PartDelta, ProviderError, ProviderErrorKind, ProviderId,
     RawProviderData, ReasoningBinding, Role, StopReason, StreamEvent, ToolName, Usage,
 };
-use futures_core::stream::BoxStream;
-use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -71,65 +69,7 @@ struct WirePart<'a> {
     refusal: Option<String>,
 }
 
-/// Stream one HTTP response body, yielding normalized events.
-pub(crate) fn stream(
-    response: reqwest::Response,
-    context: WireContext,
-) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    let header_request_id = asterpath_http::request_id(response.headers());
-    let state = State {
-        normalizer: Normalizer::new(context, header_request_id),
-        response,
-        decoder: SseDecoder::new(),
-        done: false,
-    };
-    stream::unfold(Some(state), |state| async move {
-        let mut state = state?;
-        loop {
-            if state.done {
-                return None;
-            }
-            match state.response.chunk().await {
-                Ok(Some(chunk)) => {
-                    let events = match state.decoder.push(&chunk) {
-                        Ok(frames) => state.process(frames),
-                        Err(error) => return Some((vec![Err(error)], None)),
-                    };
-                    if !events.is_empty() {
-                        let finished = state.normalizer.finished();
-                        return Some((events, (!finished).then_some(state)));
-                    }
-                }
-                Ok(None) => {
-                    state.done = true;
-                    let mut events = match state.decoder.finish() {
-                        Ok(frames) => state.process(frames),
-                        Err(error) => return Some((vec![Err(error)], None)),
-                    };
-                    if !state.normalizer.finished() {
-                        events.push(Err(state.normalizer.with_request_id(transport(
-                            "openai stream ended without a terminal event",
-                        ))));
-                    }
-                    return (!events.is_empty()).then_some((events, None));
-                }
-                Err(error) => {
-                    let kind = if error.is_timeout() {
-                        ProviderErrorKind::Timeout
-                    } else {
-                        ProviderErrorKind::Transport
-                    };
-                    let error = ProviderError::new(kind, error.to_string());
-                    return Some((vec![Err(state.normalizer.with_request_id(error))], None));
-                }
-            }
-        }
-    })
-    .flat_map(stream::iter)
-    .boxed()
-}
-
-struct Normalizer {
+pub(crate) struct Normalizer {
     context: WireContext,
     header_request_id: Option<String>,
     request_id: Option<String>,
@@ -153,10 +93,10 @@ enum ReasoningSource {
 }
 
 impl Normalizer {
-    fn new(context: WireContext, header_request_id: Option<String>) -> Self {
+    pub(crate) fn new(context: WireContext) -> Self {
         Self {
             context,
-            header_request_id,
+            header_request_id: None,
             request_id: None,
             sequence: 0,
             last_wire_sequence: None,
@@ -173,15 +113,6 @@ impl Normalizer {
 
     fn finished(&self) -> bool {
         self.terminal || self.poisoned
-    }
-
-    /// Attach the best known request id; OpenAI reports usage only on the terminal event.
-    fn with_request_id(&self, mut error: ProviderError) -> ProviderError {
-        error.request_id = self
-            .request_id
-            .clone()
-            .or_else(|| self.header_request_id.clone());
-        error
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -577,27 +508,30 @@ impl Normalizer {
     }
 }
 
-impl State {
-    fn process(&mut self, frames: Vec<SseEvent>) -> Vec<Result<StreamEvent, ProviderError>> {
-        let mut events = Vec::new();
-        for frame in frames {
-            if frame.data.is_empty() || frame.data == "[DONE]" {
-                continue;
-            }
-            events.extend(self.normalizer.handle(&frame.data));
-            if self.normalizer.finished() {
-                break;
-            }
-        }
-        events
+impl SseNormalizer for Normalizer {
+    fn connected(&mut self, header_request_id: Option<String>) {
+        self.header_request_id = header_request_id;
     }
-}
 
-struct State {
-    response: reqwest::Response,
-    normalizer: Normalizer,
-    decoder: SseDecoder,
-    done: bool,
+    fn event(&mut self, event: SseEvent) -> Vec<Result<StreamEvent, ProviderError>> {
+        if event.data.is_empty() || event.data == "[DONE]" {
+            return Vec::new();
+        }
+        self.handle(&event.data)
+    }
+
+    fn terminal(&self) -> bool {
+        self.finished()
+    }
+
+    /// OpenAI reports usage only on the terminal event.
+    fn partial_usage(&self) -> Option<Usage> {
+        None
+    }
+
+    fn request_id(&self) -> Option<String> {
+        self.request_id.clone()
+    }
 }
 
 fn response_id(raw: &RawValue) -> Option<&str> {
@@ -646,8 +580,29 @@ fn usage(value: Option<&Value>) -> Usage {
     }
 }
 
+/// Kind and retryability of a non-success HTTP response; the streamed call
+/// builds the rest of the error envelope.
+pub(crate) fn classify(
+    status: u16,
+    body: Option<&Value>,
+    message: &str,
+) -> (ProviderErrorKind, bool) {
+    let field = |name: &str| {
+        body.and_then(|body| body.pointer(name))
+            .and_then(Value::as_str)
+    };
+    classify_code(field("/error/code"), field("/error/type")).unwrap_or_else(|| {
+        let kind = if context_exceeded_message(message) {
+            ProviderErrorKind::ContextExceeded
+        } else {
+            asterpath_http::classify_status(status)
+        };
+        (kind, kind.retryable_by_default())
+    })
+}
+
 /// Kind and retryability for a documented OpenAI error `code` / `type`; `None` when unknown.
-pub(crate) fn classify_code(
+fn classify_code(
     code: Option<&str>,
     error_type: Option<&str>,
 ) -> Option<(ProviderErrorKind, bool)> {
@@ -690,7 +645,7 @@ pub(crate) fn classify_code(
 }
 
 /// Message-text fallback for gateways that omit the `context_length_exceeded` code.
-pub(crate) fn context_exceeded_message(text: &str) -> bool {
+fn context_exceeded_message(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("context_length_exceeded")
         || lower.contains("maximum context length")
@@ -700,8 +655,4 @@ pub(crate) fn context_exceeded_message(text: &str) -> bool {
 
 fn protocol(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::StreamProtocol, message)
-}
-
-fn transport(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::Transport, message)
 }
