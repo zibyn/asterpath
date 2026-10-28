@@ -110,12 +110,15 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
     }
 
     let opened = session::open(global, &args.session, Frontend::Exec, schema).await?;
-    let outcome = match &opened.owned {
+    let (outcome, error) = match &opened.owned {
         // Viewing only: the latest result as it stands, nothing driven.
-        None if parts.is_empty() && !commands => drive::DriveOutcome {
-            ran: true,
-            ..drive::DriveOutcome::default()
-        },
+        None if parts.is_empty() && !commands => (
+            drive::DriveOutcome {
+                ran: true,
+                ..drive::DriveOutcome::default()
+            },
+            None,
+        ),
         None => {
             opened.shutdown().await?;
             return Err(CliError::run(
@@ -151,7 +154,7 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         ),
     }
     opened.shutdown().await?;
-    if let Some(error) = outcome.error {
+    if let Some(error) = error {
         return Err(error);
     }
     turn_result(outcome.reason.as_ref(), &entries)?;
@@ -168,7 +171,7 @@ async fn drive_owned(
     parts: Vec<Part>,
     commands: bool,
     args: &ExecArgs,
-) -> CliResult<drive::DriveOutcome> {
+) -> CliResult<(drive::DriveOutcome, Option<CliError>)> {
     // A continued session first finishes what it had open (crash recovery).
     let recover = opened.continued && handle.facts().await.map_err(aster_error)?.is_wakeable();
     Ok(if let OutputFormat::StreamJson = args.output_format {
@@ -176,15 +179,8 @@ async fn drive_owned(
         if !parts.is_empty() {
             submit(handle, parts).await?;
         }
-        // Only an application on stdin can answer; otherwise the framework denies every `Ask`.
-        let _endpoint = commands.then(|| {
-            opened
-                .asterpath
-                .approval_gate()
-                .register(handle.owner().root)
-        });
         let stdin = commands.then(|| tokio::io::BufReader::new(tokio::io::stdin()));
-        stream::run(handle, start, stdin, &mut io::stdout()).await?
+        stream::run(&opened.asterpath, handle, start, stdin, &mut io::stdout()).await?
     } else {
         // No approval channel: no endpoint is registered, so every `Ask` is denied.
         let mut outcome = drive::DriveOutcome::default();
@@ -195,7 +191,7 @@ async fn drive_owned(
             submit(handle, parts).await?;
             outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless).await?;
         }
-        outcome
+        (outcome, None)
     })
 }
 

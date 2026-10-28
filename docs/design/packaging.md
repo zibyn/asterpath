@@ -395,7 +395,7 @@ pub enum AsterError {
 - `--output-format text`（默认）：stdout 只有最终助手文本；stderr 输出 session id 与诊断。
 - `--output-format json`：stdout 一个对象 `{ "session": <hex>, "result": <最终助手文本>, "reason": <TurnEndReason>, "usage": <本回合用量> }`；字段只增不改。
 - `--output-format stream-json`：stdout 每行一个 `AgentEvent` 的 serde 序列化（`tag = "type"`），最后一行是上面的结果对象。
-- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出，stdin 关闭时仍有审批在等则取消该回合（没有人能回答了）。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；无法解析的命令（或读不了 stdin）停止读入并取消进行中的回合，照常输出结果行后以用法错误退出（退出 2）。
+- `--input-format stream-json`（要求 `--output-format stream-json`）：stdin 每行一个命令：`{"type":"user_input","parts":[…]}`、`{"type":"approval","call":<id>,"decision":…}`、`{"type":"cancel"}`。此时 `ApprovalRequested` 从 stdout 发出、决定从 stdin 读回；stdin 关闭且会话空闲时退出，stdin 关闭时仍有审批在等则取消该回合（没有人能回答了）。`parts` 与 `decision` 用协议类型 `Part` / `ApprovalDecision` 的 serde 形状（如 `{"Text":{"text":"hi"}}`、`"Allow"`、`{"Deny":{"reason":null}}`），`call` 取 `ApprovalRequested.tool_call_id`；子智能体（子会话）的审批同样作为 `ApprovalRequested` 从 stdout 发出，`approval` 的决定写到请求所在的会话；审批请求一次发出一个，回答后才发下一个；无法解析的命令（或读不了 stdin）停止读入并取消进行中的回合，照常输出结果行后以用法错误退出（退出 2）。
 - 退出码：`0` 完成或 idle，`1` 运行失败（`TurnCommitted` 非 `Completed`、存储/模块错误），`2` 用法或配置错误。没有"停在等待点"的退出码。
 
 ### 4.4 审批
@@ -418,7 +418,7 @@ pub enum AsterError {
   - 会话级规则（#198）：桌面端审批卡片的「本会话不再询问」（`Answer::AllowForSession`，`ApprovalModes::allow_for_session`）给该会话树加允许规则，优先级与配置里的允许规则相同（拒绝 / 询问规则仍压过它）。非 `bash` 工具按工具名允许；`bash` 每个简单命令生成一条前缀规则：命令词起、到第一个不以 `-` 开头的参数为止的词（`npm run test -- --watch` → `bash(npm run)`，`cargo test -p foo` → `bash(cargo test)`，`rm -rf build` → `bash(rm -rf build)`，没有参数时只取命令词），复合命令各取各的、去重。命令不够「平」（无法解析、含命令替换、here-doc 等上文允许规则不逐词检查的结构），或前缀里有运行时展开的词时不生成：卡片上不提供这个按钮，只有允许一次与拒绝。`approvals` 给每个请求附 `session_rules`（要显示的前缀或工具名，不可生成时为 `null`），卡片按它写出「Don't ask again for `npm run …`」。会话级规则只在内存里，按会话树根保存，重启即失；CLI 交互审批没有这一项。
   - 规则不是安全边界（ADR-0055）：`env git push`、`bash -c "git push"`、`xargs` 等间接执行不会被前缀命中；边界是沙箱。
 - CLI 的 `-a`、`[approval] default` 与桌面端都用 `approval::ApprovalMode` 的名字：`read-only`、`ask`（默认）、`allow`；旧名 `untrusted` / `never` 作为 `ask` / `allow` 的别名仍可用（#213）。优先级 `-a` > `[approval] default` > `ask`。CLI 不能中途切换模式。
-- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，交互模式驱动时轮询 `pending_in(root)` 一并提示；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
+- 问人的通道：交互模式在 TTY 上提示工具名、参数、`replay` / `side_effect` / `provenance`，子会话的请求不在父会话的流里，会话驱动（GLOSSARY）驱动时轮询 `pending_in(root)` 一并交给操作者（交互模式与 stream-json）；`exec` 只有 `--input-format stream-json` 时经流交给应用。没有通道时 CLI 不注册审批端点，框架的 `Ask` 立即按 `Deny` 处理（`NO_APPROVAL_ENDPOINT`，[tools.md](tools.md) §4）；只读运行用 `-s read-only` 表达，不另设"全拒绝"取值。
 - "由策略决定"：问不问人由应用 `ApprovalPolicy` 按调用的来源、副作用等级与调用是否在受限沙箱内执行判断；工具没有让模型申请提权的参数，因此不提供 Codex 的 `on-request`。
 - 审批决定经 `SessionHandle::approve()` 投递，落日志；重启后复用已记录决定，不再提示。
 
