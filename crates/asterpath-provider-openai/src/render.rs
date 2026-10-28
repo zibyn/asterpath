@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use asterpath_http::{
-    merge_provider_option, provider_options_for, same_provider_raw_field, server_tools_for,
-    unrenderable_part,
+    merge_provider_option, provider_options_for, reasoning_in_place, same_provider_raw_field,
+    server_tools_for, unrenderable_part,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -237,8 +237,8 @@ fn tool_choice(choice: &ToolChoice) -> Value {
 
 fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
     let mut object = Map::new();
-    if params.effort.is_some() {
-        object.insert("effort".to_owned(), json!(effort_name(params.effort)));
+    if let Some(effort) = params.effort {
+        object.insert("effort".to_owned(), json!(effort_name(effort)));
     }
     if params.summary {
         object.insert("summary".to_owned(), json!("auto"));
@@ -253,33 +253,25 @@ fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
 /// missing effort or one the model does not accept falls back to the
 /// effective reasoning at the top level.
 fn inline_effort(request: &ModelRequest, profile: &OpenAiModelProfile) -> bool {
-    let baseline = request.baseline_reasoning.as_ref();
-    let in_place = |params: Option<&asterpath_protocol::ReasoningParams>| {
-        params.is_some_and(|params| {
+    profile.inline_effort
+        && reasoning_in_place(request, |params, baseline| {
             params
                 .effort
                 .is_some_and(|effort| profile.efforts.contains(&effort))
                 && params.budget_tokens.is_none()
-                && baseline.is_some_and(|baseline| params.summary == baseline.summary)
-        })
-    };
-    profile.inline_effort
-        && in_place(baseline)
-        && request.items.iter().all(|item| match item {
-            Item::ReasoningChanged { reasoning } => in_place(reasoning.as_ref()),
-            _ => true,
+                && params.summary == baseline.summary
         })
 }
 
-fn effort_name(effort: Option<ReasoningEffort>) -> &'static str {
+fn effort_name(effort: ReasoningEffort) -> &'static str {
     match effort {
-        Some(ReasoningEffort::Off) => "none",
-        Some(ReasoningEffort::Minimal) => "minimal",
-        Some(ReasoningEffort::Low) => "low",
-        Some(ReasoningEffort::Medium) => "medium",
-        Some(ReasoningEffort::High) => "high",
-        Some(ReasoningEffort::XHigh) => "xhigh",
-        Some(ReasoningEffort::Max) => "max",
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
         _ => unreachable!("validate rejects efforts missing from the model table"),
     }
 }
@@ -387,12 +379,17 @@ fn render_input(
             }
             // Top-level `tools` is already the effective set (ADR-0030).
             Item::ToolsChanged { .. } => {}
+            // `inline_effort` has checked that every change carries an effort.
             Item::ReasoningChanged {
-                reasoning: Some(params),
+                reasoning:
+                    Some(asterpath_protocol::ReasoningParams {
+                        effort: Some(effort),
+                        ..
+                    }),
             } if inline_effort => {
                 let update = raw(json!({
                     "type": "configuration_update",
-                    "reasoning": {"effort": effort_name(params.effort)},
+                    "reasoning": {"effort": effort_name(*effort)},
                 }))?;
                 match update_at {
                     Some(at) => input[at] = update,

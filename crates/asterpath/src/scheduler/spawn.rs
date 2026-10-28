@@ -289,8 +289,13 @@ impl Scheduler {
             // A system that replaces the parent's drops its sections too.
             let (system, system_sections) = match (&profile, &context) {
                 (Some(profile), _) => (profile.system.clone(), Vec::new()),
+                // The parent's baseline at the fork point, the spawn step's
+                // `StepStarted`: no change falls between it and the config
+                // watermark (ADR-0030).
                 (None, ContextPolicy::Fork { at }) => {
-                    fork_system(&parent_events, *at).map_err(SpawnError::Execution)?
+                    let snapshot =
+                        fork_snapshot_at(&parent_events, *at).map_err(SpawnError::Execution)?;
+                    (snapshot.system, snapshot.system_sections)
                 }
                 // Only the root's direct children take the environment's
                 // child system (ADR-0054).
@@ -937,17 +942,6 @@ fn fork_snapshot_at(
         ))
     })?;
     fork::snapshot(&prefix).map_err(backend)
-}
-
-/// A forked child's system and sections: the parent's baseline at the fork point. The fork
-/// point is the spawn step's `StepStarted`, so no change falls between it and
-/// the config watermark (ADR-0030).
-fn fork_system(
-    entries: &[(LogEntry, SessionEvent)],
-    at: LogId,
-) -> Result<(Vec<Part>, Vec<asterpath_protocol::SystemSection>), ExecutionError> {
-    let snapshot = fork_snapshot_at(entries, at)?;
-    Ok((snapshot.system, snapshot.system_sections))
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.

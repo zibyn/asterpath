@@ -628,10 +628,10 @@ impl SessionHandle {
     /// instructions, set or remove keyed system sections, or add and remove
     /// tools (ADR-0030, ADR-0057). Validated first: an unregistered provider;
     /// an `append_system`, `system_sections`, `add_tools` or `remove_tools`
-    /// without `id`; non-text system parts; an empty or repeated section key; an added tool that
-    /// is not registered on this `Asterpath`, differs from the registered
-    /// descriptor or is already effective; a removed tool that is not
-    /// effective. Each is a `Config` error and nothing is logged. An update
+    /// without `id`; non-text system parts; an empty or repeated section key;
+    /// an added tool that is not registered on this `Asterpath`, differs from
+    /// the registered descriptor or is already effective; a removed tool that
+    /// is not effective. Each is a `Config` error and nothing is logged. An update
     /// with an `id` is recorded once however often it is retried. Otherwise
     /// one `ConfigChanged` is appended; it may be called mid-turn and takes
     /// effect at the next `StepStarted`, so a step already running keeps its

@@ -4,11 +4,11 @@
 //! (including any previous summary) and inserts the new summary immediately
 //! before `first_kept`. The raw log is never modified.
 //!
-//! An instruction, tool change or reasoning change recorded by `ConfigChanged` takes its place
-//! at the next `StepStarted` (or the end of the scanned entries), so it always
-//! follows the tool results of the step it was recorded in. A compaction that
-//! replaces it moves it into the baseline system, tools or reasoning instead of the
-//! summary (ADR-0030).
+//! An instruction, tool change or reasoning change recorded by `ConfigChanged`
+//! takes its place at the next `StepStarted` (or the end of the scanned
+//! entries), so it always follows the tool results of the step it was
+//! recorded in. A compaction that replaces it moves it into the baseline
+//! system, tools or reasoning instead of the summary (ADR-0030).
 
 use std::collections::HashMap;
 

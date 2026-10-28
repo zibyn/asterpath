@@ -302,8 +302,9 @@ impl ConfigPatch {
         !self.add_tools.is_empty() || !self.remove_tools.is_empty()
     }
 
-    /// Whether the patch has a place in history (appended instructions or a
-    /// tool change); applying such a patch twice is not idempotent.
+    /// Whether the patch has a place in history (appended instructions,
+    /// system sections or a tool change); applying such a patch twice is not
+    /// idempotent.
     pub fn is_positional(&self) -> bool {
         !self.append_system.is_empty() || !self.system_sections.is_empty() || self.changes_tools()
     }
