@@ -1,13 +1,16 @@
 //! Facade error sum. Each layer keeps its own enum; this only adds them up.
 
 use asterpath_protocol::{AgentError, ProviderError, ToolError};
-use asterpath_protocol::{ExecutionError, StorageError};
+use asterpath_protocol::{ExecutionError, SessionId, StorageError, TurnId};
 
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AsterError {
     #[error("configuration error: {message}")]
     Config { message: String },
+    /// A fork point that is not a committed turn of the source (ADR-0045).
+    #[error("turn {turn:?} is not a committed turn of session {session:?}")]
+    InvalidForkPoint { session: SessionId, turn: TurnId },
     #[error(transparent)]
     Agent(#[from] AgentError),
     #[error(transparent)]
