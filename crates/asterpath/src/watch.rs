@@ -18,9 +18,9 @@ use tokio::sync::{broadcast, watch};
 
 use crate::AsterError;
 
-/// Longest a watcher goes without re-reading the log: the delay before it
-/// sees a commit made by another process.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Longest a watcher or a durable wait goes without re-reading the log: the
+/// delay before it sees a commit made by another process (ADR-0036/0043).
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Live events a slow watcher may fall behind by before it skips some.
 const LIVE_CAPACITY: usize = 1024;
@@ -65,11 +65,16 @@ impl Watchers {
         (slot.live.subscribe(), slot.committed.subscribe())
     }
 
+    /// The session's commit signal alone, for waits that need no live events.
+    pub(crate) fn commits(&self, session: SessionId) -> watch::Receiver<()> {
+        self.subscribe(session).1
+    }
+
     /// Calls `f` on the session's slot; drops the slot once nobody watches.
     fn with_slot(&self, session: SessionId, f: impl FnOnce(&Slot)) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(slot) = slots.get(&session) {
-            if slot.live.receiver_count() == 0 {
+            if slot.live.receiver_count() == 0 && slot.committed.receiver_count() == 0 {
                 slots.remove(&session);
             } else {
                 f(slot);

@@ -101,6 +101,13 @@ impl CommitLog {
         Arc::new(Self::new(inner, Vec::new(), Arc::default(), ownership))
     }
 
+    /// Changes on every commit to `session` made through this log. Commits
+    /// of other processes never reach it: pair it with
+    /// [`POLL_INTERVAL`](crate::watch::POLL_INTERVAL).
+    pub(crate) fn commits(&self, session: SessionId) -> tokio::sync::watch::Receiver<()> {
+        self.watchers.commits(session)
+    }
+
     /// The typed append: encodes `event`, stamps the owner of the drive or
     /// compaction being polled, shows the record to `on_record` and tells
     /// the watchers. `key` is the caller's dedup key; a replay returns the

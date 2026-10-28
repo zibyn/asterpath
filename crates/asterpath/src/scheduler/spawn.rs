@@ -858,7 +858,6 @@ impl Scheduler {
             .await
             .map_err(|error| WaitError::Execution(error.into()))?;
         self.release_slot(child.parent.session, child.parent.tool_call);
-        self.waits.wake_child(child.child);
         Ok(())
     }
 
