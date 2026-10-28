@@ -61,6 +61,7 @@ fn usage(input: u64, output: u64) -> Usage {
             uncached: input,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: output,
@@ -128,6 +129,7 @@ fn turn() -> TurnConfig {
 
 fn spec(window: Option<u32>, compaction: CompactionConfig) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),
@@ -294,8 +296,16 @@ async fn c1_c14_automatic_compaction_projects_a_text_only_summary() {
             .respond(vec![assistant("done")], StopReason::EndTurn, usage(5, 5)),
     );
     let asterpath = facade(&db, Arc::clone(&provider), Some(compactor(&provider))).await;
+    // Another summary model shares no cache, so the summary call is the
+    // independent text-only request (#176).
+    let mut config = compaction_config(1);
+    config.summary_model = Some(ModelSpec {
+        provider: ProviderId::new("p"),
+        model: ModelId::new("summarizer"),
+        context_window: None,
+    });
     let handle = asterpath
-        .create_session(spec(Some(1000), compaction_config(1)))
+        .create_session(spec(Some(1000), config))
         .await
         .expect("session")
         .claim()
@@ -1146,12 +1156,12 @@ fn anthropic_sse(blocks: &[&str], deltas: &[(usize, &str)]) -> String {
     body
 }
 
-/// #104: the summary request has an empty system, so replaying the session's
-/// Anthropic thinking into it would be rejected. A tool-free session makes the
-/// tools fingerprint match, so only the compactor's text view keeps it out.
+/// #104, #176: the summary request forks the session's request, so the
+/// session's Anthropic thinking replays under the very system it was bound
+/// to; the adapter's reasoning gate decides as for any session request.
 #[cfg(feature = "anthropic")]
 #[tokio::test]
-async fn anthropic_thinking_never_reaches_the_summary_request() {
+async fn anthropic_thinking_replays_under_the_session_system_in_the_summary_request() {
     use asterpath_testing::http_mock::{MockServer, Reply};
 
     let thinking = anthropic_sse(
@@ -1233,14 +1243,17 @@ async fn anthropic_thinking_never_reaches_the_summary_request() {
         session.iter().any(|kind| kind == "redacted_thinking"),
         "{session:?}"
     );
-    // The summary request has no system and carries neither block.
+    // The summary request keeps the session's system and both blocks.
     let summary_body = requests[2].json_body();
-    assert!(summary_body.get("system").is_none(), "{summary_body}");
+    assert_eq!(
+        summary_body["system"],
+        requests[1].json_body()["system"],
+        "{summary_body}"
+    );
     let summary = block_types(&summary_body);
+    assert!(summary.iter().any(|kind| kind == "thinking"), "{summary:?}");
     assert!(
-        !summary
-            .iter()
-            .any(|kind| kind == "thinking" || kind == "redacted_thinking"),
+        summary.iter().any(|kind| kind == "redacted_thinking"),
         "{summary:?}"
     );
     cleanup(&db);

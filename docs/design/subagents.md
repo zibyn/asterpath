@@ -207,7 +207,7 @@ pub enum ForkSource {
 
 ## 5. 配置继承
 
-- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父会话在 spawn 所在 step 水位（该 step 的 `StepStarted.seq`）的生效配置的拷贝（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)；父之后的 `ConfigChanged` 不影响子，子也可以有自己的变更；字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父生效 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析；父中途新增的工具也在其中，allowlist 作用于 spawn 水位的生效集合）。Fork 复制的历史去掉 `ToolsChanged` 条目：子的 `tools` 已是收窄后的生效集合，复制的变更会把收窄掉的工具加回（[protocol.md](protocol.md) §3.3）。`request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减）。`system` 按上下文策略取：`Fresh` 取生效 `system`（创建时 system 加全部追加指令）；`Fork` 取父在 fork 点的基线 system，再加 fork 点到 spawn 水位之间追加的指令，因为 fork 复制的历史已经带着更早的 `Instruction` 条目（[protocol.md](protocol.md) §3.3），避免重复。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（应用代码，不持久化）。
+- **spawn 时刻快照**：子会话的 `ConfigSnapshot` 是父会话在 spawn 所在 step 水位（该 step 的 `StepStarted.seq`）的生效配置的拷贝（[ADR-0030](../adr/0030-session-config-is-a-fold-of-log-records.md)；父之后的 `ConfigChanged` 不影响子，子也可以有自己的变更；字段集见 [packaging.md](packaging.md) §2.1），只有两处收窄：`model` 换成 `model_alias` 解析后的 `ModelSpec`（必须同 provider），`tools` 换成父生效 `Vec<ToolDescriptor>` 的子集（拷贝父描述符，不重新解析；父中途新增的工具也在其中，allowlist 作用于 spawn 水位的生效集合）。Fork 复制的历史去掉 `ToolsChanged` 条目：子的 `tools` 已是收窄后的生效集合，复制的变更会把收窄掉的工具加回（[protocol.md](protocol.md) §3.3）。`request` / `turn` / `compaction` / `subagents` 原样继承（`subagents` 不随深度递减），只有 `request.cache_ttl` 换成父的 `subagents.cache_ttl`：子会话是主会话之外的 TTL 分桶（#178），不悄悄沿用主会话的 1h。`system` 按上下文策略取：`Fresh` 取生效 `system`（创建时 system 加全部追加指令）；`Fork` 取父在 fork 点的基线 system，再加 fork 点到 spawn 水位之间追加的指令，因为 fork 复制的历史已经带着更早的 `Instruction` 条目（[protocol.md](protocol.md) §3.3），避免重复。写入 `SessionCreated.config` 与父流的 `ChildSessionSpawned.config`，两者逐字段相等。审批策略、MCP/插件配置与沙箱策略都不进快照（应用代码，不持久化）。
 - 之后父配置变化不影响已 spawn 的子；子配置变化也不回写父。
 - 模型可见的 spawn 参数只能收窄：
   - `model_alias` 必须来自应用提供的 alias 集合（`AsterpathConfig.model_aliases`，见 [packaging.md](packaging.md) §3.2；pre-execute 解析成具体模型并写进 effective args）；未知 alias → `Failed{InvalidArgs}`。解析结果必须与父会话**同 provider**（父 provider 取 spawn 水位的生效值，继承的 `RequestConfig` 不能跨 provider 迁移）；跨 provider → `Failed{InvalidArgs}`，不创建子会话。
@@ -395,6 +395,7 @@ pub struct SubagentConfig {
     pub max_concurrent_children: NonZeroUsize,  // 8（每父会话）
     pub spawn_timeout: Option<Duration>,        // None
     pub cancel_grace: Duration,                 // 10s（#6）
+    pub cache_ttl: CacheTtl,                    // 5m；子会话的 request.cache_ttl，serde default
 }
 ```
 
@@ -407,6 +408,7 @@ pub struct SubagentConfig {
 | 并发超限 | FIFO 排队 | 不报错 |
 | spawn timeout | `None` | 按次参数；持久截止时间（`ChildSessionSpawned.deadline`） |
 | cancel_grace | 10s | 沿用 #6 |
+| cache_ttl | 5m / 5m | 写进子会话的 `request.cache_ttl`；主会话的 TTL 不传给子 |
 | spawn replay | `Safe` | R1 |
 | spawn parallelism | `Parallel` | |
 | spawn side_effect | `Mutating` | |

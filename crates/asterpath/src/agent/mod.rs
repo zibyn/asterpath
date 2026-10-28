@@ -26,8 +26,8 @@ use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalPolicy, CancelReason, CancelRegistration,
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
-    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, ModelRequest, OpenStep,
-    OpenTool, OutputFormat, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
+    Compactor, ConfigSnapshot, ForkSource, Gate, HookError, Hooks, Item, JsonString, ModelRequest,
+    OpenStep, OpenTool, OutputFormat, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
     ProviderErrorInfo, ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts,
     SessionState, StepCtx, StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName,
     ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup,
@@ -49,6 +49,10 @@ use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt, stream};
 use pipeline::{SpawnFn, ToolOutcome, ToolPipeline, ToolStep};
+
+/// Bounds a fork chain in `session_context`. Real chains are as long as the
+/// forks the application made; the bound only stops a corrupt cycle.
+const MAX_FORK_CHAIN: usize = 64;
 
 /// The turn driver.
 pub(crate) struct Agent {
@@ -1105,15 +1109,19 @@ impl Agent {
                 session,
                 detail: error.to_string(),
             })?;
+        let mut system = history.system;
+        system
+            .extend(asterpath_protocol::SystemSection::flatten(&history.system_sections).cloned());
         let mut request = ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
-            history.system,
+            system,
             history.items,
             config.tools.clone(),
             history.tools,
             &config.request,
         );
+        request.baseline_reasoning = history.reasoning;
         request.session = Some(self.session_context(session).await?);
         let format = self.output_tool(config);
         if let Some(format) = format {
@@ -1122,30 +1130,54 @@ impl Agent {
         Ok((request, format.map(|format| ToolName::new(&format.name))))
     }
 
-    /// Who a model request of `session` is for (ADR-0039): its tree's root
-    /// and the root's metadata.
+    /// Who a model request of `session` is for (ADR-0039): its tree's root,
+    /// the root's metadata and the cache root its fork chain started from.
     async fn session_context(&self, session: SessionId) -> Result<SessionContext, AgentError> {
         let root = root_of(&*self.log, session).await?;
-        // `SessionCreated` is the first record of every session.
-        let first = self
+        let (metadata, mut source) = self.root_head(root).await?;
+        let mut cache_root = root;
+        for _ in 0..MAX_FORK_CHAIN {
+            let Some(from) = source else { break };
+            cache_root = root_of(&*self.log, from).await?;
+            source = self.root_head(cache_root).await?.1;
+        }
+        Ok(SessionContext {
+            session,
+            root,
+            cache_root,
+            metadata,
+        })
+    }
+
+    /// A root's metadata and, for a forked root, the session it was forked
+    /// from: `SessionCreated` is every session's first record and
+    /// `ContextForked` a fork's second.
+    async fn root_head(
+        &self,
+        root: SessionId,
+    ) -> Result<(BTreeMap<String, String>, Option<SessionId>), AgentError> {
+        let head: Vec<_> = self
             .log
             .scan(LogQuery {
                 session: root,
                 after: None,
-                limit: Some(1),
+                limit: Some(2),
             })
-            .next()
-            .await
-            .transpose()?;
-        let metadata = match first.as_ref().map(decode_entry) {
-            Some(Ok(SessionEvent::SessionCreated { metadata, .. })) => metadata,
-            _ => BTreeMap::new(),
-        };
-        Ok(SessionContext {
-            session,
-            root,
-            metadata,
-        })
+            .collect()
+            .await;
+        let mut metadata = BTreeMap::new();
+        let mut source = None;
+        for entry in head {
+            match decode_entry(&entry?) {
+                Ok(SessionEvent::SessionCreated { metadata: m, .. }) => metadata = m,
+                Ok(SessionEvent::ContextForked {
+                    source: ForkSource::Session { session },
+                    ..
+                }) => source = Some(session),
+                _ => {}
+            }
+        }
+        Ok((metadata, source))
     }
 
     async fn commit_turn(
@@ -1348,6 +1380,8 @@ impl Agent {
             .filter(|(step, _)| committed.contains(step))
             .map(|(_, log_id)| log_id)
             .collect();
+        // Same log and watermark as `history`, so its items are `history`'s.
+        let (request, _) = self.build_request(session, &config, watermark).await?;
         Ok((
             CompactionInput {
                 trigger,
@@ -1357,6 +1391,7 @@ impl Agent {
                 history,
                 step_starts,
                 last_usage,
+                request: Some(request),
             },
             frontier,
         ))

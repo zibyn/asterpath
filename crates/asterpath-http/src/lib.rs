@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use asterpath_protocol::{
     FileSource, Item, ModelRequest, Part, ProviderError, ProviderErrorKind, ProviderId,
-    RawProviderData,
+    RawProviderData, ReasoningParams,
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
@@ -163,6 +163,25 @@ pub fn provider_options_for(
     Ok(options)
 }
 
+/// Whether reasoning changes render in place (#180): the baseline and every
+/// `ReasoningChanged` pass the adapter's `in_place(params, baseline)` rule. A
+/// request without a baseline never does.
+pub fn reasoning_in_place(
+    request: &ModelRequest,
+    in_place: impl Fn(&ReasoningParams, &ReasoningParams) -> bool,
+) -> bool {
+    let Some(baseline) = &request.baseline_reasoning else {
+        return false;
+    };
+    in_place(baseline, baseline)
+        && request.items.iter().all(|item| match item {
+            Item::ReasoningChanged { reasoning } => reasoning
+                .as_ref()
+                .is_some_and(|params| in_place(params, baseline)),
+            _ => true,
+        })
+}
+
 /// The `server_tools` entries for `request.spec.provider`, in declaration
 /// order, to append verbatim after the function tools; a non-object entry is
 /// `InvalidRequest`. Contents are not validated (ADR-0031).
@@ -227,6 +246,7 @@ fn all_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
         Item::ToolCall { .. }
         | Item::ServerToolCall { .. }
         | Item::ToolsChanged { .. }
+        | Item::ReasoningChanged { .. }
         | Item::ProviderOpaque { .. } => &[],
     });
     request.system.iter().chain(item_parts)

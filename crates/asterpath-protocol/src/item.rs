@@ -56,8 +56,12 @@ pub enum Item {
         parts: Vec<Part>,
     },
     /// A system instruction appended mid-session (ADR-0030), at the first
-    /// `StepStarted` after its `ConfigChanged`. Only `Part::Text`.
+    /// `StepStarted` after its `ConfigChanged`. Only `Part::Text`. A keyed
+    /// section change carries its key, and its first part is the notice
+    /// saying the section is replaced or removed.
     Instruction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
         parts: Vec<Part>,
     },
     /// A mid-session tool set change (ADR-0030), placed like `Instruction`.
@@ -65,6 +69,11 @@ pub enum Item {
     ToolsChanged {
         added: Vec<crate::ToolDescriptor>,
         removed: Vec<ToolName>,
+    },
+    /// A mid-session change of `RequestConfig::reasoning` (#180), placed like
+    /// `Instruction`. The request's `baseline_reasoning` is the value before it.
+    ReasoningChanged {
+        reasoning: Option<crate::ReasoningParams>,
     },
     ProviderOpaque {
         provider: ProviderId,

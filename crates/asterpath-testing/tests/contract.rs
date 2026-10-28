@@ -14,6 +14,7 @@ async fn in_memory_backend_satisfies_the_shared_session_store_contract() {
 fn created(parent: Option<SessionId>) -> SessionEvent {
     SessionEvent::SessionCreated {
         config: ConfigSnapshot {
+            system_sections: Vec::new(),
             model: ModelSpec {
                 provider: ProviderId::new("p"),
                 model: ModelId::new("m"),

@@ -49,6 +49,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
 
 fn config(max_depth: u8) -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),
@@ -1758,12 +1759,20 @@ async fn seed_parent_with(
     subagents: &SubagentConfig,
     calls: &[ToolCallId],
 ) -> (asterpath_protocol::ParentRef, Vec<LogId>) {
+    seed_parent_config(log, config_with(3, subagents.clone()), calls).await
+}
+
+async fn seed_parent_config(
+    log: &InMemoryEventLog,
+    config: ConfigSnapshot,
+    calls: &[ToolCallId],
+) -> (asterpath_protocol::ParentRef, Vec<LogId>) {
     let parent = SessionId::from_bytes([1; 16]);
     append(
         log,
         parent,
         SessionEvent::SessionCreated {
-            config: config_with(3, subagents.clone()),
+            config,
             parent: None,
             metadata: Default::default(),
         },
@@ -2502,4 +2511,36 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
             reason: CancelReason::Timeout
         }]
     );
+}
+
+#[tokio::test]
+async fn children_take_the_subagent_cache_ttl_not_the_parents() {
+    let one_hour = asterpath_protocol::CacheTtl {
+        prefix: asterpath_protocol::CacheLifetime::OneHour,
+        messages: asterpath_protocol::CacheLifetime::OneHour,
+    };
+    for child_ttl in [asterpath_protocol::CacheTtl::default(), one_hour] {
+        let log = Arc::new(InMemoryEventLog::new());
+        let mut subagents = SubagentConfig::default();
+        subagents.cache_ttl = child_ttl;
+        let mut parent = config_with(3, subagents);
+        parent.request.cache_ttl = one_hour;
+        let call = ToolCallId::from_bytes([0x41; 16]);
+        let (reference, caused_by) = seed_parent_config(&log, parent, &[call]).await;
+        let (scheduler, _agent) = new_scheduler(log.clone(), BTreeMap::new());
+        scheduler
+            .spawn(request_for(&reference, call, caused_by[0]))
+            .await
+            .expect("spawn");
+        let spawned = events(&*log, reference.session)
+            .await
+            .into_iter()
+            .find_map(|event| match event {
+                SessionEvent::ChildSessionSpawned { config, .. } => Some(config),
+                _ => None,
+            })
+            .expect("spawn recorded");
+        assert_eq!(spawned.request.cache_ttl, child_ttl);
+        assert_eq!(spawned.subagents.cache_ttl, child_ttl);
+    }
 }

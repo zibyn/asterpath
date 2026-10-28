@@ -54,6 +54,7 @@ fn input(
     step_starts: Vec<i64>,
 ) -> CompactionInput {
     CompactionInput {
+        request: None,
         trigger,
         model: model(Some(100)),
         config: config(),
@@ -324,8 +325,10 @@ fn summary_model_defaults_to_the_session_model_and_can_be_overridden() {
         context_window: Some(10),
     };
     input.config.summary_model = Some(override_model.clone());
+    input.config.cache_ttl.messages = asterpath_protocol::CacheLifetime::OneHour;
     let CompactPlan::Summarize(job) = compactor().plan(&input) else {
         panic!("expected summarize");
     };
     assert_eq!(job.model, override_model);
+    assert_eq!(job.cache_ttl, input.config.cache_ttl);
 }

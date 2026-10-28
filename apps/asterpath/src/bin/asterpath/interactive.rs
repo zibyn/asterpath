@@ -414,6 +414,7 @@ mod tests {
 
     fn spec() -> SessionSpec {
         let mut spec = SessionSpec {
+            system_sections: Vec::new(),
             model: ModelSpec {
                 provider: ProviderId::new("p"),
                 model: ModelId::new("m"),

@@ -41,6 +41,37 @@ pub struct RequestConfig {
     /// request; entries for other providers are ignored (ADR-0031).
     #[serde(default)]
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
+    /// Prompt cache lifetimes; adapters without TTL control ignore them.
+    /// Which sessions get which is application policy (ADR-0048); children
+    /// take [`SubagentConfig::cache_ttl`], summaries [`CompactionConfig::cache_ttl`].
+    #[serde(default, skip_serializing_if = "CacheTtl::is_default")]
+    pub cache_ttl: CacheTtl,
+}
+
+/// Prompt cache lifetimes for the adapter's breakpoints (Anthropic
+/// `cache_control.ttl`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTtl {
+    /// Breakpoints on the tools and the system.
+    pub prefix: CacheLifetime,
+    /// Breakpoints on messages, which move every step. Longer than `prefix`
+    /// lifts `prefix` to it: the API needs longer TTLs before shorter ones.
+    pub messages: CacheLifetime,
+}
+
+impl CacheTtl {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How long a prompt cache entry lives without a hit. Ordered short to long.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CacheLifetime {
+    #[default]
+    FiveMinutes,
+    /// Writes cost more than 5m ones; pays off when a session idles past 5m.
+    OneHour,
 }
 
 /// A named JSON schema the model's result must follow (structured output).
@@ -96,6 +127,7 @@ impl Default for RequestConfig {
             provider_options: BTreeMap::new(),
             output_format: None,
             server_tools: BTreeMap::new(),
+            cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -178,6 +210,10 @@ pub struct CompactionConfig {
     pub max_summary_tokens: u32,
     /// `None`: the session model.
     pub summary_model: Option<ModelSpec>,
+    /// The summary request's prompt cache lifetimes, in place of the
+    /// session's `request.cache_ttl`.
+    #[serde(default)]
+    pub cache_ttl: CacheTtl,
 }
 
 impl Default for CompactionConfig {
@@ -188,6 +224,7 @@ impl Default for CompactionConfig {
             max_auto_compactions_per_turn: 1,
             max_summary_tokens: 2048,
             summary_model: None,
+            cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -200,6 +237,10 @@ pub struct SubagentConfig {
     pub max_concurrent_children: NonZeroUsize,
     pub spawn_timeout: Option<Duration>,
     pub cancel_grace: Duration,
+    /// Replaces the parent's `request.cache_ttl` in a spawned child's
+    /// config, so children do not inherit a main session's 1h TTL.
+    #[serde(default)]
+    pub cache_ttl: CacheTtl,
 }
 
 impl Default for SubagentConfig {
@@ -210,6 +251,7 @@ impl Default for SubagentConfig {
             max_concurrent_children: NonZeroUsize::new(8).expect("non-zero"),
             spawn_timeout: None,
             cancel_grace: Duration::from_secs(10),
+            cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -240,6 +282,11 @@ pub struct ConfigPatch {
     /// Instructions appended to the system. Only `Part::Text` is valid.
     #[serde(default)]
     pub append_system: Vec<Part>,
+    /// Keyed system sections set or, with empty `parts`, removed. A section
+    /// takes its place in history like `append_system`; a compaction keeps
+    /// only each key's latest value in the baseline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_sections: Vec<SystemSection>,
     /// Tools the model may call from the next step on, recorded as the
     /// registry's descriptors; recovery reads them and never re-resolves.
     #[serde(default)]
@@ -255,10 +302,11 @@ impl ConfigPatch {
         !self.add_tools.is_empty() || !self.remove_tools.is_empty()
     }
 
-    /// Whether the patch has a place in history (appended instructions or a
-    /// tool change); applying such a patch twice is not idempotent.
+    /// Whether the patch has a place in history (appended instructions,
+    /// system sections or a tool change); applying such a patch twice is not
+    /// idempotent.
     pub fn is_positional(&self) -> bool {
-        !self.append_system.is_empty() || self.changes_tools()
+        !self.append_system.is_empty() || !self.system_sections.is_empty() || self.changes_tools()
     }
 }
 
@@ -300,6 +348,10 @@ pub struct ConfigSnapshot {
     /// Only `Part::Text` is valid. In `SessionCreated` the initial system;
     /// folded, it also holds every appended instruction in log order.
     pub system: Vec<Part>,
+    /// Keyed sections rendered after `system`, one per key, in the order
+    /// their keys first appeared; folded, each holds its latest value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_sections: Vec<SystemSection>,
     /// In `SessionCreated` the tools resolved at creation; folded, the
     /// effective set after every `add_tools` / `remove_tools`.
     pub tools: Vec<ToolDescriptor>,
@@ -319,7 +371,48 @@ impl ConfigSnapshot {
             self.request = request.clone();
         }
         self.system.extend(patch.append_system.iter().cloned());
+        for section in &patch.system_sections {
+            set_section(&mut self.system_sections, section);
+        }
         change_tools(&mut self.tools, &patch.add_tools, &patch.remove_tools);
+    }
+}
+
+/// A keyed part of the system that a later change replaces whole. Only
+/// `Part::Text` is valid; empty `parts` in a patch removes the section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemSection {
+    pub key: String,
+    pub parts: Vec<Part>,
+}
+
+impl SystemSection {
+    pub fn new(key: impl Into<String>, parts: Vec<Part>) -> Self {
+        Self {
+            key: key.into(),
+            parts,
+        }
+    }
+
+    /// The system parts `sections` render to, in order.
+    pub fn flatten(sections: &[SystemSection]) -> impl Iterator<Item = &Part> {
+        sections.iter().flat_map(|section| &section.parts)
+    }
+}
+
+/// Replace the section with `change.key` in place, append it when new, or
+/// remove it when `change.parts` is empty.
+pub(crate) fn set_section(sections: &mut Vec<SystemSection>, change: &SystemSection) {
+    match sections
+        .iter()
+        .position(|section| section.key == change.key)
+    {
+        Some(index) if change.parts.is_empty() => {
+            sections.remove(index);
+        }
+        Some(index) => sections[index].parts.clone_from(&change.parts),
+        None if !change.parts.is_empty() => sections.push(change.clone()),
+        None => {}
     }
 }
 

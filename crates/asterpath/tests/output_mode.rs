@@ -61,6 +61,7 @@ fn spec(mode: OutputMode, tool_choice: ToolChoice) -> SessionSpec {
     request.output_format =
         Some(OutputFormat::new(OUTPUT, serde_json::json!({"type": "object"})).with_mode(mode));
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),

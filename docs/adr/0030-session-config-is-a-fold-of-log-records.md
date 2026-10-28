@@ -1,6 +1,6 @@
 # 会话配置是日志记录的折叠，变更是历史中的一个位置
 
-**Status**: accepted (2026-10-24)
+**Status**: accepted (2026-10-24)；「system 只能追加」部分修订 by [ADR-0057](0057-instruction-sections-are-replaced-by-key.md)（带键的指令节可按键替换或删除）；reasoning 变更的位置由 [ADR-0058](0058-reasoning-changes-take-a-place-in-history.md) 扩展
 **来源**: [#108](https://github.com/zibyn/asterpath/issues/108)
 **修订**: [ADR-0010](0010-canonical-protocol-model.md) 的请求模型（system 与工具集不再只来自创建时快照）
 

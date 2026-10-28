@@ -3,9 +3,10 @@
 mod common;
 
 use asterpath_protocol::{
-    FileSource, ImageSource, Item, JsonString, ModelId, ModelRequest, Part, Provider,
-    ProviderErrorKind, ProviderFileId, ProviderId, RawProviderData, ReasoningBinding,
-    ReasoningEffort, ReasoningParams, Role, SamplingParams, ToolChoice, ToolName,
+    CacheLifetime, CacheTtl, FileSource, ImageSource, Item, JsonString, ModelId, ModelRequest,
+    Part, Provider, ProviderErrorKind, ProviderFileId, ProviderId, RawProviderData,
+    ReasoningBinding, ReasoningEffort, ReasoningParams, RequestConfig, Role, SamplingParams,
+    ToolChoice, ToolName,
 };
 use asterpath_provider_anthropic::{
     AnthropicModelProfile, AnthropicProvider, TraceMark, TraceSink,
@@ -230,7 +231,7 @@ async fn renders_tool_calls_and_merges_consecutive_results_before_text() {
         serde_json::json!([
             {"type": "text", "text": "thinking aloud"},
             {"type": "tool_use", "id": "toolu_a", "name": "search", "input": {"q": "a"}},
-            {"type": "tool_use", "id": "toolu_b", "name": "search", "input": {"q": "b"}}
+            {"type": "tool_use", "id": "toolu_b", "name": "search", "input": {"q": "b"}, "cache_control": {"type": "ephemeral"}}
         ])
     );
     assert_eq!(messages[1]["role"], "user");
@@ -274,7 +275,7 @@ async fn renders_images_and_refusals() {
         body["messages"][0]["content"],
         serde_json::json!([
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
-            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/x.jpg"}}
+            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/x.jpg"}, "cache_control": {"type": "ephemeral"}}
         ])
     );
     assert_eq!(
@@ -958,7 +959,7 @@ fn cache_control_is_advertised() {
 }
 
 #[tokio::test]
-async fn sets_cache_breakpoints_on_last_tool_system_block_and_message_block() {
+async fn sets_cache_breakpoints_on_last_tool_system_block_and_last_two_messages() {
     let server = MockServer::start(vec![Reply::sse(empty_sse())]);
     let mut request = base_request();
     request.system = vec![text("be helpful"), text("be terse")];
@@ -991,10 +992,104 @@ async fn sets_cache_breakpoints_on_last_tool_system_block_and_message_block() {
             {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}}
         ])
     );
+    // Fallback on the previous message, in case the step added more than the
+    // API's 20-block lookback.
     assert_eq!(
-        breakpoints(&body),
-        3,
-        "at most 3 of the API's 4 breakpoints"
+        body["messages"][1]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+        ])
+    );
+    assert_eq!(breakpoints(&body), 4, "the API allows at most 4");
+}
+
+/// Every `cache_control` in body order (tools, system, messages).
+fn cache_controls(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut found = Vec::new();
+    for section in ["tools", "system", "messages"] {
+        collect_cache_controls(&body[section], &mut found);
+    }
+    found
+}
+
+fn collect_cache_controls(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(control) = map.get("cache_control") {
+                found.push(control.clone());
+            }
+            map.values()
+                .for_each(|value| collect_cache_controls(value, found));
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .for_each(|value| collect_cache_controls(value, found)),
+        _ => {}
+    }
+}
+
+fn cached_request(prefix: CacheLifetime, messages: CacheLifetime) -> ModelRequest {
+    let mut request = base_request();
+    request.tools = vec![descriptor("a")];
+    request.baseline_tools = request.tools.clone();
+    request.items = vec![
+        user_message(vec![text("hi")]),
+        assistant_message(vec![text("hello")]),
+        user_message(vec![text("again")]),
+    ];
+    request.cache_ttl = CacheTtl { prefix, messages };
+    request
+}
+
+#[tokio::test]
+async fn cache_ttl_sets_one_hour_or_five_minute_breakpoints() {
+    let five = serde_json::json!({"type": "ephemeral"});
+    let hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    let cases = [
+        (
+            CacheLifetime::FiveMinutes,
+            CacheLifetime::FiveMinutes,
+            [&five, &five, &five, &five],
+        ),
+        (
+            CacheLifetime::OneHour,
+            CacheLifetime::OneHour,
+            [&hour, &hour, &hour, &hour],
+        ),
+        // Mixed: 1h on the stable prefix, 5m on the moving message breakpoints.
+        (
+            CacheLifetime::OneHour,
+            CacheLifetime::FiveMinutes,
+            [&hour, &hour, &five, &five],
+        ),
+        // The API needs 1h breakpoints before 5m ones, so the prefix is lifted.
+        (
+            CacheLifetime::FiveMinutes,
+            CacheLifetime::OneHour,
+            [&hour, &hour, &hour, &hour],
+        ),
+    ];
+    let server = MockServer::start(cases.iter().map(|_| Reply::sse(empty_sse())).collect());
+    let provider = provider(&server);
+    for (prefix, messages, _) in &cases {
+        drain(&provider, cached_request(*prefix, *messages)).await;
+    }
+    for (recorded, (prefix, messages, expected)) in server.requests().iter().zip(&cases) {
+        let found = cache_controls(&recorded.json_body());
+        let expected: Vec<serde_json::Value> =
+            expected.iter().map(|value| (*value).clone()).collect();
+        assert_eq!(found, expected, "prefix {prefix:?}, messages {messages:?}");
+    }
+}
+
+#[test]
+fn default_cache_ttl_is_five_minutes_everywhere() {
+    assert_eq!(
+        RequestConfig::default().cache_ttl,
+        CacheTtl {
+            prefix: CacheLifetime::FiveMinutes,
+            messages: CacheLifetime::FiveMinutes,
+        }
     );
 }
 
@@ -1102,7 +1197,13 @@ async fn breakpoint_skips_replayed_raw_blocks_and_leaves_them_byte_identical() {
     assert_eq!(breakpoints(&body), 1);
 
     assert!(recorded[1].body.contains(raw), "{}", recorded[1].body);
-    assert_eq!(breakpoints(&recorded[1].json_body()), 0);
+    // Only the previous message's fallback remains.
+    let body = recorded[1].json_body();
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(breakpoints(&body), 1);
 }
 
 #[tokio::test]
@@ -1455,6 +1556,7 @@ fn instructed_request(model_id: &str) -> ModelRequest {
             raw: None,
         },
         Item::Instruction {
+            key: None,
             parts: vec![text("answer in French")],
         },
     ];
@@ -1489,6 +1591,7 @@ async fn an_instruction_followed_by_user_input_moves_after_it() {
     request.items = vec![
         user_message(vec![text("first")]),
         Item::Instruction {
+            key: None,
             parts: vec![text("rule")],
         },
         user_message(vec![text("second")]),
@@ -1659,6 +1762,116 @@ async fn without_inline_changes_a_tool_change_rewrites_the_top_level_tools_and_d
             .all(|message| message["role"] != "system"),
         "{body}"
     );
+}
+
+/// A second turn after the effort changed from `from` to `to`.
+fn effort_changed_request(
+    model_id: &str,
+    from: ReasoningEffort,
+    to: ReasoningEffort,
+) -> ModelRequest {
+    let mut request = request_for(model_id);
+    request.baseline_reasoning = effort(from);
+    request.reasoning = effort(to);
+    request.items = vec![
+        user_message(vec![text("hi")]),
+        assistant_message(vec![text("ok")]),
+        user_message(vec![text("more")]),
+        Item::ReasoningChanged {
+            reasoning: effort(to),
+        },
+    ];
+    request
+}
+
+const OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
+#[tokio::test]
+async fn an_effort_change_renders_as_an_effort_only_system_message_and_keeps_the_top_level_effort()
+{
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert!(
+        sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA),
+        "{}",
+        sent.head
+    );
+    let body = sent.json_body();
+    assert_eq!(body["output_config"]["effort"], "high", "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{body}");
+    assert_eq!(
+        messages[3],
+        serde_json::json!({"role": "system", "content": [], "output_config": {"effort": "low"}})
+    );
+    assert_eq!(
+        messages[2]["content"][0]["cache_control"]["type"], "ephemeral",
+        "the tail breakpoint skips the empty system message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_effort_change_joins_a_pending_system_message() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let mut request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    request.items.insert(
+        3,
+        Item::Instruction {
+            key: None,
+            parts: vec![text("rule")],
+        },
+    );
+    drain(&provider(&server), request).await;
+    let body = server.requests()[0].json_body();
+    let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "system", "{body}");
+    assert_eq!(last["content"][0]["text"], "rule");
+    assert_eq!(last["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+#[tokio::test]
+async fn without_inline_effort_an_effort_change_rewrites_the_top_level_effort() {
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let provider = provider(&server).with_model_profile(
+        "claude-opus-5-5",
+        AnthropicModelProfile::latest().with_inline_effort(false),
+    );
+    let request = effort_changed_request(
+        "claude-opus-5-5",
+        ReasoningEffort::High,
+        ReasoningEffort::Low,
+    );
+    drain(&provider, request).await;
+    let sent = &server.requests()[0];
+    assert!(!sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA));
+    let body = sent.json_body();
+    assert_eq!(body["output_config"]["effort"], "low");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn turning_reasoning_off_rewrites_the_top_level_even_with_inline_effort() {
+    // Off changes `thinking`, which only the top level carries.
+    let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+    let request =
+        effort_changed_request("claude-opus-5", ReasoningEffort::High, ReasoningEffort::Off);
+    drain(&provider(&server), request).await;
+    let sent = &server.requests()[0];
+    assert!(!sent.head.to_ascii_lowercase().contains(OUTPUT_CONFIG_BETA));
+    let body = sent.json_body();
+    assert_eq!(body["thinking"]["type"], "disabled", "{body}");
+    assert!(body.get("output_config").is_none(), "{body}");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{body}");
 }
 
 fn answer_format() -> Option<asterpath_protocol::OutputFormat> {

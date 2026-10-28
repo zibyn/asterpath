@@ -1309,6 +1309,7 @@ async fn an_instruction_renders_as_a_developer_message_in_place() {
     let mut request = request(vec![
         user_text("hi"),
         Item::Instruction {
+            key: None,
             parts: texts("answer in French"),
         },
     ]);
@@ -1728,6 +1729,47 @@ fn with_effort(model: &str, effort: asterpath_protocol::ReasoningEffort) -> Mode
     reasoning.effort = Some(effort);
     request.reasoning = Some(reasoning);
     request
+}
+
+fn effort_change(effort: asterpath_protocol::ReasoningEffort) -> Item {
+    let mut reasoning = asterpath_protocol::ReasoningParams::default();
+    reasoning.effort = Some(effort);
+    Item::ReasoningChanged {
+        reasoning: Some(reasoning),
+    }
+}
+
+/// `High` at the baseline, then two adjacent changes ending at `Low`.
+fn effort_changed_request(model: &str) -> ModelRequest {
+    use asterpath_protocol::ReasoningEffort::{High, Low, Medium};
+    let mut request = with_effort(model, Low);
+    request.baseline_reasoning = with_effort(model, High).reasoning;
+    request.items.push(effort_change(Medium));
+    request.items.push(effort_change(Low));
+    request
+}
+
+#[tokio::test]
+async fn an_effort_change_renders_as_one_configuration_update_on_gpt_6() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    collect(&provider(&server), effort_changed_request("gpt-6-astra")).await;
+    let body: Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+    assert_eq!(body["reasoning"], json!({"effort": "high"}), "{body}");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2, "adjacent updates collapse: {body}");
+    assert_eq!(
+        input[1],
+        json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
+    );
+}
+
+#[tokio::test]
+async fn without_inline_effort_an_effort_change_rewrites_the_top_level_reasoning() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    collect(&provider(&server), effort_changed_request("gpt-5.5")).await;
+    let body: Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+    assert_eq!(body["reasoning"], json!({"effort": "low"}), "{body}");
+    assert_eq!(body["input"].as_array().unwrap().len(), 1, "{body}");
 }
 
 #[tokio::test]
@@ -2151,4 +2193,71 @@ async fn output_format_is_unsupported_before_http_where_the_model_lacks_it() {
             "{model}"
         );
     }
+}
+
+fn in_session(session: u8, cache_root: u8) -> ModelRequest {
+    let mut request = request(vec![user_text("hello")]);
+    request.session = Some(asterpath_protocol::SessionContext {
+        session: asterpath_protocol::SessionId::from_bytes([session; 16]),
+        root: asterpath_protocol::SessionId::from_bytes([session; 16]),
+        cache_root: asterpath_protocol::SessionId::from_bytes([cache_root; 16]),
+        metadata: std::collections::BTreeMap::new(),
+    });
+    request
+}
+
+async fn sent_body(provider: &OpenAiProvider, server: &MockServer, request: ModelRequest) -> Value {
+    let events = collect(provider, request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let requests = server.requests();
+    serde_json::from_str(&requests.last().expect("a request").body).expect("request json")
+}
+
+#[tokio::test]
+async fn prompt_cache_key_defaults_to_the_sessions_cache_root() {
+    let server = MockServer::start(vec![
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+    ]);
+    let provider = provider(&server);
+
+    // A child or a fork carries its own session id but the shared cache root.
+    let body = sent_body(&provider, &server, in_session(1, 9)).await;
+    assert_eq!(body["prompt_cache_key"], json!("09".repeat(16)));
+
+    let mut explicit = in_session(1, 9);
+    explicit.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":"tenant-a"}"#),
+    );
+    let body = sent_body(&provider, &server, explicit).await;
+    assert_eq!(body["prompt_cache_key"], json!("tenant-a"), "options win");
+
+    let body = sent_body(&provider, &server, request(vec![user_text("hello")])).await;
+    assert!(body.get("prompt_cache_key").is_none(), "no session, no key");
+}
+
+#[tokio::test]
+async fn a_profile_can_turn_the_prompt_cache_key_off() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server)
+        .with_default_profile(OpenAiModelProfile::latest().with_prompt_cache_key(false));
+    let mut request = in_session(1, 9);
+    request.spec = spec("compat-model");
+    let body = sent_body(&provider, &server, request).await;
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_null_option_omits_the_prompt_cache_key_for_one_request() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server);
+    let mut request = in_session(1, 9);
+    request.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":null}"#),
+    );
+    let body = sent_body(&provider, &server, request).await;
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
 }

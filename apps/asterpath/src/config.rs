@@ -428,6 +428,7 @@ pub fn session_spec(
         WorkspaceError::Config("a model is required ([model] id or -m)".to_owned())
     })?;
     Ok(asterpath_protocol::SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new(provider),
             model: ModelId::new(model),

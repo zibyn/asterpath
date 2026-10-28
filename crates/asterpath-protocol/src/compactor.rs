@@ -9,10 +9,11 @@ use crate::{LogId, LogIdRange, SessionContext};
 use futures_core::future::BoxFuture;
 
 use crate::agent::{CompactionError, CompactionOutcome};
-use crate::config::{CompactionConfig, ModelSpec, TurnConfig};
+use crate::config::{CacheTtl, CompactionConfig, ModelSpec, TurnConfig};
 use crate::event::CompactionTrigger;
 use crate::item::Item;
 use crate::projection::ProjectedEntry;
+use crate::provider::ModelRequest;
 use crate::usage::Usage;
 
 /// One compaction attempt's view of the session.
@@ -31,6 +32,9 @@ pub struct CompactionInput {
     pub step_starts: Vec<LogId>,
     /// The latest successful `AssistantMessage` still in the projection.
     pub last_usage: Option<UsageAnchor>,
+    /// The session's request at this projection, rendered from `history`.
+    /// `None` makes the summary call an independent request.
+    pub request: Option<ModelRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +77,13 @@ pub struct CompactionJob {
     /// [`ModelRequest::session`](crate::ModelRequest::session). `plan` leaves
     /// it `None`; the agent fills it in before `compact`.
     pub session: Option<SessionContext>,
+    /// `CompactionInput.request` cut to the replaced range, so the summary
+    /// call shares the session's cached prefix (#176). Used only when its
+    /// model is `model`; otherwise the summary call is independent.
+    pub prefix: Option<ModelRequest>,
+    /// [`CompactionConfig::cache_ttl`]: the summary request's TTL whether or
+    /// not it reuses `prefix`.
+    pub cache_ttl: CacheTtl,
 }
 
 #[derive(Clone, Debug, PartialEq)]

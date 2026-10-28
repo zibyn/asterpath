@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use asterpath_http::{
-    merge_provider_option, provider_options_for, same_provider_raw_field, server_tools_for,
-    unrenderable_part,
+    merge_provider_option, provider_options_for, reasoning_in_place, same_provider_raw_field,
+    server_tools_for, unrenderable_part,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -35,7 +35,8 @@ pub(crate) fn render(
     let server_tools = server_tools_for(request)?;
 
     let instructions = system_text(&request.system);
-    let input = render_input(request, provider, trace)?;
+    let inline_effort = inline_effort(request, profile);
+    let input = render_input(request, provider, inline_effort, trace)?;
     let mut tools: Vec<Value> = request
         .tools
         .iter()
@@ -83,6 +84,8 @@ pub(crate) fn render(
         reasoning: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_key: Option<String>,
         store: bool,
         stream: bool,
         include: &'static [&'static str],
@@ -99,8 +102,21 @@ pub(crate) fn render(
         max_output_tokens: request.max_output_tokens,
         temperature: sampling.and_then(|params| params.temperature),
         top_p: sampling.and_then(|params| params.top_p),
-        reasoning: request.reasoning.as_ref().map(reasoning),
+        reasoning: if inline_effort {
+            &request.baseline_reasoning
+        } else {
+            &request.reasoning
+        }
+        .as_ref()
+        .map(reasoning),
         text,
+        // Keyed by the cache root so children, forks and summaries share a cache
+        // node; an explicit provider option wins, `null` omits it.
+        prompt_cache_key: request
+            .session
+            .as_ref()
+            .filter(|_| profile.prompt_cache_key && !options.contains_key("prompt_cache_key"))
+            .map(|context| context.cache_root.to_hex()),
         store: false,
         stream: true,
         include: &["reasoning.encrypted_content"],
@@ -115,6 +131,10 @@ pub(crate) fn render(
     let mut fields: BTreeMap<String, Box<RawValue>> =
         serde_json::from_slice(&bytes).map_err(not_serializable)?;
     for (key, value) in options {
+        // `"prompt_cache_key": null` opts this request out of the derived key.
+        if key == "prompt_cache_key" && value.is_null() {
+            continue;
+        }
         let value = match fields.get(&key) {
             Some(existing) => {
                 let mut target: Value =
@@ -218,19 +238,7 @@ fn tool_choice(choice: &ToolChoice) -> Value {
 fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
     let mut object = Map::new();
     if let Some(effort) = params.effort {
-        object.insert(
-            "effort".to_owned(),
-            json!(match effort {
-                ReasoningEffort::Off => "none",
-                ReasoningEffort::Minimal => "minimal",
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
-                ReasoningEffort::XHigh => "xhigh",
-                ReasoningEffort::Max => "max",
-                _ => unreachable!("validate rejects efforts missing from the model table"),
-            }),
-        );
+        object.insert("effort".to_owned(), json!(effort_name(effort)));
     }
     if params.summary {
         object.insert("summary".to_owned(), json!("auto"));
@@ -238,13 +246,49 @@ fn reasoning(params: &asterpath_protocol::ReasoningParams) -> Value {
     Value::Object(object)
 }
 
+/// Whether reasoning changes render in place (#180) as `configuration_update`
+/// items while the top-level `reasoning` keeps `baseline_reasoning`. The item
+/// carries only `reasoning.effort`; `reasoning.summary` and every other
+/// request field live only at the top level, so a change to any of them, a
+/// missing effort or one the model does not accept falls back to the
+/// effective reasoning at the top level.
+fn inline_effort(request: &ModelRequest, profile: &OpenAiModelProfile) -> bool {
+    profile.inline_effort
+        && reasoning_in_place(request, |params, baseline| {
+            params
+                .effort
+                .is_some_and(|effort| profile.efforts.contains(&effort))
+                && params.budget_tokens.is_none()
+                && params.summary == baseline.summary
+        })
+}
+
+fn effort_name(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        _ => unreachable!("validate rejects efforts missing from the model table"),
+    }
+}
+
 fn render_input(
     request: &ModelRequest,
     provider: &ProviderId,
+    inline_effort: bool,
     trace: Option<&dyn TraceSink>,
 ) -> Result<Vec<Box<RawValue>>, ProviderError> {
     let mut input = Vec::with_capacity(request.items.len());
+    // The API rejects adjacent updates, so the last of a run replaces the others.
+    let mut update_at: Option<usize> = None;
     for item in &request.items {
+        if update_at.is_some_and(|at| at + 1 != input.len()) {
+            update_at = None;
+        }
         match item {
             Item::Message {
                 role,
@@ -326,7 +370,7 @@ fn render_input(
                     "content": text_content(parts, provider, trace),
                 }))?);
             }
-            Item::Instruction { parts } => {
+            Item::Instruction { parts, .. } => {
                 input.push(raw(json!({
                     "type": "message",
                     "role": "developer",
@@ -335,6 +379,28 @@ fn render_input(
             }
             // Top-level `tools` is already the effective set (ADR-0030).
             Item::ToolsChanged { .. } => {}
+            // `inline_effort` has checked that every change carries an effort.
+            Item::ReasoningChanged {
+                reasoning:
+                    Some(asterpath_protocol::ReasoningParams {
+                        effort: Some(effort),
+                        ..
+                    }),
+            } if inline_effort => {
+                let update = raw(json!({
+                    "type": "configuration_update",
+                    "reasoning": {"effort": effort_name(*effort)},
+                }))?;
+                match update_at {
+                    Some(at) => input[at] = update,
+                    None => {
+                        update_at = Some(input.len());
+                        input.push(update);
+                    }
+                }
+            }
+            // The top level already carries the effective reasoning.
+            Item::ReasoningChanged { .. } => {}
         }
     }
     Ok(input)

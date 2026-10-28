@@ -25,6 +25,7 @@ fn usage(input: u64, output: u64) -> Usage {
             uncached: input,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: output,
@@ -104,6 +105,8 @@ impl asterpath_protocol::Compactor for AlwaysCompact {
             retained_tokens: 0,
             turn: input.turn.clone(),
             session: None,
+            prefix: None,
+            cache_ttl: Default::default(),
         })
     }
 

@@ -2,9 +2,10 @@
 //!
 //! `plan` is pure: it cuts only at committed step boundaries, keeps at least
 //! the latest complete step and targets a fraction of the usable window.
-//! `compact` runs an independent text-only summary request; it never inherits
-//! the session's request, tools or reasoning settings and never falls back to
-//! another provider.
+//! `compact` forks the session's request cut to the replaced range and appends
+//! the summary prompt, so the summary call reads the session's cached prefix
+//! (#176). A different summary model shares no cache and gets an independent
+//! text-only request instead. It never falls back to another provider.
 
 // The public compaction error shape is fixed by protocol.md §6.1.
 #![allow(clippy::result_large_err)]
@@ -41,9 +42,9 @@ fn origin_end(origin: &ProjectedOrigin) -> LogId {
 const NON_TEXT_PLACEHOLDER: &str = "[non-text content omitted]";
 
 /// Fixed summary prompt; not exposed to applications in v1.
-const SUMMARY_PROMPT: &str = "Summarize the conversation segment below for future turns. \
+const SUMMARY_PROMPT: &str = "Summarize the conversation segment for future turns. \
 Keep it compact and factual. Include: the goal, work completed, key facts and files, \
-open questions, and the next steps.";
+open questions, and the next steps. Reply with text only; do not call tools.";
 
 const DEFAULT_RESERVE: u32 = 8192;
 
@@ -108,12 +109,22 @@ impl Compactor for DefaultCompactor {
             last: origin_end(&last_replaced.origin),
         };
 
-        let summary_input = input
-            .history
-            .iter()
-            .filter(|entry| origin_start(&entry.origin) < first_kept)
+        let replaced = || {
+            input
+                .history
+                .iter()
+                .filter(|entry| origin_start(&entry.origin) < first_kept)
+        };
+        let summary_input = replaced()
             .flat_map(|entry| text_view(&entry.items))
             .collect();
+        // The session request's items are `history` flattened, so the replaced
+        // range is its first `cut` items.
+        let cut = replaced().map(|entry| entry.items.len()).sum();
+        let prefix = input.request.clone().map(|mut request| {
+            request.items.truncate(cut);
+            request
+        });
 
         CompactPlan::Summarize(CompactionJob {
             first_kept,
@@ -135,6 +146,8 @@ impl Compactor for DefaultCompactor {
             ),
             turn: input.turn.clone(),
             session: None,
+            prefix,
+            cache_ttl: input.config.cache_ttl,
         })
     }
 
@@ -154,26 +167,49 @@ impl DefaultCompactor {
                 format!("summary provider {} is not registered", job.model.provider),
             )));
         };
-        let mut items = vec![Item::Message {
+        let prompt = Item::Message {
             role: Role::User,
             parts: vec![Part::Text {
                 text: SUMMARY_PROMPT.to_owned(),
             }],
             raw: None,
-        }];
-        items.extend(job.summary_input.iter().cloned());
-        let mut request = ModelRequest::new(
-            job.model.clone(),
-            0,
-            Vec::new(),
-            items,
-            Vec::new(),
-            Vec::new(),
-            &RequestConfig::default(),
-        );
-        request.tool_choice = ToolChoice::None;
-        request.max_output_tokens = job.max_summary_tokens;
+        };
+        let mut request = match job.prefix.clone().filter(|prefix| prefix.spec == job.model) {
+            Some(mut request) => {
+                // Cache-safe fork (#176): the session's system, tools,
+                // parameters and history, with the prompt appended last.
+                request.items.push(prompt);
+                // `tool_choice` and the output format are part of the cached
+                // prefix; change them only when they would force a non-text reply.
+                if !matches!(request.tool_choice, ToolChoice::Auto | ToolChoice::None) {
+                    request.tool_choice = ToolChoice::None;
+                }
+                request.output_format = None;
+                // A thinking budget counts against the output limit.
+                let budget = request.reasoning.as_ref().and_then(|r| r.budget_tokens);
+                request.max_output_tokens =
+                    job.max_summary_tokens.saturating_add(budget.unwrap_or(0));
+                request
+            }
+            None => {
+                let mut items = vec![prompt];
+                items.extend(job.summary_input.iter().cloned());
+                let mut request = ModelRequest::new(
+                    job.model.clone(),
+                    0,
+                    Vec::new(),
+                    items,
+                    Vec::new(),
+                    Vec::new(),
+                    &RequestConfig::default(),
+                );
+                request.tool_choice = ToolChoice::None;
+                request.max_output_tokens = job.max_summary_tokens;
+                request
+            }
+        };
         request.session.clone_from(&job.session);
+        request.cache_ttl = job.cache_ttl;
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {
             Ok(result) => result,
@@ -261,6 +297,17 @@ impl DefaultCompactor {
                     );
                 }
             }
+            // A forked request keeps `tool_choice: Auto`, so the reply may be
+            // tool calls only; an empty summary would erase the history.
+            if !summary
+                .iter()
+                .any(|part| matches!(part, Part::Text { text } if !text.trim().is_empty()))
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::StreamProtocol,
+                    "summary reply has no text",
+                ));
+            }
             Ok((summary, usage))
         };
         match job.turn.request_timeout {
@@ -327,7 +374,7 @@ fn text_view(items: &[Item]) -> Vec<Item> {
                     });
                 }
             }
-            // Never forward reasoning: the summary request's system differs from
+            // Never forward reasoning: the independent summary request's system differs from
             // the session's, and Anthropic rejects thinking replayed under it (#104).
             // Instructions and tool changes are rebased into the baseline, never
             // summarized (ADR-0030).
@@ -335,7 +382,8 @@ fn text_view(items: &[Item]) -> Vec<Item> {
             | Item::ProviderOpaque { .. }
             | Item::ServerToolCall { .. }
             | Item::Instruction { .. }
-            | Item::ToolsChanged { .. } => {}
+            | Item::ToolsChanged { .. }
+            | Item::ReasoningChanged { .. } => {}
             Item::ToolCall { name, raw_args, .. } => view.push(text_item(format!(
                 "tool call {name}({})",
                 raw_args.as_str()

@@ -24,6 +24,14 @@
 //! unrecognized ids (third-party endpoints such as DeepSeek reach
 //! [`UNRECOGNIZED`]): only listed models render inline.
 //!
+//! `inline_effort`: the per-message effort list of build-with-claude/effort
+//! ("Change effort mid-conversation", checked 2026-10-28; beta
+//! `mid-conversation-output-config-2026-07-01`): Fable 5.1, Mythos 5.1,
+//! Opus 5.5, Opus 5, Sonnet 5.5 and Haiku 5.5 on the Claude API and Google
+//! Cloud. On Amazon Bedrock only Fable 5.1, Mythos 5.1 and Opus 5.5 have it,
+//! so applications there turn it off for the others. Fable 5 and Mythos 5
+//! have inline system messages but reject per-message effort.
+//!
 //! `structured_output`: the `supportedModels` list of build-with-claude/
 //! structured-outputs (checked 2026-10-24; GA, no beta header): every table
 //! row from Sonnet 4.5 / Haiku 4.5 / Opus 4.5 on. Opus 4 / 4.1, Sonnet 4 and
@@ -81,6 +89,11 @@ pub struct AnthropicModelProfile {
     /// instruction joins the top-level `system` and a tool change rewrites the
     /// top-level `tools`; thinking from before the change is dropped.
     pub inline_changes: bool,
+    /// Accepts an effort-only `role: "system"` message carrying
+    /// `output_config.effort`. With it a change of reasoning effort renders in
+    /// place and the top level keeps the baseline effort; see
+    /// `request::inline_effort` for what can change in place.
+    pub inline_effort: bool,
     /// Accepts `output_config.format` (structured outputs).
     pub structured_output: bool,
     /// Accepts server-executed tools (web search, web fetch, code execution…)
@@ -136,6 +149,12 @@ impl AnthropicModelProfile {
     }
 
     #[must_use]
+    pub fn with_inline_effort(mut self, inline: bool) -> Self {
+        self.inline_effort = inline;
+        self
+    }
+
+    #[must_use]
     pub fn with_structured_output(mut self, structured: bool) -> Self {
         self.structured_output = structured;
         self
@@ -172,6 +191,7 @@ const fn rules(
         forced_tool_choice: forced,
         sampling,
         inline_changes: false,
+        inline_effort: false,
         structured_output: true,
         server_tools: true,
         file_media_types: Cow::Borrowed(PDF),
@@ -180,6 +200,11 @@ const fn rules(
 
 const fn inline(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
     profile.inline_changes = true;
+    profile
+}
+
+const fn inline_effort(mut profile: AnthropicModelProfile) -> AnthropicModelProfile {
+    profile.inline_effort = true;
     profile
 }
 
@@ -200,7 +225,8 @@ const OFF_TO_MAX: &[ReasoningEffort] = &[Off, Low, Medium, High, XHigh, Max];
 const NO_XHIGH: &[ReasoningEffort] = &[Low, Medium, High, Max];
 
 /// Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
-const LATEST: AnthropicModelProfile = inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false));
+const LATEST: AnthropicModelProfile =
+    inline_effort(inline(rules(Thinking::Adaptive, LOW_TO_MAX, false, false)));
 /// Unrecognized ids: [`LATEST`] without inline changes, structured outputs,
 /// server tools or file input (protocol.md §5: unknown means false).
 const UNRECOGNIZED: AnthropicModelProfile = AnthropicModelProfile {
@@ -210,6 +236,7 @@ const UNRECOGNIZED: AnthropicModelProfile = AnthropicModelProfile {
     forced_tool_choice: false,
     sampling: false,
     inline_changes: false,
+    inline_effort: false,
     structured_output: false,
     server_tools: false,
     file_media_types: Cow::Borrowed(&[]),
@@ -222,6 +249,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
     forced_tool_choice: true,
     sampling: false,
     inline_changes: true,
+    inline_effort: true,
     structured_output: true,
     server_tools: true,
     file_media_types: Cow::Borrowed(PDF),
@@ -229,6 +257,7 @@ const ADAPTIVE: AnthropicModelProfile = AnthropicModelProfile {
 /// Sonnet 5: as [`ADAPTIVE`], but no mid-conversation system messages.
 const SONNET_5: AnthropicModelProfile = AnthropicModelProfile {
     inline_changes: false,
+    inline_effort: false,
     ..ADAPTIVE
 };
 /// Fable 5 and Mythos 5: thinking is always on.
@@ -329,6 +358,25 @@ mod tests {
             ("claude-3-haiku", false),
         ] {
             assert_eq!(builtin(model).inline_changes, inline, "{model}");
+        }
+    }
+
+    #[test]
+    fn inline_effort_follows_the_per_message_effort_list() {
+        for (model, inline) in [
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-haiku-5-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-mythos-5-1", true),
+            ("claude-opus-5", true),
+            ("claude-fable-5", false),
+            ("claude-mythos-5", false),
+            ("claude-sonnet-5", false),
+            ("claude-opus-4-8", false),
+            ("claude-next", false),
+        ] {
+            assert_eq!(builtin(model).inline_effort, inline, "{model}");
         }
     }
 

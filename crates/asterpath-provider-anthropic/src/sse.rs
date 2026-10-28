@@ -36,7 +36,7 @@ pub(crate) struct Decoder {
     prefix_epoch: u32,
     tools_hash: String,
     body: String,
-    beta: Option<&'static str>,
+    beta: Option<String>,
 
     phase: Option<Phase>,
     terminal: bool,
@@ -92,7 +92,7 @@ impl Decoder {
         prefix_epoch: u32,
         tools_hash: String,
         body: String,
-        beta: Option<&'static str>,
+        beta: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -172,8 +172,8 @@ impl Decoder {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        if let Some(beta) = self.beta {
-            request = request.header("anthropic-beta", beta);
+        if let Some(beta) = &self.beta {
+            request = request.header("anthropic-beta", beta.as_str());
         }
         let response = request.body(self.body.clone()).send().await;
         let response = match response {
@@ -274,6 +274,7 @@ impl Decoder {
             uncached: u64_field(usage, "input_tokens"),
             cache_read: u64_field(usage, "cache_read_input_tokens"),
             cache_write: u64_field(usage, "cache_creation_input_tokens"),
+            cache_write_1h: one_hour_writes(usage).unwrap_or(0),
         };
         self.output_total = u64_field(usage, "output_tokens");
         self.output_reasoning = usage
@@ -437,6 +438,9 @@ impl Decoder {
                 if let Some(tokens) = usage.get(field).and_then(Value::as_u64) {
                     *slot = tokens;
                 }
+            }
+            if let Some(tokens) = one_hour_writes(Some(usage)) {
+                self.usage_input.cache_write_1h = tokens;
             }
             if let Some(total) = usage.get("output_tokens").and_then(Value::as_u64) {
                 self.output_total = total;
@@ -621,6 +625,14 @@ fn u64_field(value: Option<&Value>, field: &str) -> u64 {
         .and_then(|value| value.get(field))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// `usage.cache_creation.ephemeral_1h_input_tokens`: the 1h share of
+/// `cache_creation_input_tokens`.
+fn one_hour_writes(usage: Option<&Value>) -> Option<u64> {
+    usage?
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64)
 }
 
 fn map_stop_reason(label: &str) -> StopReason {

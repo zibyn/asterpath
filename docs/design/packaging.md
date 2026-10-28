@@ -51,6 +51,7 @@
 pub struct ConfigSnapshot {
     pub model: ModelSpec,
     pub system: Vec<Part>,          // 只允许 Text
+    pub system_sections: Vec<SystemSection>, // 带键的指令节，渲染在 system 之后；折叠后每键为最新值（ADR-0057）；serde default
     pub tools: Vec<ToolDescriptor>, // 创建时解析后的固定集合（name / description / schema / 执行声明）
     pub request: RequestConfig,     // 回合内模型调用的请求参数（#26）
     pub turn: TurnConfig,
@@ -74,6 +75,7 @@ pub struct ConfigSnapshot {
       pub model: Option<ModelSpec>,
       pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
       pub append_system: Vec<Part>,       // 追加到 system，只含 Text；不替换已有 system
+      pub system_sections: Vec<SystemSection>, // 按键设置指令节；parts 为空即删除（ADR-0057）
       pub add_tools: Vec<ToolDescriptor>, // 新增工具：注册表中的描述符，记录后恢复只读不解析
       pub remove_tools: Vec<ToolName>,    // 移除生效集合中的工具；折叠时先删后加
   }
@@ -85,7 +87,9 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
+  可变的是 `model`、`request`、追加 system 指令、指令节与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
+
+- **易变内容放进指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：日期、cwd、git 状态这类会变的内容不要写进无键的 `SessionSpec.system`，否则要么过时，要么只能新开会话。把它们放进 `SessionSpec.system_sections`（如键 `date`、`env`），变化时用 `update_config` 按同一个键写一节（带 `id`）。刷新落在历史原位，不改前缀缓存；压缩后基线里每个键只有最新值。AGENTS.md、技能索引这类会被刷新的指令同理。键非空、同一补丁内不重复，节只含 `Part::Text`。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 
@@ -175,7 +179,7 @@ impl Asterpath {
 - `create_session` 先解析 `SessionSpec`（未知工具名、未知 `ModelSpec.provider`、会话元数据超出 [storage.md](storage.md) §5 的上限 = `AsterError::Config`），再写 `SessionCreated { config, parent: None, metadata }`。
 - `fork_session(source, metadata)` 创建独立的新会话：水位是源会话最后一个已提交回合的末尾，进行中的回合不复制，源会话可以正在被驱动；配置按上下文分叉的规则继承但不收窄；元数据由应用重新给出（同 `create_session` 的上限）。写 `SessionCreated { parent: None, metadata }` 与 `ContextForked { source: ForkSource::Session { .. } }`（[subagents.md](subagents.md) §4.2、[ADR-0033](../adr/0033-session-fork-reuses-context-fork-snapshot.md)）。未知源会话 = `AgentError::NotFound`。
 - `sessions(query)` 是存储目录查询的原样转发：按父会话与元数据过滤（`SessionQuery.metadata` 的每个键值都要相等，空表示不过滤，ADR-0039），按 `(created_at, session)` 降序，`CatalogCursor` 游标分页；目录项带会话元数据。按元数据排序、前缀或范围匹配由应用在结果上完成（ADR-0032）。子会话不继承元数据，所以按租户键过滤只列出根会话。
-- 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
+- 多用户内嵌（ADR-0039）：用户是应用写进根会话元数据的键；每个 model 请求带 `ModelRequest.session: Option<SessionContext { session, root, cache_root, metadata }>`，`metadata` 是根会话的元数据，应用包装 provider 据此选凭据或端点（摘要调用同样带上）；审批端点按会话树 `approval_gate().register(root)`。
 
 ### 3.3 Session 驱动
 
@@ -183,6 +187,7 @@ impl Asterpath {
 pub struct SessionSpec {
     pub model: ModelSpec,
     pub system: Vec<Part>,
+    pub system_sections: Vec<SystemSection>,  // 创建时的指令节；键非空且不重复，只含 Text（ADR-0057）
     pub tools: ToolSelection,
     pub request: RequestConfig,
     pub turn: TurnConfig,

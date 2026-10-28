@@ -87,6 +87,7 @@ fn profile(name: &str) -> AgentProfile {
 
 fn spec(subagents: SubagentConfig) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: model("p", "model-1", Some(1000)),
         system: vec![text("parent system")],
         tools: ToolSelection::All,

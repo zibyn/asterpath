@@ -138,6 +138,7 @@ async fn reasoning_is_dropped_after_a_model_switch_and_replayed_after_switching_
         .expect("build");
     let handle = asterpath
         .create_session(SessionSpec {
+            system_sections: Vec::new(),
             model: model("model-1"),
             system: Vec::new(),
             tools: ToolSelection::Names(vec![ToolName::new("switch")]),
@@ -249,6 +250,7 @@ async fn run_append_turn(provider: Arc<dyn Provider>, model: ModelSpec) {
         .expect("build");
     let handle = asterpath
         .create_session(SessionSpec {
+            system_sections: Vec::new(),
             model,
             system: vec![Part::Text {
                 text: "be helpful".to_owned(),
@@ -482,6 +484,7 @@ async fn run_equip_turn(
         .expect("build");
     let handle = asterpath
         .create_session(SessionSpec {
+            system_sections: Vec::new(),
             model,
             system: vec![Part::Text {
                 text: "be helpful".to_owned(),

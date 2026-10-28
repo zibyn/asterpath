@@ -84,11 +84,15 @@ pub enum Item {
         parts: Vec<Part>,
     },
     Instruction {               // 会话中途追加的 system 指令（§3.3）；只含 Text
+        key: Option<String>,    // 指令节的键（ADR-0057）；带键时首个 part 是替换 / 删除通知
         parts: Vec<Part>,
     },
     ToolsChanged {              // 会话中途的工具集变更（§3.3）；先删后加
         added: Vec<ToolDescriptor>,
         removed: Vec<ToolName>,
+    },
+    ReasoningChanged {          // 会话中途的 reasoning 变更（§3.3，ADR-0058）；渲染见 R16
+        reasoning: Option<ReasoningParams>,
     },
     ProviderOpaque {
         provider: ProviderId,
@@ -192,6 +196,8 @@ pub struct RawProviderData {
 - **基线**：`request_history(entries)` 同时返回基线 system、基线工具集与 items。基线 system 是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）；基线工具集是 `SessionCreated.config.tools`，依次应用被替换区间内的工具变更（先删后加，同名替换）。压缩不把它们交给摘要，而是并入基线（[compaction.md](compaction.md) §5），所以压缩后基线工具集等于压缩时的生效工具集。
 - `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。它的 `tools` 是生效工具集，即 `ModelRequest.tools`。
 - 被移除工具在历史中的 `ToolCall` / `ToolResult` 原样保留。
+- **指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：`patch.system_sections` 的每一节生成一条带 `key` 的 `Instruction`（排在无键指令之后、`ToolsChanged` 之前），落位规则同上。`parts` 为首个文本片段 ``Instruction section `<key>` (supersedes any earlier text of this section):`` 加新值；新值为空表示删除，只有 ``Instruction section `<key>` removed; disregard its earlier text.``。基线另有 `system_sections`（`SessionCreated.config.system_sections` 起始）：被替换区间内的带键条目按键并入（原位替换、新键追加在后、删除即移除），所以同一节刷新多次后压缩，基线里只有最新值。`ModelRequest.system` 是基线 system 后接各节的 parts。
+- **推理变更条目**（[ADR-0058](../adr/0058-reasoning-changes-take-a-place-in-history.md)）：`patch.request` 的 `reasoning` 与此前生效值不同时，生成一条 `Item::ReasoningChanged { reasoning }`（排在同一补丁的 `ToolsChanged` 之后），落位规则同上。基线另有 `baseline_reasoning`（`SessionCreated.config.request.reasoning` 起始）：被替换区间内的推理变更按序并入，所以压缩后基线等于压缩时的生效值。`ModelRequest.reasoning` 是生效值，`baseline_reasoning` 是基线，渲染按 R16 选其一放顶层。`request` 的其他字段没有原位形式，变更只改顶层。
 - **fork**：子会话的 `SessionCreated.config.tools` 已是父在 spawn 水位的生效集合（再经 allowlist 收窄），所以 fork 复制的历史去掉 `ToolsChanged`，否则会把收窄掉的工具重新加回（[subagents.md](subagents.md)）。
 
 ## 4. 请求模型
@@ -203,7 +209,7 @@ pub struct ModelSpec {
     pub context_window: Option<u32>,
 }
 
-// 会话级请求配置；只用于回合内的模型调用，压缩摘要请求独立构造（compaction.md §4）。
+// 会话级请求配置；用于回合内的模型调用。压缩摘要请求同模型时沿用会话请求，否则独立构造（compaction.md §4）。
 #[non_exhaustive]                // Default + 赋字段构造
 pub struct RequestConfig {
     pub max_output_tokens: NonZeroU32,      // 默认 8192
@@ -215,6 +221,19 @@ pub struct RequestConfig {
     pub provider_options: BTreeMap<ProviderId, JsonString>, // 默认空；serde default；规则 R11
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>, // 默认空；serde default；规则 R12（ADR-0031）
     pub output_format: Option<OutputFormat>, // 默认 None；serde default；规则 R13
+    pub cache_ttl: CacheTtl,                 // 默认 5m / 5m；serde default；子会话取 SubagentConfig.cache_ttl，摘要请求取 CompactionConfig.cache_ttl
+}
+
+// prompt cache 断点的 TTL（Anthropic cache_control.ttl）；没有 TTL 控制的 adapter 忽略。
+// 哪些会话用哪种是应用策略（ADR-0048）。
+pub struct CacheTtl {
+    pub prefix: CacheLifetime,   // tools 与 system 上的断点
+    pub messages: CacheLifetime, // 消息上的断点（最后一条与倒数第二条）；长于 prefix 时 prefix 提到同值（API 要求长 TTL 在前）
+}
+
+pub enum CacheLifetime {         // 由短到长有序
+    FiveMinutes,                 // 默认；渲染为 {"type":"ephemeral"}
+    OneHour,                     // {"type":"ephemeral","ttl":"1h"}；写入更贵，会话空闲超过 5m 时划算
 }
 
 pub struct OutputFormat {
@@ -242,17 +261,20 @@ pub struct ModelRequest {
     pub disable_parallel_tool_use: bool,
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,         // 必填；Anthropic max_tokens
-    pub reasoning: Option<ReasoningParams>,
+    pub reasoning: Option<ReasoningParams>,          // 生效值
+    pub baseline_reasoning: Option<ReasoningParams>, // 基线（§3.3）；items 中的 ReasoningChanged 从它通向 reasoning；new 时等于 reasoning
     pub stop_sequences: Vec<String>,    // Anthropic stop_sequences；OpenAI Responses 无此参数，非空 → Unsupported
     pub provider_options: BTreeMap<ProviderId, JsonString>,
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
     pub output_format: Option<OutputFormat>,
-    pub session: Option<SessionContext>, // 请求为谁而发（ADR-0039）；会话外构造为 None，适配器不读
+    pub cache_ttl: CacheTtl,             // 见 RequestConfig.cache_ttl
+    pub session: Option<SessionContext>, // 请求为谁而发（ADR-0039）；会话外构造为 None；适配器只读 cache_root 作默认缓存键
 }
 
 pub struct SessionContext {
     pub session: SessionId,
     pub root: SessionId,                    // 会话树的根；根会话即自身
+    pub cache_root: SessionId,              // 共享 prompt cache 的会话：root；fork 出的根取源会话的 cache_root（ADR-0033）
     pub metadata: BTreeMap<String, String>, // 根会话的会话元数据：子会话不继承，租户键在根上
 }
 
@@ -303,13 +325,14 @@ pub enum ReasoningEffort {
 | R6 | `sampling` 非空时需要 `sampling` 能力；不支持返回 `Unsupported`，不静默丢弃字段。 |
 | R7 | `disable_parallel_tool_use = true` 需要 `parallel_tool_calls` 能力；否则 `Unsupported`。 |
 | R8 | `reasoning` 非空时按 provider 映射；不支持的字段或档位（如 Anthropic 的 `Minimal`、OpenAI 的 `budget_tokens`）返回 `Unsupported`。 |
-| R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。 |
+| R9 | OpenAI adapter 固定设置 `store:false` 与 `include:["reasoning.encrypted_content"]`。请求带 `session` 时默认发 `prompt_cache_key` = `cache_root` 的十六进制，子会话、fork 与摘要请求共享；`provider_options` 给出的 `prompt_cache_key` 优先，给 `null` 则该请求不发（按会话的 `RequestConfig.provider_options` 即按会话关闭），`OpenAiModelProfile::with_prompt_cache_key(false)` 不发（不认识该字段的兼容端点）。 |
 | R10 | 任何无法渲染的规范内容都返回 `Unsupported` 或 `InvalidRequest`；不静默改写历史。adapter 尚不认识的 `Part` 变体（system 与所有 item 中）在发 HTTP 前经 `asterpath_http::unrenderable_part` 返回 `Unsupported`。 |
 | R11 | `provider_options` 只取 `spec.provider` 对应的条目，值必须是 JSON 对象（否则 `InvalidRequest`），按键深合并进请求体顶层：adapter 没写的键直接加入；两边都是对象时逐键递归；其余重叠（会替换 adapter 写入的值，如 `model`、`input`/`messages`、`stream`、`store`、`reasoning.effort`）返回 `Unsupported` 并给出路径。adapter 另可保留未写入的键：OpenAI 保留 `previous_response_id` / `conversation`（R1）。全部在发出 HTTP 前检查。取值属于应用策略。 |
 | R12 | `server_tools` 只取 `spec.provider` 对应的条目，每个值必须是 JSON 对象（否则 `InvalidRequest`），按序原样追加在函数工具之后；adapter 不校验内容。非空而模型 `server_tools` 能力为 false → `Unsupported`。只支持服务端执行的工具；客户端执行的供应商工具（OpenAI `shell` / `apply_patch` / `computer`，Anthropic `text_editor` / `computer` / `memory` 等）不在此机制内，误放时由供应商报错。`tool_choice` 不指向服务端工具。 |
 | R13 | `output_format` 非空时需要 `structured_output` 能力，否则 `Unsupported`。Anthropic `output_config.format: {type:"json_schema", schema}`；OpenAI `text.format: {type:"json_schema", name, schema, strict:true}`。原生模式下结果是普通 `Message` 文本。输出模式（ADR-0034）由引擎在建请求时解析，adapter 不知道：`Tool`，或 `Auto` 且模型无 `structured_output` 而有 `forced_tool_choice`、应用的 `tool_choice` 允许调用输出工具时，引擎把输出工具（名为 `OutputFormat.name`，参数 schema 为 `schema`）加入 `tools` 与 `baseline_tools`（计入工具集指纹），`tool_choice` 设为 `Required`（应用指定的正是输出工具时保留 `Tool(name)`），清空 `output_format`；其余情况发原生约束，不支持时 `Unsupported`。输出工具调用以 `Provenance::Output` 记录意图，补一条固定内容的 `Completed` 结果，不经工具管线；该 step 其他调用照常执行，step 结束后回合 `Completed`。结果是该调用的参数；多个时取位置最前的。`create_session` / `update_config` 拒绝 `Tool` 加 `ToolChoice::None` 或指向其他工具，以及 `Tool` / `Auto` 下与已注册工具重名或不合法的输出工具名（`Config`）。框架不解析、不校验、不重试。 |
 | R14 | `Part::File` 需要 `file_input` 能力；media type 不被模型接受、出现在 assistant 消息、或 `ProviderFile` 指向其他 provider → `Unsupported`（`ImageSource::ProviderFile` 同理）。 |
 | R15 | `ToolDescriptor.strict: Option<bool>`：`Some` 时 Anthropic / OpenAI 都发送 `strict`，`None` 不发送。 |
+| R16 | 推理变更的原位渲染（ADR-0058）：模型 profile 的 `inline_effort` 为 true，且基线与每条 `ReasoningChanged` 都能原位表达时，顶层 `reasoning` 渲染 `baseline_reasoning`，每条变更渲染为历史原位项；否则顶层渲染生效的 `reasoning`，`ReasoningChanged` 不渲染。能原位表达的只有 effort：须有 effort 且为模型接受的档位，其余字段与基线相同。Anthropic：`Off` 不能原位，`budget_tokens` 与 `summary` 须等于基线；变更作为同位置 `role: "system"` 消息（与指令同一条，或单独一条空内容）上的 `output_config.effort`，相邻变更取最后一个，请求带 `anthropic-beta: mid-conversation-output-config-2026-07-01`；工具结果之后的变更从下一条用户输入起生效。OpenAI：`budget_tokens` 须为空、`summary` 须等于基线；变更渲染为 `{"type":"configuration_update","reasoning":{"effort":…}}` input 项，相邻变更取最后一个。 |
 
 - `RequestConfig` 在 `create_session` 时随 `SessionSpec` 写入 `ConfigSnapshot`；loop 每次都从快照读取，恢复后重建出同一请求。
 - R5–R8 用到的按模型规则（`forced_tool_choice`、`sampling`、可用档位、thinking 形态）由 adapter 的 profile 查找给出：实例的模型前缀条目 → 实例默认 → 内置官方表 → 未识别 id 的回退规则（OpenAI `LATEST`，Anthropic `UNRECOGNIZED`）；应用可为第三方服务商注入（ADR-0029）。
@@ -474,6 +497,7 @@ pub struct CompactionInput {
     pub history: Vec<ProjectedEntry>,     // 模型可见投影，按序
     pub step_starts: Vec<LogId>,          // 可切割边界的 StepStarted LogId（已提交 step），升序
     pub last_usage: Option<UsageAnchor>,  // 最近一次 AssistantMessage
+    pub request: Option<ModelRequest>,    // 会话此刻的请求，由 history 渲染；None 时摘要走独立请求
 }
 
 pub struct UsageAnchor {
@@ -509,6 +533,7 @@ pub struct CompactionJob {
     pub usable_window: u32,               // 由会话模型算出，不是摘要模型
     pub retained_tokens: u64,             // first_kept 之后的估算
     pub session: Option<SessionContext>,  // plan 填 None，agent 在 compact 前填入；摘要请求原样带上（ADR-0039）
+    pub prefix: Option<ModelRequest>,     // request 截到被替换区间；模型与 model 相同时摘要请求沿用它（#176）
 }
 
 #[non_exhaustive]
@@ -564,6 +589,8 @@ pub struct InputTokens {
     pub uncached: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// cache_write 中 1h TTL 的部分，是子集、不叠加
+    pub cache_write_1h: u64,
 }
 
 pub struct OutputTokens {
@@ -587,6 +614,7 @@ impl Usage {
 | `input.uncached` | `input_tokens` | `input_tokens - cached_tokens - cache_write_tokens`（饱和减到 0） |
 | `input.cache_read` | `cache_read_input_tokens` | `input_tokens_details.cached_tokens` |
 | `input.cache_write` | `cache_creation_input_tokens` | `input_tokens_details.cache_write_tokens` |
+| `input.cache_write_1h` | `cache_creation.ephemeral_1h_input_tokens` | 0 |
 | `output.total` | `output_tokens` | `output_tokens` |
 | `output.reasoning` | `output_tokens_details.thinking_tokens` | `output_tokens_details.reasoning_tokens` |
 | 总 token | 派生 | 派生；忽略供应商的 `total_tokens` |
@@ -689,6 +717,7 @@ pub enum ProviderErrorKind {
 | `items: Vec<Item>` | `messages[]`（按 §10.2 分组） | `input[]`（扁平 item 列表） |
 | `Item::Instruction` | `messages` 中的 `role: "system"` 消息（text blocks），推迟到下一条 assistant 之前或末尾；连续指令合并为一条。模型不支持（`inline_changes = false`，未识别的 id 默认如此）时并入顶层 `system`（§9 规则 8） | `role: "developer"` 的 input 消息（`input_text`），原位 |
 | `Item::ToolsChanged` | 与指令同一条 `role: "system"` 消息中的 `tool_addition`（`tool: {type: "tool_definition", definition: {name, description, input_schema}}`）与 `tool_removal`（`tool: {type: "tool_reference", name}`）块，请求带 `anthropic-beta: inline-tools-2026-09-15`。模型不支持（`inline_changes = false`，未识别的 id 默认如此）时不渲染（§9 规则 9） | 不渲染：顶层 `tools` 已是生效集合 |
+| `Item::ReasoningChanged` | 原位时为 `role: "system"` 消息上的 `output_config.effort`，否则不渲染（R16） | 原位时为 `configuration_update` input 项，否则不渲染（R16） |
 | `tools` / `baseline_tools` | 顶层 `tools[{name, description, input_schema}]`：inline 路径渲染 `baseline_tools`，退回路径渲染 `tools` | 顶层 `tools[{type:"function", name, description, parameters}]`，渲染 `tools` |
 | `tool_choice` | `auto` / `any` / `tool` / `none` | `auto` / `required` / `function` / `none` |
 | `disable_parallel_tool_use` | `tool_choice.disable_parallel_tool_use` | `parallel_tool_calls: false` |
@@ -699,7 +728,7 @@ pub enum ProviderErrorKind {
 | 输出工具（工具模式，R13） | 普通 `tools[]` 条目 + `tool_choice: {type:"any"}` | 普通 `tools[]` 函数 + `tool_choice: "required"` |
 | `Part::File` | `document` block（`source`: `base64` / `url` / `file`）；接受的 media type 见模型规则 | `input_file`（`file_data` / `file_url` / `file_id`） |
 | `ImageSource::ProviderFile` | `image` block `source: {type:"file", file_id}` | `input_image` `file_id` |
-| `reasoning` | `thinking` | `reasoning` |
+| `reasoning` / `baseline_reasoning` | `thinking` / `output_config.effort`：原位路径渲染 `baseline_reasoning`，否则 `reasoning`（R16） | `reasoning`：同左 |
 | `prefix_epoch` | adapter 内部使用，不发送 | adapter 内部使用，不发送 |
 | 完整历史 | 每次发送 `messages[]` | 每次发送 `input[]`；`store:false` |
 

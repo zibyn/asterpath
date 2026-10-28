@@ -62,6 +62,7 @@ fn usage(input: u64, output: u64) -> Usage {
             uncached: input,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: output,
@@ -79,6 +80,7 @@ fn test_turn_config() -> TurnConfig {
 
 fn spec(provider: &str) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new(provider),
             model: ModelId::new("model-1"),

@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures_core::stream::BoxStream;
 
 use crate::config::{
-    ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
+    CacheTtl, ModelSpec, OutputFormat, ReasoningParams, RequestConfig, SamplingParams, ToolChoice,
     ToolDescriptor,
 };
 use crate::ids::{JsonString, ProviderId, SessionId};
@@ -36,6 +36,10 @@ pub struct ModelRequest {
     pub sampling: Option<SamplingParams>,
     pub max_output_tokens: u32,
     pub reasoning: Option<ReasoningParams>,
+    /// The reasoning at creation or the latest compaction; the
+    /// `Item::ReasoningChanged` entries in `items` lead from it to
+    /// `reasoning`. `new` sets it to `reasoning`.
+    pub baseline_reasoning: Option<ReasoningParams>,
     pub stop_sequences: Vec<String>,
     /// See [`RequestConfig::provider_options`].
     pub provider_options: BTreeMap<ProviderId, JsonString>,
@@ -43,9 +47,11 @@ pub struct ModelRequest {
     pub output_format: Option<OutputFormat>,
     /// See [`RequestConfig::server_tools`].
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
-    /// The session the request is made for; `None` outside one. Adapters
-    /// ignore it; application wrappers pick credentials or endpoints by it
-    /// (ADR-0039).
+    /// See [`RequestConfig::cache_ttl`].
+    pub cache_ttl: CacheTtl,
+    /// The session the request is made for; `None` outside one. Application
+    /// wrappers pick credentials or endpoints by it (ADR-0039); adapters read
+    /// only [`SessionContext::cache_root`] for a default cache key.
     pub session: Option<SessionContext>,
 }
 
@@ -56,6 +62,10 @@ pub struct SessionContext {
     pub session: SessionId,
     /// The root of the session's tree; the session itself for a root.
     pub root: SessionId,
+    /// The session whose prompt cache this request shares: `root`, or for a
+    /// root forked from another session (ADR-0033), the source's
+    /// `cache_root`. Adapters derive their default cache key from it.
+    pub cache_root: SessionId,
     /// The root's session metadata (ADR-0032): children have their own, never
     /// inherited, so a tree's tenancy lives on its root.
     pub metadata: BTreeMap<String, String>,
@@ -85,10 +95,12 @@ impl ModelRequest {
             sampling: request.sampling.clone(),
             max_output_tokens: request.max_output_tokens.get(),
             reasoning: request.reasoning.clone(),
+            baseline_reasoning: request.reasoning.clone(),
             stop_sequences: request.stop_sequences.clone(),
             provider_options: request.provider_options.clone(),
             output_format: request.output_format.clone(),
             server_tools: request.server_tools.clone(),
+            cache_ttl: request.cache_ttl,
             session: None,
         }
     }

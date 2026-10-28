@@ -41,6 +41,7 @@ fn assistant(value: &str) -> Item {
 
 fn spec() -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),
@@ -169,6 +170,12 @@ async fn forked_sessions_continue_independently() {
         "fork request"
     );
     assert_eq!(last.system, [text("be helpful")]);
+    let context = last.session.expect("a session's request");
+    assert_eq!(
+        (context.session, context.root, context.cache_root),
+        (fork.id(), fork.id(), source.id()),
+        "a fork is its own root but shares its source's prompt cache"
+    );
 
     let fork_events = events(&asterpath, &fork).await;
     let SessionEvent::SessionCreated {

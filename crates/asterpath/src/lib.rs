@@ -233,15 +233,7 @@ impl Asterpath {
                 message: "max_steps_per_turn must be greater than zero".to_owned(),
             });
         }
-        if !spec
-            .system
-            .iter()
-            .all(|part| matches!(part, asterpath_protocol::Part::Text { .. }))
-        {
-            return Err(AsterError::Config {
-                message: "system may only contain text parts".to_owned(),
-            });
-        }
+        check_system(&spec.system, &spec.system_sections)?;
         check_metadata(&spec.metadata)?;
         let env = self.resolve(&spec.metadata).await?;
         let lookup = |name: &_| environment::tool(&self.tools, env.as_deref(), name);
@@ -311,6 +303,7 @@ impl Asterpath {
         let mut config =
             asterpath_protocol::effective_config(&records, waterline.seq).ok_or_else(not_found)?;
         config.system = snapshot.system;
+        config.system_sections = snapshot.system_sections;
         let items = snapshot.items;
 
         let session = SessionId::from_bytes(unique_bytes(self.clock.now()));
@@ -632,12 +625,13 @@ impl SessionHandle {
     }
 
     /// Change the session's model or request parameters, append system
-    /// instructions, or add and remove tools (ADR-0030). Validated first: an
-    /// unregistered provider; an `append_system`, `add_tools` or
-    /// `remove_tools` without `id`; non-text system parts; an added tool that
-    /// is not registered on this `Asterpath`, differs from the registered
-    /// descriptor or is already effective; a removed tool that is not
-    /// effective. Each is a `Config` error and nothing is logged. An update
+    /// instructions, set or remove keyed system sections, or add and remove
+    /// tools (ADR-0030, ADR-0057). Validated first: an unregistered provider;
+    /// an `append_system`, `system_sections`, `add_tools` or `remove_tools`
+    /// without `id`; non-text system parts; an empty or repeated section key;
+    /// an added tool that is not registered on this `Asterpath`, differs from
+    /// the registered descriptor or is already effective; a removed tool that
+    /// is not effective. Each is a `Config` error and nothing is logged. An update
     /// with an `id` is recorded once however often it is retried. Otherwise
     /// one `ConfigChanged` is appended; it may be called mid-turn and takes
     /// effect at the next `StepStarted`, so a step already running keeps its
@@ -652,20 +646,12 @@ impl SessionHandle {
         }
         if patch.is_positional() && patch.id.is_none() {
             return Err(AsterError::Config {
-                message: "append_system, add_tools and remove_tools need an update id: \
-                          they are not idempotent"
+                message: "append_system, system_sections, add_tools and remove_tools \
+                          need an update id: they are not idempotent"
                     .to_owned(),
             });
         }
-        if !patch
-            .append_system
-            .iter()
-            .all(|part| matches!(part, asterpath_protocol::Part::Text { .. }))
-        {
-            return Err(AsterError::Config {
-                message: "system may only contain text parts".to_owned(),
-            });
-        }
+        check_system(&patch.append_system, &patch.system_sections)?;
         if let Some(request) = &patch.request {
             agent::output::check(request, |name| self.tool(name).is_some())
                 .map_err(|message| AsterError::Config { message })?;
@@ -997,4 +983,29 @@ pub(crate) fn corrupt<E: std::fmt::Display>(session: SessionId) -> impl FnOnce(E
         session,
         detail: error.to_string(),
     }
+}
+
+/// System parts must be text; section keys must be non-empty and distinct.
+fn check_system(
+    system: &[asterpath_protocol::Part],
+    sections: &[asterpath_protocol::SystemSection],
+) -> Result<(), AsterError> {
+    let config = |message: &str| {
+        Err(AsterError::Config {
+            message: message.to_owned(),
+        })
+    };
+    if !system
+        .iter()
+        .chain(asterpath_protocol::SystemSection::flatten(sections))
+        .all(|part| matches!(part, asterpath_protocol::Part::Text { .. }))
+    {
+        return config("system may only contain text parts");
+    }
+    for (index, section) in sections.iter().enumerate() {
+        if section.key.is_empty() || sections[..index].iter().any(|s| s.key == section.key) {
+            return config("system section keys must be non-empty and distinct");
+        }
+    }
+    Ok(())
 }

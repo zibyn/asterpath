@@ -247,6 +247,7 @@ async fn resume_registers_load_skill_even_when_skills_are_disabled() {
         .await
         .expect("build");
     let spec = SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("anthropic"),
             model: ModelId::new("claude-test"),
