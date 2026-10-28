@@ -2193,3 +2193,57 @@ async fn output_format_is_unsupported_before_http_where_the_model_lacks_it() {
         );
     }
 }
+
+fn in_session(session: u8, cache_root: u8) -> ModelRequest {
+    let mut request = request(vec![user_text("hello")]);
+    request.session = Some(asterpath_protocol::SessionContext {
+        session: asterpath_protocol::SessionId::from_bytes([session; 16]),
+        root: asterpath_protocol::SessionId::from_bytes([session; 16]),
+        cache_root: asterpath_protocol::SessionId::from_bytes([cache_root; 16]),
+        metadata: std::collections::BTreeMap::new(),
+    });
+    request
+}
+
+async fn sent_body(provider: &OpenAiProvider, server: &MockServer, request: ModelRequest) -> Value {
+    let events = collect(provider, request).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let requests = server.requests();
+    serde_json::from_str(&requests.last().expect("a request").body).expect("request json")
+}
+
+#[tokio::test]
+async fn prompt_cache_key_defaults_to_the_sessions_cache_root() {
+    let server = MockServer::start(vec![
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+        MockResponse::sse(completed_text_body("Hi")),
+    ]);
+    let provider = provider(&server);
+
+    // A child or a fork carries its own session id but the shared cache root.
+    let body = sent_body(&provider, &server, in_session(1, 9)).await;
+    assert_eq!(body["prompt_cache_key"], json!("09".repeat(16)));
+
+    let mut explicit = in_session(1, 9);
+    explicit.provider_options.insert(
+        ProviderId::new("openai"),
+        JsonString::new(r#"{"prompt_cache_key":"tenant-a"}"#),
+    );
+    let body = sent_body(&provider, &server, explicit).await;
+    assert_eq!(body["prompt_cache_key"], json!("tenant-a"), "options win");
+
+    let body = sent_body(&provider, &server, request(vec![user_text("hello")])).await;
+    assert!(body.get("prompt_cache_key").is_none(), "no session, no key");
+}
+
+#[tokio::test]
+async fn a_profile_can_turn_the_prompt_cache_key_off() {
+    let server = MockServer::start(vec![MockResponse::sse(completed_text_body("Hi"))]);
+    let provider = provider(&server)
+        .with_default_profile(OpenAiModelProfile::latest().with_prompt_cache_key(false));
+    let mut request = in_session(1, 9);
+    request.spec = spec("compat-model");
+    let body = sent_body(&provider, &server, request).await;
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+}

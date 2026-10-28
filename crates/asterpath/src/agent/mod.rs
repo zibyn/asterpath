@@ -26,8 +26,8 @@ use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalPolicy, CancelReason, CancelRegistration,
     CancelToken, CancellationRegistry, ChildOutcome, CompactPlan, CompactResult, CompactSummary,
     CompactionAbortReason, CompactionError, CompactionInput, CompactionOutcome, CompactionTrigger,
-    Compactor, ConfigSnapshot, Gate, HookError, Hooks, Item, JsonString, ModelRequest, OpenStep,
-    OpenTool, OutputFormat, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
+    Compactor, ConfigSnapshot, ForkSource, Gate, HookError, Hooks, Item, JsonString, ModelRequest,
+    OpenStep, OpenTool, OutputFormat, ProjectedOrigin, Provenance, ProviderCatalog, ProviderError,
     ProviderErrorInfo, ProviderErrorKind, ResumeReason, RunRequest, SessionEvent, SessionFacts,
     SessionState, StepCtx, StopReason, StorageError, StreamEvent, ToolCallId, ToolConfig, ToolName,
     ToolResultStatus, TurnConfig, TurnEndReason, Usage, UsageAnchor, UsageError, UsageLookup,
@@ -1127,26 +1127,52 @@ impl Agent {
     /// and the root's metadata.
     async fn session_context(&self, session: SessionId) -> Result<SessionContext, AgentError> {
         let root = root_of(&*self.log, session).await?;
-        // `SessionCreated` is the first record of every session.
-        let first = self
+        let (metadata, mut source) = self.root_head(root).await?;
+        let mut cache_root = root;
+        // A fork chain is bounded by the forks the application made; the bound
+        // only stops a corrupt cycle.
+        for _ in 0..64 {
+            let Some(from) = source else { break };
+            cache_root = root_of(&*self.log, from).await?;
+            source = self.root_head(cache_root).await?.1;
+        }
+        Ok(SessionContext {
+            session,
+            root,
+            cache_root,
+            metadata,
+        })
+    }
+
+    /// A root's metadata and, for a forked root, the session it was forked
+    /// from: `SessionCreated` is every session's first record and
+    /// `ContextForked` a fork's second.
+    async fn root_head(
+        &self,
+        root: SessionId,
+    ) -> Result<(BTreeMap<String, String>, Option<SessionId>), AgentError> {
+        let head: Vec<_> = self
             .log
             .scan(LogQuery {
                 session: root,
                 after: None,
-                limit: Some(1),
+                limit: Some(2),
             })
-            .next()
-            .await
-            .transpose()?;
-        let metadata = match first.as_ref().map(decode_entry) {
-            Some(Ok(SessionEvent::SessionCreated { metadata, .. })) => metadata,
-            _ => BTreeMap::new(),
-        };
-        Ok(SessionContext {
-            session,
-            root,
-            metadata,
-        })
+            .collect()
+            .await;
+        let mut metadata = BTreeMap::new();
+        let mut source = None;
+        for entry in head {
+            match decode_entry(&entry?) {
+                Ok(SessionEvent::SessionCreated { metadata: m, .. }) => metadata = m,
+                Ok(SessionEvent::ContextForked {
+                    source: ForkSource::Session { session },
+                    ..
+                }) => source = Some(session),
+                _ => {}
+            }
+        }
+        Ok((metadata, source))
     }
 
     async fn commit_turn(

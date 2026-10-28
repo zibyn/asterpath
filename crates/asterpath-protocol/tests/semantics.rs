@@ -440,6 +440,7 @@ fn usage_totals_use_the_exclusive_rule() {
             uncached: 10,
             cache_read: 2,
             cache_write: 3,
+            cache_write_1h: 0,
         },
         output: OutputTokens {
             total: 7,

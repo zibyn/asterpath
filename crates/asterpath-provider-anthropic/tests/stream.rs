@@ -130,6 +130,7 @@ async fn normalizes_the_full_stream_into_s1_to_s10() {
                         uncached: 25,
                         cache_read: 7,
                         cache_write: 3,
+                        cache_write_1h: 0,
                     },
                     output: asterpath_protocol::OutputTokens {
                         total: 42,
@@ -622,6 +623,7 @@ async fn a_stream_without_message_stop_is_a_transport_truncation() {
                 uncached: 9,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
             },
             output: Default::default(),
         })
@@ -888,6 +890,7 @@ async fn message_delta_cumulative_input_usage_overrides_message_start() {
                     uncached: 30,
                     cache_read: 12,
                     cache_write: 6,
+                    cache_write_1h: 0,
                 },
                 output: asterpath_protocol::OutputTokens {
                     total: 9,
@@ -895,6 +898,31 @@ async fn message_delta_cumulative_input_usage_overrides_message_start() {
                 },
             }
         ),
+        other => panic!("expected ResponseEnded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn one_hour_cache_writes_are_split_out_of_cache_write() {
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"cache_creation_input_tokens":248,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"output_tokens":1}}}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    let server = MockServer::start(vec![Reply::sse(body)]);
+    let events = ok(drain(&provider(&server), base_request()).await);
+    match events.last() {
+        Some(StreamEvent::ResponseEnded { usage, .. }) => {
+            assert_eq!(usage.input.cache_write, 248);
+            assert_eq!(usage.input.cache_write_1h, 100);
+            assert_eq!(usage.input_total(), 258, "the 1h share is not added twice");
+        }
         other => panic!("expected ResponseEnded, got {other:?}"),
     }
 }

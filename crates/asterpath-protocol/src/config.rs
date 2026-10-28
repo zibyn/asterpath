@@ -41,6 +41,36 @@ pub struct RequestConfig {
     /// request; entries for other providers are ignored (ADR-0031).
     #[serde(default)]
     pub server_tools: BTreeMap<ProviderId, Vec<JsonString>>,
+    /// Prompt cache lifetimes; adapters without TTL control ignore them.
+    /// Which sessions get which is application policy (ADR-0048).
+    #[serde(default, skip_serializing_if = "CacheTtl::is_default")]
+    pub cache_ttl: CacheTtl,
+}
+
+/// Prompt cache lifetimes for the adapter's breakpoints (Anthropic
+/// `cache_control.ttl`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTtl {
+    /// Breakpoints on the tools and the system.
+    pub prefix: CacheLifetime,
+    /// Breakpoints on messages, which move every step. Longer than `prefix`
+    /// lifts `prefix` to it: the API needs longer TTLs before shorter ones.
+    pub messages: CacheLifetime,
+}
+
+impl CacheTtl {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How long a prompt cache entry lives without a hit. Ordered short to long.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CacheLifetime {
+    #[default]
+    FiveMinutes,
+    /// Writes cost more than 5m ones; pays off when a session idles past 5m.
+    OneHour,
 }
 
 /// A named JSON schema the model's result must follow (structured output).
@@ -96,6 +126,7 @@ impl Default for RequestConfig {
             provider_options: BTreeMap::new(),
             output_format: None,
             server_tools: BTreeMap::new(),
+            cache_ttl: CacheTtl::default(),
         }
     }
 }

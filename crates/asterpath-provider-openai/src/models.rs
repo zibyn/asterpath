@@ -57,6 +57,10 @@ pub struct OpenAiModelProfile {
     /// `Part::File` media types sent as `input_file`; empty means no file
     /// input.
     pub file_media_types: Cow<'static, [&'static str]>,
+    /// Sends `prompt_cache_key` derived from the session's cache root
+    /// (api/docs/guides/prompt-caching); turn it off for endpoints that reject
+    /// the field. A key in provider options is sent either way.
+    pub prompt_cache_key: bool,
 }
 
 impl OpenAiModelProfile {
@@ -108,6 +112,12 @@ impl OpenAiModelProfile {
         self.file_media_types = types.into();
         self
     }
+
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, send: bool) -> Self {
+        self.prompt_cache_key = send;
+        self
+    }
 }
 
 const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
@@ -119,6 +129,7 @@ const fn profile(efforts: &'static [ReasoningEffort]) -> OpenAiModelProfile {
         server_tools: true,
         structured_output: true,
         file_media_types: Cow::Borrowed(PDF),
+        prompt_cache_key: true,
     }
 }
 
@@ -183,6 +194,8 @@ static LATEST_PROFILE: OpenAiModelProfile = OpenAiModelProfile {
     server_tools: false,
     structured_output: false,
     file_media_types: Cow::Borrowed(&[]),
+    // Any model on the Responses endpoint accepts it, unlike the features above.
+    prompt_cache_key: true,
 };
 
 /// Application model entries (first prefix match wins), then the application default, then

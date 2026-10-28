@@ -616,6 +616,7 @@ fn usage(value: Option<&Value>) -> Usage {
             uncached: input.saturating_sub(cache_read + cache_write),
             cache_read,
             cache_write,
+            cache_write_1h: 0,
         },
         output: asterpath_protocol::OutputTokens {
             total: value
