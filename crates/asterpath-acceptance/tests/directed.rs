@@ -69,6 +69,7 @@ fn descriptor(name: &str, replay: ReplaySafety, provenance: Provenance) -> ToolD
 
 fn spec() -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: model(),
         system: vec![text("be helpful")],
         tools: asterpath_protocol::ToolSelection::All,

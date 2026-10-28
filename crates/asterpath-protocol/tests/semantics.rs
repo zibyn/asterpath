@@ -42,6 +42,7 @@ fn model() -> ModelSpec {
 
 fn config() -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: model(),
         system: vec![],
         tools: vec![],
@@ -599,6 +600,7 @@ fn step_started(byte: u8) -> SessionEvent {
 
 fn instruction(value: &str) -> Item {
     Item::Instruction {
+        key: None,
         parts: vec![text(value)],
     }
 }
@@ -794,4 +796,135 @@ fn compaction_moves_replaced_tool_changes_into_the_baseline_tools() {
 fn a_patch_recorded_before_tool_changes_still_decodes() {
     let patch: ConfigPatch = serde_json::from_value(json!({"model": null})).expect("decode");
     assert!(!patch.changes_tools());
+}
+
+fn section(key: &str, value: &str) -> SystemSection {
+    SystemSection::new(key, vec![text(value)])
+}
+
+fn refreshed(key: &str, value: &str) -> SessionEvent {
+    let mut patch = ConfigPatch::default();
+    patch.system_sections = vec![section(key, value)];
+    SessionEvent::ConfigChanged { patch }
+}
+
+fn removed_section(key: &str) -> SessionEvent {
+    let mut patch = ConfigPatch::default();
+    patch.system_sections = vec![SystemSection::new(key, vec![])];
+    SessionEvent::ConfigChanged { patch }
+}
+
+fn created_with_sections(sections: Vec<SystemSection>) -> SessionEvent {
+    SessionEvent::SessionCreated {
+        config: ConfigSnapshot {
+            system: vec![text("base")],
+            system_sections: sections,
+            ..config()
+        },
+        parent: None,
+        metadata: Default::default(),
+    }
+}
+
+#[test]
+fn effective_config_replaces_and_removes_sections_by_key() {
+    let records = records(vec![
+        created_with_sections(vec![section("agents", "v0"), section("date", "mon")]),
+        refreshed("agents", "v1"),
+        refreshed("skills", "s1"),
+        removed_section("date"),
+    ]);
+    let config = effective_config(&records, u64::MAX).expect("config");
+    assert_eq!(config.system, vec![text("base")]);
+    assert_eq!(
+        config.system_sections,
+        vec![section("agents", "v1"), section("skills", "s1")],
+        "a refresh keeps the section's place; a new key goes last"
+    );
+}
+
+#[test]
+fn a_keyed_refresh_is_appended_in_place_and_leaves_the_baseline_alone() {
+    let entries = log(&[
+        created_with_sections(vec![section("agents", "v0")]),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        refreshed("agents", "v1"),
+        step_started(1),
+    ]);
+    let history = request_history(&entries).expect("project");
+    assert_eq!(history.system, vec![text("base")]);
+    assert_eq!(history.system_sections, vec![section("agents", "v0")]);
+    assert_eq!(
+        history.items[1],
+        Item::Instruction {
+            key: Some("agents".to_owned()),
+            parts: vec![
+                text("Instruction section `agents` (supersedes any earlier text of this section):"),
+                text("v1"),
+            ],
+        }
+    );
+}
+
+#[test]
+fn compaction_keeps_only_the_latest_value_of_a_section_refreshed_three_times() {
+    let entries = log(&[
+        created_with_sections(vec![section("agents", "v0"), section("date", "mon")]),
+        SessionEvent::InputRecorded {
+            input: vec![text("hi")],
+        },
+        refreshed("agents", "v1"),
+        step_started(1),
+        assistant("ok"),
+        refreshed("agents", "v2"),
+        step_started(2),
+        assistant("ok"),
+        refreshed("agents", "v3"),
+        removed_section("date"),
+        appended("plain"),
+        step_started(3),
+        assistant("ok"),
+        SessionEvent::CompactionApplied {
+            first_kept: LogId::from_i64(15),
+            summary: vec![text("summary")],
+            replaces: LogIdRange {
+                first: LogId::from_i64(2),
+                last: LogId::from_i64(13),
+            },
+            model: model(),
+            usage: Usage::default(),
+            raw: None,
+        },
+        step_started(4),
+    ]);
+    let history = request_history(&entries).expect("project");
+    assert_eq!(history.system, vec![text("base"), text("plain")]);
+    assert_eq!(history.system_sections, vec![section("agents", "v3")]);
+    assert_eq!(
+        history.items,
+        vec![Item::Compaction {
+            parts: vec![text("summary")]
+        }]
+    );
+}
+
+#[test]
+fn a_removed_section_renders_as_a_removal_notice() {
+    let entries = log(&[
+        created_with_sections(vec![section("date", "mon")]),
+        removed_section("date"),
+        step_started(1),
+    ]);
+    let history = request_history(&entries).expect("project");
+    assert_eq!(
+        history.items,
+        vec![Item::Instruction {
+            key: Some("date".to_owned()),
+            parts: vec![text(
+                "Instruction section `date` removed; disregard its earlier text."
+            )],
+        }]
+    );
 }

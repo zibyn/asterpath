@@ -271,6 +271,11 @@ pub struct ConfigPatch {
     /// Instructions appended to the system. Only `Part::Text` is valid.
     #[serde(default)]
     pub append_system: Vec<Part>,
+    /// Keyed system sections set or, with empty `parts`, removed. A section
+    /// takes its place in history like `append_system`; a compaction keeps
+    /// only each key's latest value in the baseline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_sections: Vec<SystemSection>,
     /// Tools the model may call from the next step on, recorded as the
     /// registry's descriptors; recovery reads them and never re-resolves.
     #[serde(default)]
@@ -289,7 +294,7 @@ impl ConfigPatch {
     /// Whether the patch has a place in history (appended instructions or a
     /// tool change); applying such a patch twice is not idempotent.
     pub fn is_positional(&self) -> bool {
-        !self.append_system.is_empty() || self.changes_tools()
+        !self.append_system.is_empty() || !self.system_sections.is_empty() || self.changes_tools()
     }
 }
 
@@ -331,6 +336,10 @@ pub struct ConfigSnapshot {
     /// Only `Part::Text` is valid. In `SessionCreated` the initial system;
     /// folded, it also holds every appended instruction in log order.
     pub system: Vec<Part>,
+    /// Keyed sections rendered after `system`, one per key, in the order
+    /// their keys first appeared; folded, each holds its latest value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_sections: Vec<SystemSection>,
     /// In `SessionCreated` the tools resolved at creation; folded, the
     /// effective set after every `add_tools` / `remove_tools`.
     pub tools: Vec<ToolDescriptor>,
@@ -350,7 +359,48 @@ impl ConfigSnapshot {
             self.request = request.clone();
         }
         self.system.extend(patch.append_system.iter().cloned());
+        for section in &patch.system_sections {
+            set_section(&mut self.system_sections, section);
+        }
         change_tools(&mut self.tools, &patch.add_tools, &patch.remove_tools);
+    }
+}
+
+/// A keyed part of the system that a later change replaces whole. Only
+/// `Part::Text` is valid; empty `parts` in a patch removes the section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemSection {
+    pub key: String,
+    pub parts: Vec<Part>,
+}
+
+impl SystemSection {
+    pub fn new(key: impl Into<String>, parts: Vec<Part>) -> Self {
+        Self {
+            key: key.into(),
+            parts,
+        }
+    }
+
+    /// The system parts `sections` render to, in order.
+    pub fn flatten(sections: &[SystemSection]) -> impl Iterator<Item = &Part> {
+        sections.iter().flat_map(|section| &section.parts)
+    }
+}
+
+/// Replace the section with `change.key` in place, append it when new, or
+/// remove it when `change.parts` is empty.
+pub(crate) fn set_section(sections: &mut Vec<SystemSection>, change: &SystemSection) {
+    match sections
+        .iter()
+        .position(|section| section.key == change.key)
+    {
+        Some(index) if change.parts.is_empty() => {
+            sections.remove(index);
+        }
+        Some(index) => sections[index].parts.clone_from(&change.parts),
+        None if !change.parts.is_empty() => sections.push(change.clone()),
+        None => {}
     }
 }
 

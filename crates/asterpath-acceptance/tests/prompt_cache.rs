@@ -17,9 +17,9 @@ use asterpath::{Asterpath, DefaultCompactor, OwnedSession};
 use asterpath_protocol::{
     CompactResult, CompactionConfig, ConfigPatch, InputId, ModelId, ModelSpec, Part, Provider,
     ProviderCatalog, ProviderId, ReasoningEffort, ReasoningParams, ReplaySafety, RequestConfig,
-    SessionSpec, SessionStore, SideEffect, SubagentConfig, Tool, ToolArgs, ToolContext,
-    ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig, UpdateId,
-    UserInput,
+    SessionSpec, SessionStore, SideEffect, SubagentConfig, SystemSection, Tool, ToolArgs,
+    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
+    UpdateId, UserInput,
 };
 use asterpath_testing::cache_prefix::{assert_cache_prefix, prefix_break};
 use asterpath_testing::http_mock::{MockServer, Reply};
@@ -197,6 +197,7 @@ struct Setup {
     tools: ToolSelection,
     patches: Vec<ConfigPatch>,
     compactor: bool,
+    sections: Vec<SystemSection>,
 }
 
 impl Setup {
@@ -206,6 +207,7 @@ impl Setup {
             tools: ToolSelection::Names(tools.iter().map(|name| ToolName::new(*name)).collect()),
             patches: Vec::new(),
             compactor: false,
+            sections: Vec::new(),
         }
     }
 }
@@ -247,6 +249,7 @@ async fn create(wire: Wire, asterpath: &Asterpath, setup: &Setup) -> OwnedSessio
             system: vec![Part::Text {
                 text: "be helpful".to_owned(),
             }],
+            system_sections: setup.sections.clone(),
             tools: setup.tools.clone(),
             request: RequestConfig::default(),
             turn: {
@@ -356,6 +359,51 @@ async fn appended_instructions_extend_the_prefix_unless_they_rewrite_the_system(
                 Some(r#"{"text":"answer in French","type":"text"}"#)
             ),
             _ => assert_eq!(broken, None, "{wire:?}"),
+        }
+    }
+}
+
+fn date_section(day: &str) -> SystemSection {
+    SystemSection::new(
+        "date",
+        vec![Part::Text {
+            text: format!("Today is {day}."),
+        }],
+    )
+}
+
+#[tokio::test]
+async fn a_keyed_refresh_extends_the_prefix_unless_it_rewrites_the_system() {
+    for wire in WIRES {
+        let server = wire.serve(vec![
+            calls(vec![wire.reasoning(), call("call-1", "patch")]),
+            calls(vec![call("call-2", "patch")]),
+            ends("fini"),
+        ]);
+        let mut setup = Setup::new(&["patch"]);
+        setup.sections = vec![date_section("Monday")];
+        setup.patches = [9, 10]
+            .into_iter()
+            .zip(["Tuesday", "Wednesday"])
+            .map(|(id, day)| {
+                let mut patch = ConfigPatch::default();
+                patch.id = Some(UpdateId::from_bytes([id; 16]));
+                patch.system_sections = vec![date_section(day)];
+                patch
+            })
+            .collect();
+        let bodies = session(wire, &server, &setup, &["go"]).await;
+        assert_eq!(bodies.len(), 3, "{wire:?}");
+        assert!(bodies[0].contains("Today is Monday."), "{wire:?}");
+        match wire {
+            // Without inline changes the refresh joins the top-level system.
+            Wire::Anthropic {
+                inline_changes: false,
+            } => {
+                let line = prefix_break(&bodies[0], &bodies[1]).expect("rewrites the system");
+                assert!(line.contains("Instruction section `date`"), "{line}");
+            }
+            _ => assert_each_extends(wire, &bodies),
         }
     }
 }

@@ -747,6 +747,7 @@ async fn run_session(args: &Args, run_mode: bool) -> Result<i32, String> {
 
 fn session_spec(fixture: &Fixture, provider: Option<&str>) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new(provider.unwrap_or(&fixture.provider)),
             model: ModelId::new(fixture.model.clone()),

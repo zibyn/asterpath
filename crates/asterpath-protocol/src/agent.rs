@@ -24,6 +24,9 @@ use crate::usage::Usage;
 pub struct SessionSpec {
     pub model: ModelSpec,
     pub system: Vec<Part>,
+    /// Keyed sections after `system`, which `ConfigPatch::system_sections`
+    /// can later replace or remove by key.
+    pub system_sections: Vec<crate::SystemSection>,
     pub tools: ToolSelection,
     pub request: RequestConfig,
     pub turn: TurnConfig,
@@ -280,6 +283,7 @@ impl SessionSpec {
         ConfigSnapshot {
             model: self.model.clone(),
             system: self.system.clone(),
+            system_sections: self.system_sections.clone(),
             tools,
             request: self.request.clone(),
             turn: self.turn.clone(),

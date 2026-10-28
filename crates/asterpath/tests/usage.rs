@@ -65,6 +65,7 @@ fn usage(input: u64, output: u64) -> Usage {
 
 fn spec() -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),

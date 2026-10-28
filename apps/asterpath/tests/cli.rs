@@ -2011,6 +2011,7 @@ fn prepared_session(
             .expect("build");
         let handle = asterpath
             .create_session(SessionSpec {
+                system_sections: Vec::new(),
                 model: ModelSpec {
                     provider: ProviderId::new(id),
                     model: ModelId::new("claude-test"),

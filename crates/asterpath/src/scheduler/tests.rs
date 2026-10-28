@@ -49,6 +49,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
 
 fn config(max_depth: u8) -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),
