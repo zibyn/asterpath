@@ -46,3 +46,4 @@
 ### 修复
 
 - OpenAI 适配器（#208）：流结束时只要没收到终止事件就报 `Transport`，最后一帧缺结尾空行时也不再静默结束；流中途读失败按超时分出 `Timeout`，错误带上已知的 request id。provider 契约套件新增这两个场景。
+- 两个协议适配器改用 `asterpath-http` 的流式调用（#209），HTTP 错误信封统一：OpenAI 非 2xx 错误的 `message` 取 `error.message`（以前是整个响应体），`raw` 带上模型；两边空响应体的消息都是 `<provider> returned HTTP <status>`；Anthropic 在 `message_start` 之前读失败或截断时，错误也带上响应头的 request id。

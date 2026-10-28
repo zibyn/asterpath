@@ -4,45 +4,25 @@
 //! (never after a failure), unique `output_index`, one `ItemCompleted` per
 //! started block, and strictly increasing adapter-assigned `sequence` values.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 
-use asterpath_http::{SseDecoder, SseEvent};
+use asterpath_http::{SseEvent, SseNormalizer};
 use asterpath_protocol::{
     ImageSource, InputTokens, Item, JsonString, ModelId, OutputTokens, Part, PartDelta,
     ProviderError, ProviderId, RawProviderData, ReasoningBinding, Role, StopReason, StreamEvent,
     ToolName, Usage,
 };
-use bytes::Bytes;
-use futures_core::stream::BoxStream;
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::error;
-use crate::request::ANTHROPIC_VERSION;
-
-type ByteStream = BoxStream<'static, reqwest::Result<Bytes>>;
-
-enum Phase {
-    Connect,
-    Read(ByteStream),
-}
 
 pub(crate) struct Decoder {
-    client: reqwest::Client,
-    url: String,
-    api_key: String,
     provider: ProviderId,
     model: ModelId,
     prefix_epoch: u32,
     tools_hash: String,
-    body: String,
-    beta: Option<String>,
 
-    phase: Option<Phase>,
     terminal: bool,
-    queue: VecDeque<Result<StreamEvent, ProviderError>>,
-
-    sse: SseDecoder,
 
     sequence: u64,
     started: bool,
@@ -82,32 +62,18 @@ impl Block {
 }
 
 impl Decoder {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: reqwest::Client,
-        url: String,
-        api_key: String,
         provider: ProviderId,
         model: ModelId,
         prefix_epoch: u32,
         tools_hash: String,
-        body: String,
-        beta: Option<String>,
     ) -> Self {
         Self {
-            client,
-            url,
-            api_key,
             provider,
             model,
             prefix_epoch,
             tools_hash,
-            body,
-            beta,
-            phase: Some(Phase::Connect),
             terminal: false,
-            queue: VecDeque::new(),
-            sse: SseDecoder::new(),
             sequence: 0,
             started: false,
             request_id_header: None,
@@ -119,111 +85,6 @@ impl Decoder {
             output_total: 0,
             output_reasoning: 0,
             usage_known: false,
-        }
-    }
-
-    pub(crate) async fn next_event(&mut self) -> Option<Result<StreamEvent, ProviderError>> {
-        loop {
-            if let Some(event) = self.queue.pop_front() {
-                return Some(event);
-            }
-            if self.terminal {
-                return None;
-            }
-            match self.phase.take() {
-                None => return None,
-                Some(Phase::Connect) => self.connect().await,
-                Some(Phase::Read(mut stream)) => match stream.next().await {
-                    Some(Ok(chunk)) => {
-                        let events = self.sse.push(&chunk);
-                        self.pump(events);
-                        if !self.terminal {
-                            self.phase = Some(Phase::Read(stream));
-                        }
-                    }
-                    Some(Err(failure)) => {
-                        let error = error::transport(
-                            failure,
-                            self.request_id.clone(),
-                            self.partial_usage(),
-                        );
-                        self.fail(error);
-                    }
-                    None => {
-                        let events = self.sse.finish();
-                        self.pump(events);
-                        if !self.terminal {
-                            self.fail(error::truncated(
-                                self.request_id.clone(),
-                                self.partial_usage(),
-                            ));
-                        }
-                    }
-                },
-            }
-        }
-    }
-
-    async fn connect(&mut self) {
-        let mut request = self
-            .client
-            .post(&self.url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-        if let Some(beta) = &self.beta {
-            request = request.header("anthropic-beta", beta.as_str());
-        }
-        let response = request.body(self.body.clone()).send().await;
-        let response = match response {
-            Ok(response) => response,
-            Err(failure) => {
-                let error = error::transport(failure, None, None);
-                self.fail(error);
-                return;
-            }
-        };
-        self.request_id_header = asterpath_http::request_id(response.headers());
-        let status = response.status();
-        if !status.is_success() {
-            let headers = response.headers().clone();
-            let body = match response.text().await {
-                Ok(body) => body,
-                Err(failure) => {
-                    let error = error::transport(failure, self.request_id_header.clone(), None);
-                    self.fail(error);
-                    return;
-                }
-            };
-            let error = error::http(status.as_u16(), &headers, body, &self.provider, &self.model);
-            self.fail(error);
-            return;
-        }
-        self.phase = Some(Phase::Read(response.bytes_stream().boxed()));
-    }
-
-    fn fail(&mut self, error: ProviderError) {
-        self.queue.push_back(Err(error));
-        self.terminal = true;
-        self.phase = None;
-    }
-
-    fn pump(&mut self, events: Result<Vec<SseEvent>, ProviderError>) {
-        let events = match events {
-            Ok(events) => events,
-            Err(error) => return self.fail(error),
-        };
-        for event in events {
-            match self.handle_event(event.event.as_deref(), &event.data) {
-                Ok(events) => {
-                    self.queue.extend(events.into_iter().map(Ok));
-                    if self.terminal {
-                        return;
-                    }
-                }
-                Err(error) => return self.fail(error),
-            }
         }
     }
 
@@ -605,6 +466,31 @@ impl Decoder {
 
     fn partial_usage(&self) -> Option<Usage> {
         self.usage_known.then(|| self.usage())
+    }
+}
+
+impl SseNormalizer for Decoder {
+    fn connected(&mut self, header_request_id: Option<String>) {
+        self.request_id_header = header_request_id;
+    }
+
+    fn event(&mut self, event: SseEvent) -> Vec<Result<StreamEvent, ProviderError>> {
+        match self.handle_event(event.event.as_deref(), &event.data) {
+            Ok(events) => events.into_iter().map(Ok).collect(),
+            Err(error) => vec![Err(error)],
+        }
+    }
+
+    fn terminal(&self) -> bool {
+        self.terminal
+    }
+
+    fn partial_usage(&self) -> Option<Usage> {
+        Decoder::partial_usage(self)
+    }
+
+    fn request_id(&self) -> Option<String> {
+        self.request_id.clone()
     }
 }
 

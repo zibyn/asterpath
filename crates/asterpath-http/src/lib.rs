@@ -3,6 +3,8 @@
 //! Not part of the stable surface (ADR-0026, re-audit candidate 5 revision).
 #![allow(clippy::result_large_err)]
 
+mod streamed_call;
+
 use std::time::Duration;
 
 use asterpath_protocol::{
@@ -11,6 +13,8 @@ use asterpath_protocol::{
 };
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
+
+pub use streamed_call::{ErrorEnvelope, SseNormalizer, streamed_call};
 
 /// One dispatched server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
