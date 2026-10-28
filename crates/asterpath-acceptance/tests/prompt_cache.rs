@@ -21,7 +21,7 @@ use asterpath_protocol::{
     ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, ToolSelection, TurnConfig,
     UpdateId, UserInput,
 };
-use asterpath_testing::cache_prefix::{assert_cache_prefix, prefix_break};
+use asterpath_testing::cache_prefix::{assert_cache_prefix, cache_prefix, prefix_break};
 use asterpath_testing::http_mock::{MockServer, Reply};
 use asterpath_testing::{Fixture, InMemoryEventLog};
 use futures_util::StreamExt;
@@ -557,7 +557,27 @@ async fn the_second_request_after_compaction_extends_the_first() {
         );
         assert_cache_prefix(&bodies[0], &bodies[1]);
         assert_cache_prefix(&bodies[3], &bodies[4]);
+        // #176: the summary call is the session's last request cut to the
+        // replaced range, plus the summary prompt as the last user message.
+        let summary = without_last_user_text(&cache_prefix(&bodies[2]));
+        assert!(
+            cache_prefix(&bodies[1]).starts_with(&summary),
+            "{wire:?}: summary request does not reuse the session prefix\n{summary}\n---\n{}",
+            cache_prefix(&bodies[1])
+        );
     }
+}
+
+/// `prefix` without its last line (the summary prompt), nor the user role
+/// line that opened it when the prompt starts its own message.
+fn without_last_user_text(prefix: &str) -> String {
+    let mut lines: Vec<&str> = prefix.lines().collect();
+    let last = lines.pop().expect("non-empty prefix");
+    assert!(last.contains("the conversation segment"), "{last}");
+    if lines.last() == Some(&r#"{"role":"user"}"#) {
+        lines.pop();
+    }
+    lines.iter().map(|line| format!("{line}\n")).collect()
 }
 
 #[tokio::test]

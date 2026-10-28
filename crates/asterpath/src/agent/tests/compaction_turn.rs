@@ -105,6 +105,7 @@ impl asterpath_protocol::Compactor for AlwaysCompact {
             retained_tokens: 0,
             turn: input.turn.clone(),
             session: None,
+            prefix: None,
         })
     }
 

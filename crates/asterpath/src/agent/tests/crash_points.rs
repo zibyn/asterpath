@@ -150,6 +150,7 @@ impl Compactor for ForcedCompactor {
             retained_tokens: 0,
             turn: input.turn.clone(),
             session: None,
+            prefix: None,
         })
     }
 

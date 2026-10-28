@@ -754,9 +754,12 @@ async fn compaction_rebases_replaced_instructions_into_the_system() {
 
     let requests = provider.inner.requests();
     let summary = &requests[3];
+    // The summary call forks the session's request (#176): the instruction
+    // stays the in-place item it was there, not text to summarize.
+    assert_eq!(summary.items[..3], requests[2].items[..3]);
     assert!(
-        !mentions(&summary.items, "answer in French"),
-        "the instruction is not summarized: {:?}",
+        summary.items.contains(&instruction("answer in French")),
+        "{:?}",
         summary.items
     );
     assert!(mentions(&summary.items, "first"), "{:?}", summary.items);

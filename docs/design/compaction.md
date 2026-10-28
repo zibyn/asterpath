@@ -15,7 +15,7 @@
 - v1 **只做摘要**，不单独折叠旧工具输出。
 - 压缩**不是 step**：`plan` 判定要调用摘要模型后，agent 写 `CompactionStarted` 意图；成功由 `CompactionApplied` 闭合，失败由 `CompactionAborted` 闭合；append 是唯一提交点，崩溃在 append 前重做，无副作用。
 - 强制压缩在**当前 step 内**完成：不新开 `StepStarted`、不写 `StepCommitted`，压缩后按新投影重试同一 step；每 step 至多一次。
-- 摘要输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、`ToolsChanged`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
+- 摘要请求默认**沿用会话请求**（#176）：会话最后一次请求截到被替换区间，末尾追加摘要指令，共享会话已缓存的前缀。摘要模型与会话模型不同时退回独立请求，输入是**文本视图**：丢弃 `Reasoning`、`Instruction`、`ToolsChanged`、provider raw 与非文本 `Part`，只把文本与工具文本形式交给摘要模型。
 - 压缩**重新定基线**（ADR-0030）：被替换区间内追加的 system 指令并入基线 system、工具变更并入基线工具集，不进摘要；保留区间里的条目仍按位置投影（§5 投影）。压缩后基线工具集等于压缩时的生效工具集。
 - 窗口只有 `ModelSpec.context_window` 一个来源；`CompactionConfig` 不重复定义。
 - 进程重启上限归应用：内核每次恢复写 `StreamResumed`，应用据此计数并决定停车；内核不持有恢复计数器。
@@ -90,15 +90,20 @@ pub enum CompactResult {
 
 ### 摘要
 
-- **输入只含文本**（避免把 reasoning / raw / 图片交给摘要模型，触发 400 或无界图片）：
+- **同模型：沿用会话请求**（cache-safe fork，#176）。agent 在 `CompactionInput.request` 里带上会话此刻的请求（与 `history` 同一日志、同一水位，由 `build_request` 渲染，含基线 system、指令节、工具、`cache_ttl`、`prefix_epoch`）；`plan` 把它的 `items` 截到被替换区间（`history` 中被替换条目的 item 数之和），放进 `CompactionJob.prefix`。`compact` 在 `prefix.spec == job.model` 时用它：末尾追加摘要指令作为最后一条 user 消息，其余字段原样保留，因此去掉最后一条 user 消息后，摘要请求是会话最后一次请求的前缀。例外只有会改变回复形态的字段：
+  - `tool_choice` 为 `Required` / `Tool` 时改成 `None`；`Auto` / `None` 保持不变——`tool_choice` 属于 Anthropic 消息缓存的前缀，改成 `None` 会让被摘要区间按全价重读。指令里要求只回复文本，模型若仍调用工具，只取文本部分；
+  - `output_format = None`（结构化输出会把摘要约束成 schema）；
+  - `max_output_tokens = max_summary_tokens + reasoning.budget_tokens`（thinking 预算计入输出上限）。
+  - reasoning 照常回放：system、工具、`prefix_epoch` 都与会话请求一致，adapter 的 reasoning 回放门控（provider / 模型 / `prefix_epoch` / 工具指纹）按普通会话请求判断。
+- **不同模型：独立请求**。不同模型不共享缓存，摘要请求不带 system 与工具。**输入只含文本**（避免把 reasoning / raw / 图片交给摘要模型，触发 400 或无界图片）：
   - 整条丢弃 `Reasoning` item 及其 binding，丢弃 provider raw 与 `ProviderOpaque`；
   - 每个模型可见 item 只保留文本 `Part`；非文本 `Part`（图片、音频、文件等）替换为固定占位文本，不携带原始字节；
   - 工具调用与结果保留文本形式（名称、参数、文本输出）；
   - 摘要请求不挂工具，不启用 reasoning / thinking。
 - 摘要模型：默认 = 当前会话的 provider + 模型；可配 `compaction.summary_model` 单独指定；**不做跨 provider 自动回退**。
 - 摘要调用的 attempt / 退避 / `request_timeout` 取 `CompactionInput.turn`（`TurnConfig`），与模型调用一致。
-- 调用由 compactor 独立构造请求，**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（应用包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
-- 提示词是 compactor 内的固定模板，v1 不开放给应用；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
+- 独立请求**不继承** `SessionSpec.request`：`tools = []`、`tool_choice = None`、`disable_parallel_tool_use = false`、`sampling = None`、`reasoning = None`、`max_output_tokens = max_summary_tokens`（默认 2048）、`session = job.session`（应用包装 provider 按会话选凭据，ADR-0039）；输出达到上限按截断文本接受，不重试。
+- 提示词是 compactor 内的固定模板，v1 不开放给应用；沿用会话请求时放在最后，独立请求时放在最前；输入是待替换区间的投影，输出一段文本，固定包含：目标 / 已完成 / 关键事实与文件 / 未决 / 下一步。
 - 产出是单条 `Item::Compaction { parts: Vec<Part> }`（类型归 #11）；v1 两边都渲染为文本——Anthropic 为用户文本块，OpenAI 为普通 input 文本消息；原生 compaction item 出界。
 
 ## 5. 事件、投影与恢复
@@ -185,7 +190,7 @@ project(entries):
 
 ## 7. 缓存、追踪与统计
 
-- **前缀缓存**：压缩必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
+- **前缀缓存**：摘要请求同模型时沿用会话前缀（§6），被摘要区间按缓存读计费。压缩之后的请求必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
 - **追踪**：`CompactionStarted` 到 `CompactionApplied` / `CompactionAborted` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
 - **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取同 dedup key 的 `CompactionStarted.turn`；最终口径见 [usage.md](usage.md)（#13）。
 
@@ -233,7 +238,7 @@ pub struct CompactionConfig {
 | C11 | token 归因 | 摘要 usage 在 `compaction` 桶；不计入任何 step |
 | C12 | fork 快照 | 子会话物化父的投影（含压缩结果）；之后父子压缩互不影响 |
 | C13 | 未配置 `ModelSpec.context_window` | 自动 / 手动压缩返回 `NotConfigured`；错误路径直接 `ContextExhausted` |
-| C14 | 摘要输入含 reasoning / raw / 图片 | 请求中全部剥离；非文本 Part 变占位文本；请求不挂工具、不启用 reasoning |
+| C14 | 摘要输入含 reasoning / raw / 图片 | 摘要模型与会话模型相同：请求是会话请求截到被替换区间再追加摘要指令，reasoning 按回放门控处理；不同：请求中全部剥离，非文本 Part 变占位文本，请求不挂工具、不启用 reasoning |
 | C15 | 强制压缩摘要失败 / `Insufficient` | 分别 `CompactionAborted{SummaryFailed}` + `TurnCommitted(CompactionFailed)`、`CompactionAborted{Insufficient}` + `TurnCommitted(ContextExhausted)`；无 open 压缩意图 |
 | C17 | 被替换区间内有追加指令 | 指令出现在下一次请求的基线 `system` 中，不在摘要输入里，也不再作为 `Instruction` 条目出现；`prefix_epoch` 加一；保留区间里的指令仍在原位 |
 | C16 | 未装配 Compactor（M0） | 自动压缩跳过；手动返回 `NotConfigured`；强制压缩直接 `ContextExhausted`；无压缩事件 |
