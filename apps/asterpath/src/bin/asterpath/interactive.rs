@@ -204,7 +204,8 @@ async fn turn<W: Write>(
             out: &mut *out,
         },
     )
-    .await?;
+    .await
+    .map_err(aster_error)?;
     let _ = writeln!(out);
     let entries = scan(asterpath.store(), handle.id())
         .await

@@ -147,9 +147,6 @@ impl Asterpath {
             }
         };
 
-        // Usage reads the backend; every write goes through the one append
-        // entry so hooks see it.
-        let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
         let watchers = Arc::new(Watchers::default());
         let ownership = Arc::new(owner::Ownership::new(
             Arc::clone(&backend),
@@ -162,7 +159,10 @@ impl Asterpath {
             Arc::clone(&watchers),
             Arc::clone(&ownership),
         ));
+        // Every read and write goes through the one append entry, so hooks
+        // see every write.
         let trace = TracingQuery::new(Arc::clone(&store));
+        let usage = Arc::new(UsageService::new(store.clone()));
 
         let waits = Arc::new(Waits::new(Arc::clone(&store)));
         let cancellations = Arc::new(CancellationRegistry::new());
@@ -347,7 +347,7 @@ impl Asterpath {
             },
             None => not_found(),
         })?;
-        let snapshot = fork::snapshot(&prefix).map_err(|e| corrupt(e.to_string()))?;
+        let snapshot = fork::snapshot(prefix).map_err(|e| corrupt(e.to_string()))?;
         let mut config = records.config_at(waterline.log_id).ok_or_else(not_found)?;
         config.system = snapshot.system;
         config.system_sections = snapshot.system_sections;
@@ -800,8 +800,8 @@ impl SessionHandle {
     /// The model-visible projection folded from the log, not driver memory.
     /// Each entry keeps its origin so applications can map items back to log ids.
     pub async fn projection(&self) -> Result<Vec<ProjectedEntry>, AsterError> {
-        let entries = self.store.read(self.session).await?.entries();
-        Ok(asterpath_protocol::project(&entries).map_err(corrupt(self.session))?)
+        let log = self.store.read(self.session).await?;
+        Ok(asterpath_protocol::project_decoded(log.decoded()).map_err(corrupt(self.session))?)
     }
 
     /// The effective config folded from the log at its frontier (ADR-0030):

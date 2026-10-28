@@ -111,14 +111,8 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
 
     let opened = session::open(global, &args.session, Frontend::Exec, schema).await?;
     let (outcome, error) = match &opened.owned {
-        // Viewing only: the latest result as it stands, nothing driven.
-        None if parts.is_empty() && !commands => (
-            drive::DriveOutcome {
-                ran: true,
-                ..drive::DriveOutcome::default()
-            },
-            None,
-        ),
+        // Viewing only: nothing driven.
+        None if parts.is_empty() && !commands => (drive::DriveOutcome::default(), None),
         None => {
             opened.shutdown().await?;
             return Err(CliError::run(
@@ -128,7 +122,8 @@ pub async fn exec(global: &GlobalArgs, args: ExecArgs) -> CliResult<()> {
         }
         Some(handle) => drive_owned(&opened, handle, parts, commands, &args).await?,
     };
-    let ran = outcome.ran;
+    // A viewer shows the latest result as it stands.
+    let ran = outcome.ran || opened.owned.is_none();
 
     let entries = scan(opened.asterpath.store(), opened.handle.id())
         .await
@@ -185,11 +180,15 @@ async fn drive_owned(
         // No approval channel: no endpoint is registered, so every `Ask` is denied.
         let mut outcome = drive::DriveOutcome::default();
         if recover {
-            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless).await?;
+            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless)
+                .await
+                .map_err(aster_error)?;
         }
         if !parts.is_empty() {
             submit(handle, parts).await?;
-            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless).await?;
+            outcome = drive::drive(&opened.asterpath, handle, &mut drive::Headless)
+                .await
+                .map_err(aster_error)?;
         }
         (outcome, None)
     })

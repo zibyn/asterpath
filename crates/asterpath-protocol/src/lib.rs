@@ -80,7 +80,7 @@ pub use names::{
 };
 pub use projection::{
     ProjectedEntry, ProjectedOrigin, ProjectionError, RequestHistory, history, project,
-    request_history,
+    project_decoded, request_history, request_history_decoded,
 };
 pub use provider::{
     DuplicateProviderId, ModelRequest, PartDelta, Provider, ProviderCapabilities, ProviderCatalog,

@@ -34,12 +34,12 @@ impl Waits {
             .log
             .read(session)
             .await?
-            .into_iter()
+            .iter()
             .find_map(|(_, event)| match event {
                 SessionEvent::ApprovalDecided {
                     tool_call_id,
                     decision,
-                } if tool_call_id == call => Some(decision),
+                } if *tool_call_id == call => Some(decision.clone()),
                 _ => None,
             }))
     }

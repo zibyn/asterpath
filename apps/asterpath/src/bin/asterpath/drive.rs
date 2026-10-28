@@ -4,7 +4,6 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
     ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin, Provenance,
     ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason, decode_entry,
@@ -13,18 +12,7 @@ use asterpath_protocol::{
 
 use crate::{CliError, CliResult};
 
-pub use asterpath_app::driver::{DriveOutcome, Headless, Interrupt, Operator};
-
-/// Drive the tree with the session driver (GLOSSARY「会话驱动」).
-pub async fn drive(
-    asterpath: &Asterpath,
-    handle: &OwnedSession,
-    operator: &mut impl Operator,
-) -> CliResult<DriveOutcome> {
-    asterpath_app::driver::drive(asterpath, handle, operator)
-        .await
-        .map_err(|error| CliError::run(format!("drive failed: {error}")))
-}
+pub use asterpath_app::driver::{DriveOutcome, Headless, Interrupt, Operator, drive};
 
 /// Print an approval request's fields and the question.
 pub fn ask<W: Write>(out: &mut W, request: &ApprovalRequest) {

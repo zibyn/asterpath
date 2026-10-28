@@ -40,6 +40,9 @@ pub(crate) async fn scan_decoded(
     Ok(DecodedLog { session, records })
 }
 
+/// Records borrowed from a [`DecodedLog`], in the shape projection takes.
+pub(crate) type Decoded<'a> = Vec<(&'a LogEntry, &'a SessionEvent)>;
+
 /// One read of a session: every record decoded once, in log order. It
 /// answers the questions several engine parts share; a lookup only one
 /// caller needs stays with that caller, over these records.
@@ -58,11 +61,11 @@ impl DecodedLog {
         SessionFacts::fold_decoded(self.records.iter().map(|(entry, event)| (entry, event)))
     }
 
-    /// Every record, undecoded.
-    pub(crate) fn entries(&self) -> Vec<LogEntry> {
+    /// Every record as projection takes it.
+    pub(crate) fn decoded(&self) -> Decoded<'_> {
         self.records
             .iter()
-            .map(|(entry, _)| entry.clone())
+            .map(|(entry, event)| (entry, event))
             .collect()
     }
 
@@ -97,7 +100,7 @@ impl DecodedLog {
     /// record before it plus every `CompactionApplied`, which rewrites history
     /// wherever it lands. Shared by the agent's request and compaction input
     /// and by spawn forks. `None` when `at` is not in this log.
-    pub(crate) fn step_prefix(&self, at: LogId) -> Option<Vec<LogEntry>> {
+    pub(crate) fn step_prefix(&self, at: LogId) -> Option<Decoded<'_>> {
         let at = self.seq_of(at)?;
         Some(
             self.records
@@ -105,7 +108,7 @@ impl DecodedLog {
                 .filter(|(entry, event)| {
                     entry.seq < at || matches!(event, SessionEvent::CompactionApplied { .. })
                 })
-                .map(|(entry, _)| entry.clone())
+                .map(|(entry, event)| (entry, event))
                 .collect(),
         )
     }
@@ -117,7 +120,7 @@ impl DecodedLog {
     /// never leaks. Inputs recorded after the waterline turn's last
     /// `StepStarted` belong to the next turn. `None` for an empty log or an
     /// `at` that is not a committed turn of this log.
-    pub(crate) fn fork_prefix(&self, at: Option<TurnId>) -> Option<(LogEntry, Vec<LogEntry>)> {
+    pub(crate) fn fork_prefix(&self, at: Option<TurnId>) -> Option<(LogEntry, Decoded<'_>)> {
         let entries = &self.records;
         let committed = |event: &SessionEvent| match event {
             SessionEvent::TurnCommitted { turn_id, .. } => at.is_none_or(|at| *turn_id == at),
@@ -144,35 +147,18 @@ impl DecodedLog {
                 SessionEvent::InputRecorded { .. } => entry.seq <= last_step,
                 _ => entry.seq <= waterline.seq,
             })
-            .map(|(entry, _)| entry.clone())
+            .map(|(entry, event)| (entry, event))
             .collect();
         Some((waterline, prefix))
     }
 }
 
+/// Read access to the records, in log order.
 impl Deref for DecodedLog {
     type Target = [(LogEntry, SessionEvent)];
 
     fn deref(&self) -> &Self::Target {
         &self.records
-    }
-}
-
-impl<'a> IntoIterator for &'a DecodedLog {
-    type Item = &'a (LogEntry, SessionEvent);
-    type IntoIter = std::slice::Iter<'a, (LogEntry, SessionEvent)>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.iter()
-    }
-}
-
-impl IntoIterator for DecodedLog {
-    type Item = (LogEntry, SessionEvent);
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.into_iter()
     }
 }
 
@@ -255,11 +241,8 @@ mod tests {
         .store
     }
 
-    fn kinds(prefix: &[LogEntry]) -> Vec<&'static str> {
-        prefix
-            .iter()
-            .map(|entry| decode_entry(entry).expect("decodes").kind())
-            .collect()
+    fn kinds(prefix: &super::Decoded<'_>) -> Vec<&'static str> {
+        prefix.iter().map(|(_, event)| event.kind()).collect()
     }
 
     /// Input, a turn with one step that commits, then a compaction after the

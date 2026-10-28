@@ -938,7 +938,7 @@ struct Recorded {
 impl Recorded {
     fn of(decoded: &DecodedLog, turn: TurnId, step: StepId) -> Self {
         let mut recorded = Self::default();
-        for (_, event) in decoded {
+        for (_, event) in decoded.iter() {
             match event {
                 SessionEvent::ToolCallRequested {
                     turn_id,
