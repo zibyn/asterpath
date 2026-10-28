@@ -1,10 +1,8 @@
 //! Context-fork snapshots, shared by spawn forks (subagents.md §4.2) and application
 //! session forks (ADR-0033): which source records a fork copies, and the
-//! projection it materializes.
+//! projection it materializes from a prefix of the decoded log.
 
-use asterpath_protocol::{
-    Item, LogEntry, LogId, Part, ProjectionError, SessionEvent, SystemSection, TurnId,
-};
+use asterpath_protocol::{Item, LogEntry, Part, ProjectionError, SystemSection};
 
 /// What a fork materializes from its prefix.
 pub(crate) struct Snapshot {
@@ -33,64 +31,4 @@ pub(crate) fn snapshot(prefix: &[LogEntry]) -> Result<Snapshot, ProjectionError>
         system_sections: history.system_sections,
         items,
     })
-}
-
-/// A spawn fork's prefix at `at`, the spawn step's `StepStarted`.
-/// `CompactionApplied` folds regardless of `at`, mirroring the agent's
-/// request projection. `None` when `at` is not in `entries`.
-pub(crate) fn spawn_prefix(
-    entries: &[(LogEntry, SessionEvent)],
-    at: LogId,
-) -> Option<Vec<LogEntry>> {
-    let at_seq = entries.iter().find(|(entry, _)| entry.log_id == at)?.0.seq;
-    Some(
-        entries
-            .iter()
-            .filter(|(entry, event)| {
-                entry.seq <= at_seq || matches!(event, SessionEvent::CompactionApplied { .. })
-            })
-            .map(|(entry, _)| entry.clone())
-            .collect(),
-    )
-}
-
-/// A session fork's waterline and prefix (ADR-0033, ADR-0045). The waterline
-/// is `at`'s `TurnCommitted`, or without `at` the last one, or
-/// `SessionCreated` when none has committed; nothing after it is copied,
-/// compactions included, so a turn in progress or a later compaction never
-/// leaks. Inputs recorded after the waterline turn's last `StepStarted`
-/// belong to the next turn. `None` for an empty log or an `at` that is not a
-/// committed turn of this log.
-pub(crate) fn session_prefix(
-    entries: &[(LogEntry, SessionEvent)],
-    at: Option<TurnId>,
-) -> Option<(LogEntry, Vec<LogEntry>)> {
-    let committed = |event: &SessionEvent| match event {
-        SessionEvent::TurnCommitted { turn_id, .. } => at.is_none_or(|at| *turn_id == at),
-        _ => false,
-    };
-    let found = entries.iter().rev().find(|(_, event)| committed(event));
-    let waterline = match at {
-        Some(_) => found?,
-        None => found.or_else(|| entries.first())?,
-    }
-    .0
-    .clone();
-    let last_step = entries
-        .iter()
-        .filter(|(entry, event)| {
-            entry.seq <= waterline.seq && matches!(event, SessionEvent::StepStarted { .. })
-        })
-        .map(|(entry, _)| entry.seq)
-        .max()
-        .unwrap_or(0);
-    let prefix = entries
-        .iter()
-        .filter(|(entry, event)| match event {
-            SessionEvent::InputRecorded { .. } => entry.seq <= last_step,
-            _ => entry.seq <= waterline.seq,
-        })
-        .map(|(entry, _)| entry.clone())
-        .collect();
-    Some((waterline, prefix))
 }
