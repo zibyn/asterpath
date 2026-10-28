@@ -40,7 +40,7 @@ pub use asterpath_provider_anthropic as anthropic;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentParts};
 use crate::commit::{AppendError, CommitLog};
 use crate::scheduler::{Scheduler, SpawnTool};
 use crate::tools::ToolTable;
@@ -106,10 +106,12 @@ impl Asterpath {
     }
 
     pub async fn build(config: AsterpathConfig) -> Result<Self, AsterError> {
-        Self::from_config(config).await
+        Self::from_config(config)
     }
 
-    pub(crate) async fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
+    /// The composition root: the only place engine parts are constructed.
+    /// Synchronous so crate tests assemble through it too.
+    pub(crate) fn from_config(config: AsterpathConfig) -> Result<Self, AsterError> {
         check_tool_names(&config.tools)?;
 
         let providers = Arc::new(ProviderCatalog::new(config.providers).map_err(|error| {
@@ -195,23 +197,22 @@ impl Asterpath {
                     .await
             })
         });
-        let agent = Arc::new(
-            Agent::new(
-                Arc::clone(&store),
-                Arc::clone(&providers),
-                Arc::clone(&tools),
-                config.tool.clone(),
-                approval,
-                Arc::clone(&gate),
-                Arc::clone(&waits),
-                Arc::clone(&config.clock),
-            )
-            .with_hooks(config.hooks, Some(usage_lookup))
-            .with_compactor(config.compactor.clone())
-            .with_cancellations(Arc::clone(&cancellations))
-            .with_scheduler(scheduler)
-            .with_watchers(Arc::clone(&watchers)),
-        );
+        let agent = Arc::new(Agent::new(AgentParts {
+            log: Arc::clone(&store),
+            providers: Arc::clone(&providers),
+            tools: Arc::clone(&tools),
+            tool_config: config.tool.clone(),
+            approval,
+            gate: Arc::clone(&gate),
+            waits: Arc::clone(&waits),
+            clock: Arc::clone(&config.clock),
+            hooks: config.hooks,
+            usage: usage_lookup,
+            compactor: config.compactor.clone(),
+            cancellations: Arc::clone(&cancellations),
+            scheduler,
+            watchers: Arc::clone(&watchers),
+        }));
 
         Ok(Self {
             store,
@@ -228,6 +229,21 @@ impl Asterpath {
             watchers,
             ownership,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent(&self) -> &Arc<Agent> {
+        &self.agent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler(&self) -> &Arc<Scheduler> {
+        self.agent.scheduler()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waits(&self) -> &Arc<Waits> {
+        &self.waits
     }
 
     pub async fn create_session(&self, spec: SessionSpec) -> Result<SessionHandle, AsterError> {

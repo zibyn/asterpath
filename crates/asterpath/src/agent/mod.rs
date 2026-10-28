@@ -69,26 +69,52 @@ pub(crate) struct Agent {
     busy: Arc<Mutex<HashSet<SessionId>>>,
     cancellations: Arc<CancellationRegistry>,
     /// Runs `spawn_agent` calls; children are driven by this agent.
-    scheduler: Option<Arc<Scheduler>>,
+    scheduler: Arc<Scheduler>,
     /// Every drive's events, children's included, reach this process's
     /// watchers (ADR-0038).
     watchers: Arc<Watchers>,
 }
 
+/// Everything the agent runs with, supplied at once by the composition root
+/// (`Asterpath::from_config`), so the parts it shares with the facade and the
+/// scheduler are never private copies.
+pub(crate) struct AgentParts {
+    pub(crate) log: Arc<CommitLog>,
+    pub(crate) providers: Arc<ProviderCatalog>,
+    pub(crate) tools: Arc<ToolTable>,
+    pub(crate) tool_config: ToolConfig,
+    pub(crate) approval: Arc<dyn ApprovalPolicy>,
+    pub(crate) gate: Arc<ApprovalGate>,
+    pub(crate) waits: Arc<Waits>,
+    pub(crate) clock: Arc<dyn Clock>,
+    /// Application hooks; `usage` backs their `usage()` lookups.
+    pub(crate) hooks: Vec<Arc<dyn Hooks>>,
+    pub(crate) usage: UsageLookup,
+    /// `None` means compaction is unavailable everywhere (`NotConfigured`).
+    pub(crate) compactor: Option<Arc<dyn Compactor>>,
+    pub(crate) cancellations: Arc<CancellationRegistry>,
+    pub(crate) scheduler: Arc<Scheduler>,
+    pub(crate) watchers: Arc<Watchers>,
+}
+
 impl Agent {
-    /// The composition root supplies policy, gate and durable waits; this
-    /// module never constructs them, so approval waits are real.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        log: Arc<CommitLog>,
-        providers: Arc<ProviderCatalog>,
-        tools: Arc<ToolTable>,
-        tool_config: ToolConfig,
-        approval: Arc<dyn ApprovalPolicy>,
-        gate: Arc<ApprovalGate>,
-        waits: Arc<Waits>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub(crate) fn new(parts: AgentParts) -> Self {
+        let AgentParts {
+            log,
+            providers,
+            tools,
+            tool_config,
+            approval,
+            gate,
+            waits,
+            clock,
+            hooks,
+            usage,
+            compactor,
+            cancellations,
+            scheduler,
+            watchers,
+        } = parts;
         Self {
             pipeline: ToolPipeline::new(
                 Arc::clone(&log),
@@ -98,62 +124,24 @@ impl Agent {
                 gate,
                 waits,
                 Arc::clone(&clock),
-            ),
+            )
+            .with_hooks(hooks.clone(), Some(usage.clone())),
             log,
             providers,
             clock,
-            hooks: Vec::new(),
-            usage: None,
-            compactor: None,
+            hooks,
+            usage: Some(usage),
+            compactor,
             busy: Arc::new(Mutex::new(HashSet::new())),
-            cancellations: Arc::new(CancellationRegistry::new()),
-            scheduler: None,
-            watchers: Arc::default(),
+            cancellations,
+            scheduler,
+            watchers,
         }
     }
 
-    /// Inject the optional compaction capability. `None` means compaction is
-    /// unavailable everywhere (`NotConfigured`).
-    #[must_use]
-    pub(crate) fn with_compactor(mut self, compactor: Option<Arc<dyn Compactor>>) -> Self {
-        self.compactor = compactor;
-        self
-    }
-
-    /// Register application hooks; `usage` backs their `usage()` lookups.
-    #[must_use]
-    pub(crate) fn with_hooks(
-        mut self,
-        hooks: Vec<Arc<dyn Hooks>>,
-        usage: Option<UsageLookup>,
-    ) -> Self {
-        self.pipeline = self.pipeline.with_hooks(hooks.clone(), usage.clone());
-        self.hooks = hooks;
-        self.usage = usage;
-        self
-    }
-
-    /// Share the facade's per-session cancellation registry. Without this the
-    /// agent keeps a private one.
-    #[must_use]
-    pub(crate) fn with_cancellations(mut self, cancellations: Arc<CancellationRegistry>) -> Self {
-        self.cancellations = cancellations;
-        self
-    }
-
-    /// Run `spawn_agent` through this scheduler, driving children with this
-    /// agent. Without it the spawn tool is an ordinary tool.
-    #[must_use]
-    pub(crate) fn with_scheduler(mut self, scheduler: Arc<Scheduler>) -> Self {
-        self.scheduler = Some(scheduler);
-        self
-    }
-
-    /// Share the facade's watchers. Without this the agent keeps private ones.
-    #[must_use]
-    pub(crate) fn with_watchers(mut self, watchers: Arc<Watchers>) -> Self {
-        self.watchers = watchers;
-        self
+    #[cfg(test)]
+    pub(crate) fn scheduler(&self) -> &Arc<Scheduler> {
+        &self.scheduler
     }
 
     /// Ids come from the injected clock plus a process counter, so a fixed
@@ -982,14 +970,9 @@ impl Agent {
         cancel: &CancelToken,
         events: &EventSink,
     ) -> Result<ToolOutcome, AgentError> {
-        let spawn;
-        let spawn: Option<&SpawnFn<'_>> = match &self.scheduler {
-            Some(scheduler) => {
-                spawn = move |args, ctx| scheduler.run_spawn_tool(self, args, ctx);
-                Some(&spawn)
-            }
-            None => None,
-        };
+        let scheduler = &self.scheduler;
+        let spawn = move |args, ctx| scheduler.run_spawn_tool(self, args, ctx);
+        let spawn: Option<&SpawnFn<'_>> = Some(&spawn);
         let step = ToolStep {
             session,
             turn,

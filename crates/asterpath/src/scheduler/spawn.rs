@@ -27,9 +27,6 @@ use crate::fork;
 use crate::scan::{DecodedLog, backend, scan_decoded};
 use crate::waits::Waits;
 
-#[cfg(test)]
-const DEFAULT_MAX_LIVE_CHILDREN: NonZeroUsize = NonZeroUsize::new(32).expect("non-zero");
-
 /// Consecutive child spawns; used for the depth check.
 const MAX_PARENT_CHAIN: u8 = 64;
 
@@ -64,22 +61,6 @@ struct ParentAdmission {
 }
 
 impl Scheduler {
-    #[cfg(test)]
-    pub(crate) fn with_defaults(
-        log: Arc<CommitLog>,
-        waits: Arc<Waits>,
-        aliases: BTreeMap<ModelAlias, ModelSpec>,
-    ) -> Self {
-        Self::new(
-            log,
-            waits,
-            aliases,
-            Arc::new(asterpath_protocol::SystemClock),
-            DEFAULT_MAX_LIVE_CHILDREN,
-            Arc::new(CancellationRegistry::new()),
-        )
-    }
-
     /// Full wiring: the facade passes the injected clock, the global live-child
     /// cap and the registry the agent shares.
     pub(crate) fn new(
@@ -100,18 +81,6 @@ impl Scheduler {
             admission: Mutex::new(Admission::default()),
             notify: tokio::sync::Notify::new(),
         }
-    }
-
-    /// The registry child drives must share to see cancellation.
-    #[cfg(test)]
-    pub(crate) fn cancellations(&self) -> Arc<CancellationRegistry> {
-        Arc::clone(&self.cancellations)
-    }
-
-    /// The log and waits child drives must share with this scheduler.
-    #[cfg(test)]
-    pub(crate) fn wiring(&self) -> (Arc<CommitLog>, Arc<Waits>) {
-        (Arc::clone(&self.log), Arc::clone(&self.waits))
     }
 
     /// The parent `ToolCallRequested` log id for a spawn tool call.

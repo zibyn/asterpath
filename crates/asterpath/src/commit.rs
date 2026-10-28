@@ -94,14 +94,6 @@ impl CommitLog {
         }
     }
 
-    /// A commit log over `inner` with no hooks, private watchers and an
-    /// ownership that holds no claims: what engine parts get in unit tests.
-    #[cfg(test)]
-    pub(crate) fn for_tests(inner: Arc<dyn SessionStore>) -> Arc<Self> {
-        let ownership = Arc::new(Ownership::new(Arc::clone(&inner), Vec::new()));
-        Arc::new(Self::new(inner, Vec::new(), Arc::default(), ownership))
-    }
-
     /// Changes on every commit to `session` made through this log. Commits
     /// of other processes never reach it: pair it with
     /// [`POLL_INTERVAL`](crate::watch::POLL_INTERVAL).
