@@ -434,6 +434,7 @@ fn corrupt_payload_is_reported_and_not_repaired() {
 
 fn config() -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("test"),
             model: ModelId::new("model"),

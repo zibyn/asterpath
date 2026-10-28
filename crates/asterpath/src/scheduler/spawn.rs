@@ -286,8 +286,9 @@ impl Scheduler {
             if let Some(names) = profile.as_ref().and_then(|p| p.tools.as_ref()) {
                 tools.retain(|tool| names.contains(&tool.name));
             }
-            let system = match (&profile, &context) {
-                (Some(profile), _) => profile.system.clone(),
+            // A system that replaces the parent's drops its sections too.
+            let (system, system_sections) = match (&profile, &context) {
+                (Some(profile), _) => (profile.system.clone(), Vec::new()),
                 (None, ContextPolicy::Fork { at }) => {
                     fork_system(&parent_events, *at).map_err(SpawnError::Execution)?
                 }
@@ -296,12 +297,21 @@ impl Scheduler {
                 (None, ContextPolicy::Fresh) => crate::environment::current()
                     .and_then(|env| env.child_system.clone())
                     .filter(|_| child_depth == 1)
-                    .unwrap_or_else(|| parent_config.system.clone()),
+                    .map_or_else(
+                        || {
+                            (
+                                parent_config.system.clone(),
+                                parent_config.system_sections.clone(),
+                            )
+                        },
+                        |system| (system, Vec::new()),
+                    ),
             };
 
             let config = ConfigSnapshot {
                 model,
                 system,
+                system_sections,
                 tools,
                 ..parent_config
             };
@@ -928,14 +938,15 @@ fn fork_snapshot_at(
     fork::snapshot(&prefix).map_err(backend)
 }
 
-/// A forked child's system: the parent's baseline at the fork point. The fork
+/// A forked child's system and sections: the parent's baseline at the fork point. The fork
 /// point is the spawn step's `StepStarted`, so no change falls between it and
 /// the config watermark (ADR-0030).
 fn fork_system(
     entries: &[(LogEntry, SessionEvent)],
     at: LogId,
-) -> Result<Vec<Part>, ExecutionError> {
-    Ok(fork_snapshot_at(entries, at)?.system)
+) -> Result<(Vec<Part>, Vec<asterpath_protocol::SystemSection>), ExecutionError> {
+    let snapshot = fork_snapshot_at(entries, at)?;
+    Ok((snapshot.system, snapshot.system_sections))
 }
 
 /// The `StepStarted` of the step whose `ToolCallRequested` is `caused_by`.

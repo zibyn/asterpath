@@ -184,7 +184,7 @@ pub(crate) fn check(
 /// Every appended instruction's parts, in history order.
 fn instruction_parts(request: &ModelRequest) -> impl Iterator<Item = &Part> {
     request.items.iter().flat_map(|item| match item {
-        Item::Instruction { parts } => parts.as_slice(),
+        Item::Instruction { parts, .. } => parts.as_slice(),
         _ => &[],
     })
 }
@@ -498,7 +498,7 @@ fn render_messages(
                     messages.push("user", Vec::new(), blocks);
                 }
             }
-            Item::Instruction { parts } if inline_changes => {
+            Item::Instruction { parts, .. } if inline_changes => {
                 messages
                     .pending_system
                     .extend(parts.iter().filter_map(|part| render_part(provider, part)));

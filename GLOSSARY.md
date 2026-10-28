@@ -151,6 +151,10 @@ _Avoid_: 消息（作为同义词）、记录
 会话中途追加的 system 指令在历史中的位置（`Item::Instruction`），由投影从带 `append_system` 的配置变更生成，落在其后第一个 `StepStarted` 处。Anthropic 渲染为 `role: "system"` 消息，OpenAI 渲染为 `developer` 消息；压缩替换它时并入基线 system。
 _Avoid_: system 消息（作为规范名）、developer 消息、注入提示
 
+**指令节（Instruction Section）**：
+system 中带键的一段（`SystemSection { key, parts }`），同一个键至多一节。创建时由 `SessionSpec.system_sections` 给出，会话中途由 `ConfigPatch.system_sections` 按键替换或删除；刷新投影为带键的指令条目，压缩时每个键只保留最新值并入基线（ADR-0057）。
+_Avoid_: 指令块、system 分段
+
 **工具变更条目（Tools Changed）**：
 会话中途工具增删在历史中的位置（`Item::ToolsChanged { added, removed }`），由投影从带 `add_tools` / `remove_tools` 的配置变更生成，落位规则同指令条目。Anthropic 渲染为 `role: "system"` 消息中的 `tool_addition` / `tool_removal` 块，OpenAI 不渲染（顶层 `tools` 已是生效集合）；压缩替换它时并入基线工具集。
 _Avoid_: 工具更新事件、tools diff

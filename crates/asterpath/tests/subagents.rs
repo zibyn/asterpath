@@ -148,6 +148,7 @@ impl Tool for ProbeTool {
 
 fn spec(max_steps: Option<u32>) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),

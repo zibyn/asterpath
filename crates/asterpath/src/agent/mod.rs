@@ -1105,10 +1105,13 @@ impl Agent {
                 session,
                 detail: error.to_string(),
             })?;
+        let mut system = history.system;
+        system
+            .extend(asterpath_protocol::SystemSection::flatten(&history.system_sections).cloned());
         let mut request = ModelRequest::new(
             config.model.clone(),
             prefix_epoch,
-            history.system,
+            system,
             history.items,
             config.tools.clone(),
             history.tools,

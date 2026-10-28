@@ -84,6 +84,7 @@ pub enum Item {
         parts: Vec<Part>,
     },
     Instruction {               // 会话中途追加的 system 指令（§3.3）；只含 Text
+        key: Option<String>,    // 指令节的键（ADR-0057）；带键时首个 part 是替换 / 删除通知
         parts: Vec<Part>,
     },
     ToolsChanged {              // 会话中途的工具集变更（§3.3）；先删后加
@@ -192,6 +193,7 @@ pub struct RawProviderData {
 - **基线**：`request_history(entries)` 同时返回基线 system、基线工具集与 items。基线 system 是 `SessionCreated.config.system`，加上被 `CompactionApplied` 替换区间内的全部指令（按日志顺序）；基线工具集是 `SessionCreated.config.tools`，依次应用被替换区间内的工具变更（先删后加，同名替换）。压缩不把它们交给摘要，而是并入基线（[compaction.md](compaction.md) §5），所以压缩后基线工具集等于压缩时的生效工具集。
 - `effective_config` 的 `system` 是创建时 system 加全部追加指令，供 trace 与 fresh 子会话继承使用；请求渲染不用它。它的 `tools` 是生效工具集，即 `ModelRequest.tools`。
 - 被移除工具在历史中的 `ToolCall` / `ToolResult` 原样保留。
+- **指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：`patch.system_sections` 的每一节生成一条带 `key` 的 `Instruction`（排在无键指令之后、`ToolsChanged` 之前），落位规则同上。`parts` 为首个文本片段 ``Instruction section `<key>` (supersedes any earlier text of this section):`` 加新值；新值为空表示删除，只有 ``Instruction section `<key>` removed; disregard its earlier text.``。基线另有 `system_sections`（`SessionCreated.config.system_sections` 起始）：被替换区间内的带键条目按键并入（原位替换、新键追加在后、删除即移除），所以同一节刷新多次后压缩，基线里只有最新值。`ModelRequest.system` 是基线 system 后接各节的 parts。
 - **fork**：子会话的 `SessionCreated.config.tools` 已是父在 spawn 水位的生效集合（再经 allowlist 收窄），所以 fork 复制的历史去掉 `ToolsChanged`，否则会把收窄掉的工具重新加回（[subagents.md](subagents.md)）。
 
 ## 4. 请求模型

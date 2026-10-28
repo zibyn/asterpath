@@ -64,6 +64,7 @@ fn descriptor(name: &str) -> ToolDescriptor {
 
 fn config() -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: model(),
         system: vec![],
         tools: vec![descriptor("echo")],

@@ -1455,6 +1455,7 @@ fn instructed_request(model_id: &str) -> ModelRequest {
             raw: None,
         },
         Item::Instruction {
+            key: None,
             parts: vec![text("answer in French")],
         },
     ];
@@ -1489,6 +1490,7 @@ async fn an_instruction_followed_by_user_input_moves_after_it() {
     request.items = vec![
         user_message(vec![text("first")]),
         Item::Instruction {
+            key: None,
             parts: vec![text("rule")],
         },
         user_message(vec![text("second")]),

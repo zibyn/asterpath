@@ -21,6 +21,7 @@ fn call(byte: u8) -> ToolCallId {
 
 fn config() -> ConfigSnapshot {
     ConfigSnapshot {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("test"),
             model: ModelId::new("model"),

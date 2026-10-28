@@ -74,6 +74,7 @@ pub struct ConfigSnapshot {
       pub model: Option<ModelSpec>,
       pub request: Option<RequestConfig>, // 出现即整体覆盖，不按子字段合并
       pub append_system: Vec<Part>,       // 追加到 system，只含 Text；不替换已有 system
+      pub system_sections: Vec<SystemSection>, // 按键设置指令节；parts 为空即删除（ADR-0057）
       pub add_tools: Vec<ToolDescriptor>, // 新增工具：注册表中的描述符，记录后恢复只读不解析
       pub remove_tools: Vec<ToolName>,    // 移除生效集合中的工具；折叠时先删后加
   }
@@ -85,7 +86,9 @@ pub struct ConfigSnapshot {
   ) -> Option<ConfigSnapshot>;
   ```
 
-  可变的是 `model`、`request`、追加 system 指令与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
+  可变的是 `model`、`request`、追加 system 指令、指令节与工具集。追加的指令与工具增删在请求里不改顶层 `system`，而是历史中带位置的 `Instruction` / `ToolsChanged` 条目，压缩时并入基线（[protocol.md](protocol.md) §3.3）；生效配置的 `system` 是创建时 system 加全部追加指令，`tools` 是生效工具集（`ModelRequest.tools`），基线工具集另由 `ModelRequest.baseline_tools` 携带。`turn` / `compaction` / `subagents` 始终取创建时的值。引擎只有这一个折叠入口（`ConfigSnapshot::apply` 是它的单步），agent、调度、trace 与 CLI 续会话都经它取值。
+
+- **易变内容放进指令节**（[ADR-0057](../adr/0057-instruction-sections-are-replaced-by-key.md)）：日期、cwd、git 状态这类会变的内容不要写进无键的 `SessionSpec.system`，否则要么过时，要么只能新开会话。把它们放进 `SessionSpec.system_sections`（如键 `date`、`env`），变化时用 `update_config` 按同一个键写一节（带 `id`）。刷新落在历史原位，不改前缀缓存；压缩后基线里每个键只有最新值。AGENTS.md、技能索引这类会被刷新的指令同理。键非空、同一补丁内不重复，节只含 `Part::Text`。
 
 ### 2.2 引擎内部模块（`crates/asterpath/src/`）
 

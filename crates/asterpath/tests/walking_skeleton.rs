@@ -79,6 +79,7 @@ fn test_turn_config() -> TurnConfig {
 
 fn spec(provider: &str) -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new(provider),
             model: ModelId::new("model-1"),

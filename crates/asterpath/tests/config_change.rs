@@ -11,8 +11,8 @@ use asterpath::protocol::{
     CompactionConfig, ConfigPatch, ImageSource, InputId, Item, JsonString, ModelId, ModelRequest,
     ModelSpec, Part, Provider, ProviderCapabilities, ProviderCatalog, ProviderError,
     ProviderErrorKind, ProviderId, RequestConfig, Role, SessionEvent, SessionSpec, StopReason,
-    StreamEvent, SubagentConfig, ToolName, ToolSelection, TurnConfig, UpdateId, Usage, UserInput,
-    decode_entry, scan_all,
+    StreamEvent, SubagentConfig, SystemSection, ToolName, ToolSelection, TurnConfig, UpdateId,
+    Usage, UserInput, decode_entry, scan_all,
 };
 use asterpath::protocol::{ContextPolicy, LogId, SessionStore, SpanAttributes, StorageError};
 use asterpath::protocol::{
@@ -50,6 +50,7 @@ fn model(name: &str) -> ModelSpec {
 
 fn spec() -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: model("model-1"),
         system: vec![text("be helpful")],
         tools: ToolSelection::Names(Vec::new()),
@@ -420,6 +421,7 @@ fn append(id: u8, value: &str) -> ConfigPatch {
 
 fn instruction(value: &str) -> Item {
     Item::Instruction {
+        key: None,
         parts: vec![text(value)],
     }
 }
@@ -463,6 +465,73 @@ async fn an_appended_instruction_reaches_the_next_step_in_place() {
     );
     assert_eq!(step_2.items.last(), Some(&instruction("answer in French")));
     assert_eq!(step_2.prefix_epoch, 0);
+}
+
+fn refresh(id: u8, key: &str, value: &str) -> ConfigPatch {
+    let mut update = ConfigPatch::default();
+    update.id = Some(UpdateId::from_bytes([id; 16]));
+    update.system_sections = vec![SystemSection::new(key, vec![text(value)])];
+    update
+}
+
+#[tokio::test]
+async fn a_keyed_refresh_reaches_the_next_step_and_keeps_the_system_prefix() {
+    let provider = Switching::new(
+        ScriptedProvider::new("p")
+            .respond(reply("first"), StopReason::PauseTurn, Usage::default())
+            .respond(reply("second"), StopReason::EndTurn, Usage::default()),
+        vec![Some(refresh(1, "date", "Tuesday"))],
+    );
+    let asterpath = assemble(Arc::new(InMemoryEventLog::new()), provider.clone()).await;
+    let mut spec = spec();
+    spec.system_sections = vec![SystemSection::new("date", vec![text("Monday")])];
+    let handle = asterpath
+        .create_session(spec)
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    provider.handle.set(handle.clone()).expect("set once");
+    handle.submit_input(input(1)).await.expect("input");
+    drive(&handle).await;
+
+    let requests = provider.inner.requests();
+    let system = vec![text("be helpful"), text("Monday")];
+    assert_eq!(requests[0].system, system);
+    assert_eq!(
+        requests[1].system, system,
+        "the refresh does not rewrite it"
+    );
+    assert!(mentions(&requests[1].items, "Tuesday"));
+}
+
+#[tokio::test]
+async fn invalid_section_keys_are_rejected_and_nothing_is_logged() {
+    let asterpath = assemble(
+        Arc::new(InMemoryEventLog::new()),
+        Arc::new(ScriptedProvider::new("p")),
+    )
+    .await;
+    let handle = asterpath
+        .create_session(spec())
+        .await
+        .expect("create")
+        .claim()
+        .await
+        .unwrap();
+    let before = events(&asterpath, &handle).await;
+
+    let empty_key = refresh(1, "", "rule");
+    let mut repeated = refresh(2, "date", "a");
+    repeated
+        .system_sections
+        .push(SystemSection::new("date", vec![text("b")]));
+    for update in [empty_key, repeated] {
+        let error = handle.update_config(update).await.unwrap_err();
+        assert!(matches!(error, AsterError::Config { .. }), "{error:?}");
+    }
+    assert_eq!(events(&asterpath, &handle).await, before);
 }
 
 #[tokio::test]

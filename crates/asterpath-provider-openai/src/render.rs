@@ -326,7 +326,7 @@ fn render_input(
                     "content": text_content(parts, provider, trace),
                 }))?);
             }
-            Item::Instruction { parts } => {
+            Item::Instruction { parts, .. } => {
                 input.push(raw(json!({
                     "type": "message",
                     "role": "developer",

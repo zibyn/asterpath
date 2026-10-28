@@ -141,6 +141,7 @@ fn openai_sse(item: serde_json::Value) -> String {
 /// A session spec on the scripted provider `p`.
 pub fn template() -> SessionSpec {
     SessionSpec {
+        system_sections: Vec::new(),
         model: ModelSpec {
             provider: ProviderId::new("p"),
             model: ModelId::new("model-1"),
