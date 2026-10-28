@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub use crate::approval::{ApprovalMode, ApprovalModes};
 use crate::config::{self, KeySource, Settings, SetupChoice};
+use crate::driver;
 use crate::workspace::{
     AGENT, CWD, NAME, STYLE, WorkRoot, Workspace, agent_profiles, find_style, in_root, load_agent,
     load_style, new_session_spec, roots, selected_agent, style_files, work_root,
 };
 use asterpath::{AsterError, Asterpath, LogId, OwnedSession, SessionId, WatchEvent};
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalGate, ApprovalRequest, CatalogEntry, Clock, ConfigPatch,
+    AgentEvent, ApprovalDecision, ApprovalRequest, CatalogEntry, Clock, ConfigPatch,
     EnvironmentAdapter, InputId, ModelSpec, Part, SessionEvent, SessionSpec, StorageError,
     SystemClock, ToolCallId, ToolSelection, UsageScope, UserInput, decode_entry, root_of, scan_all,
     unique_bytes,
@@ -264,7 +265,7 @@ type Drivers = Arc<Mutex<HashMap<SessionId, Driver>>>;
 type Errors = Arc<Mutex<HashMap<SessionId, String>>>;
 
 pub struct Desktop {
-    asterpath: Asterpath,
+    asterpath: Arc<Asterpath>,
     /// The policy `asterpath` was built with.
     modes: Arc<ApprovalModes>,
     /// New sessions' work-root rules and `config.toml` spec.
@@ -293,7 +294,7 @@ impl Desktop {
         projects_file: PathBuf,
     ) -> Self {
         Self {
-            asterpath,
+            asterpath: Arc::new(asterpath),
             modes,
             workspace,
             models: vec![template.model.clone()],
@@ -628,7 +629,7 @@ impl Desktop {
             tokio::spawn(drive(
                 Arc::clone(&self.drivers),
                 Arc::clone(&self.errors),
-                self.asterpath.approval_gate(),
+                Arc::clone(&self.asterpath),
                 owned,
             ));
         }
@@ -737,28 +738,11 @@ impl Desktop {
 /// `again` and removing the driver happen under the lock `send` takes, so
 /// input sent while the task stops always gets a drive. The tree's approval
 /// endpoint is open meanwhile; the view answers through `approve`.
-async fn drive(drivers: Drivers, errors: Errors, gate: Arc<ApprovalGate>, owned: OwnedSession) {
+async fn drive(drivers: Drivers, errors: Errors, asterpath: Arc<Asterpath>, owned: OwnedSession) {
     let session = owned.id();
-    let _endpoint = gate.register(owned.owner().root);
     loop {
-        let mut stream = owned.drive();
-        let mut failed = false;
-        while let Some(event) = stream.next().await {
-            if let Err(error) = event {
-                lock(&errors).insert(session, error.to_string());
-                failed = true;
-                break;
-            }
-        }
-        drop(stream);
-        // After an error only new input retries; old pending input would fail again.
-        if !failed
-            && owned
-                .facts()
-                .await
-                .is_ok_and(|facts| facts.has_pending_input())
-        {
-            continue;
+        if let Err(error) = driver::drive(&asterpath, &owned, &mut View).await {
+            lock(&errors).insert(session, error.to_string());
         }
         let mut drivers = lock(&drivers);
         let again = drivers
@@ -768,6 +752,15 @@ async fn drive(drivers: Drivers, errors: Errors, gate: Arc<ApprovalGate>, owned:
             drivers.remove(&session);
             return;
         }
+    }
+}
+
+/// The conversation view pulls the tree's approvals itself (`approvals`).
+struct View;
+
+impl driver::Operator for View {
+    fn approvals(&self) -> driver::Approvals {
+        driver::Approvals::Pulled
     }
 }
 

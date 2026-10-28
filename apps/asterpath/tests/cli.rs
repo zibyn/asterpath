@@ -407,6 +407,43 @@ fn stream_json_input_round_trips_an_approval_through_the_application() {
     assert!(dir.path.join("ran").exists(), "the allowed bash ran");
 }
 
+/// A child session's `Ask` never reaches the parent's stream; it still goes out on
+/// stdout, and the application's answer lands in the child (#212).
+#[test]
+fn stream_json_child_approval_round_trips_through_the_application() {
+    let server = MockServer::start(vec![
+        Reply::sse(common::tool_use_sse("spawn_agent", r#"{"task":"touch"}"#)),
+        Reply::sse(common::tool_use_sse("bash", r#"{"command":"touch ran"}"#)),
+        Reply::sse(common::text_sse("child done")),
+        Reply::sse(common::text_sse("done")),
+    ]);
+    let dir = TestDir::new("stream-child");
+    dir.config(&config_body(&server, &dir.db()));
+    let mut app = App::start(&dir);
+
+    app.send(GO);
+    let mut tools = Vec::new();
+    while tools.len() < 2 {
+        let request = app.until("approval_requested");
+        tools.push(request["tool"].as_str().unwrap().to_owned());
+        app.send(&format!(
+            r#"{{"type":"approval","call":{},"decision":"Allow"}}"#,
+            request["tool_call_id"]
+        ));
+    }
+    assert_eq!(tools, ["spawn_agent", "bash"]);
+    app.until("turn_committed");
+    app.close();
+
+    let result = app.next();
+    assert_eq!(result["result"], "done", "{result}");
+    assert_eq!(app.exit_code(), Some(0));
+    assert!(
+        dir.path.join("ran").exists(),
+        "the child's allowed bash ran"
+    );
+}
+
 /// Closing stdin while an approval waits cancels the turn instead of hanging.
 #[test]
 fn stream_json_stdin_closed_during_an_approval_cancels_the_turn() {

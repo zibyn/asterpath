@@ -18,6 +18,8 @@
 - **用户配置在首次运行时创建，API key 可以写在配置里**（ADR-0050）。默认路径的 `config.toml` 不存在时，CLI 与桌面端写一份只含注释示例的模板（目录 `0700`、文件 `0600`），创建失败只在 stderr 提示一行；`--config` / `ASTERPATH_CONFIG` 指定的文件仍须存在。`[providers.<id>] api_key` 不再是配置错误，环境变量优先；别处的 `api_key` / `secret` / `token` 与 `-c …api_key=…` 仍报错。Unix 上含 key 的文件对组或其他人有任何权限时报配置错误并提示 `chmod 600`。`doctor` 列出各 provider 的 key 来源（`env:VAR` / `file` / `not set`），不显示值。
 - **新会话默认带上内置的 `default` 智能体档案**（ADR-0051）。没配 `default_agent` 时，CLI 与桌面端新建的会话取名为 `default` 的档案，其正文排在 `system` 最前、`AGENTS.md` 与技能索引之前。内置档案是随安装包分发的资源文件（CLI 找二进制旁的 `agents/` 或 `<prefix>/share/asterpath/agents`，桌面端找资源目录的 `agents/`），用户级或项目级的同名 `default.md` 覆盖它；找不到内置目录时 stderr 提示一行，照常运行。
 - 参考 CLI 交互模式会提示子会话的审批请求；以前 `untrusted` 模式下子会话的变更类工具会让 CLI 一直挂起。
+- `exec --input-format stream-json` 也会把子会话的审批请求作为 `approval_requested` 一行发到 stdout，`approval` 命令的决定写到请求所在的会话；以前子会话的 `Ask` 不出现在 stdout，回合一直挂起（#212）。审批请求一次发出一个，应用回答后才发下一个。
+- CLI 交互、`exec` 与桌面端共用一个会话驱动（GLOSSARY「会话驱动」，#212）：一次驱动正常结束后**只在有待处理输入时**再驱动，出错后不再驱动。stream-json 不再按 `is_wakeable` 再驱动；CLI 交互与 headless `exec` 现在也会接着处理驱动期间到达的输入。
 
 ### 新增
 

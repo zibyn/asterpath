@@ -1,140 +1,29 @@
 //! Driving a session to the end of its turn, with or without an operator
 //! approval prompt, and reading the result back from the log.
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
 
-use asterpath::{Asterpath, OwnedSession, SessionHandle};
+use asterpath::{Asterpath, OwnedSession};
 use asterpath_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin,
-    Provenance, ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason,
-    Usage, decode_entry, project, scan_all,
+    ApprovalDecision, ApprovalRequest, Item, LogEntry, Part, ProjectedOrigin, Provenance,
+    ProviderErrorInfo, Role, SessionEvent, SessionId, SessionStore, TurnEndReason, decode_entry,
+    project, scan_all,
 };
-use futures_util::StreamExt;
 
-use crate::{CliError, CliResult, aster_error};
+use crate::{CliError, CliResult};
 
-#[derive(Default)]
-pub struct DriveOutcome {
-    /// Whether anything was driven.
-    pub ran: bool,
-    pub idle: bool,
-    pub reason: Option<TurnEndReason>,
-    /// The usage of the last committed turn.
-    pub usage: Option<Usage>,
-    /// A stream-json input error that stopped serving early; reported after the
-    /// result line.
-    pub error: Option<CliError>,
-}
+pub use asterpath_app::driver::{DriveOutcome, Headless, Interrupt, Operator};
 
-impl DriveOutcome {
-    /// Fold one live event into the outcome.
-    pub fn observe(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::TurnCommitted { reason, usage, .. } => {
-                self.reason = Some(reason.clone());
-                self.usage = Some(*usage);
-            }
-            AgentEvent::Idle { .. } => self.idle = true,
-            _ => {}
-        }
-    }
-}
-
-/// Who watches a drive and answers its approvals.
-pub trait Operator {
-    /// A live event to show.
-    fn show(&mut self, _event: &AgentEvent) {}
-
-    /// The answer to an approval request; `None` cancels the turn.
-    fn decide(
-        &mut self,
-        _request: &ApprovalRequest,
-    ) -> impl Future<Output = Option<ApprovalDecision>> {
-        std::future::ready(Some(ApprovalDecision::Deny { reason: None }))
-    }
-
-    /// Resolves when the operator interrupts the turn; never by default.
-    fn interrupted(&mut self) -> impl Future<Output = ()> {
-        std::future::pending()
-    }
-}
-
-/// No operator: nothing is shown and every approval is denied (with no
-/// endpoint registered, the framework denies first).
-pub struct Headless;
-
-impl Operator for Headless {}
-
-/// How often a drive looks for child sessions' approval requests.
-const CHILD_APPROVAL_POLL: Duration = Duration::from_millis(100);
-
-/// Drive to `TurnCommitted` or `Idle`; an interrupt cancels the turn and
-/// the drive runs on to its end. There is no exit code for "stopped at a wait".
-/// Child sessions' requests never reach this stream, so the tree's pending
-/// list is polled for them.
+/// Drive the tree with the session driver (GLOSSARY「会话驱动」).
 pub async fn drive(
     asterpath: &Asterpath,
     handle: &OwnedSession,
     operator: &mut impl Operator,
 ) -> CliResult<DriveOutcome> {
-    let mut outcome = DriveOutcome {
-        ran: true,
-        ..DriveOutcome::default()
-    };
-    let gate = asterpath.approval_gate();
-    let mut asked = HashSet::new();
-    let mut poll = tokio::time::interval(CHILD_APPROVAL_POLL);
-    let mut stream = handle.drive();
-    loop {
-        let event = tokio::select! {
-            event = stream.next() => event,
-            () = operator.interrupted() => {
-                handle.cancel().await.map_err(aster_error)?;
-                continue;
-            }
-            _ = poll.tick() => {
-                for request in gate.pending_in(handle.owner().root) {
-                    if request.session != handle.id()
-                        && asked.insert((request.session, request.tool_call_id))
-                    {
-                        let child = asterpath
-                            .open_session(request.session)
-                            .await
-                            .map_err(aster_error)?;
-                        respond(&child, handle, operator, &request).await?;
-                    }
-                }
-                continue;
-            }
-        };
-        let Some(event) = event else { break };
-        let event = event.map_err(|error| CliError::run(format!("drive failed: {error}")))?;
-        outcome.observe(&event);
-        if let AgentEvent::ApprovalRequested(request) = &event {
-            respond(handle, handle, operator, request).await?;
-        } else {
-            operator.show(&event);
-        }
-    }
-    Ok(outcome)
-}
-
-/// Ask the operator and record the answer in `session`; no answer cancels
-/// the driven turn.
-async fn respond(
-    session: &SessionHandle,
-    driven: &OwnedSession,
-    operator: &mut impl Operator,
-    request: &ApprovalRequest,
-) -> CliResult<()> {
-    match operator.decide(request).await {
-        Some(decision) => session.approve(request.tool_call_id, decision).await,
-        None => driven.cancel().await,
-    }
-    .map_err(aster_error)
+    asterpath_app::driver::drive(asterpath, handle, operator)
+        .await
+        .map_err(|error| CliError::run(format!("drive failed: {error}")))
 }
 
 /// Print an approval request's fields and the question.
@@ -266,6 +155,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use asterpath_protocol::AgentEvent;
     use asterpath_protocol::ToolCallId;
     use asterpath_protocol::{
         ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CompactionConfig, JsonString, ModelId,
@@ -275,6 +165,7 @@ mod tests {
         TurnConfig, Usage,
     };
     use asterpath_testing::ScriptedProvider;
+    use futures_util::StreamExt;
     use futures_util::future::BoxFuture;
 
     fn request() -> ApprovalRequest {
@@ -720,7 +611,13 @@ mod tests {
                 reader: Cursor::new(b"n\n"),
                 writer: Vec::new(),
             };
-            drive(&asterpath, &handle, &mut io).await.expect("drive");
+            // A closed gate is a frontend without an approval channel.
+            if open {
+                drive(&asterpath, &handle, &mut io).await
+            } else {
+                drive(&asterpath, &handle, &mut Headless).await
+            }
+            .expect("drive");
 
             let asked = String::from_utf8(io.writer).unwrap().contains("tool: bash");
             assert_eq!(asked, open, "ApprovalRequested only while the gate is open");
