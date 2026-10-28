@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agent::Agent;
+use crate::commit::{AppendError, CommitLog};
 use crate::scheduler::{Scheduler, SpawnTool};
 use crate::tools::ToolTable;
 use crate::views::trace::TracingQuery;
@@ -78,7 +79,7 @@ pub use asterpath_storage_postgres as postgres;
 pub struct Asterpath {
     /// The single append entry: the backend wrapped in `CommitLog`, so every
     /// append reaches the hooks.
-    store: Arc<dyn SessionStore>,
+    store: Arc<CommitLog>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
@@ -143,9 +144,8 @@ impl Asterpath {
             }
         };
 
-        // Projections read the backend; every write goes through the one
-        // append entry so hooks see it.
-        let trace = TracingQuery::new(Arc::clone(&backend));
+        // Usage reads the backend; every write goes through the one append
+        // entry so hooks see it.
         let usage = Arc::new(UsageService::new(Arc::clone(&backend)));
         let watchers = Arc::new(Watchers::default());
         let ownership = Arc::new(owner::Ownership::new(
@@ -153,12 +153,13 @@ impl Asterpath {
             config.hooks.clone(),
         ));
         owner::Ownership::keep_renewed(&ownership, config.lease_renew_interval);
-        let store: Arc<dyn SessionStore> = Arc::new(commit::CommitLog::new(
+        let store = Arc::new(CommitLog::new(
             backend,
             config.hooks.clone(),
             Arc::clone(&watchers),
             Arc::clone(&ownership),
         ));
+        let trace = TracingQuery::new(Arc::clone(&store));
 
         let waits = Arc::new(Waits::new(Arc::clone(&store)));
         let cancellations = Arc::new(CancellationRegistry::new());
@@ -269,15 +270,9 @@ impl Asterpath {
             parent: None,
             metadata: spec.metadata,
         };
-        let entry = asterpath_protocol::encode_entry(
-            session,
-            Some(dedup::session_created(session)),
-            &event,
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(session, event, Some(dedup::session_created(session)))
+            .await?;
         Ok(self.handle(session, env))
     }
 
@@ -364,9 +359,7 @@ impl Asterpath {
                 },
             ),
         ] {
-            let entry = asterpath_protocol::encode_entry(session, Some(key), &event)
-                .map_err(|error| corrupt(error.to_string()))?;
-            self.store.append(entry).await?;
+            self.store.append_event(session, event, Some(key)).await?;
         }
         Ok(self.handle(session, env))
     }
@@ -437,7 +430,7 @@ impl Asterpath {
     /// the claimed tree in order (`Unsupported` when the injected store has
     /// no retirement).
     pub fn store(&self) -> Arc<dyn SessionStore> {
-        Arc::clone(&self.store)
+        self.store.clone()
     }
 
     /// One page of the session catalog, session metadata included (ADR-0032):
@@ -592,7 +585,7 @@ pub struct SessionHandle {
     session: SessionId,
     /// Resolved when the handle was made; `None` without an adapter.
     env: Option<Arc<SessionEnvironment>>,
-    store: Arc<dyn SessionStore>,
+    store: Arc<CommitLog>,
     providers: Arc<ProviderCatalog>,
     tools: Arc<ToolTable>,
     agent: Arc<Agent>,
@@ -641,15 +634,9 @@ impl SessionHandle {
     /// Append `InputRecorded` only. Never starts a turn.
     pub async fn submit_input(&self, input: UserInput) -> Result<InputId, AsterError> {
         let event = SessionEvent::InputRecorded { input: input.parts };
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            Some(dedup::input_recorded(input.id)),
-            &event,
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, event, Some(dedup::input_recorded(input.id)))
+            .await?;
         Ok(input.id)
     }
 
@@ -707,15 +694,9 @@ impl SessionHandle {
             self.check_tool_change(&patch, &effective.tools)?;
         }
         // Without an id a retry may land twice; whole-field overrides fold the same.
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            key,
-            &SessionEvent::ConfigChanged { patch },
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, SessionEvent::ConfigChanged { patch }, key)
+            .await?;
         Ok(())
     }
 
@@ -729,25 +710,22 @@ impl SessionHandle {
     /// session was created with.
     pub async fn update_metadata(&self, patch: MetadataPatch) -> Result<(), AsterError> {
         let MetadataPatch { set, remove } = patch;
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            None,
-            &SessionEvent::MetadataChanged { set, remove },
-        )
-        .map_err(corrupt(self.session))?;
+        let event = SessionEvent::MetadataChanged { set, remove };
         let not_found = AsterError::Agent(AgentError::NotFound {
             session: self.session,
         });
-        match self.store.append(entry).await {
+        match self.store.append_event(self.session, event, None).await {
             Ok(_) => Ok(()),
-            Err(StorageError::Retired { .. }) => Err(not_found),
+            Err(AppendError::Storage(StorageError::Retired { .. })) => Err(not_found),
             // A store that forgets retired sessions rejects them as entries.
-            Err(StorageError::InvalidEntry(_))
+            Err(AppendError::Storage(StorageError::InvalidEntry(_)))
                 if self.store.frontier(self.session).await?.is_none() =>
             {
                 Err(not_found)
             }
-            Err(StorageError::InvalidEntry(message)) => Err(AsterError::Config { message }),
+            Err(AppendError::Storage(StorageError::InvalidEntry(message))) => {
+                Err(AsterError::Config { message })
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -851,7 +829,7 @@ impl SessionHandle {
         &self,
         after: Option<LogId>,
     ) -> BoxStream<'static, Result<WatchEvent, AsterError>> {
-        watch::watch(Arc::clone(&self.store), &self.watchers, self.session, after)
+        watch::watch(self.store.clone(), &self.watchers, self.session, after)
     }
 
     /// State is the log-derived classification, not driver memory.
@@ -910,15 +888,9 @@ impl OwnedSession {
             return Ok(());
         }
         // Folds the same if a concurrent claim in this process appends it too.
-        let entry = asterpath_protocol::encode_entry(
-            self.session,
-            None,
-            &SessionEvent::ConfigChanged { patch },
-        )
-        .map_err(|error| AsterError::Config {
-            message: error.to_string(),
-        })?;
-        self.store.append(entry).await?;
+        self.store
+            .append_event(self.session, SessionEvent::ConfigChanged { patch }, None)
+            .await?;
         Ok(())
     }
 

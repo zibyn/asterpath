@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::Agent;
+use crate::commit::CommitLog;
 use crate::scheduler::{ChildRef, Scheduler, SpawnError, SpawnRequest, WaitError};
 use crate::tools::ToolTable;
 use crate::waits::Waits;
@@ -117,13 +118,13 @@ fn new_scheduler<L: SessionStore + 'static>(
     log: Arc<L>,
     aliases: BTreeMap<ModelAlias, ModelSpec>,
 ) -> (Arc<Scheduler>, Agent) {
-    let log: Arc<dyn SessionStore> = log;
+    let log = CommitLog::for_tests(log);
     let scheduler = Arc::new(Scheduler::with_defaults(
         Arc::clone(&log),
-        Arc::new(Waits::new(Arc::clone(&log))),
+        Arc::new(Waits::new(log)),
         aliases,
     ));
-    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
+    let agent = agent_for(&scheduler, Arc::new(ScriptedProvider::new("p")));
     (scheduler, agent)
 }
 
@@ -131,36 +132,33 @@ fn new_scheduler_with<L: SessionStore + 'static>(
     log: Arc<L>,
     clock: Arc<dyn Clock>,
 ) -> (Arc<Scheduler>, Agent) {
-    let log: Arc<dyn SessionStore> = log;
+    let log = CommitLog::for_tests(log);
     let scheduler = Arc::new(Scheduler::new(
         Arc::clone(&log),
-        Arc::new(Waits::new(Arc::clone(&log))),
+        Arc::new(Waits::new(log)),
         BTreeMap::new(),
         clock,
         NonZeroUsize::new(32).expect("non-zero"),
         Default::default(),
     ));
-    let agent = agent_for(log, &scheduler, Arc::new(ScriptedProvider::new("p")));
+    let agent = agent_for(&scheduler, Arc::new(ScriptedProvider::new("p")));
     (scheduler, agent)
 }
 
 /// The real agent that drives children of `scheduler`, sharing its
-/// cancellation registry.
-fn agent_for(
-    log: Arc<dyn SessionStore>,
-    scheduler: &Arc<Scheduler>,
-    provider: Arc<ScriptedProvider>,
-) -> Agent {
+/// log, waits and cancellation registry.
+fn agent_for(scheduler: &Arc<Scheduler>, provider: Arc<ScriptedProvider>) -> Agent {
     let provider: Arc<dyn Provider> = provider;
     let gate = Arc::new(asterpath_protocol::ApprovalGate::new());
+    let (log, waits) = scheduler.wiring();
     Agent::new(
-        Arc::clone(&log),
+        log,
         Arc::new(ProviderCatalog::new(vec![provider]).expect("catalog")),
         Arc::new(ToolTable::new()),
         ToolConfig::default(),
         Arc::new(DefaultApprovalPolicy),
         gate,
-        Arc::new(Waits::new(log)),
+        waits,
         Arc::new(SystemClock),
     )
     .with_cancellations(scheduler.cancellations())
@@ -922,7 +920,7 @@ async fn driving_a_fresh_child_opens_exactly_one_turn() {
         StopReason::EndTurn,
         Usage::default(),
     ));
-    let agent = agent_for(log.clone(), &scheduler, Arc::clone(&provider));
+    let agent = agent_for(&scheduler, Arc::clone(&provider));
 
     let child = scheduler
         .spawn(SpawnRequest::new(
@@ -2035,17 +2033,12 @@ async fn a_tree_that_changed_owner_rebuilds_admission_from_the_log() {
     let subagents = limit(1);
     let (reference, caused_by) = seed_parent_with(&log, &subagents, &calls).await;
     let (scheduler, _agent) = new_scheduler_with(log.clone(), Arc::new(SystemClock));
-    let as_owner = |epoch, future| crate::owner::Owned {
-        owner: asterpath_protocol::OwnerToken {
-            root: reference.session,
-            epoch,
-        },
-        future,
-    };
+    let as_owner = |owner, future| crate::owner::Owned { owner, future };
 
     // Epoch 1: call A takes the only slot.
+    let first = log.claim(reference.session).await.expect("claim");
     let a = as_owner(
-        1,
+        first.token(),
         scheduler.spawn(request_for(&reference, calls[0], caused_by[0])),
     )
     .await
@@ -2062,12 +2055,14 @@ async fn a_tree_that_changed_owner_rebuilds_admission_from_the_log() {
         },
     )
     .await;
+    drop(first);
 
     // Epoch 2: the slot A held here is not counted from stale memory.
+    let second = log.claim(reference.session).await.expect("reclaim");
     let b = tokio::time::timeout(
         Duration::from_secs(1),
         as_owner(
-            2,
+            second.token(),
             scheduler.spawn(request_for(&reference, calls[1], caused_by[1])),
         ),
     )
@@ -2378,9 +2373,8 @@ async fn completions(log: &dyn SessionStore, parent: SessionId) -> Vec<ChildOutc
 
 /// An agent whose child never reaches a terminal, however long it is driven:
 /// the model stream opens and never ends.
-fn hanging_agent(log: Arc<dyn SessionStore>, scheduler: &Arc<Scheduler>) -> Agent {
+fn hanging_agent(scheduler: &Arc<Scheduler>) -> Agent {
     agent_for(
-        log,
         scheduler,
         Arc::new(
             ScriptedProvider::new("p")
@@ -2460,7 +2454,7 @@ async fn a_spawn_deadline_that_expired_while_stopped_times_out_exactly_once_afte
 
     for _restart in 0..2 {
         let (scheduler, _) = new_scheduler_with(log.clone(), clock.clone());
-        let agent = hanging_agent(log.clone(), &scheduler);
+        let agent = hanging_agent(&scheduler);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             scheduler.await_completion(&child_ref, &agent),
@@ -2491,7 +2485,7 @@ async fn a_live_wait_sleeps_until_the_spawn_deadline() {
     )
     .await;
     let (scheduler, _) = new_scheduler_with(log.clone(), clock);
-    let agent = hanging_agent(log.clone(), &scheduler);
+    let agent = hanging_agent(&scheduler);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         scheduler.await_completion(

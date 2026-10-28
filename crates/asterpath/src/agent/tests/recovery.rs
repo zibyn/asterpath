@@ -11,6 +11,7 @@ use super::support::{
     self, SESSION, append, config, descriptor, drive, model, scan, text, tool_call, tool_table,
 };
 use crate::agent::Agent;
+use crate::commit::CommitLog;
 use crate::waits::Waits;
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
@@ -1005,7 +1006,7 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
 
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register(SESSION);
-    let waits = Arc::new(Waits::new(log.clone()));
+    let waits = Arc::new(Waits::new(CommitLog::for_tests(log.clone())));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
