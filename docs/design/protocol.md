@@ -275,7 +275,7 @@ pub struct SessionContext {
     pub session: SessionId,
     pub root: SessionId,                    // 会话树的根；根会话即自身
     pub cache_root: SessionId,              // 共享 prompt cache 的会话：root；fork 出的根取源会话的 cache_root（ADR-0033）
-    pub metadata: BTreeMap<String, String>, // 根会话的会话元数据：子会话不继承，租户键在根上
+    pub metadata: BTreeMap<String, String>, // 根会话创建时的会话元数据：子会话不继承，租户键在根上；之后的 MetadataChanged 不改它（ADR-0044）
 }
 
 pub enum ToolChoice {
