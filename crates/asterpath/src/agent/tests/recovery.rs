@@ -11,15 +11,14 @@ use super::support::{
     self, SESSION, append, config, descriptor, drive, model, scan, text, tool_call, tool_table,
 };
 use crate::agent::Agent;
-use crate::commit::CommitLog;
-use crate::waits::Waits;
+use crate::{Asterpath, AsterpathConfig};
 use asterpath_protocol::{
     AbortKind, AgentError, AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest,
     ApprovalVerdict, CancelReason, ChildOutcome, ConfigSnapshot, ContextPolicy,
     DefaultApprovalPolicy, HookError, Hooks, Item, JsonString, ParentRef, Provenance, ReplaySafety,
     Role, RunRequest, RunTrigger, SessionEvent, StopReason, Tool, ToolArgs, ToolCallCtx,
-    ToolConfig, ToolDescriptor, ToolGate, ToolName, ToolResultStatus, TurnEndReason, Usage,
-    decode_entry, dedup, encode_entry,
+    ToolDescriptor, ToolGate, ToolName, ToolResultStatus, TurnEndReason, Usage, decode_entry,
+    dedup, encode_entry,
 };
 use asterpath_protocol::{
     ApprovalGate, CatalogEntry, DedupKey, InputId, LogEntry, LogId, LogQuery, SessionId,
@@ -109,30 +108,37 @@ fn described(name: &str, replay: ReplaySafety) -> ToolDescriptor {
     descriptor(name).with_replay(replay)
 }
 
-/// `support::agent_with` with the default tool config and an optional hook.
+/// The engine with the default tool config and an optional hook.
+fn engine<L: SessionStore + 'static>(
+    log: Arc<L>,
+    provider: Arc<ScriptedProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+    approval: Arc<dyn ApprovalPolicy>,
+    gate: Arc<ApprovalGate>,
+    hooks: Option<Arc<dyn Hooks>>,
+) -> Asterpath {
+    let config = AsterpathConfig {
+        approval,
+        gate,
+        hooks: hooks.into_iter().collect(),
+        ..AsterpathConfig::default()
+    };
+    support::engine(log, provider, tool_table(tools), config)
+}
+
 fn agent_with<L: SessionStore + 'static>(
     log: Arc<L>,
     provider: Arc<ScriptedProvider>,
     tools: Vec<Arc<dyn Tool>>,
     approval: Arc<dyn ApprovalPolicy>,
     gate: Arc<ApprovalGate>,
-    waits: Option<Arc<Waits>>,
     hooks: Option<Arc<dyn Hooks>>,
-) -> Agent {
-    support::agent_with(
-        log,
-        provider,
-        tool_table(tools),
-        ToolConfig::default(),
-        approval,
-        gate,
-        waits,
-    )
-    .with_hooks(hooks.into_iter().collect(), None)
+) -> Arc<Agent> {
+    Arc::clone(engine(log, provider, tools, approval, gate, hooks).agent())
 }
 
 struct Harness {
-    agent: Agent,
+    agent: Arc<Agent>,
 }
 
 fn harness(
@@ -147,7 +153,6 @@ fn harness(
         tools,
         Arc::new(DefaultApprovalPolicy),
         gate,
-        None,
         None,
     );
     Harness { agent }
@@ -695,7 +700,6 @@ async fn unknown_tool_intent_recovers_as_not_found_without_approval_or_rerun() {
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
         None,
-        None,
     );
     let events = drive(&agent).await;
 
@@ -880,7 +884,6 @@ async fn pre_execute_runs_only_for_calls_without_recorded_intents() {
         vec![alpha, beta],
         Arc::new(DefaultApprovalPolicy),
         gate,
-        None,
         Some(hooks),
     );
     let _ = drive(&agent).await;
@@ -957,7 +960,6 @@ async fn recorded_allow_executes_without_reprompting_on_recovery() {
         Arc::new(AlwaysAsk),
         gate,
         None,
-        None,
     );
     let events = drive(&agent).await;
 
@@ -1006,21 +1008,20 @@ async fn undecided_ask_resuspends_then_executes_after_delivery() {
 
     let gate = Arc::new(ApprovalGate::new());
     let _endpoint = gate.register(SESSION);
-    let waits = Arc::new(Waits::new(CommitLog::for_tests(log.clone())));
     let provider = Arc::new(ScriptedProvider::new("p").respond(
         completed(),
         StopReason::EndTurn,
         Usage::default(),
     ));
-    let agent = agent_with(
+    let engine = engine(
         Arc::clone(&log),
         Arc::clone(&provider),
         vec![tool],
         Arc::new(AlwaysAsk),
         Arc::clone(&gate),
-        Some(waits.clone()),
         None,
     );
+    let (agent, waits) = (engine.agent(), engine.waits());
 
     let mut stream = agent.run(RunRequest {
         session: SESSION,
@@ -1086,7 +1087,6 @@ async fn undecided_ask_with_a_closed_gate_denies() {
         vec![tool],
         Arc::new(AlwaysAsk),
         gate,
-        None,
         None,
     );
     let _ = drive(&agent).await;
@@ -1386,7 +1386,6 @@ async fn orphan_child_closes_open_intents_as_cancelled_without_a_new_turn() {
         Arc::new(DefaultApprovalPolicy),
         gate,
         None,
-        None,
     );
     let agent_events = drive(&agent).await;
 
@@ -1618,7 +1617,6 @@ async fn a_corrupt_parent_log_is_a_hard_error_not_an_orphan_check() {
         Vec::new(),
         Arc::new(DefaultApprovalPolicy),
         gate,
-        None,
         None,
     );
     let mut stream = agent.run(RunRequest {

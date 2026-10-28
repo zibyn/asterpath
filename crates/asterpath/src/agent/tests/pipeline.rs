@@ -1,15 +1,14 @@
 //! The tool pipeline driven directly: no provider, no turn loop.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use super::support::{SESSION, append, decoded, descriptor, text, tool_call, tool_table};
+use super::support::{SESSION, append, decoded, descriptor, engine, text, tool_call, tool_table};
 use crate::agent::EventSink;
 use crate::agent::pipeline::{ToolOutcome, ToolPipeline, ToolStep};
-use crate::commit::CommitLog;
-use crate::waits::Waits;
+use crate::{Asterpath, AsterpathConfig};
 use asterpath_protocol::{
     AgentEvent, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalVerdict, CancelReason,
     CancelToken, ChildOutcome, ContextPolicy, DefaultApprovalPolicy, HookError, Hooks, Item,
@@ -18,7 +17,7 @@ use asterpath_protocol::{
     ToolOutput, ToolResultStatus, ToolResultView, dedup,
 };
 use asterpath_protocol::{ApprovalGate, LogId, SessionId, StepId, ToolCallId, TurnId};
-use asterpath_testing::{InMemoryEventLog, ManualClock, TestTool};
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider, TestTool};
 use futures_core::future::BoxFuture;
 
 const TURN: TurnId = TurnId::from_bytes([1; 16]);
@@ -27,10 +26,9 @@ const RECORDED: ToolCallId = ToolCallId::from_bytes([3; 16]);
 
 struct Harness {
     log: Arc<InMemoryEventLog>,
-    /// The engine's append entry over `log`, shared by the pipeline and `waits`.
-    commit: Arc<CommitLog>,
+    /// Assembled on first use, from the parts below as they stand then.
+    engine: OnceLock<Asterpath>,
     gate: Arc<ApprovalGate>,
-    waits: Arc<Waits>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Option<Arc<dyn ApprovalPolicy>>,
     hooks: Vec<Arc<dyn Hooks>>,
@@ -52,13 +50,10 @@ impl Harness {
             None,
         )
         .await;
-        let commit = CommitLog::for_tests(log.clone());
-        let waits = Arc::new(Waits::new(Arc::clone(&commit)));
         Self {
             log,
-            commit,
+            engine: OnceLock::new(),
             gate: Arc::new(ApprovalGate::new()),
-            waits,
             tools,
             policy: None,
             hooks: Vec::new(),
@@ -112,27 +107,38 @@ impl Harness {
     }
 
     async fn deliver(&self, call: ToolCallId, decision: ApprovalDecision) {
-        self.waits
+        self.engine()
+            .waits()
             .record_approval(SESSION, call, decision)
             .await
             .expect("record");
     }
 
-    fn pipeline(&self) -> ToolPipeline {
-        let policy = self
-            .policy
-            .clone()
-            .unwrap_or_else(|| Arc::new(DefaultApprovalPolicy));
-        ToolPipeline::new(
-            Arc::clone(&self.commit),
-            tool_table(self.tools.clone()),
-            self.config.clone(),
-            policy,
-            Arc::clone(&self.gate),
-            Arc::clone(&self.waits),
-            Arc::new(ManualClock::new()),
-        )
-        .with_hooks(self.hooks.clone(), None)
+    /// The engine's pipeline is the one under test.
+    fn engine(&self) -> &Asterpath {
+        self.engine.get_or_init(|| {
+            let config = AsterpathConfig {
+                tool: self.config.clone(),
+                approval: self
+                    .policy
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(DefaultApprovalPolicy)),
+                gate: Arc::clone(&self.gate),
+                hooks: self.hooks.clone(),
+                ..AsterpathConfig::default()
+            };
+            let provider = Arc::new(ScriptedProvider::new("p"));
+            engine(
+                self.log.clone(),
+                provider,
+                tool_table(self.tools.clone()),
+                config,
+            )
+        })
+    }
+
+    fn pipeline(&self) -> &ToolPipeline {
+        &self.engine().agent().pipeline
     }
 
     /// Run one step's calls; `recovering` marks a resumed open step.

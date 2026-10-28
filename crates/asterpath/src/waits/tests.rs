@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use crate::commit::CommitLog;
 use crate::waits::Waits;
+use crate::{Asterpath, AsterpathConfig};
 use asterpath_protocol::{
     ApprovalDecision, CancelReason, ChildOutcome, LogQuery, SessionId, SessionStore, ToolCallId,
 };
 use asterpath_protocol::{SessionEvent, decode_entry, dedup, encode_entry};
-use asterpath_testing::InMemoryEventLog;
+use asterpath_testing::{InMemoryEventLog, ScriptedProvider};
 use futures_util::StreamExt;
 
 const SESSION: SessionId = SessionId::from_bytes([7; 16]);
@@ -22,12 +23,16 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let log = Arc::new(InMemoryEventLog::new());
-    let commits = CommitLog::for_tests(log.clone());
-    let waits = Arc::new(Waits::new(Arc::clone(&commits)));
+    let engine = Asterpath::from_config(AsterpathConfig {
+        store: Some(log.clone()),
+        providers: vec![Arc::new(ScriptedProvider::new("p"))],
+        ..AsterpathConfig::default()
+    })
+    .expect("assemble");
     Fixture {
         log,
-        commits,
-        waits,
+        commits: Arc::clone(&engine.store),
+        waits: Arc::clone(engine.waits()),
     }
 }
 
