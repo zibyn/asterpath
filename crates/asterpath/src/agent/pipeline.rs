@@ -14,18 +14,19 @@ use std::time::Duration;
 
 use asterpath_protocol::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest,
-    ApprovalVerdict, CancelReason, CancelToken, ChildOutcome, Clock, DedupKey, HookError, Hooks,
-    Item, LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance, ReplaySafety,
-    SessionEvent, SessionFacts, SessionId, SessionStore, StepId, Tool, ToolArgs, ToolCallCtx,
-    ToolCallId, ToolConfig, ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind,
-    ToolGate, ToolName, ToolOutput, ToolResultStatus, ToolResultView, TurnId, UsageLookup, dedup,
-    root_of, unique_bytes,
+    ApprovalVerdict, CancelReason, CancelToken, ChildOutcome, Clock, HookError, Hooks, Item,
+    LogEntry, NO_APPROVAL_ENDPOINT, Parallelism, Part, Provenance, ReplaySafety, SessionEvent,
+    SessionFacts, SessionId, StepId, Tool, ToolArgs, ToolCallCtx, ToolCallId, ToolConfig,
+    ToolContext, ToolDescriptor, ToolError, ToolErrorInfo, ToolErrorKind, ToolGate, ToolName,
+    ToolOutput, ToolResultStatus, ToolResultView, TurnId, UsageLookup, dedup, root_of,
+    unique_bytes,
 };
 use futures_core::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
 use super::{EventSink, caught};
+use crate::commit::CommitLog;
 use crate::scan::scan_decoded;
 use crate::scheduler::SPAWN_TOOL_NAME;
 use crate::tools::ToolTable;
@@ -69,7 +70,7 @@ pub(crate) enum ToolOutcome {
 }
 
 pub(crate) struct ToolPipeline {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
     tools: Arc<ToolTable>,
     config: ToolConfig,
     approval: Arc<dyn ApprovalPolicy>,
@@ -84,7 +85,7 @@ pub(crate) struct ToolPipeline {
 
 impl ToolPipeline {
     pub(crate) fn new(
-        log: Arc<dyn SessionStore>,
+        log: Arc<CommitLog>,
         tools: Arc<ToolTable>,
         config: ToolConfig,
         approval: Arc<dyn ApprovalPolicy>,
@@ -299,21 +300,22 @@ impl ToolPipeline {
             ),
             None => {
                 let tool_call_id = ToolCallId::from_bytes(unique_bytes(self.clock.now()));
-                self.append(
-                    step.session,
-                    SessionEvent::ToolCallRequested {
-                        turn_id: step.turn,
-                        step_id: step.step,
-                        tool_call_id,
-                        provider_call_id: call.provider_call_id,
-                        name: call.name.clone(),
-                        raw_args: call.raw_args.clone(),
-                        replay: ReplaySafety::Safe,
-                        provenance: Provenance::Output,
-                    },
-                    Some(dedup::tool_call(tool_call_id)),
-                )
-                .await?;
+                self.log
+                    .append_event(
+                        step.session,
+                        SessionEvent::ToolCallRequested {
+                            turn_id: step.turn,
+                            step_id: step.step,
+                            tool_call_id,
+                            provider_call_id: call.provider_call_id,
+                            name: call.name.clone(),
+                            raw_args: call.raw_args.clone(),
+                            replay: ReplaySafety::Safe,
+                            provenance: Provenance::Output,
+                        },
+                        Some(dedup::tool_call(tool_call_id)),
+                    )
+                    .await?;
                 (tool_call_id, call.name, call.raw_args)
             }
         };
@@ -411,21 +413,22 @@ impl ToolPipeline {
             replay,
         );
         let pre_failure = self.before_tool(&ctx, &mut args).await;
-        self.append(
-            step.session,
-            SessionEvent::ToolCallRequested {
-                turn_id: step.turn,
-                step_id: step.step,
-                tool_call_id,
-                provider_call_id: call.provider_call_id.clone(),
-                name: call.name.clone(),
-                raw_args: args.clone(),
-                replay,
-                provenance,
-            },
-            Some(dedup::tool_call(tool_call_id)),
-        )
-        .await?;
+        self.log
+            .append_event(
+                step.session,
+                SessionEvent::ToolCallRequested {
+                    turn_id: step.turn,
+                    step_id: step.step,
+                    tool_call_id,
+                    provider_call_id: call.provider_call_id.clone(),
+                    name: call.name.clone(),
+                    raw_args: args.clone(),
+                    replay,
+                    provenance,
+                },
+                Some(dedup::tool_call(tool_call_id)),
+            )
+            .await?;
         Ok(Some(Admitted {
             tool_call_id,
             output_index: call.output_index,
@@ -492,17 +495,18 @@ impl ToolPipeline {
             .open_children()
             .filter(|(_, child)| step_calls.contains(&child.parent_tool_call));
         for (child, _) in owned_children {
-            self.append(
-                step.session,
-                SessionEvent::ChildSessionCompleted {
-                    child,
-                    outcome: ChildOutcome::Cancelled {
-                        reason: CancelReason::Parent,
+            self.log
+                .append_event(
+                    step.session,
+                    SessionEvent::ChildSessionCompleted {
+                        child,
+                        outcome: ChildOutcome::Cancelled {
+                            reason: CancelReason::Parent,
+                        },
                     },
-                },
-                Some(dedup::child_session(child)),
-            )
-            .await?;
+                    Some(dedup::child_session(child)),
+                )
+                .await?;
         }
         // Every pending call has a recorded intent; an open one has no result.
         for call in pending {
@@ -891,33 +895,19 @@ impl ToolPipeline {
         error: Option<ToolErrorInfo>,
         truncated: bool,
     ) -> Result<(), AgentError> {
-        self.append(
-            session,
-            SessionEvent::ToolResult {
-                tool_call_id,
-                status,
-                output,
-                error,
-                truncated,
-            },
-            Some(dedup::tool_result(tool_call_id)),
-        )
-        .await
-    }
-
-    async fn append(
-        &self,
-        session: SessionId,
-        event: SessionEvent,
-        key: Option<DedupKey>,
-    ) -> Result<(), AgentError> {
-        let entry = asterpath_protocol::encode_entry(session, key, &event).map_err(|error| {
-            AgentError::Corrupt {
+        self.log
+            .append_event(
                 session,
-                detail: error.to_string(),
-            }
-        })?;
-        self.log.append(entry).await?;
+                SessionEvent::ToolResult {
+                    tool_call_id,
+                    status,
+                    output,
+                    error,
+                    truncated,
+                },
+                Some(dedup::tool_result(tool_call_id)),
+            )
+            .await?;
         Ok(())
     }
 }

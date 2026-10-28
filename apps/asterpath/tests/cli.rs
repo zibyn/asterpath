@@ -1294,8 +1294,9 @@ fn resume_continues_pending_input() {
     assert_eq!(stdout, "Pending input ran");
 }
 
+/// `ask` / `allow`, and their old names `untrusted` / `never` (#213).
 #[test]
-fn untrusted_denies_mutating_tools_in_exec_and_never_runs_them() {
+fn ask_denies_mutating_tools_in_exec_and_allow_runs_them() {
     for (flags, ran) in [
         (&["-s", "full-access"][..], false),
         (&["-a", "never", "-s", "full-access"], true),
@@ -1309,6 +1310,22 @@ fn untrusted_denies_mutating_tools_in_exec_and_never_runs_them() {
                 "approval.default=\"never\"",
                 "-a",
                 "untrusted",
+                "-s",
+                "full-access",
+            ],
+            false,
+        ),
+        (&["-a", "allow", "-s", "full-access"], true),
+        (
+            &["-c", "approval.default=\"allow\"", "-s", "full-access"],
+            true,
+        ),
+        (
+            &[
+                "-c",
+                "approval.default=\"allow\"",
+                "-a",
+                "ask",
                 "-s",
                 "full-access",
             ],
@@ -1364,7 +1381,7 @@ fn a_bad_approval_mode_lists_the_three_modes() {
         let output = dir.exec(&dir.path).args(flags).arg("go").output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{flags:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        for mode in ["untrusted", "never", "read-only"] {
+        for mode in ["read-only", "ask", "allow"] {
             assert!(stderr.contains(mode), "{flags:?}: {stderr}");
         }
     }

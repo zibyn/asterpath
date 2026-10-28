@@ -2125,3 +2125,82 @@ async fn server_tools_fail_before_http_when_unsupported_or_not_objects() {
 
     assert!(server.requests().is_empty());
 }
+
+#[tokio::test]
+async fn invalid_requests_fail_before_any_http() {
+    let server = MockServer::start(Vec::new());
+
+    let mut other_provider = base_request();
+    other_provider.spec.provider = ProviderId::new("other");
+    let error = one_request(&server, other_provider).await;
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    let mut non_text_instruction = base_request();
+    non_text_instruction.items = vec![
+        user_message(vec![text("go")]),
+        Item::Instruction {
+            key: None,
+            parts: vec![Part::Image {
+                media_type: "image/png".to_owned(),
+                source: ImageSource::Base64 {
+                    data: "AAAA".to_owned(),
+                },
+            }],
+        },
+    ];
+    let error = one_request(&server, non_text_instruction).await;
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    assert!(
+        server.requests().is_empty(),
+        "invalid requests must not reach HTTP"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_is_dropped_and_traced_when_its_binding_does_not_match() {
+    let mismatched = |change: fn(&mut ReasoningBinding, &mut RawProviderData)| {
+        let mut item = thinking("claude-opus-5-5", THINKING);
+        if let Item::Reasoning { binding, raw, .. } = &mut item {
+            change(binding, raw);
+        }
+        item
+    };
+    let cases = [
+        (
+            mismatched(|binding, _| binding.provider = ProviderId::new("other")),
+            "cross_provider",
+        ),
+        (
+            mismatched(|_, raw| raw.provider = ProviderId::new("other")),
+            "cross_provider",
+        ),
+        (
+            mismatched(|binding, _| binding.model = ModelId::new("claude-other")),
+            "model_mismatch",
+        ),
+        (
+            mismatched(|binding, _| binding.prefix_epoch = 1),
+            "prefix_epoch_mismatch",
+        ),
+        (
+            mismatched(|binding, _| binding.tools_hash = "stale".to_owned()),
+            "tools_hash_mismatch",
+        ),
+    ];
+    for (item, reason) in cases {
+        let server = MockServer::start(vec![Reply::sse(empty_sse())]);
+        let sink = Arc::new(RecordingSink::default());
+        let provider = provider(&server).with_trace_sink(sink.clone());
+        let mut request = request_for("claude-opus-5-5");
+        request.items = vec![
+            user_message(vec![text("hi")]),
+            item,
+            assistant_message(vec![text("ok")]),
+            user_message(vec![text("next")]),
+        ];
+        drain(&provider, request).await;
+        assert!(!server.requests()[0].body.contains(THINKING), "{reason}");
+        assert_eq!(sink.marks(), dropped_reasoning(reason));
+    }
+}
