@@ -7,17 +7,52 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use asterpath_protocol::{
-    CatalogEntry, Claim, LogEntry, LogId, LogQuery, NewEntry, OwnerToken, RetirementError,
-    SessionId, SessionQuery, SessionStore, StorageError,
+    AgentError, CatalogEntry, Claim, DedupKey, ExecutionError, LogEntry, LogId, LogQuery, NewEntry,
+    OwnerToken, RetirementError, SessionEvent, SessionId, SessionQuery, SessionStore, StorageError,
 };
-use asterpath_protocol::{CommittedRecord, Hooks, decode_entry};
+use asterpath_protocol::{CommittedRecord, Hooks, decode_entry, encode_entry};
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::lock::Mutex as AsyncMutex;
 
+use crate::error::AsterError;
 use crate::owner::Ownership;
 use crate::watch::Watchers;
+
+/// Why a typed append did not commit. An event that does not encode is an
+/// engine bug, never the caller's input: it maps to an internal error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AppendError {
+    #[error("cannot encode a record of session {session:?}: {detail}")]
+    Encode { session: SessionId, detail: String },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+impl From<AppendError> for ExecutionError {
+    fn from(error: AppendError) -> Self {
+        Self::Backend(error.to_string())
+    }
+}
+
+impl From<AppendError> for AgentError {
+    fn from(error: AppendError) -> Self {
+        match error {
+            AppendError::Storage(error) => Self::Storage(error),
+            encode @ AppendError::Encode { .. } => Self::Execution(encode.into()),
+        }
+    }
+}
+
+impl From<AppendError> for AsterError {
+    fn from(error: AppendError) -> Self {
+        match error {
+            AppendError::Storage(error) => Self::Storage(error),
+            encode @ AppendError::Encode { .. } => Self::Execution(encode.into()),
+        }
+    }
+}
 
 /// Last record shown to `on_record` for one session.
 #[derive(Clone, Copy, Default)]
@@ -56,6 +91,31 @@ impl CommitLog {
             watchers,
             ownership,
         }
+    }
+
+    /// A commit log over `inner` with no hooks, private watchers and an
+    /// ownership that holds no claims: what engine parts get in unit tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(inner: Arc<dyn SessionStore>) -> Arc<Self> {
+        let ownership = Arc::new(Ownership::new(Arc::clone(&inner), Vec::new()));
+        Arc::new(Self::new(inner, Vec::new(), Arc::default(), ownership))
+    }
+
+    /// The typed append: encodes `event`, stamps the owner of the drive or
+    /// compaction being polled, shows the record to `on_record` and tells
+    /// the watchers. `key` is the caller's dedup key; a replay returns the
+    /// committed record's id.
+    pub(crate) async fn append_event(
+        &self,
+        session: SessionId,
+        event: SessionEvent,
+        key: Option<DedupKey>,
+    ) -> Result<LogId, AppendError> {
+        let entry = encode_entry(session, key, &event).map_err(|error| AppendError::Encode {
+            session,
+            detail: error.to_string(),
+        })?;
+        Ok(self.append(entry).await?)
     }
 
     fn cursor(&self, session: SessionId) -> Arc<AsyncMutex<Cursor>> {
@@ -196,5 +256,85 @@ impl SessionStore for CommitLog {
         expected_frontier: LogId,
     ) -> BoxFuture<'_, Result<(), RetirementError>> {
         self.inner.retire(session, expected_frontier)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use asterpath_protocol::{
+        CommittedRecord, Hooks, InputId, SessionEvent, SessionId, SessionStore, StorageError,
+        decode_entry, dedup, scan_all,
+    };
+    use asterpath_testing::InMemoryEventLog;
+
+    use super::{AppendError, CommitLog};
+    use crate::owner::Ownership;
+
+    const SESSION: SessionId = SessionId::from_bytes([4; 16]);
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<SessionEvent>>);
+
+    impl Hooks for Seen {
+        fn on_record(&self, record: &CommittedRecord) {
+            self.0.lock().unwrap().push(record.event.clone());
+        }
+    }
+
+    fn input() -> SessionEvent {
+        SessionEvent::InputRecorded { input: Vec::new() }
+    }
+
+    fn commit_log(inner: &Arc<InMemoryEventLog>, hooks: Vec<Arc<dyn Hooks>>) -> CommitLog {
+        let inner: Arc<dyn SessionStore> = inner.clone();
+        CommitLog::new(
+            Arc::clone(&inner),
+            hooks.clone(),
+            Arc::default(),
+            Arc::new(Ownership::new(inner, hooks)),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_typed_append_is_committed_once_and_shown_to_on_record() {
+        let inner = Arc::new(InMemoryEventLog::new());
+        let seen = Arc::new(Seen::default());
+        let log = commit_log(&inner, vec![seen.clone()]);
+        let key = Some(dedup::input_recorded(InputId::from_bytes([1; 16])));
+
+        let first = log
+            .append_event(SESSION, input(), key.clone())
+            .await
+            .expect("append");
+        let replay = log
+            .append_event(SESSION, input(), key)
+            .await
+            .expect("replay");
+
+        assert_eq!(first, replay);
+        let entries = scan_all(&*inner, SESSION).await.expect("scan");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(decode_entry(&entries[0]).expect("decodes"), input());
+        assert_eq!(*seen.0.lock().unwrap(), vec![input()]);
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_is_the_storage_arm_of_the_append_error() {
+        let inner = Arc::new(InMemoryEventLog::new());
+        let log = commit_log(&inner, Vec::new());
+        // The store rejects metadata for a session it never saw created.
+        let orphan = SessionEvent::MetadataChanged {
+            set: Default::default(),
+            remove: Vec::new(),
+        };
+
+        let error = log.append_event(SESSION, orphan, None).await.unwrap_err();
+
+        assert!(
+            matches!(error, AppendError::Storage(StorageError::InvalidEntry(_))),
+            "{error:?}"
+        );
     }
 }

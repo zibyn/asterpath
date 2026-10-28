@@ -9,13 +9,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use asterpath_protocol::{
-    ApprovalDecision, ExecutionError, LogId, SessionId, SessionStore, ToolCallId,
-};
-use asterpath_protocol::{SessionEvent, dedup, encode_entry};
+use asterpath_protocol::{ApprovalDecision, ExecutionError, SessionId, ToolCallId};
+use asterpath_protocol::{SessionEvent, dedup};
 use futures_core::future::BoxFuture;
 
-use crate::scan::{backend, scan_decoded};
+use crate::commit::CommitLog;
+use crate::scan::scan_decoded;
 use tokio::sync::Notify;
 
 /// Longest a wait goes without re-reading the log.
@@ -57,26 +56,16 @@ impl Waiters {
 
 /// Approval and child-completion waits backed by the event log.
 pub(crate) struct Waits {
-    log: Arc<dyn SessionStore>,
+    log: Arc<CommitLog>,
     waiters: Waiters,
 }
 
 impl Waits {
-    pub(crate) fn new(log: Arc<dyn SessionStore>) -> Self {
+    pub(crate) fn new(log: Arc<CommitLog>) -> Self {
         Self {
             log,
             waiters: Waiters::default(),
         }
-    }
-
-    async fn append(
-        &self,
-        session: SessionId,
-        event: &SessionEvent,
-        key: Option<asterpath_protocol::DedupKey>,
-    ) -> Result<LogId, ExecutionError> {
-        let entry = encode_entry(session, key, event).map_err(backend)?;
-        self.log.append(entry).await.map_err(backend)
     }
 
     pub(crate) async fn find_approval(
@@ -157,15 +146,16 @@ impl Waits {
         decision: ApprovalDecision,
     ) -> BoxFuture<'_, Result<(), ExecutionError>> {
         Box::pin(async move {
-            self.append(
-                session,
-                &SessionEvent::ApprovalDecided {
-                    tool_call_id: call,
-                    decision,
-                },
-                Some(dedup::approval_decided(call)),
-            )
-            .await?;
+            self.log
+                .append_event(
+                    session,
+                    SessionEvent::ApprovalDecided {
+                        tool_call_id: call,
+                        decision,
+                    },
+                    Some(dedup::approval_decided(call)),
+                )
+                .await?;
             self.waiters.wake(WaitKey::Approval(call));
             Ok(())
         })
