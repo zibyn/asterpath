@@ -173,7 +173,7 @@ impl DefaultCompactor {
             }],
             raw: None,
         };
-        let request = match job.prefix.clone().filter(|prefix| prefix.spec == job.model) {
+        let mut request = match job.prefix.clone().filter(|prefix| prefix.spec == job.model) {
             Some(mut request) => {
                 // Cache-safe fork (#176): the session's system, tools,
                 // parameters and history, with the prompt appended last.
@@ -207,7 +207,6 @@ impl DefaultCompactor {
                 request
             }
         };
-        let mut request = request;
         request.session.clone_from(&job.session);
 
         let (summary, usage) = match self.call_summary(provider.as_ref(), request, &job).await {
@@ -295,6 +294,17 @@ impl DefaultCompactor {
                             .filter(|part| matches!(part, Part::Text { .. })),
                     );
                 }
+            }
+            // A forked request keeps `tool_choice: Auto`, so the reply may be
+            // tool calls only; an empty summary would erase the history.
+            if !summary
+                .iter()
+                .any(|part| matches!(part, Part::Text { text } if !text.trim().is_empty()))
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::StreamProtocol,
+                    "summary reply has no text",
+                ));
             }
             Ok((summary, usage))
         };

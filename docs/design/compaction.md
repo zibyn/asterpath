@@ -91,8 +91,8 @@ pub enum CompactResult {
 ### 摘要
 
 - **同模型：沿用会话请求**（cache-safe fork，#176）。agent 在 `CompactionInput.request` 里带上会话此刻的请求（与 `history` 同一日志、同一水位，由 `build_request` 渲染，含基线 system、指令节、工具、`cache_ttl`、`prefix_epoch`）；`plan` 把它的 `items` 截到被替换区间（`history` 中被替换条目的 item 数之和），放进 `CompactionJob.prefix`。`compact` 在 `prefix.spec == job.model` 时用它：末尾追加摘要指令作为最后一条 user 消息，其余字段原样保留，因此去掉最后一条 user 消息后，摘要请求是会话最后一次请求的前缀。例外只有会改变回复形态的字段：
-  - `tool_choice` 为 `Required` / `Tool` 时改成 `None`；`Auto` / `None` 保持不变——`tool_choice` 属于 Anthropic 消息缓存的前缀，改成 `None` 会让被摘要区间按全价重读。指令里要求只回复文本，模型若仍调用工具，只取文本部分；
-  - `output_format = None`（结构化输出会把摘要约束成 schema）；
+  - `tool_choice` 为 `Required` / `Tool` 时改成 `None`；`Auto` / `None` 保持不变——`tool_choice` 属于 Anthropic 消息缓存的前缀，改成 `None` 会让被摘要区间按全价重读。指令里要求只回复文本，模型若仍调用工具，只取文本部分；回复里没有非空文本（例如只有工具调用）按摘要调用失败处理（`StreamProtocol`，不重试，→ `CompactionAborted{SummaryFailed}`），不会以空摘要替换历史；
+  - `output_format = None`：结构化输出会把摘要约束成应用的 schema，而摘要必须是自由文本。与 `tool_choice` 不同，这里没有保持不变的选项；供应商若把输出格式计入缓存（Anthropic 改 `output_config.format` 会使缓存失效），设了结构化输出的会话压缩时付一次全价读；
   - `max_output_tokens = max_summary_tokens + reasoning.budget_tokens`（thinking 预算计入输出上限）。
   - reasoning 照常回放：system、工具、`prefix_epoch` 都与会话请求一致，adapter 的 reasoning 回放门控（provider / 模型 / `prefix_epoch` / 工具指纹）按普通会话请求判断。
 - **不同模型：独立请求**。不同模型不共享缓存，摘要请求不带 system 与工具。**输入只含文本**（避免把 reasoning / raw / 图片交给摘要模型，触发 400 或无界图片）：
@@ -179,7 +179,7 @@ project(entries):
 
 | 情况 | 结果 |
 | --- | --- |
-| 摘要调用失败 / 重试耗尽（沿用 `TurnConfig` 的 attempt / 退避） | `CompactionAborted{SummaryFailed}`；回合内 → `TurnCommitted(CompactionFailed)`，手动 → `Err(AgentError::Compaction(..))` |
+| 摘要调用失败 / 重试耗尽（沿用 `TurnConfig` 的 attempt / 退避）/ 回复没有文本 | `CompactionAborted{SummaryFailed}`；回合内 → `TurnCommitted(CompactionFailed)`，手动 → `Err(AgentError::Compaction(..))` |
 | 没有可删前缀且仍超窗 | `TurnCommitted(ContextExhausted)`，无事件 |
 | 压完仍超 usable window | `CompactionAborted{Insufficient}`；回合内 → `TurnCommitted(ContextExhausted)`，手动 → `Ok(CompactResult::Insufficient)` |
 | `stop_reason` 超限 | `TurnCommitted(ContextExhausted)`，无事件 |
@@ -190,7 +190,7 @@ project(entries):
 
 ## 7. 缓存、追踪与统计
 
-- **前缀缓存**：摘要请求同模型时沿用会话前缀（§6），被摘要区间按缓存读计费。压缩之后的请求必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
+- **前缀缓存**：摘要请求同模型时沿用会话前缀（§4），被摘要区间按缓存读计费。压缩之后的请求必然使 Anthropic 显式断点与 OpenAI 自动前缀失效。接受每次压缩一次全价缓存写；不为缓存调整触发点或保留边界；压缩后下一次请求自然建立新前缀；system / tools 顺序不变。这是已知成本，写进吞吐预算。
 - **追踪**：`CompactionStarted` 到 `CompactionApplied` / `CompactionAborted` 构成一个 `compaction` span，父为当前 step / turn / session（见 [tracing.md](tracing.md)）。失败 attempt 只在实时 tap 中可见，没有日志记录。
 - **token 统计**：`CompactionApplied.usage` 单列 `compaction` 桶；计入 session 总量；若位于回合内，也计入该 turn 总量，但不属于任何 step 的 usage；子会话的压缩只进子会话，不 rollup 到父会话。turn 归属取同 dedup key 的 `CompactionStarted.turn`；最终口径见 [usage.md](usage.md)（#13）。
 

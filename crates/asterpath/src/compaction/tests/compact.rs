@@ -185,6 +185,35 @@ async fn rejected_failure_is_not_retried() {
 }
 
 #[tokio::test]
+async fn reply_without_text_is_a_summary_failure() {
+    // `tool_choice` stays `Auto` on a forked request, so the model may answer
+    // with tool calls only.
+    let provider = Arc::new(ScriptedProvider::new("p").respond(
+        vec![Item::ToolCall {
+            call_id: "c9".to_owned(),
+            provider_item_id: None,
+            name: asterpath_protocol::ToolName::new("shell"),
+            raw_args: asterpath_protocol::JsonString::new("{}"),
+            raw: None,
+        }],
+        StopReason::ToolUse,
+        usage(1, 1),
+    ));
+    let mut job = job(1000, 0);
+    job.prefix = Some(session_request());
+    let error = compactor(Arc::clone(&provider))
+        .compact(job)
+        .await
+        .expect_err("an empty summary is never applied");
+    assert!(matches!(
+        error,
+        asterpath_protocol::CompactionError::Provider(error)
+            if error.kind == ProviderErrorKind::StreamProtocol
+    ));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn missing_summary_provider_is_an_error_without_fallback() {
     let compactor = DefaultCompactor::new(Arc::new(ProviderCatalog::default()));
     let mut job = job(1000, 0);
