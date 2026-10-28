@@ -67,8 +67,8 @@ pub const STYLE: &str = "style";
 /// The agent profile of new sessions when none is configured (ADR-0051).
 pub const DEFAULT_AGENT: &str = "default";
 
-/// `[sandbox] mode`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+/// `[sandbox] mode` and `-s`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,

@@ -114,7 +114,7 @@ async fn read_only_in_the_config_is_the_new_session_default() {
         .unwrap();
     assert_eq!(
         desktop.approval_mode(session.id).await.unwrap(),
-        ApprovalMode::Deny
+        ApprovalMode::ReadOnly
     );
 }
 

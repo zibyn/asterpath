@@ -151,7 +151,7 @@ export function Conversation({ session }: { session: string }) {
               disabled={readOnly || !mode.data}
               onChange={(event) => setMode.mutate(event.target.value as commands.ApprovalMode)}
             >
-              <option value="deny">Read only</option>
+              <option value="read-only">Read only</option>
               <option value="ask">Ask outside the sandbox</option>
               <option value="allow">Allow all</option>
             </select>

@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use asterpath_http::{
-    merge_provider_option, provider_options_for, reasoning_in_place, same_provider_raw_field,
-    server_tools_for, unrenderable_part,
+    check_request, merge_provider_option, provider_options_for, reasoning_drop_reason,
+    reasoning_in_place, same_provider_raw_field, server_tools_for,
 };
 use asterpath_protocol::{
     FileSource, ImageSource, Item, ModelRequest, Part, ProviderCapabilities, ProviderError,
@@ -165,25 +165,14 @@ fn validate(
     capabilities: ProviderCapabilities,
     profile: &OpenAiModelProfile,
 ) -> Result<(), ProviderError> {
-    if let Some(feature) = capabilities.unsupported_feature(request) {
-        return Err(unsupported(feature));
-    }
-    if let Some(detail) = unrenderable_part(request, &profile.file_media_types) {
-        return Err(unsupported(&detail));
-    }
-    if request.spec.provider != *provider {
-        return Err(invalid_request(format!(
-            "request provider {} does not match adapter {provider}",
-            request.spec.provider
-        )));
-    }
-    if !request
-        .system
-        .iter()
-        .all(|part| matches!(part, Part::Text { .. }))
-    {
-        return Err(invalid_request("system may only contain text parts"));
-    }
+    check_request(
+        request,
+        provider,
+        ADAPTER_NAME,
+        capabilities,
+        &profile.file_media_types,
+        &profile.efforts,
+    )?;
     // The Responses create body has no `stop`/`stop_sequences` parameter
     // (https://developers.openai.com/api/reference/resources/responses/methods/create, 2026-10-24).
     if !request.stop_sequences.is_empty() {
@@ -203,14 +192,6 @@ fn validate(
         && reasoning.budget_tokens.is_some()
     {
         return Err(unsupported("reasoning budget_tokens"));
-    }
-    if let Some(effort) = request.reasoning.as_ref().and_then(|params| params.effort)
-        && !profile.efforts.contains(&effort)
-    {
-        return Err(unsupported(&format!(
-            "reasoning effort {effort:?} on {}",
-            request.spec.model
-        )));
     }
     Ok(())
 }
@@ -305,18 +286,9 @@ fn render_input(
             Item::Reasoning {
                 binding, raw: data, ..
             } => {
-                let reason = if binding.provider != *provider {
-                    Some("cross_provider")
-                } else if binding.model != request.spec.model {
-                    Some("model_mismatch")
-                } else if binding.prefix_epoch != request.prefix_epoch {
-                    Some("prefix_epoch_mismatch")
-                } else {
-                    // No tools_hash check: OpenAI documents no binding between
-                    // reasoning items and the tool set (#108).
-                    None
-                };
-                match reason {
+                // No tools_hash check: OpenAI documents no binding between
+                // reasoning items and the tool set (#108).
+                match reasoning_drop_reason(binding, data, request, None) {
                     Some(reason) => drop_mark(provider, "reasoning", reason, trace),
                     None => input.push(raw_json(data)?),
                 }
@@ -557,7 +529,7 @@ fn text_content(
     content
 }
 
-/// A text placeholder for a non-text compaction or instruction part, traced.
+/// A text placeholder for a non-text compaction part, traced.
 fn omitted(provider: &ProviderId, trace: Option<&dyn TraceSink>, kind: &str, noun: &str) -> Value {
     mark(
         trace,
@@ -601,10 +573,12 @@ fn mark(trace: Option<&dyn TraceSink>, mark: TraceMark) {
     }
 }
 
+const ADAPTER_NAME: &str = "openai";
+
 fn unsupported(detail: &str) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Unsupported,
-        format!("{detail} is not supported by the openai adapter"),
+        format!("{detail} is not supported by the {ADAPTER_NAME} adapter"),
     )
 }
 

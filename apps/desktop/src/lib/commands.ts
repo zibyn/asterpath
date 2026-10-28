@@ -90,7 +90,7 @@ export const approve = (request: ApprovalRequest, answer: Answer) =>
   invoke<void>("approve", { session: request.session, call: request.tool_call_id, answer });
 
 /** What a session tree's mutating tool calls get; in memory, applies from the next call. */
-export type ApprovalMode = "deny" | "ask" | "allow";
+export type ApprovalMode = "read-only" | "ask" | "allow";
 
 export const approvalMode = (session: string) => invoke<ApprovalMode>("approval_mode", { session });
 
